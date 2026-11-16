@@ -2,6 +2,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 
@@ -20,6 +21,7 @@ const page = vi.hoisted(() => ({
   destroyed: 0,
   deniedPopups: 0,
   targetCalls: 0,
+  requestGuard: null as null | ((details: { url: string }, callback: (result: { cancel: boolean }) => void) => void),
   lateOverlays: [] as Array<{ reason: string; selector_hint: string; label: string }>,
 }));
 
@@ -74,7 +76,8 @@ vi.mock('electron', () => {
     };
     constructor(public options: any) {}
     setContentSize() {}
-    async loadURL() {
+    async loadURL(url: string) {
+      page.url = url;
       if (page.loadError) throw page.loadError;
       if (page.redirectTo) {
         page.url = page.redirectTo;
@@ -89,7 +92,8 @@ vi.mock('electron', () => {
     session: {
       fromPartition(name: string) {
         page.partitions.push(name);
-        return { setPermissionRequestHandler() {}, setPermissionCheckHandler() {}, on() {} };
+        return { setPermissionRequestHandler() {}, setPermissionCheckHandler() {}, on() {},
+          webRequest: { onBeforeRequest(handler: typeof page.requestGuard) { page.requestGuard = handler; } } };
       },
     },
   };
@@ -120,6 +124,7 @@ beforeEach(async () => {
     destroyed: 0,
     deniedPopups: 0,
     targetCalls: 0,
+    requestGuard: null,
     lateOverlays: [{ reason: 'fixed_overlay', selector_hint: 'div.newsletter', label: 'Subscribe' }],
     facts: {
       title: 'Example — Your AI team',
@@ -180,6 +185,54 @@ describe('product.capture input normalization', () => {
 });
 
 describe('product.capture through the real tool', () => {
+  it('captures a scoped local HTML entry while blocking sibling files, symlink escapes and non-web schemes', async () => {
+    const entryDir = path.join(workspace, 'site');
+    fs.mkdirSync(entryDir);
+    const entry = path.join(entryDir, 'index.html');
+    fs.writeFileSync(entry, '<h1>Local product</h1>');
+    fs.writeFileSync(path.join(entryDir, 'style.css'), 'body { color: red }');
+    fs.writeFileSync(path.join(workspace, 'outside.txt'), 'private');
+    fs.symlinkSync(path.join(workspace, 'outside.txt'), path.join(entryDir, 'escape.txt'));
+    const { createVideoTimelineTool } = await import('../../../../src/main/model/core-agent/video-timeline-tool');
+    const t = createVideoTimelineTool({ userId: UID, cid: 'conversation' }, await tool());
+    const report = body(await t.execute({ op: 'product.capture', production_dir: 'ad', input_path: 'site/index.html' }, ctx()));
+    const entryUrl = pathToFileURL(fs.realpathSync(entry)).href;
+    expect(report).toMatchObject({ ok: true, source_url: entryUrl, final_url: entryUrl,
+      visual_evidence: { attached: true, role: 'product_capture_overview' } });
+    expect(report.paths_relative_to).toBe(path.join(workspace, 'ad/videos/main'));
+    const allowed = (url: string) => {
+      let cancelled: boolean | undefined;
+      page.requestGuard!({ url }, result => { cancelled = result.cancel; });
+      return cancelled === false;
+    };
+    expect(page.requestGuard).toBeTypeOf('function');
+    expect(allowed(pathToFileURL(path.join(entryDir, 'style.css')).href)).toBe(true);
+    for (const file of ['outside.txt', 'site/escape.txt', 'site/../outside.txt'])
+      expect(allowed(pathToFileURL(path.join(workspace, file)).href)).toBe(false);
+    expect(allowed('https://example.com/style.css')).toBe(true);
+    expect(allowed('data:image/png;base64,AAAA')).toBe(true);
+    expect(allowed('javascript:alert(1)')).toBe(false);
+    expect(fs.readFileSync(entry, 'utf8')).toBe('<h1>Local product</h1>');
+  });
+
+  it('rejects ambiguous, missing, non-HTML and out-of-scope local entries before opening a window', async () => {
+    fs.writeFileSync(path.join(root, 'outside.html'), '<h1>private</h1>');
+    fs.writeFileSync(path.join(workspace, 'image.png'), 'image');
+    fs.writeFileSync(path.join(workspace, 'large.html'), '');
+    fs.truncateSync(path.join(workspace, 'large.html'), 8 * 1024 * 1024 + 1);
+    fs.symlinkSync(path.join(root, 'outside.html'), path.join(workspace, 'escape.html'));
+    const t = await tool();
+    for (const input of [
+      { input_path: 'image.png' }, { input_path: 'missing.html' }, { input_path: '../outside.html' },
+      { input_path: 'escape.html' }, { input_path: 'site.html', url: 'https://example.com/' },
+      { input_path: 'large.html' }, { input_path: '' }, { input_path: 42 },
+    ]) {
+      const result = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', ...input }, ctx());
+      expect(result.isError, JSON.stringify(input)).toBe(true);
+    }
+    expect(page.partitions).toHaveLength(0);
+    expect(fs.existsSync(path.join(workspace, 'project/composition/assets/product'))).toBe(false);
+  });
   it('returns cancellation and removes partial assets when cancelled during overview encoding', async () => {
     const controller = new AbortController();
     const runtime = await import('../../../../src/main/util/sharp-runtime');
@@ -190,7 +243,7 @@ describe('product.capture through the real tool', () => {
     });
     try {
       const t = await tool();
-      const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, { ...ctx(), signal: controller.signal });
+      const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, { ...ctx(), signal: controller.signal });
       expect(controller.signal.aborted).toBe(true);
       expect(result.isError).toBe(true);
       expect(body(result)).toMatchObject({ ok: false, errorCode: 'E_PRODUCT_CAPTURE_CANCELLED' });
@@ -208,7 +261,7 @@ describe('product.capture through the real tool', () => {
     page.incompressibleCrops = true;
     (page.facts as any).regions = [{ ...(page.facts as any).regions[0], x: 0, y: 0, width: 1440, height: 700 }];
     const t = await tool();
-    const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, ctx());
+    const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, ctx());
     expect(body(result)).toMatchObject({ ok: true, visual_evidence: { attached: true, role: 'product_capture_overview' } });
     expect(result.isError).toBeFalsy();
     expect(result.images).toHaveLength(1);
@@ -236,7 +289,7 @@ describe('product.capture through the real tool', () => {
     const encoding = vi.spyOn(runtime, 'encodeImage').mockRejectedValue(new Error('SYNTHETIC_ENCODER_FAILURE'));
     try {
       const t = await tool();
-      const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, ctx());
+      const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, ctx());
       expect(result.isError).toBeFalsy();
       expect(result.images).toBeUndefined();
       const report = body(result);
@@ -268,7 +321,7 @@ describe('product.capture through the real tool', () => {
     });
     try {
       const t = await tool();
-      const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, { ...ctx(), signal: controller.signal });
+      const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, { ...ctx(), signal: controller.signal });
       expect(result.isError).toBe(true);
       expect(body(result)).toMatchObject({ ok: false, errorCode: 'E_PRODUCT_CAPTURE_CANCELLED' });
       expect(fs.readdirSync(path.join(workspace, 'project/composition/assets/product'))).toEqual([]);
@@ -280,7 +333,7 @@ describe('product.capture through the real tool', () => {
   it.each(['../../escape', '..\\escape', 'r01/child', 'r01\\child', 'r01:stream', 'r01\0', 'r01\n'])('rejects a page-controlled filename %j before writing capture files', async (id) => {
     (page.facts as any).regions = [{ ...(page.facts as any).regions[0], id }];
     const t = await tool();
-    const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, ctx());
+    const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, ctx());
     expect(result.isError).toBe(true);
     expect(body(result)).toMatchObject({ ok: false, errorCode: 'E_PRODUCT_CAPTURE_READ' });
     const product = path.join(workspace, 'project/composition/assets/product');
@@ -292,7 +345,7 @@ describe('product.capture through the real tool', () => {
 
   it('keeps a requested crop named overview separate from the generated overview sheet', async () => {
     const t = await tool();
-    const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/',
+    const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/',
       clips: [{ id: 'overview', x: 10, y: 20, width: 100, height: 50 }],
     }, ctx());
     expect(result.isError).toBeFalsy();
@@ -305,10 +358,10 @@ describe('product.capture through the real tool', () => {
 
   it('saves page tiles, 2x region crops, page words and a manifest under the composition, then attaches the overview', async () => {
     const t = await tool();
-    const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, ctx());
+    const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, ctx());
     expect(result.isError).toBeFalsy();
     const report = body(result);
-    expect(report).toMatchObject({ ok: true, op: 'product.capture', mode: 'auto_regions', visual_evidence: { attached: true, role: 'product_capture_overview' } });
+    expect(report).toMatchObject({ ok: true, op: 'product.capture', composition_dir: path.join(workspace, 'project/composition'), mode: 'auto_regions', visual_evidence: { attached: true, role: 'product_capture_overview' } });
     expect(report.overview_abs_path).toBeUndefined();
     expect(result.images).toHaveLength(1);
     expect(result.imageRetention).toBe('active_turn');
@@ -354,7 +407,7 @@ describe('product.capture through the real tool', () => {
   it('follows a redirect the page starts while loading and reports language alternates', async () => {
     page.redirectTo = 'https://example.com/?lang=zh';
     const t = await tool();
-    const result: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, ctx());
+    const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, ctx());
     expect(result.isError).toBeFalsy();
     const report = body(result);
     expect(report.final_url).toBe('https://example.com/?lang=zh');
@@ -370,7 +423,7 @@ describe('product.capture through the real tool', () => {
     ];
     const t = await tool();
     const report = body(await t.execute({
-      op: 'product.capture', url: 'https://example.com/',
+      op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/',
       clips: [{ id: 'commander', x: 100, y: 2300, width: 400, height: 300 }],
       selectors: ['.oks-ui', '.missing'],
     }, ctx()));
@@ -390,13 +443,13 @@ describe('product.capture through the real tool', () => {
       { url: 'https://example.com/', clips: [{ x: -1, y: 0, width: 50, height: 50 }] },
       { url: 'https://example.com/', selectors: [123] },
     ]) {
-      const result: any = await t.execute({ op: 'product.capture', ...input }, ctx());
+      const result: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', ...input }, ctx());
       expect(result.isError).toBe(true);
     }
     expect(page.partitions).toHaveLength(0);
 
     page.loadError = new Error('ERR_NAME_NOT_RESOLVED');
-    const failed: any = await t.execute({ op: 'product.capture', url: 'https://example.com/' }, ctx());
+    const failed: any = await t.execute({ op: 'product.capture', composition_dir: 'project/composition', url: 'https://example.com/' }, ctx());
     expect(failed.isError).toBe(true);
     expect(body(failed)).toMatchObject({ ok: false, errorCode: 'E_PRODUCT_CAPTURE_LOAD' });
     expect(failed.images).toBeUndefined();

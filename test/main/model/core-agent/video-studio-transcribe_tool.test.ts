@@ -75,9 +75,9 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-async function tool() {
+async function tool(extra: Record<string, unknown> = {}) {
   return (await import('../../../../src/main/model/core-agent/video-studio-tool')).createVideoStudioTool({
-    userId: UID, cid: 'current-chat',
+    userId: UID, cid: 'current-chat', ...extra,
   } as any);
 }
 const body = (result: any) => JSON.parse(String(result.content).split('\n\n<file-renamed>')[0]);
@@ -102,6 +102,24 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe tr
     expect(body(result)).toMatchObject({ ok: false, errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT' });
     expect(fs.readFileSync(transcript, 'utf8')).toBe('{"text":"Prior usable result"}\n');
     expect(fs.readFileSync(source, 'utf8')).toBe('fake media');
+  });
+
+  it('notifies only preserved text after invalid timing and leaves the previous transcript intact', async () => {
+    const source = path.join(workspace, 'project', 'raw', 'clip.mp4'); fs.writeFileSync(source, 'fake media');
+    fs.mkdirSync(transcriptsDir(), { recursive: true });
+    const output = path.join(transcriptsDir(), 'old.json'); fs.writeFileSync(output, '{"text":"Prior"}');
+    writeExecutable(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
+      '#!/usr/bin/env node', "const fs=require('node:fs'),a=process.argv.slice(2);",
+      "fs.writeFileSync(a[a.indexOf('-of')+1]+'.json',JSON.stringify({transcription:[{text:'Keep this text.',offsets:{from:0,to:6000}}]}));",
+    ]);
+    const written: string[] = [];
+    const t = await tool({ onFileWritten: (file: string) => { written.push(file); } });
+    const result = await t.execute({ op: 'speech.transcribe', input_path: source, transcript_path: output }, { workingDir: workspace, state: {} } as any);
+    const data = body(result);
+    expect(result.isError).toBe(true); expect(data).toMatchObject({ ok: false, timing_valid: false });
+    expect(fs.readFileSync(data.text_path, 'utf8')).toBe('Keep this text.\n');
+    expect(written).toEqual([data.text_path]); expect(fs.readFileSync(output, 'utf8')).toBe('{"text":"Prior"}');
+    expect(data.text_path.startsWith(transcriptsDir() + path.sep)).toBe(true);
   });
 
   it('saves an unrequested transcript in the project, once per source file', async () => {
@@ -168,5 +186,63 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe tr
     } finally {
       fs.rmSync(elsewhere, { recursive: true, force: true });
     }
+  });
+});
+
+// 2026-11-13: three clips cut from a podcast on whole-second times taken from the
+// transcript's sentences dropped a question, a closing line and a payoff. The result
+// now opens with the transcript split at pauses measured while the audio is extracted.
+describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe phrase view', () => {
+  it('opens the result with lines split at the pauses measured in the audio', async () => {
+    // The extraction logs one silence; the recognizer stretches "without" over it.
+    writeExecutable(path.join(root, 'bin', 'ffmpeg'), [
+      '#!/usr/bin/env node',
+      "process.stderr.write('[silencedetect @ 0x1] silence_start: 0.5\\n[silencedetect @ 0x1] silence_end: 1.1 | silence_duration: 0.6\\n');",
+      "require('node:fs').writeFileSync(process.argv[process.argv.length - 1], 'wav');",
+    ]);
+    writeExecutable(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
+      '#!/usr/bin/env node',
+      "const args = process.argv.slice(2);",
+      "const base = args[args.indexOf('-of') + 1];",
+      "const tok = (text, from, to) => ({ text, offsets: { from, to } });",
+      "require('node:fs').writeFileSync(base + '.json', JSON.stringify({ result: { language: 'en' }, transcription: [{ offsets: { from: 0, to: 2000 }, text: ' Grow without hiring.', tokens: [tok(' Grow', 0, 500), tok(' without', 500, 1500), tok(' hiring', 1500, 1900), tok('.', 1900, 2000)] }] }));",
+    ]);
+    const source = path.join(workspace, 'project', 'raw', 'talk.mp4');
+    fs.writeFileSync(source, 'fake media');
+    const result = await (await tool()).execute({ op: 'speech.transcribe', input_path: 'project/raw/talk.mp4' }, { workingDir: workspace, state: {} } as any);
+    const content = String(result.content);
+    const reply = body(result);
+    expect(reply).toMatchObject({ ok: true, phrases: { lines: 2, measured_pauses: 1 } });
+    expect(reply.phrases.text).toBe('[0.00–0.50] Grow\n  — 0.60s —\n[1.10–2.00] without hiring.');
+    // Ahead of the full transcript, so a capped result still shows it.
+    expect(content.indexOf('"phrases"')).toBeLessThan(content.indexOf('"summary"'));
+    // The saved transcript is unchanged: the view is not written next to it.
+    expect(fs.readdirSync(transcriptsDir())).toHaveLength(1);
+  });
+  it('builds the view from word times even when the caller asks for sentences', async () => {
+    // 2026-11-13: a run that asked for sentence times got a view split only between
+    // sentences and cut on whole seconds again.
+    writeExecutable(path.join(root, 'bin', 'ffmpeg'), [
+      '#!/usr/bin/env node',
+      "process.stderr.write('[silencedetect @ 0x1] silence_start: 0.5\\n[silencedetect @ 0x1] silence_end: 1.1\\n');",
+      "require('node:fs').writeFileSync(process.argv[process.argv.length - 1], 'wav');",
+    ]);
+    const argsLog = path.join(root, 'whisper-args.json');
+    writeExecutable(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
+      '#!/usr/bin/env node',
+      "const args = process.argv.slice(2);",
+      `require('node:fs').writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(args));`,
+      "const base = args[args.indexOf('-of') + 1];",
+      "const tok = (text, from, to) => ({ text, offsets: { from, to } });",
+      "require('node:fs').writeFileSync(base + '.json', JSON.stringify({ result: { language: 'en' }, transcription: [{ offsets: { from: 0, to: 2000 }, text: ' Grow without hiring.', tokens: [tok(' Grow', 0, 500), tok(' without', 500, 1500), tok(' hiring', 1500, 1900), tok('.', 1900, 2000)] }] }));",
+    ]);
+    fs.writeFileSync(path.join(workspace, 'project', 'raw', 'talk.mp4'), 'fake media');
+    const reply = body(await (await tool()).execute(
+      { op: 'speech.transcribe', input_path: 'project/raw/talk.mp4', timestamps: 'segment' },
+      { workingDir: workspace, state: {} } as any,
+    ));
+    expect(JSON.parse(fs.readFileSync(argsLog, 'utf8'))).toContain('-ojf');
+    expect(reply.summary).toMatchObject({ timestamp_detail: 'segment', words: [] });
+    expect(reply.phrases.text).toBe('[0.00–0.50] Grow\n  — 0.60s —\n[1.10–2.00] without hiring.');
   });
 });

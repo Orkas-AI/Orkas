@@ -1,207 +1,23 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: frontend-design
-description_zh: COMPOSE 的视觉方向：设计模板、字体、配色、版式与动效，在 stage-compose 写方案和 HTML 之前使用。
-description_en: Visual direction for COMPOSE: design presets, type, palette, layout and motion, before stage-compose writes art direction and HTML.
+description_zh: 页面视频的视觉方向：设计模板、字体、配色、版式与动效。写 index.html 前按需读。
+description_en: Visual direction for page-rendered video: design presets, type, palette, layout and motion. Read as needed before writing index.html.
 ---
 
 # frontend-design
 
-Use this as the design-lead layer for VideoStudio COMPOSE work. It shapes `project/composition/composition-manifest.json::art_direction` and the model-authored HTML/SVG motion graphics in `index.html`.
+Choose a look before writing `index.html`, and put the decisions straight into its CSS. Do not write a design document.
 
-This skill does not pick the video production line, replace `video-craft`, or relax Orkas renderer constraints. If there is a conflict, renderer determinism, safe zones, legibility, audio ownership, and user-approved creative direction win.
+- **A concrete reference exists** (the user's brand, a reference video, a product site you captured): take palette, type and layout from what you actually see. Use the real logo and real screens at hero size, never a redrawn placeholder.
+- **No reference:** read [references/design-presets.md](references/design-presets.md), pick the one preset that fits the product, read only that preset's file, and remap it onto the brand's colors.
 
-## Generation references
+Read more only when stuck: [visual-primitives.md](references/visual-primitives.md) for reusable CSS and SVG patterns, [worked-compositions.md](references/worked-compositions.md) for examples.
 
-Read only the references required by the current composition:
+Make it belong to this product:
 
-- [HTML generation playbook](references/html-generation-playbook.md) — read before filling reference-led `art_direction` and before coding every non-trivial COMPOSE deliverable, so the scene plan and HTML use the same frame-composition decisions.
-- [Visual primitives](references/visual-primitives.md) — read when selecting reusable CSS/SVG composition primitives and scene grammar.
-- [Worked compositions](references/worked-compositions.md) — read when examples are needed to turn subject matter into a cohesive visual system without copying a fixed template.
-- [Design presets](references/design-presets.md) — the recommended starting point when no concrete reference sets the look, or when the reference's grammar matches one: thirteen looks to pick from and remap onto the brand tokens.
-
-These references improve the initial generation. They do not create a new artifact, user gate, or approval step. Keep the art-direction pass internal and record only the decisions needed to make the manifest art direction executable.
-
-## Reference-led direction
-
-Choose the design path before filling the fields below:
-
-- **Concrete reference:** use the inspected source as the visual thesis; skip inventing a new visual style. Derive palette, light/dark scene distribution, typography hierarchy, layout and scene grammar from observed frames, then adapt the target product's confirmed content and explicit user changes. Fill each existing scene `composition` from its mapped source frame: dominant regions, relative placement/scale, surface organization and visual hierarchy. Replace the content inside that arrangement; do not substitute a new diagram or card layout to illustrate the same idea. Approval of a content outline does not authorize wholesale redesign. An inferred guide keeps recognizable attributes without becoming exact reproduction.
-- **Product visuals:** captures under `assets/product/` (screens, product photos) are the hero material for product beats in either path: show them as images at hero scale and build the frame around them; never redraw them as placeholder cards. Type floors govern DOM type, not text inside a screenshot.
-- **No concrete reference:** we recommend starting from the [design preset](references/design-presets.md) that best fits the brand and the brief, remapped onto the brand tokens. A brand website supplies colors, fonts and a logo (read them from the product capture); a brand guide or design system goes through `design-system-importer`. Neither is a frame grammar, so on its own neither is a concrete reference here. Judge the fit yourself; when none fits, choose an original thesis using the design traditions, anti-template preferences and examples below and in the generation references. These originality preferences never reject an observed source choice; renderer correctness and readability still apply to both paths.
-
-## Design Thesis
-
-Before writing HTML, fill a compact visual thesis. Reference-led fields describe the inspected source with the requested content substitutions; original work chooses a new thesis:
-
-- `subject_world`: the source visual materials and surfaces when reference-led; otherwise the real materials, artifacts, interfaces, gestures, environment, or culture of the topic.
-- `audience`: who must understand this at phone size and what they already know.
-- `one_job`: what this video frame sequence must make clear.
-- `tone`: one or two precise words that shape type, color, spacing, and motion.
-- `signature_device`: the observed recurring element or visual relationship when reference-led; otherwise one memorable visual move that belongs to the brief.
-- `aesthetic_risk`: the adaptation needed for new content inside the source visual system; without a reference, one justified non-default choice.
-
-Keep the thesis specific. "Modern tech style" is not a thesis. "Battery-lab oscilloscope traces become the progress line" is.
-
-## HyperFrames-style authoring discipline
-
-This is a creative discipline, not a fixed renderer or template catalog. VideoStudio still uses model-authored HTML, but the model must author like a motion designer instead of jumping straight from storyboard text to scattered SVG nodes.
-
-### Visual identity hard gate
-
-Do not start `index.html` until the composition has a usable visual identity in `manifest.art_direction`:
-
-- `aesthetic.subject_world`
-- `aesthetic.one_job`
-- `aesthetic.signature_device`
-- `aesthetic.aesthetic_risk`
-- `aesthetic.anti_template_check` (or legacy `anti_template`): departures from the source to avoid; without a reference, rejected generic choices
-- `cover` with first-scene id, approved headline, two or more content signals, hero visual, composition strategy, and `frame_time_sec:0`
-- role-based `typography_tokens`
-- baseline `color_tokens`
-- `visual_direction` with a design tradition, lazy-default rejections, video-scale rule, depth-layer rule, motion-verb rule, and rhythm pattern
-- a scene-level plan with `hero_visual`, `depth_layers`, `opening_state`, and `resolved_state`
-- for every concrete reference image or video, executable `references` + `reference_fidelity` contracts from `design-system-importer`, based on reproduce/edit/guide intent rather than origin
-
-For an original thesis, if the first concrete visual move is a generic grid, circles connected by lines, a centered title card, emoji-as-icon, or a web-dashboard layout, the visual identity is not ready. Revise the art direction first; do not compensate with more glows or animation.
-
-### VisualDirectionV1
-
-For non-trivial COMPOSE work, write a compact `visual_direction` object inside `manifest.art_direction`. It is the front-loaded aesthetic director for HTML authoring; it is not a template and not a user gate.
-
-Required fields:
-
-- `visual_tradition`: the observed source design grammar when reference-led; do not select another designer or art movement. Without a reference, choose a concrete tradition such as Swiss precision grid or editorial typography instead of an empty "modern tech" label.
-- `composition_behavior`: the observed spatial arrangement and eye path for each mapped source frame; without a reference, choose a frame grammar such as editorial archive, full-field object, product surface, map/flow, or diagram build.
-- `lazy_defaults_rejected`: an unrelated redesign rejected in favor of the observed source arrangement. Without a reference, name the generic choice rejected and its brief-specific replacement.
-- `video_scale`: the scale floor for this canvas. For 1920x1080, default to headline 72-140px, body 28-42px, labels 18-26px, borders 2-4px, safe padding 60-140px, and decorative opacity 12-25%.
-- `depth_layer_rule`: the observed layering for reference-led scenes; for original work, use background atmosphere, midground content, and foreground accents with topic-derived materials.
-- `motion_verb_rule`: the verbs primary elements are allowed to use. Every meaningful element needs a verb such as draws, locks, counts up, slams, drifts, fractures, reveals, or resolves.
-- `typography_register`: the communication roles for display, body, data/label, caption, and any expressive font. Do not pair two similar sans-serifs; use extreme weight/scale contrast and video-readable type.
-- `rhythm_pattern`: the observed scene changes and holds, adjusted for requested duration; for original work, choose a rhythm such as `hook-build-HOLD-surge-resolve` or `fast-fast-SLOW-fast-hold`.
-
-Original-thesis example (not a reference-led starting point):
-
-```json
-{
-  "visual_direction": {
-    "visual_tradition": "Swiss Pulse precision grid + Data Drift AI atmosphere",
-    "composition_behavior": "research atlas: huge years anchor a coordinate grid while model/paper fragments lock into position",
-    "lazy_defaults_rejected": "reject glowing circles on a thin timeline; replace with paper fragments, parameter contours, and data-field coordinates",
-    "video_scale": "1920x1080: headline 88-132px, body 30-38px, labels 20-26px, borders 2-4px, safe padding 96-140px, atmospheric opacity 12-22%",
-    "depth_layer_rule": "BG token field/grid/grain, MG timeline and model artifacts, FG large year + metadata ticks",
-    "motion_verb_rule": "timeline draws, years stamp, nodes lock, token fields drift, paper fragments slide/resolve",
-    "typography_register": "large tabular years as display voice, concise Chinese labels as body, monospace metadata for data",
-    "rhythm_pattern": "hook-build-HOLD-surge-resolve"
-  }
-}
-```
-
-### Resolved frame before motion
-
-For each scene, build the fully readable resolved frame first in static HTML/CSS/SVG. This is the frame where the scene's message, hierarchy, and hero visual are clearest.
-
-Then add GSAP entrances and meaningful reveals from that static state. The resolved frame must be what renders at t=0: entrances animate FROM a visible state, never from `opacity: 0` — not on the scene, and not on the one element that carries its message. Every composition is frame-0 sampled — including each AUTO segment — so a scene that fades in captures blank and fails QA before anyone sees it. The CSS/SVG resolved layout is the source of truth; the timeline describes how the viewer arrives there. Do not design a scene by placing elements at their animated start state and hoping the tween lands in a good composition.
-
-For every non-trivial scene, internally check before writing tweens:
-
-- What is the one dominant visual object at the resolved frame?
-- Does meaningful visual material occupy the safe canvas, or is it a small cluster in empty space?
-- Which source layers remain visible, or which topic-derived layers does an original composition need?
-- What changes between opening and resolved state beyond a container fade?
-- Which element carries continuity from the prior scene?
-
-### Preview critique before draft
-
-When the COMPOSE HTML Preview Gate is required, treat the contact sheet as the design checkpoint. If the preview shows a scene that looks like a low-effort slide, a generic diagram, or text labels substituting for the promised visual, repair the manifest art direction or affected HTML before moving to mp4 draft. This is a localized HTML-preview correction, not an open-ended final-video rerender loop.
-
-## Avoid Template Gravity
-
-For an original thesis, reject choices that could fit almost any brief (components the chosen design preset defines are exempt):
-
-- Purple/blue neon gradients, glass panels, generic bento cards, floating UI cards, decorative blobs, and stock SaaS dashboards unless the subject truly calls for them.
-- Numbered markers, timelines, terminal windows, blueprint grids, or newspaper rules when the content is not actually sequential, technical, architectural, or editorial.
-- A palette made from one hue family with lighter/darker variations only.
-- Long labels in circles, tiny badges, dense microcopy, or walls of text doing the visual's job.
-- Competing motion: several elements moving with equal weight. Let one focal move lead; slow ambient drift is fine.
-- Decorative emoji/icons as the primary graphic language. Use topic-specific SVG marks, diagrams, data forms, object silhouettes, or typographic systems instead unless the user explicitly asked for playful emoji language.
-
-For an original thesis, if the first design idea feels like a reusable demo template, revise it before coding.
-
-## HTML Aesthetic Floor
-
-Treat the composition as designed video frames, not a web page inside a video canvas. Renderer correctness and readability apply to both paths; original composition preferences below apply only without a concrete reference.
-
-- For original work, choose a frame grammar that matches the brief: full-field visual system, split focal/annotation, diagram build, editorial title wall, data mark, product surface, map/flow, or quote/argument; vary it across scenes.
-- For original work, avoid default centered-card scenes, generic gradient backgrounds, floating bento panels, pill badges, and dashboard fragments unless the subject itself is an app/dashboard and the UI is the point.
-- The first frame must be a composed thumbnail: readable promise, subject-specific visual signal, and no blank/slow intro. Never tween from `opacity: 0` at 0s — not the opening scene, and not any single element that carries its promise: the `data-role="title"`, the `data-cover-hero`, a declared signal. Hiding only the title still leaves frame 0 without the promise and returns `HOOK_PROMISE_NOT_VISIBLE`; the rule binds to the elements that carry the cover, not only to their container. Motion may begin at 0s, but the exact still frame at 0s must already say what the video is about.
-- Treat that first frame as a dedicated cover design. It needs one dominant hero plus at least two visible content signals from the actual video; a generic branded/title treatment that could front an unrelated topic does not pass. Bind it to `art_direction.cover`, not only to an aesthetic paragraph. Mark the topic-specific dominant visual with `data-role="visual" data-cover-hero`; do not put that marker on a generic background or decorative accent. Native QA reads the declared signals off the visible frame-0 copy, so a signal you actually put on screen counts; add `data-cover-signal="<content_signals value>"` when the signal is carried by an element with no readable text of its own. Signals must say something the headline does not — a `content_signals` entry that only restates the headline is reported as `headline_only` and does not count. The headline itself may run across consecutive `data-role="title"` lines. Native QA reports rendered hooks and hero bounds as advisories, not blockers: design the cover to this standard because it is what makes the video open well, not because a checker will bounce you.
-- For original work, build three semantic depth layers: a topic-derived background, a dominant midground message/diagram, and foreground accents or metadata. Each layer should reinforce subject, hierarchy, scale, direction, or continuity.
-- Use video scale, not web scale: for 1920x1080, headlines usually need 72-140px, body/supporting text 28-42px, labels 18-26px, borders 2-4px, safe padding 60-140px, and atmospheric decoratives 12-25% opacity. Anything under 24px or under 10% opacity needs a reason.
-- For original work, use one dominant focal element, one supporting focal/text zone, and optional labels. Meaningful visual material should usually occupy most of the safe canvas. If a scene needs more than two text zones, split the beat or convert detail into a diagram.
-- Describe each scene's `opening_state`, `explanation_state`, and `resolved_state` from observed changes and holds when reference-led. For original work, reveal new information between opening and resolved states and hold it before the next scene.
-- Give every meaningful element a motion verb before writing GSAP. If the author cannot say whether a path draws, a year stamps, a number counts up, a card locks, or a texture drifts, the element is not yet designed.
-- For original work, carry one subject-specific visual object across scene boundaries when the story benefits from continuity: a signal, path, document fragment, product surface, token stream, map route, or data mark. Transform it instead of resetting every scene to a fresh title slide.
-- For original work, prefer custom SVG marks for the signature device: paths, meters, grids, maps, traces, connectors, data shapes, or object silhouettes. Do not rely on rows of identical cards to create visual interest.
-- For original product or brand work, make the product/brand signal large in the first viewport/frame. Do not hide it as a tiny nav/logo equivalent.
-- Use texture, depth, and color sparingly but deliberately. A good frame should still read in grayscale; accent colors should explain hierarchy, data meaning, brand, or transition state.
-- Add semantic hooks in HTML: `data-scene-id` on each scene root and `data-role="title|body|label|caption|visual"` on important elements. Native QA uses them to attach findings to a scene and role; missing hooks remain advisory and should not trigger a rerender by themselves.
-
-## Manifest Art-direction Fields
-
-Add an `aesthetic` object under `art_direction` in `project/composition/composition-manifest.json`:
-
-```json
-{
-  "art_direction": {
-    "aesthetic": {
-      "subject_world": "what the visual language borrows from",
-      "audience": "who it is for",
-      "one_job": "the frame sequence's job",
-      "tone": ["precise", "brief"],
-      "signature_device": "one remembered visual behavior",
-      "aesthetic_risk": "source-preserving adaptation, or an original non-default choice",
-      "anti_template_check": "source departures avoided, or generic choices rejected"
-    }
-  }
-}
-```
-
-The rest of `manifest.art_direction` must make the thesis executable:
-
-- `visual_direction`: the `VisualDirectionV1` object: design tradition, composition behavior, rejected lazy defaults, video scale, depth-layer rule, motion-verb rule, typography register, and rhythm pattern.
-- `cover`: the frame-0 communication contract: first canonical `scene_id`, approved `headline`, concrete `content_signals`, `hero_visual`, thumbnail `composition_strategy`, and `frame_time_sec:0`.
-- `references` + `reference_fidelity`: when concrete media exists, its image/video type, reproduce/edit/guide intent, user/inferred intent basis, roles, local path, preserve/may-change axes, target scenes, and layout/temporal anchors supplied by `design-system-importer`. Explicit user constraints override inferred defaults.
-- `provenance`: keep visual-source records under `art_direction.provenance`. For authored visuals, set `art_direction.provenance.visuals` to `self-authored HTML/CSS/SVG`; never put provenance at the manifest root. Any external replacement asset must record its source and license here.
-- `typography_tokens`: role-based, not just sizes. Include display, body, data/label, and caption roles when needed.
-- `color_tokens`: named baseline values with rationale. Include neutrals, primary accent, and any purposeful supporting accents needed for brand, hierarchy, data meaning, or scene variation.
-- `layout_boxes`: describe visual hierarchy, not only coordinates. Name the focal zone, supporting zone, depth layers, and intended meaningful canvas coverage.
-- `motion_budget`: state what carries meaning, what stays still, and how each transition maps to the story.
-- `scene_variation`: the observed sequence of source layouts when reference-led; for original work, prevent three near-identical card/title scenes in a row.
-- Each designed `art_direction.scenes[]` entry should compactly name `id`, `scene_world`, `hero_visual`, `composition`, `depth_layers`, `motion_verbs`, `opening_state`, `resolved_state`, `continuity_in`, `continuity_out`, and any `primitive_refs` selected from the generation references. With four or more scenes, each entry also carries its task sheet (`source`, `layout`, `beats`) from stage-compose "Scene-by-scene authoring". Keep these fields inside the canonical manifest; do not create another planning artifact.
-
-## HTML Direction
-
-When writing `index.html`:
-
-- Complete the selected reference-led or original pass from the [HTML generation playbook](references/html-generation-playbook.md) immediately before coding; keep its scene mapping in the existing manifest.
-- Use [Visual primitives](references/visual-primitives.md) as implementation parts fitted to the mapped source regions. For original work, select a useful scene grammar and adapt its geometry, scale, rhythm, and content to the brief.
-- Derive the main CSS variables from `manifest.art_direction`; keep extra chromatic colors intentional and named enough to audit. Do not flatten the design or recolor the whole video only to reduce a static palette count.
-- For original work, let one element carry personality: a custom progress line, typographic reveal, diagram grammar, texture, data mark, or transition family. Keep surrounding elements quiet.
-- Use type as design material: contrast display/body roles, make title/body hierarchy unmistakable, and keep labels within the video-scale ranges above.
-- Preserve the authored casing of approved English copy. Use sentence case or natural title case for titles and sentence case for body copy, captions, subtitles, and CTAs. Existing all caps may remain only when that exact casing appears in approved user copy or an external brand/source, and then only for one short metadata label, eyebrow, acronym, or code. A model-authored art direction, design tradition, typography register, or generic tech/editorial mood is never permission to convert copy to all caps. Never apply `text-transform: uppercase` through a broad selector or use all caps for multi-line copy; if a title, body, caption, subtitle, or CTA is all caps, or two English text roles in one scene read as all caps, restore the approved casing and revise the hierarchy with family, width, weight, scale, color, or spacing instead. Casing findings are advisory and never block a preview — except changing the casing of copy the user approved, which is a signed-intent violation and does block.
-- Do not default every composition to Arial/Helvetica with only size changes. Use available local or deterministic system font stacks deliberately, create contrast through family, width, weight, scale, color, spacing, or tracking while preserving approved casing, and vendor any required font inside `assets/`; never fetch a remote font at render time.
-- Use structural marks only when they encode meaning: steps for sequences, coordinates for maps, ticks for time, nodes for relationships, brackets for comparison.
-- Prefer SVG for diagrams, paths, meters, masks, charts, and signature geometry; keep prose and captions as real HTML text.
-- Build the structure from SVG/static held states and animate a few containers or SVG groups rather than many HTML cards. Keep each scene alive for its whole window: after the entrance, give the hero a slow push or drift, or reveal the scene's next point midway. A frame that stays still for more than about 3 seconds needs a reason, such as reading time.
-- For vertical video, design for platform UI: keep essential text away from the bottom action area and make the first frame readable as a thumbnail.
-- Respect `prefers-reduced-motion` in CSS where practical, but drive render-critical animation through the paused GSAP timeline.
-
-## Build Loop
-
-1. Draft the thesis, dedicated cover, any concrete reference-fidelity contract, and the rest of `manifest.art_direction`.
-2. Check the art direction against the selected path: correct departures from an observed reference; for an original thesis, replace the most generic choice.
-3. Run the internal pre-code art-direction pass on that direction, carrying its scene composition into HTML geometry rather than choosing the visual system again. Keep it inside the generation turn; no new user confirmation.
-4. Write HTML/SVG from the manifest art direction using adapted visual primitives and worked examples as references, not fixed templates.
-5. Run the draft QA command. If `draft_disposition.blocking_error_count` or structural/video/audio QA fails, repair `manifest.art_direction` or the canonical scene structure first; do not only nudge CSS numbers. Missing preview-required art direction is a blocking manifest error, not a cosmetic note: complete the aesthetic thesis, dedicated cover, VisualDirectionV1, motion budget, scene variation budget, per-scene depth layers, and per-scene motion verbs before preview or draft. Treat visual/readability findings as draft notes unless they make the approved message unreadable. Low-cost native warnings for contrast, safe area, density, repeated layout, or palette narrowness are feedback for the next localized edit; they do not by themselves justify expensive rerender loops.
-6. Follow [render-and-preview.md](../stage-compose/references/render-and-preview.md) for reference comparison and `composition-design-review` for the full contact-sheet critique.
+- One clear focal point per frame. Big type and big product beat many small things.
+- At most 2 font families and about 3 colors on screen. Contrast of at least 4.5:1 for text.
+- Avoid the generic look: centered cards on a gradient, floating blobs, glow, decorative icons in circles. Use the product's own materials instead.
+- Vary the scenes: change framing, scale or layout from one scene to the next.
+- Never linear easing. Entrances about 0.3–0.5s, staggered by 0.1–0.2s, one focal entrance at a time.

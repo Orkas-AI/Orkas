@@ -2,13 +2,16 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { bundledFfmpegPaths } from '../../../src/main/util/bundled-runtime';
 
 const TEST_MP4 = Buffer.from([0,0,0,24,0x66,0x74,0x79,0x70,0x69,0x73,0x6f,0x6d,0,0,2,0,0x69,0x73,0x6f,0x6d,0x69,0x73,0x6f,0x32]);
 const mockState = vi.hoisted(() => ({ videoProfiles: [] as any[], workspace: '' }));
 vi.mock('../../../src/main/features/auth', () => ({ loadVideoProfiles: () => mockState.videoProfiles }));
 vi.mock('../../../src/main/features/user_workspace', () => ({getWorkspacePath:()=>mockState.workspace}));
 vi.mock('../../../src/main/logger', () => ({ createLogger: () => ({info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()}) }));
-vi.mock('../../../src/main/features/generation_reference_assets', () => ({
+vi.mock('../../../src/main/features/generation_reference_assets', async original => ({
+ ...(await original<object>()),
  prepareReferenceUrls: async ({urls,paths}: {urls?: string[],paths?:string[]}) => {
    if(paths?.length) throw new Error('local references are outside this protocol fixture');
    return [...(urls || [])];
@@ -18,6 +21,23 @@ afterEach(async () => {
  (await import('../../../src/main/util/proxy-dispatcher'))._resetProxyRoutingForTests();
  vi.useRealTimers(); vi.unstubAllGlobals(); vi.resetModules(); mockState.videoProfiles = [];
 });
+// A header-only MP4 remains sufficient for pure wire cases. Conversion journeys
+// use an actual native clip so the public output-fitting owner runs unchanged.
+async function nativeClip(root: string): Promise<Buffer> {
+ const file = path.join(root, 'native-720p.mp4');
+ const result = spawnSync(bundledFfmpegPaths().ffmpeg!, ['-nostdin', '-hide_banner', '-loglevel', 'error',
+  '-f', 'lavfi', '-i', 'color=c=teal:s=1280x720:r=8:d=1', '-c:v', 'libx264', '-threads', '2',
+  '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', file], {encoding:'utf8',timeout:30_000});
+ expect(result.stderr).toBe('');expect(result.status).toBe(0);
+ return fs.readFile(file);
+}
+function measuredVideo(file: string): {width:number;height:number} {
+ const result = spawnSync(bundledFfmpegPaths().ffprobe!, ['-v', 'error', '-show_streams', '-of', 'json', file], {encoding:'utf8',timeout:30_000});
+ expect(result.stderr).toBe('');expect(result.status).toBe(0);
+ const video = JSON.parse(result.stdout).streams.find((stream:any) => stream.codec_type==='video');
+ return {width:video.width,height:video.height};
+}
+
 // Shared frozen-source provider contracts; every request is intercepted by the fixture.
 describe('video control request lifecycle', () => {
   const req = (signal?: AbortSignal) => ({ apiKey: 'fixture-key', model: 'kling-v3-0-turbo',
@@ -166,38 +186,42 @@ describe('video_gen › latest user-key provider adapters', () => {
         return new Response(JSON.stringify({ id: 'mini-task' }));
       }
       if (url.endsWith('/tasks/mini-task')) return new Response(JSON.stringify({ model: 'doubao-seedance-2-0-mini-260615', status: 'succeeded', content: { video_url: 'https://video.example/mini.mp4' } }));
-      if (url === 'https://video.example/mini.mp4') return new Response(TEST_MP4);
+      if (url === 'https://video.example/mini.mp4') return new Response(nativeVideo);
       throw new Error('unexpected fixture request');
     });
     vi.stubGlobal('fetch', fetch);
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mini-model-id-'));
+    const nativeVideo = await nativeClip(root);
     try {
       const { generateVideo } = await import('../../../src/main/features/video_gen');
       const output = path.join(root, 'clip.mp4');
-      expect(await generateVideo({ prompt: 'a quiet lake', outputAbsPath: output, resolution: '1080p', pollIntervalMs: 1, timeoutMs: 1000 }))
-        .toMatchObject({ ok: true, provider: 'doubao', model: 'doubao-seedance-2-0-mini', taskId: 'mini-task', resolution: '720p' });
+      const generated = await generateVideo({ prompt: 'a quiet lake', outputAbsPath: output, resolution: '1080p', pollIntervalMs: 1, timeoutMs: 1000 });
+      expect(generated, JSON.stringify(generated)).toMatchObject({ ok: true, provider: 'doubao', model: 'doubao-seedance-2-0-mini', taskId: 'mini-task', resolution: '1080p' });
       expect(mockState.videoProfiles.find(p => p.id === 'saved-mini')).toEqual(profile);
-      expect(await fs.readFile(output)).toEqual(TEST_MP4);
+      expect(measuredVideo(output)).toEqual({width:1920,height:1080});
+      expect(await fs.readFile(output)).not.toEqual(nativeVideo);
       expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
-  it('reports the confirmed720p fallback throughout the saved Fast profile journey', async () => {
+  it('sends the saved Fast profile at native720p and finishes requested1080p locally', async () => {
     mockState.videoProfiles = [{ id: 'saved-fast', provider: 'doubao', model: 'doubao-seedance-2-0-fast-260128', apiKey: 'fixture-key', label: 'Doubao', createdAt: 1 }];
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {
       if (init?.method === 'POST') return new Response(JSON.stringify({ id: 'fixture-fast' }));
       if (url.endsWith('/tasks/fixture-fast')) return new Response(JSON.stringify({ status: 'succeeded', content: { video_url: 'https://video.example/fast.mp4' } }));
-      if (url === 'https://video.example/fast.mp4') return new Response(TEST_MP4);
+      if (url === 'https://video.example/fast.mp4') return new Response(nativeVideo);
       throw new Error(`unexpected fixture request: ${url}`);
     });
     vi.stubGlobal('fetch', fetch);
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fast-resolution-'));
+    const nativeVideo = await nativeClip(root);
     const events: any[] = [];
     try {
       const { generateVideo } = await import('../../../src/main/features/video_gen');
-      expect(await generateVideo({ prompt: 'a quiet lake', outputAbsPath: path.join(root, 'clip.mp4'), resolution: '1080p', pollIntervalMs: 1, timeoutMs: 1000, onProgress: e => events.push(e) }))
-        .toMatchObject({ ok: true, model: 'doubao-seedance-2-0-fast-260128', resolution: '720p' });
-      expect(await fs.readFile(path.join(root, 'clip.mp4'))).toEqual(TEST_MP4);
+      const generated = await generateVideo({ prompt: 'a quiet lake', outputAbsPath: path.join(root, 'clip.mp4'), resolution: '1080p', pollIntervalMs: 1, timeoutMs: 1000, onProgress: e => events.push(e) });
+      expect(generated, JSON.stringify(generated)).toMatchObject({ ok: true, model: 'doubao-seedance-2-0-fast-260128', resolution: '1080p' });
+      expect(measuredVideo(path.join(root, 'clip.mp4'))).toEqual({width:1920,height:1080});
+      expect(await fs.readFile(path.join(root, 'clip.mp4'))).not.toEqual(nativeVideo);
       for (const event of events.filter(e => e.phase === 'configuration' || e.phase === 'create_task')) expect(event.data.resolution).toBe('720p');
       expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
     } finally { await fs.rm(root, { recursive: true, force: true }); }
@@ -414,11 +438,10 @@ describe('video_gen › latest user-key provider adapters', () => {
     expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
   });
 
-  it('sends the native Veo image object and delivers the generated video through the saved profile', async () => {
+  it('retains the legacy Veo image-wire contract in its direct adapter', async () => {
     // Google-owned SDK oracle: src/converters/_models_converters.ts,
     // imageToMldev + generateVideosParametersToMldev. predictLongRunning uses
     // bytesBase64Encoded/mimeType, unlike Gemini generateContent inlineData.
-    mockState.videoProfiles = [{ id: 'saved-veo', provider: 'google', model: 'veo-3.1-generate-preview', apiKey: 'fixture-key', label: 'Google', createdAt: 1 }];
     const image = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {
       if (url === 'https://images.example/first.png') return new Response(image);
@@ -436,16 +459,25 @@ describe('video_gen › latest user-key provider adapters', () => {
       throw new Error(`unexpected fixture request: ${url}`);
     });
     vi.stubGlobal('fetch', fetch);
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'veo-image-contract-'));
+    const { callGoogleVideo } = await import('../../../src/main/features/video_gen');
+    const generated = await callGoogleVideo({apiKey:'fixture-key',model:'veo-3.1-generate-preview',
+      prompt:'Animate the first frame.',referenceImageUrls:['https://images.example/first.png'],referenceVideoUrls:[],
+      operation:'generate',ratio:'16:9',resolution:'1080p',duration:6,quality:'balanced',generateAudio:true,
+      watermark:false,pollIntervalMs:1,timeoutMs:1000});
+    expect(generated).toMatchObject({taskId:'operations/fixture-veo',duration:8,buffer:TEST_MP4});
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('keeps a retired saved Veo profile unchanged and unavailable without dispatch or output', async () => {
+    const profile = { id:'saved-veo',provider:'google',model:'veo-3.1-generate-preview',apiKey:'fixture-key',label:'Google',createdAt:1 };
+    mockState.videoProfiles=[{...profile}];const fetch=vi.fn();vi.stubGlobal('fetch',fetch);
+    const root=await fs.mkdtemp(path.join(os.tmpdir(),'retired-veo-'));
     try {
-      const { generateVideo } = await import('../../../src/main/features/video_gen');
-      const output = path.join(root, 'clip.mp4');
-      expect(await generateVideo({ prompt: 'Animate the first frame.', outputAbsPath: output,
-        referenceImageUrls: ['https://images.example/first.png'], resolution: '1080p', duration: 6, pollIntervalMs: 1, timeoutMs: 1000 }))
-        .toMatchObject({ ok: true, provider: 'google', taskId: 'operations/fixture-veo', duration: 8 });
-      expect(await fs.readFile(output)).toEqual(TEST_MP4);
-      expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
-    } finally { await fs.rm(root, { recursive: true, force: true }); }
+      const {generateVideo}=await import('../../../src/main/features/video_gen');
+      expect(await generateVideo({prompt:'Animate the first frame.',outputAbsPath:path.join(root,'clip.mp4'),referenceImageUrls:['https://images.example/first.png']}))
+        .toMatchObject({ok:false,errorCode:'NO_CAPABLE_MODEL',dispatched:false});
+      expect(fetch).not.toHaveBeenCalled();expect(mockState.videoProfiles).toEqual([profile]);expect(await fs.readdir(root)).toEqual([]);
+    } finally {await fs.rm(root,{recursive:true,force:true});}
   });
 
   it('uses Runway image-to-video only when a reference image is present', async () => {
@@ -492,7 +524,7 @@ describe('video_gen › latest user-key provider adapters', () => {
       promptImage: 'https://images.example/portrait.png',
       promptText: 'animate the supplied portrait',
       ratio: '960:960',
-      duration: 10,
+      duration: 8,
     });
   });
 });

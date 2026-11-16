@@ -1,14 +1,13 @@
 # Design presets
 
-Thirteen starting systems for COMPOSE. Each one fixes a look: color roles, type
+Thirteen starting systems for page-rendered video. Each one fixes a look: color roles, type
 ramp, components, frame types and motion. The brand supplies colors and fonts;
 the brief supplies every word, number and image. They are the recommended
 starting point when no concrete reference sets the look, or when a reference's
 grammar matches one; skip them when none fits the brand and the brief. A brand
 website or design system gives the tokens to remap onto, not the look itself. Pick one,
 read its file, remap it, apply the video-type rules below, then design each
-scene for this subject. Name it in `art_direction.visual_direction.visual_tradition`
-(for example "blue-professional preset, remapped to the brand tokens").
+scene for this subject.
 
 The presets are adapted from the HyperFrames frame presets (heygen-com/hyperframes
 @279d40dc, Apache License 2.0); each file states what changed, and the license

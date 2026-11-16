@@ -1,11 +1,13 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const refOwner = vi.hoisted(() => ({ id: 'open-device-id' }));
 vi.mock('../../../src/main/features/machine_device_id', () => ({
-  getDeviceId: () => 'open-device-id',
+  getDeviceId: () => refOwner.id,
 }));
 
 vi.mock('../../../src/main/util/image-transform', () => ({
@@ -29,6 +31,7 @@ async function writeTinyMp4(fileName = 'reference.mp4', suffix = ''): Promise<st
 }
 
 beforeEach(async () => {
+  refOwner.id = 'open-device-id';
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-generation-reference-'));
   vi.resetModules();
 });
@@ -95,22 +98,27 @@ describe('generation reference assets', () => {
     expect(fetchMock).toHaveBeenCalledTimes(failure === 'download' ? 1 : 0);
   });
 
-  it('reuses a generated public URL for the unchanged local output', async () => {
-    const localPath = await writeTinyMp4();
-    const fetchMock = vi.fn();
+  it('retries a transient reference-image GET without replaying any generation request', async () => {
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    const fetchMock = vi.fn(async () => {
+      if (fetchMock.mock.calls.length === 1) throw new Error('temporary reference transfer failure');
+      return new Response(png, { status: 200 });
+    });
     vi.stubGlobal('fetch', fetchMock);
+    vi.useFakeTimers();
     const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
 
-    referenceAssets.registerGeneratedMediaUrl(localPath, 'https://cdn.example/account-a.mp4');
-    expect(referenceAssets.generatedMediaUrlForPath(localPath))
-      .toBe('https://cdn.example/account-a.mp4');
-    await expect(referenceAssets.prepareReferenceUrls({
-      kind: 'video',
-      paths: [localPath],
-      maxItems: 1,
-    })).resolves.toEqual(['https://cdn.example/account-a.mp4']);
-    expect(fetchMock).not.toHaveBeenCalled();
+    const loading = referenceAssets.loadImageReferenceBuffersWithProgress(
+      ['https://cdn.example/reference.png'],
+      [],
+    );
+    await vi.advanceTimersByTimeAsync(600);
 
+    await expect(loading).resolves.toEqual([png]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('invalidates a generated URL when the local file has been replaced', async () => {
@@ -300,3 +308,103 @@ describe('reference image transfer guards', () => {
     await expect(loadImageReferenceBuffersWithProgress(['https://cdn.example/empty.png'], [], {})).rejects.toThrow(/empty body/);
   });
 });
+
+it('does not reuse an expired COS signature but preserves unsigned public URLs', async () => {
+    const localPath = await writeTinyMp4();
+    const refs = await import('../../../src/main/features/generation_reference_assets');
+    refs.registerGeneratedMediaUrl(localPath, 'https://bucket.cos.example/ref.mp4?q-sign-time=1000000000%3B1000000001');
+    expect(refs.generatedMediaUrlForPath(localPath)).toBe('');
+    const validUrl = `https://bucket.cos.example/ref.mp4?q-sign-time=1000000000%3B${Math.floor(Date.now() / 1000) + 3600}`;
+    refs.registerGeneratedMediaUrl(localPath, validUrl);
+    expect(refs.generatedMediaUrlForPath(localPath)).toBe(validUrl);
+    refs.registerGeneratedMediaUrl(localPath, 'https://cdn.example/ref.mp4?expires_label=old');
+    expect(refs.generatedMediaUrlForPath(localPath)).toBe('https://cdn.example/ref.mp4?expires_label=old');
+  });
+
+it.each(['missing', 'shadowed'])('compresses a large reference with bundled FFmpeg when system FFmpeg is %s', async (systemFfmpeg) => {
+    const { bundledFfmpegPaths } = await import('../../../src/main/util/bundled-runtime');
+    const ffmpeg = bundledFfmpegPaths().ffmpeg!;
+    expect(path.isAbsolute(ffmpeg)).toBe(true);
+    const localPath = path.join(tmpDir, 'large reference.mp4');
+    const generated = spawnSync(ffmpeg, [
+      '-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=64x64:d=0.25',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', localPath,
+    ], { timeout: 10_000, encoding: 'utf8' });
+    expect(generated.stderr).toBe('');
+    expect(generated.status).toBe(0);
+    // A valid MP4 free atom crosses the upload ceiling without costly encoding.
+    const padding = Buffer.alloc(21 * 1024 * 1024);
+    padding.writeUInt32BE(padding.length, 0);
+    padding.write('free', 4, 'ascii');
+    await fs.appendFile(localPath, padding);
+    if (systemFfmpeg === 'shadowed') {
+      await fs.writeFile(path.join(tmpDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
+        'invalid executable', { mode: 0o755 });
+    }
+    vi.stubEnv('PATH', tmpDir);
+    vi.stubEnv('FFMPEG_PATH', undefined);
+    vi.stubEnv('ORKAS_BUNDLED_FFMPEG', ffmpeg);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
+    await expect(referenceAssets.prepareReferenceUrls({ kind: 'video', paths: [localPath], maxItems: 1 }))
+      .rejects.toThrow('E_REFERENCE_PUBLIC_URL_REQUIRED');
+    expect(fetchMock).not.toHaveBeenCalled();
+    // Compression never mutates the user's source or claims upload success.
+    expect((await fs.stat(localPath)).size).toBeGreaterThan(20 * 1024 * 1024);
+    expect(referenceAssets.generatedMediaUrlForPath(localPath)).toBe('');
+  });
+
+it('reuses a generated URL only for the account that registered it', async () => {
+    const localPath = await writeTinyMp4();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
+
+    referenceAssets.registerGeneratedMediaUrl(localPath, 'https://cdn.example/account-a.mp4');
+    expect(referenceAssets.generatedMediaUrlForPath(localPath))
+      .toBe('https://cdn.example/account-a.mp4');
+    await expect(referenceAssets.prepareReferenceUrls({
+      kind: 'video',
+      paths: [localPath],
+      maxItems: 1,
+    })).resolves.toEqual(['https://cdn.example/account-a.mp4']);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    refOwner.id = 'account-b';
+    expect(referenceAssets.generatedMediaUrlForPath(localPath)).toBe('');
+  });
+
+it('clears generated URL reuse before an in-process account switch commits', async () => {
+    const localPath = await writeTinyMp4();
+    const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
+    const switchHooks = await import('../../../src/main/features/user-switch-hooks');
+
+    referenceAssets.registerGeneratedMediaUrl(localPath, 'https://cdn.example/account-a.mp4');
+    switchHooks.notifyUserSwitch('account-a', 'account-b');
+    refOwner.id = 'account-b';
+
+    expect(referenceAssets.generatedMediaUrlForPath(localPath)).toBe('');
+  });
+
+it('shares one preparation deadline across sequential image and video work', async () => {
+    vi.useFakeTimers();
+    const refs = await import('../../../src/main/features/generation_reference_assets');
+    let preparedImage = false;
+    let videoAborted = false;
+    const work = refs.withReferencePreparation(undefined, async signal => {
+      await new Promise(resolve => setTimeout(resolve, 1_200_000));
+      preparedImage = true;
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => {
+        videoAborted = true;
+        reject(signal.reason);
+      }, { once: true }));
+    });
+    const rejected = expect(work).rejects.toThrow('Reference preparation timed out');
+    await vi.advanceTimersByTimeAsync(1_799_999);
+    expect(preparedImage).toBe(true);
+    expect(videoAborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(videoAborted).toBe(true);
+  });
