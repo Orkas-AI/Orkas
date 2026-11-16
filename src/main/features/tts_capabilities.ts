@@ -1,3 +1,4 @@
+import { DOUBAO_TTS_FORMATS, ttsModelPreset } from './tts_catalog';
 import * as crypto from 'node:crypto';
 
 import type { TtsProfile } from './auth';
@@ -204,6 +205,7 @@ function configuredVoice(routeRef: string, providerVoiceId: string): TtsVoiceCap
 }
 
 function profileRoute(profile: TtsProfile): TtsRouteCapability {
+  const nativeModel = ttsModelPreset(profile.provider, profile.model);
   const configured = String(profile.voice || '').trim();
   const voices = configured ? [configuredVoice(profile.id, configured)] : [];
   return {
@@ -215,8 +217,8 @@ function profileRoute(profile: TtsProfile): TtsRouteCapability {
     ...(voices[0] ? { defaultVoiceRef: voices[0].voiceRef } : {}),
     voices,
     supports: {
-      speed: true,
-      formats: [profile.format || DEFAULT_TTS_FORMAT],
+      speed: nativeModel ? !!nativeModel.speed : true,
+      formats: profile.provider === 'doubao' ? [...DOUBAO_TTS_FORMATS] : nativeModel ? [...nativeModel.formats] : [profile.format || DEFAULT_TTS_FORMAT],
       languageContract: false,
     },
   };
