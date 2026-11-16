@@ -11,6 +11,7 @@ type Stub = Record<string, any>;
 
 function element(extra: Stub = {}): Stub {
   const classes = new Set<string>();
+  const listeners: Stub = {};
   return {
     hidden: false,
     disabled: false,
@@ -28,7 +29,8 @@ function element(extra: Stub = {}): Stub {
     focus() { this.focused = true; },
     setAttribute(name: string, value: string) { this[`attr:${name}`] = value; },
     setSelectionRange() {},
-    addEventListener() {},
+    listeners,
+    addEventListener(name: string, handler: (...args: any[]) => any) { listeners[name] = handler; },
     ...extra,
   };
 }
@@ -49,6 +51,9 @@ function mount(content: string | null) {
   const sectionHead = element();
   const context = vm.createContext({
     console,
+    performance,
+    currentUserId: 'account_a',
+    currentView: 'project',
     createLogger: () => ({ warn() {}, info() {}, error() {} }),
     document: {
       readyState: 'loading',
@@ -66,6 +71,7 @@ function mount(content: string | null) {
     clearTimeout,
   });
   vm.runInContext(source, context, { filename: 'project-detail.js' });
+  vm.runInContext('_projectDetailPid = "project_a"', context);
   vm.runInContext(
     content === null
       ? '_projectDetailMeta = {}'
@@ -138,9 +144,176 @@ describe('project instructions editor', () => {
     expect(elements['project-instructions-input'].value).toBe('Updated shared rules');
   });
 
+  it.each(['project', 'account', 'reopened editor', 'new draft'])('keeps the current draft after an older discard confirmation crosses a %s transition', async transition => {
+    const { context, elements } = mount('A saved');
+    const input = elements['project-instructions-input'];
+    const modal = elements['project-instructions-modal'];
+    let finish!: (ok: boolean) => void;
+    context.uiConfirm = () => new Promise(resolve => { finish = resolve; });
+    context._openProjectInstructionsEditor();
+    input.value = 'A unsaved';
+    const closing = context._closeProjectInstructionsEditor();
+    if (transition === 'project') {
+      vm.runInContext('_projectDetailPid = "project_b"; _projectDetailMeta = { instructions: { content: "B saved" } }', context);
+      context._renderProjectInstructions();
+      context._openProjectInstructionsEditor();
+    } else if (transition === 'account') {
+      context.currentUserId = 'account_b';
+    } else if (transition === 'reopened editor') {
+      await context._closeProjectInstructionsEditor({ force: true });
+      context._openProjectInstructionsEditor();
+    }
+    input.value = 'Current unsaved draft';
+    finish(true);
+    await closing;
+    expect(modal.classList.contains('open')).toBe(true);
+    expect(input.value).toBe('Current unsaved draft');
+    expect(input.dataset.savedValue).toBe(transition === 'project' ? 'B saved' : 'A saved');
+    expect(elements['project-instructions-read'].textContent).toBe(transition === 'project' ? 'B saved' : 'A saved');
+  });
+
+  it('returns to the current saved rules after confirming the unchanged draft', async () => {
+    const { context, elements } = mount('Original saved');
+    const input = elements['project-instructions-input'];
+    let finish!: (ok: boolean) => void;
+    context.uiConfirm = () => new Promise(resolve => { finish = resolve; });
+    context._openProjectInstructionsEditor();
+    input.value = 'Discard this draft';
+    const closing = context._closeProjectInstructionsEditor();
+    vm.runInContext('_projectDetailMeta.instructions.content = "New shared saved rules"', context);
+    context._renderProjectInstructions();
+    finish(true);
+    await closing;
+    expect(elements['project-instructions-modal'].classList.contains('open')).toBe(false);
+    expect(input.value).toBe('New shared saved rules');
+    expect(input.dataset.savedValue).toBe('New shared saved rules');
+    expect(elements['project-instructions-read'].textContent).toBe('New shared saved rules');
+  });
+
+  it.each([true, false])('honors an unchanged discard decision (%s) without writing rules', async discard => {
+    const { context, elements } = mount('Saved rules');
+    const writes: unknown[] = [];
+    context.window.orkas.invoke = (...args: unknown[]) => { writes.push(args); return Promise.resolve({ ok: true }); };
+    context.uiConfirm = async () => discard;
+    context._openProjectInstructionsEditor();
+    elements['project-instructions-input'].value = 'Draft rules';
+    await context._closeProjectInstructionsEditor();
+    expect(elements['project-instructions-modal'].classList.contains('open')).toBe(!discard);
+    expect(elements['project-instructions-input'].value).toBe(discard ? 'Saved rules' : 'Draft rules');
+    expect(writes).toEqual([]);
+  });
+
   it('refuses to open the editor for instructions it could not load', () => {
     const { context, elements } = mount(null);
     context._openProjectInstructionsEditor();
     expect(elements['project-instructions-modal'].classList.contains('open')).toBe(false);
+  });
+
+  it.each(['success', 'failure', 'exception'])('isolates a late save %s from another project draft', async outcome => {
+    const { context, elements } = mount('A saved');
+    const input = elements['project-instructions-input'];
+    let finish!: (result: unknown) => void;
+    let fail!: (error: Error) => void;
+    const writes: unknown[] = [];
+    const alerts: string[] = [];
+    context.uiAlert = (text: string) => alerts.push(text);
+    context.window.orkas.invoke = (channel: string, args: unknown) => {
+      writes.push([channel, args]);
+      return new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+    };
+    context._bindProjectInstructions();
+    context._openProjectInstructionsEditor();
+    input.value = 'A submitted';
+    const saving = elements['project-instructions-save-btn'].listeners.click();
+    vm.runInContext('_projectDetailPid = "project_b"; _projectDetailMeta = { instructions: { content: "B saved" } }', context);
+    context._renderProjectInstructions();
+    context._openProjectInstructionsEditor();
+    input.value = 'B unsaved';
+    if (outcome === 'exception') fail(new Error('controlled save failure'));
+    else finish({ ok: outcome === 'success' });
+    await saving;
+    expect(writes).toEqual([['projects.instructions.set', { projectId: 'project_a', content: 'A submitted' }]]);
+    expect(input.value).toBe('B unsaved');
+    expect(input.dataset.savedValue).toBe('B saved');
+    expect(elements['project-instructions-read'].textContent).toBe('B saved');
+    expect(elements['project-instructions-modal'].classList.contains('open')).toBe(true);
+    expect(elements['project-instructions-status'].textContent).toBe('');
+    expect(alerts).toEqual([]);
+  });
+
+  it.each(['new draft', 'reopened editor', 'account change'])('preserves a %s while a save completes', async transition => {
+    const { context, elements } = mount('A saved');
+    const input = elements['project-instructions-input'];
+    let finish!: (result: unknown) => void;
+    context.window.orkas.invoke = () => new Promise(resolve => { finish = resolve; });
+    context._bindProjectInstructions();
+    context._openProjectInstructionsEditor();
+    input.value = 'A submitted';
+    const saving = elements['project-instructions-save-btn'].listeners.click();
+    if (transition === 'reopened editor') {
+      await context._closeProjectInstructionsEditor({ force: true });
+      context._openProjectInstructionsEditor();
+    }
+    if (transition === 'account change') context.currentUserId = 'account_b';
+    input.value = transition === 'reopened editor' ? 'A submitted' : 'New unsaved';
+    finish({ ok: true });
+    await saving;
+    expect(input.value).toBe(transition === 'reopened editor' ? 'A submitted' : 'New unsaved');
+    expect(elements['project-instructions-modal'].classList.contains('open')).toBe(true);
+    expect(elements['project-instructions-status'].textContent).toBe('');
+    expect(input.dataset.savedValue).toBe(transition === 'account change' ? 'A saved' : 'A submitted');
+  });
+
+  it.each(['save', 'account'])('ignores an old instructions-change read after a newer %s', async transition => {
+    const { context, elements } = mount('Original rules');
+    let finish!: (result: unknown) => void;
+    context.window.orkas.invoke = (channel: string) => channel === 'projects.instructions.get'
+      ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({ ok: true });
+    context._onProjectInstructionsChanged({ projectId: 'project_a' });
+    if (transition === 'save') {
+      context._bindProjectInstructions();
+      context._openProjectInstructionsEditor();
+      elements['project-instructions-input'].value = 'New acknowledged rules';
+      await elements['project-instructions-save-btn'].listeners.click();
+    } else context.currentUserId = 'account_b';
+    finish({ ok: true, content: 'Old read', limit: 4000 });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(elements['project-instructions-read'].textContent).toBe(transition === 'save' ? 'New acknowledged rules' : 'Original rules');
+  });
+
+  it('keeps the newest successful save when an older acknowledgement arrives last', async () => {
+    const { context, elements } = mount('Original rules');
+    const pending: Array<(result: unknown) => void> = [];
+    context.window.orkas.invoke = () => new Promise(resolve => pending.push(resolve));
+    context._bindProjectInstructions();
+    context._openProjectInstructionsEditor();
+    elements['project-instructions-input'].value = 'First submitted rules';
+    const first = elements['project-instructions-save-btn'].listeners.click();
+    elements['project-instructions-input'].value = 'Latest submitted rules';
+    const latest = elements['project-instructions-save-btn'].listeners.click();
+    pending[1]({ ok: true });
+    await latest;
+    pending[0]({ ok: true });
+    await first;
+    expect(elements['project-instructions-read'].textContent).toBe('Latest submitted rules');
+    context._openProjectInstructionsEditor();
+    expect(elements['project-instructions-input'].value).toBe('Latest submitted rules');
+  });
+
+  it('does not apply an old save to a project reopened with newer persisted rules', async () => {
+    const { context, elements } = mount('Original rules');
+    let finish!: (result: unknown) => void;
+    context.window.orkas.invoke = () => new Promise(resolve => { finish = resolve; });
+    context._bindProjectInstructions();
+    context._openProjectInstructionsEditor();
+    elements['project-instructions-input'].value = 'Old submitted rules';
+    const saving = elements['project-instructions-save-btn'].listeners.click();
+    for (const [pid, content] of [['project_b', 'B rules'], ['project_a', 'New persisted A rules']]) {
+      vm.runInContext(`_projectDetailPid = ${JSON.stringify(pid)}; _projectDetailMeta = { instructions: { content: ${JSON.stringify(content)} } }`, context);
+      context._renderProjectInstructions();
+    }
+    finish({ ok: true });
+    await saving;
+    expect(elements['project-instructions-read'].textContent).toBe('New persisted A rules');
   });
 });

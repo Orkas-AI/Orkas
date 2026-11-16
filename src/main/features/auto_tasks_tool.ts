@@ -13,7 +13,7 @@ const contract = require('../../../bin/auto-tasks-contract.cjs');
 const EDIT_FIELDS = ['title', 'content', 'schedule', 'enabled', 'end_condition', 'recipient', 'skill', 'connector', 'attachments', 'project_id'];
 
 function taskView(task: autoTasks.AutoTask) {
-  const { device_id: _deviceId, ...view } = task;
+  const { device_id: _deviceId, conversation_id: _conversationId, ...view } = task;
   return view;
 }
 
@@ -78,7 +78,7 @@ export function createAutoTasksTool(opts: {
         const updates = Object.fromEntries(EDIT_FIELDS.filter((key) => data[key] !== undefined).map((key) => [key, data[key]]));
         const result = await autoTasks.applyAutoTaskMutation(opts.userId, {
           action, taskId, updates,
-        }, { sourceAttachmentCid: opts.cid, projectId: opts.projectId });
+        }, { sourceAttachmentCid: opts.cid, projectId: opts.projectId, ...(opts.cid ? { conversationId: opts.cid } : {}) });
         if (!result.ok && result.error && !/^[a-z][a-z0-9_]*$/.test(result.error)) return fail('automation operation failed');
         if (result.ok && result.taskId && result.kind !== 'deleted') {
           try { opts.onSaved?.(result.taskId, result.task?.title || result.title || ''); } catch { /* navigation is an offer, never a failure */ }

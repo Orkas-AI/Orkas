@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Session } from '../../../../src/core-agent/src/agent/session';
 import { PersistentSession } from '../../../../src/core-agent/src/agent/persistent-session';
 import {
@@ -181,4 +181,60 @@ describe('actor attribution survives the final model-history boundary', () => {
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
+});
+
+it('reads the final and superseded facts from a distinct persisted conversation without changing its history', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-native-history-recall-'));
+  const previousRoot = process.env.ORKAS_WORKSPACE_ROOT;
+  const data = path.join(root, 'data');
+  fs.mkdirSync(data);
+  process.env.ORKAS_WORKSPACE_ROOT = data;
+  vi.resetModules();
+  const { captureMainLogWorkers } = await import('../../../helpers/capture-main-log-workers');
+  const closeLogs = await captureMainLogWorkers();
+  try {
+    const uid = 'agent-e2e';
+    (await import('../../../../src/main/features/users')).activateUser(uid);
+    const chats = await import('../../../../src/main/features/chats');
+    const { conversationLayout } = await import('../../../../src/main/util/project-layout');
+    const { appendJsonl } = await import('../../../../src/main/storage');
+    const prior = await chats.createConversation(uid, { title: 'Library collection authorization' });
+    const messages = [
+      { from: 'user', text: 'Draft: Noah at East desk; authorization pending.' },
+      { from: 'commander', text: 'Draft retained; no authorization claimed.' },
+      { from: 'user', text: 'Final authorization: Ari, West desk, 2026-12-29 at 16:00. Supersedes the draft.' },
+    ];
+    const file = conversationLayout(uid, prior.conversation_id).messageFile;
+    for (const [index, message] of messages.entries()) {
+      await appendJsonl(file, { id: `history-source-${index}`, ts: new Date(1_700_000_000_000 + index).toISOString(),
+        ...message, to: [message.from === 'user' ? 'commander' : 'user'] });
+    }
+    const current = await chats.createConversation(uid, { title: 'Current retrieval request' });
+    expect(prior.conversation_id).not.toBe(current.conversation_id);
+    const before = fs.readFileSync(file);
+    expect((await chats.getMessages(uid, prior.conversation_id)).map(({ from, text }) => ({ from, text }))).toEqual(messages);
+    const tool = (await import('../../../../src/main/model/core-agent/chat-history-tools')).createChatHistoryTool({
+      userId: uid, currentCid: current.conversation_id,
+    });
+    const result = await tool.execute({ action: 'read', cid: prior.conversation_id, scope: 'all' }, { state: {} } as any);
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toContain('Final authorization: Ari');
+    expect(result.content).toContain('authorization pending');
+    expect(result.content).not.toContain('Current retrieval request');
+    expect(fs.readFileSync(file)).toEqual(before);
+    expect((await chats.getMessages(uid, prior.conversation_id)).map(({ from, text }) => ({ from, text }))).toEqual(messages);
+    expect((await chats.listConversations(uid)).map(row => row.conversation_id).sort())
+      .toEqual([prior.conversation_id, current.conversation_id].sort());
+  } finally {
+    try { await (await import('../../../helpers/drain-main-runtime')).drainMainRuntimeForTest(); }
+    finally {
+      try { await closeLogs(); }
+      finally {
+        if (previousRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+        else process.env.ORKAS_WORKSPACE_ROOT = previousRoot;
+        vi.resetModules();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }
 });

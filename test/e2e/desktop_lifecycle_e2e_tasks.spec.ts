@@ -69,7 +69,7 @@ test('a task completes and an automation fires exactly once after the user close
   expect(app.modelRequests).toHaveLength(3);
   expect(await native.evaluate(win => ({ destroyed: win.isDestroyed(), visible: win.isVisible(), shows: (win as any).__shows }))).toEqual({ destroyed: false, visible: false, shows: 0 });
   expect(app.electronApp!.process().pid).toBe(mainPid);
-  expect((await trayMenu(app.electronApp!)).map(item => item.label)).toEqual(['Open', 'Quit']);
+  expect((await trayMenu(app.electronApp!)).map(item => item.label)).toEqual(['Open Orkas', 'Quit Orkas']);
   await selectTrayItem(app.electronApp!, 0);
   await native.evaluate(win => win.emit('show'));
   await expect(app.page!.locator('#chat-history .chat-message.assistant')).toContainText('Background task completed.');
@@ -190,7 +190,7 @@ for (const entry of ['tray-exit', 'native-quit'] as const) {
       schedule: { type: 'one_time', at: '2099-12-01T10:00:00.000Z' } });
     const deviceFile = path.join(app.workspaceRoot, 'device.json');
     const beforeDevice = JSON.parse(readFileSync(deviceFile, 'utf8'));
-    if (entry === 'tray-exit') expect((await trayMenu(app.electronApp!)).map(item => item.label)).toEqual(['Open', 'Quit']);
+    if (entry === 'tray-exit') expect((await trayMenu(app.electronApp!)).map(item => item.label)).toEqual(['Open Orkas', 'Quit Orkas']);
     const electron = app.electronApp!;
     const child = electron.process();
     const pids = await electron.evaluate(({ app }) => [...new Set([process.pid, ...app.getAppMetrics().map(row => row.pid)])]);

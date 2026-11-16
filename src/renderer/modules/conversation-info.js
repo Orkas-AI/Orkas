@@ -38,7 +38,6 @@ const ConversationInfo = (() => {
     filesTruncated: false,
     filesCount: 0,
     filesScanSkipped: false,
-    syncEnabled: false,
     attachments: [],
   };
   const _CI_TEXT_EXTS = new Set([
@@ -260,7 +259,7 @@ const ConversationInfo = (() => {
 
   async function _load(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, filesData, attachmentData, syncEnabled] = await Promise.all([
+    const [historyData, filesData, attachmentData] = await Promise.all([
       _fetchJson(typeof _historyRequestUrl === 'function'
         ? _historyRequestUrl(cid)
         : `/api/conversations/${enc}/history?limit=10`),
@@ -268,11 +267,10 @@ const ConversationInfo = (() => {
         _infoLog.warn('file list load failed', { cid, error: err && err.message });
         return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
       }),
-      _fetchJson(`/api/conversations/${enc}/attachments`).catch((err) => {
+      _fetchJson(`/api/conversations/${enc}/attachments?scope=all`).catch((err) => {
         _infoLog.warn('attachment load failed', { cid, error: err && err.message });
         return { items: [] };
       }),
-      _loadSyncEnabled(),
     ]);
     return {
       conversation: historyData.conversation || null,
@@ -281,7 +279,6 @@ const ConversationInfo = (() => {
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
-      syncEnabled: syncEnabled === true,
       attachments: Array.isArray(attachmentData.items) ? attachmentData.items : [],
     };
   }
@@ -295,31 +292,13 @@ const ConversationInfo = (() => {
     // A file-only refresh used to fetch the complete history again just to
     // preserve the existing snapshot. The original panel load already owns
     // that history; generated files are authoritative in the workspace scan.
-    // Leave history/conversation/syncEnabled untouched in the caller's merge.
+    // Leave history/conversation untouched in the caller's merge.
     return {
       files: Array.isArray(filesData.items) ? filesData.items : [],
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
     };
-  }
-
-  async function _loadSyncEnabled() {
-    return false;
-  }
-
-  function _normalizeAttachmentItems(items) {
-    return (Array.isArray(items) ? items : [])
-      .filter((item) => item && item.status !== 'error')
-      .map((item) => ({
-        name: String(item.name || ''),
-        displayName: item.displayName ? String(item.displayName) : '',
-        kind: item.kind || _kindForName(item.name || item.displayName || ''),
-        bytes: Number(item.bytes) || 0,
-        mtime: item.mtime,
-        status: item.status || '',
-      }))
-      .filter((item) => item.name);
   }
 
   function _currentConversationTitle() {
@@ -523,15 +502,6 @@ const ConversationInfo = (() => {
       return `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.empty_files', 'No files yet'))}</div>`;
     }
     const tree = _buildFileTree(files);
-    const syncNotice = _snapshot.syncEnabled
-      ? `<div class="ci-files-sync-note">
-          <span class="ci-files-sync-note-icon">${_uiIcon('info', 'ui-icon ci-files-sync-note-svg')}</span>
-          <span>${escapeHtml(_label(
-            'conversation_info.files_sync_note',
-            'Cloud sync does not include these files. Add supported files to Library if you want them synced.'
-          ))}</span>
-        </div>`
-      : '';
     const trunc = _snapshot.filesTruncated
       ? `<div class="conversation-info-empty is-small">${escapeHtml(_label('conversation_info.files_truncated', 'Showing first {count} files', { count: _snapshot.filesCount || allFiles.length }))}</div>`
       : '';
@@ -548,7 +518,7 @@ const ConversationInfo = (() => {
       'Interactive apps',
       artifacts.length ? `<div class="conversation-info-tree">${_renderArtifactRows(artifacts)}</div>` : '',
     );
-    return `<div class="ci-files">${syncNotice}${trunc}${treeHtml}${outsideHtml}${artifactHtml}</div>`;
+    return `<div class="ci-files">${trunc}${treeHtml}${outsideHtml}${artifactHtml}</div>`;
   }
 
   function _collectConversationAttachments() {
@@ -713,7 +683,7 @@ const ConversationInfo = (() => {
   }
 
   function _setOpen(next) {
-    if (next) window.VideoReviewPanel?.close();
+    if (next) window.VideoCanvas?.close();
     else _panelResize?.finish();
     _open = !!next;
     _syncChrome();
@@ -724,6 +694,10 @@ const ConversationInfo = (() => {
     const target = cid || _cid;
     if (!target || target !== _cid || !_open) return;
     const seq = ++_seq;
+    // Full and partial reads share ownership of each resource. A later read
+    // supersedes only its slice, without discarding the rest of a full load.
+    const fileSeq = ++_fileSeq;
+    const attachmentSeq = ++_attachmentSeq;
     const silent = !!opts.silent;
     if (silent && _loadingSource === 'full') {
       _clearLoading('full', seq, { clearAnyForSource: true });
@@ -736,7 +710,16 @@ const ConversationInfo = (() => {
     try {
       const snapshot = await _load(target);
       if (seq !== _seq || target !== _cid) return;
-      _snapshot = snapshot;
+      _snapshot = {
+        ...snapshot,
+        ...(fileSeq !== _fileSeq ? {
+          files: _snapshot.files,
+          filesTruncated: _snapshot.filesTruncated,
+          filesCount: _snapshot.filesCount,
+          filesScanSkipped: _snapshot.filesScanSkipped,
+        } : {}),
+        ...(attachmentSeq !== _attachmentSeq ? { attachments: _snapshot.attachments } : {}),
+      };
       _error = '';
     } catch (err) {
       if (seq !== _seq || target !== _cid) return;
@@ -749,25 +732,21 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function refreshAttachments(cid, opts = {}) {
+  async function refreshAttachments(cid) {
     const target = cid || _cid;
     if (!target || target !== _cid || !_open) return;
-    const items = Array.isArray(opts.items) ? _normalizeAttachmentItems(opts.items) : null;
-    if (items) {
-      _snapshot = { ..._snapshot, attachments: items };
-      if (_activeTab === 'attachments') _renderBody();
-      return;
-    }
-
+    // Composer selections contain only unsent files. Always refresh the task
+    // inventory so sending/clearing a selection cannot erase earlier uploads.
     const seq = ++_attachmentSeq;
     try {
-      const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments`);
+      const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments?scope=all`);
       if (seq !== _attachmentSeq || target !== _cid) return;
       _snapshot = {
         ..._snapshot,
         attachments: Array.isArray(data.items) ? data.items : [],
       };
       if (_activeTab === 'attachments') _renderBody();
+      else _refreshTabCounts();
     } catch (err) {
       _infoLog.warn('attachment refresh failed', { cid: target, error: err && err.message });
     }
@@ -814,9 +793,9 @@ const ConversationInfo = (() => {
     const saved = _cid ? _panelStateByCid.get(_cid) : null;
     _open = saved?.open || false;
     _activeTab = saved?.tab || 'files';
-    if (_open) window.VideoReviewPanel?.close();
+    if (_open) window.VideoCanvas?.close();
     _expandedDirectoryPaths.clear();
-    _snapshot = { conversation: null, history: [], files: [], filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
+    _snapshot = { conversation: null, history: [], files: [], filesTruncated: false, filesCount: 0, filesScanSkipped: false, attachments: [] };
     _error = '';
     _resetLoading();
     _seq++;

@@ -159,6 +159,24 @@ const baseMessage = {
 };
 
 describe('chat input form widget', () => {
+
+  it('leaves an ordinary select as a dropdown with Submit', async () => {
+    const context = loadFormModule();
+    const container = new FakeElement('div');
+    const submissions: unknown[] = [];
+    context.window.renderChatInputForm(container, { form: {
+      form_id: 'select1234', agent_id: 'writer', fields: [{
+        id: 'choice', label: 'Choose an option', type: 'select', required: true, default: 'b',
+        options: [{ value: 'a', label: 'First' }, { value: 'b', label: 'Second' }],
+      }],
+    } }, { cid: 'ordinary-select', onSubmit: (_text: string, values: unknown) => { submissions.push(values); } });
+    expect(context.selects).toHaveLength(1);
+    const buttons = container.querySelectorAll('button');
+    expect(buttons.map(button => button.textContent)).toContain('Submit');
+    await buttons.find(button => button.textContent === 'Submit')!.dispatch('click');
+    expect(submissions).toEqual([{ choice: 'b' }]);
+  });
+
   it('preserves selection order across file fields, upload completion and draft rerender', async () => {
     const context = loadFormModule();
     const releases = new Map<string, () => void>();

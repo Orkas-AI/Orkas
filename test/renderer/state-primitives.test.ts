@@ -20,6 +20,12 @@ function extractFunction(name: string): string {
 }
 
 describe('shared Renderer state primitives', () => {
+  it('ignores unsupported model destinations and rechecks the active account after lazy settings loading',async()=>{
+    let release:any;const setView=vi.fn(),activate=vi.fn(),models=vi.fn(),load=vi.fn(()=>new Promise(resolve=>{release=resolve;}));
+    const sandbox:any={currentUserId:'a',window:{loadRendererFeature:load,activateSettingsTab:activate},setView,_settingsActivateModelTab:models};vm.createContext(sandbox);vm.runInContext('async '+extractFunction('_openBuiltinModelSettings'),sandbox);
+    for(const payload of [null,{user_id:'b',kind:'image'},{user_id:'a',kind:'chat'},{user_id:'a',kind:'image/../account'}])await sandbox._openBuiltinModelSettings(payload);
+    expect(load).not.toHaveBeenCalled();const pending=sandbox._openBuiltinModelSettings({user_id:'a',kind:'image'});sandbox.currentUserId='b';release();await pending;expect(setView).not.toHaveBeenCalled();expect(activate).not.toHaveBeenCalled();expect(models).not.toHaveBeenCalled();
+  });
   it('inserts a newline at the current selection for Ctrl/Cmd+Enter', () => {
     const dispatched = vi.fn();
     const sandbox: any = { Event };

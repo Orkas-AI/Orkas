@@ -107,6 +107,22 @@ describe('attachment image action recovery', () => {
 });
 
 describe('chat image lightbox file ownership', () => {
+  it('labels zoom controls in every registered product locale without fallback', () => {
+    const renderer = path.join(__dirname, '../../src/renderer');
+    const supported = vm.runInNewContext(fs.readFileSync(path.join(renderer, 'modules/i18n.js'), 'utf8')
+      + '; getSupportedLanguages()', { createLogger: () => ({ warn() {} }), window: {} }) as Array<{ code: string }>;
+    expect(supported.length).toBeGreaterThan(0);
+    for (const { code } of supported) {
+      const table = JSON.parse(fs.readFileSync(path.join(renderer, `locales/${code}.json`), 'utf8'));
+      for (const action of ['in', 'out', 'reset']) {
+        const key = `chat.lightbox_zoom_${action}`;
+        expect(typeof table[key], `${code}: ${key}`).toBe('string');
+        expect(table[key].trim(), `${code}: ${key}`).not.toBe('');
+        expect(table[key], code).not.toBe(key);
+      }
+    }
+  });
+
   it('forwards an outside image path when the user clicks reveal and re-enables the button', async () => {
     const context = loadLightbox();
     const invoke = vi.fn(async () => ({ ok: true }));

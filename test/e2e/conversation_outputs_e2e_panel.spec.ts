@@ -11,7 +11,7 @@
 //
 // The first reply below deliberately does NOT paste a media link; the second
 // one does, and must not gain a duplicate underneath it.
-import { appendFileSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
@@ -79,6 +79,126 @@ function wavBytes(): Buffer {
 
 test.describe.configure({ timeout: 120_000 });
 
+test('task attachments include early uploads beyond the history page and survive composer clearing', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Complete attachment inventory' })).conversation.conversation_id;
+  const oldName = 'Earlier-brief-历史附件-完整文件名称.txt';
+  for (const [name, text] of [[oldName, 'Earlier attachment contents'], ['pending.txt', 'Pending contents']]) {
+    await orkas.invoke('conversations.attachments.upload', { cid, name, data: Buffer.from(text).toString('base64') });
+  }
+  const chatFile = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`);
+  appendFileSync(chatFile, [
+    { role: 'user', text: 'Earlier upload', attachments: [oldName], time: '2026-11-01T00:00:00Z' },
+    ...Array.from({ length: 25 }, (_, i) => ({ role: 'assistant', text: `Later reply ${i}`, time: '2026-11-02T00:00:00Z' })),
+  ].map(row => JSON.stringify(row)).join('\n') + '\n');
+  await page.evaluate(async id => {
+    await (window as any).loadConversations();
+    await (window as any).setView('conversation', id);
+  }, cid);
+  await page.locator('#conversation-info-toggle').click();
+  const panel = page.locator('#conversation-info-panel');
+  await panel.locator('[data-info-tab="attachments"]').click();
+  await expect(panel.locator('.ci-attach-row')).toHaveCount(2);
+  await expect(panel.locator('.ci-attach-row', { hasText: oldName })).toBeVisible();
+  await expect(page.locator('#chat-attachments .chat-attach-label')).toHaveText(['pending.txt']);
+  await expect(page.locator('#conversation-info-tab-count-attachments')).toHaveText('2');
+
+  for (const [locale, width, height] of [['en', 1440, 900], ['zh', 800, 600]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(lang => (window as any).setLang(lang), locale);
+    await expect(panel.locator('.ci-attach-row', { hasText: oldName })).toBeInViewport();
+    await panel.screenshot({ path: testInfo.outputPath(`attachment-inventory-${locale}.png`) });
+  }
+  const preview = await orkas.openPreview(() => panel.locator('.ci-attach-row', { hasText: oldName }).click());
+  await expect(preview.locator('body')).toContainText('Earlier attachment contents');
+  await orkas.closePreview(preview);
+
+  appendFileSync(chatFile, JSON.stringify({ role: 'user', text: 'Sent pending', attachments: ['pending.txt'] }) + '\n');
+  await page.evaluate(id => (window as any)._chatAttachClear(id), cid);
+  await expect(panel.locator('.ci-attach-row')).toHaveCount(2);
+  await expect(page.locator('#chat-attachments .chat-attach-label')).toHaveCount(0);
+  await page.evaluate(id => (window as any).ConversationInfo.refreshAttachments(id), cid);
+  await expect(panel.locator('.ci-attach-row')).toHaveCount(2);
+});
+
+test('task inventory keeps new files and attachments across full and partial refresh races', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Refresh ordering' })).conversation.conversation_id;
+  const listing = await orkas.invoke<{ root: string }>('conversations.files.list', { cid });
+  const chat = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`);
+  const addFile = (name: string) => {
+    const file = path.join(listing.root, name);
+    mkdirSync(listing.root, { recursive: true });
+    writeFileSync(file, 'Current generated output');
+    appendFileSync(chat, JSON.stringify({ id: 'output-' + name, ts: new Date().toISOString(),
+      from: 'commander', to: ['user'], text: 'Generated output', produced: [file] }) + '\n');
+  };
+  addFile('original.txt');
+  await orkas.invoke('conversations.attachments.upload', { cid, name: 'original.txt', data: Buffer.from('Original source').toString('base64') });
+  await page.evaluate(async id => {
+    await (window as any).loadConversations();
+    await (window as any).setView('conversation', id);
+  }, cid);
+  await page.locator('#conversation-info-toggle').click();
+  const panel = page.locator('#conversation-info-panel');
+  await expect(panel.locator('.conversation-info-file')).toHaveCount(1);
+  for (const resource of ['files', 'attachments'] as const) {
+    await panel.locator(`[data-info-tab="${resource}"]`).click();
+    for (const older of ['full', 'partial'] as const) {
+      await page.evaluate(({ id, resource, older }) => {
+        const win = window as any;
+        const original = win.apiFetch;
+        let held = false;
+        win.__inventoryRace = { ready: false, original };
+        win.apiFetch = async (url: string, ...args: any[]) => {
+          const response = await original(url, ...args);
+          if (!held && url.includes('/' + resource)) {
+            held = true;
+            const payload = await response.json();
+            return new Promise(resolve => {
+              win.__inventoryRace.release = () => resolve({ json: async () => payload });
+              win.__inventoryRace.ready = true;
+            });
+          }
+          return response;
+        };
+        const info = win.ConversationInfo;
+        win.__inventoryRace.pending = older === 'full' ? info.refresh(id, { silent: true })
+          : resource === 'files' ? info.refreshFiles(id, { silent: true }) : info.refreshAttachments(id);
+      }, { id: cid, resource, older });
+      await page.waitForFunction(() => (window as any).__inventoryRace?.ready === true);
+      const name = `latest-${resource}-${older}.txt`;
+      if (resource === 'files') addFile(name);
+      else {
+        const uploaded = await orkas.invoke<any>('conversations.attachments.upload', { cid, name, data: Buffer.from('Current source ' + name).toString('base64') });
+        expect(uploaded.ok).toBe(true);
+        expect(uploaded.info.name).toBe(name);
+      }
+      await page.evaluate(async ({ id, resource, older }) => {
+        const win = window as any;
+        const race = win.__inventoryRace;
+        win.apiFetch = race.original;
+        try {
+          if (older === 'partial') await win.ConversationInfo.refresh(id, { silent: true });
+          else if (resource === 'files') await win.ConversationInfo.refreshFiles(id, { silent: true });
+          else await win.ConversationInfo.refreshAttachments(id);
+        } finally {
+          race.release();
+          await race.pending;
+          delete win.__inventoryRace;
+        }
+      }, { id: cid, resource, older });
+      await expect(panel).toContainText(name);
+    }
+  }
+  for (const [locale, width, height] of [['en', 1440, 900], ['zh', 800, 600]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(lang => (window as any).setLang(lang), locale);
+    await expect(panel.locator('.ci-attach-row')).toHaveCount(3);
+    await panel.screenshot({ path: testInfo.outputPath(`inventory-race-${locale}.png`) });
+  }
+});
+
 test('task details remembers open and closed panels and each selected tab across navigation', async ({ orkas }) => {
   const page = orkas.page!;
   const first = (await orkas.invoke<any>('conversations.create', { title: 'Details state first' })).conversation.conversation_id;
@@ -123,6 +243,26 @@ test('task details remembers open and closed panels and each selected tab across
   await expect(panel).toBeHidden();
 });
 
+test('lists nothing for a conversation that has not run, whatever else is in the workspace', async ({ orkas }) => {
+  const page = orkas.page!;
+  orkas.createWorkspaceFile('another-conversation/report.md', '# Not this one\n');
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Not run yet' })).conversation.conversation_id;
+  await page.evaluate(async (id) => {
+    await (window as any).loadConversations();
+    (window as any).setView('conversation', id);
+  }, cid);
+  await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+  await page.locator('#conversation-info-toggle').click();
+  const panel = page.locator('#conversation-info-panel');
+  await expect(panel).toContainText('No files yet');
+  await expect(panel.locator('.conversation-info-file')).toHaveCount(0);
+  // Finish the cold derived turn index before the isolated fixture closes its worker.
+  await page.evaluate(async id => {
+    await (window as any).ConversationTurnNav.open({ cid: id,
+      loadPage: (before: number | null) => (window as any)._loadConversationTurnNavigationPage(id, before) });
+  }, cid);
+});
+
 test('surfaces produced files, outside files, and artifacts for one conversation', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const diagnostics = orkas.rendererDiagnosticCheckpoint();
@@ -137,9 +277,16 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   );
   const cid = created.conversation.conversation_id;
 
-  // Opening the conversation is what freezes `state.workspace_dir`, so resolve
-  // the scan root only after that — otherwise the seeded files land beside the
-  // conversation folder instead of inside it.
+  // Each injected bad-media record belongs to one fault/recovery scenario.
+  // Retire it only after its outcome and exact diagnostic were asserted, so
+  // later independent history redraws cannot replay an earlier fixture fault.
+  const retireFixtureFault = (id: string) => {
+    const records = readFileSync(chatFile(cid), 'utf8').trim().split('\n').filter(Boolean);
+    const kept = records.filter(line => JSON.parse(line).id !== id);
+    expect(records.length - kept.length).toBe(1);
+    writeFileSync(chatFile(cid), `${kept.join('\n')}\n`);
+  };
+
   await page.evaluate(async (id) => {
     await (window as any).loadConversations();
     (window as any).setView('conversation', id);
@@ -306,6 +453,71 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   expect((await staleNarrationResponse).status()).toBe(404);
   await orkas.acknowledgeRendererFailure({ surface: page, after: staleNarrationDiagnostics, count: 1,
     detail: 'Failed to load resource: the server responded with a status of 404 (Not Found)' });
+  retireFixtureFault('m_outputs_reply_stale_narration');
+
+  // A model can copy a long delivery link wrong: on 2026-11-07 Luna's link broke the
+  // percent-encoding of a Chinese folder name mid-character. Such a link names no file, so it
+  // never plays and retrying cannot help. With the delivered file shown by the host in the same
+  // reply, the reply keeps that one player; without it, the link becomes the missing-video chip.
+  const deliveredPath = path.join(wsDir, 'main-v1.mp4');
+  await orkas.electronApp!.evaluate(async (_electron, args) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const { ffmpeg } = require(args.module).bundledFfmpegPaths();
+    if (!ffmpeg) throw new Error('Bundled FFmpeg is required for this fixture');
+    await new Promise<void>((resolve, reject) => {
+      require('node:child_process').execFile(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc2=s=320x568:r=30:d=1', '-c:v', 'libx264', '-preset', 'veryfast',
+        '-pix_fmt', 'yuv420p', '-threads', '1', args.file],
+      { windowsHide: true, timeout: 60000 }, (error: Error | null) => (error ? reject(error) : resolve()));
+    });
+  }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), file: deliveredPath });
+  const encodedReports = wsDir.replace(/^\//, '').split(/[\\/]/).map(encodeURIComponent).join('/');
+  const brokenDeliveryUrl = `chat-media://local/${encodedReports}/%E8%BF%99%E6%98%AF%E护眼台灯/main-v1.mp4?v=1-1-1`;
+  const brokenDiagnostics = orkas.rendererDiagnosticCheckpoint();
+  const brokenResponse = page.waitForResponse(response => response.url().startsWith(`chat-media://local/${encodedReports}/%E8%BF%99`));
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_outputs_reply_broken_delivery_link',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `[Download the video](${brokenDeliveryUrl}) The video is ready.`,
+    produced: [deliveredPath],
+  })}\n`, 'utf8');
+  await reopen();
+  const delivered = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(delivered.locator('.chat-msg-produced-media video')).toHaveCount(1);
+  await expect(delivered.locator('video')).toHaveCount(1);
+  await expect(delivered.locator('.chat-md-video-load-failure, .chat-md-video-missing')).toHaveCount(0);
+  await expect.poll(() => delivered.locator('.chat-msg-produced-media video')
+    .evaluate((video: HTMLVideoElement) => video.duration)).toBeGreaterThan(0.9);
+  expect((await brokenResponse).status()).toBe(400);
+  await orkas.acknowledgeRendererFailure({ surface: page, after: brokenDiagnostics, count: 1,
+    detail: 'Failed to load resource: the server responded with a status of 400 (Bad Request)' });
+  retireFixtureFault('m_outputs_reply_broken_delivery_link');
+
+  const brokenAloneDiagnostics = orkas.rendererDiagnosticCheckpoint();
+  appendFileSync(chatFile(cid), `${JSON.stringify({
+    id: 'm_outputs_reply_broken_link_alone',
+    ts: new Date().toISOString(),
+    from: 'commander',
+    to: ['user'],
+    text: `Earlier cut:\n\n[Earlier cut](chat-media://local/${encodedReports}/%E8%BF%99%E6%98%AF%E护眼台灯/earlier-cut.mp4)`,
+  })}\n`, 'utf8');
+  await reopen();
+  const alone = page.locator('#chat-history .chat-message.assistant').last();
+  await expect(alone.locator('.chat-md-video-missing')).toHaveCount(1);
+  for (const [language, width, height] of [['en', 1280, 720], ['zh', 900, 600]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(lang => (window as any).setLang(lang), language);
+    await alone.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath('missing-media-' + language + '.png') });
+  }
+  await page.evaluate(() => (window as any).setLang('en'));
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await expect(alone.locator('.chat-md-video-shell, video, .chat-md-video-load-failure')).toHaveCount(0);
+  await orkas.acknowledgeRendererFailure({ surface: page, after: brokenAloneDiagnostics, count: 1,
+    detail: 'Failed to load resource: the server responded with a status of 400 (Bad Request)' });
+  retireFixtureFault('m_outputs_reply_broken_link_alone');
 
   // Revisit existing files in the body while the footer contains only this
   // reply's new output. The outside file needs the current conversation scope;
@@ -430,8 +642,12 @@ test('opens code references from the project task selected directory', async ({ 
   const selection = path.join(orkas.workspaceRoot, uid, 'local', 'cli-directories', `${cid}.json`);
   mkdirSync(path.dirname(selection), { recursive: true });
   writeFileSync(selection, JSON.stringify({ version: 1, directory: repository, explicit: true }));
-  const unavailable = path.join(orkas.root, 'unselected.txt');
-  writeFileSync(unavailable, 'Outside the selected task directory');
+  // Ordinary local files can be previewed read-only. Managed data belonging to
+  // another account is the denied boundary, even when referenced by this task.
+  const unavailable = path.join(orkas.workspaceRoot, 'other-account', 'cloud', 'unselected.txt');
+  mkdirSync(path.dirname(unavailable), { recursive: true });
+  const privateSource = 'Private source belonging to another account';
+  writeFileSync(unavailable, privateSource);
   const history = path.join(orkas.workspaceRoot, uid, 'cloud', 'projects', project.project_id, 'chats', `${cid}.jsonl`);
   appendFileSync(history, `${JSON.stringify({
     id: 'm_code_reference', ts: new Date().toISOString(), from: 'commander', to: ['user'],
@@ -470,5 +686,61 @@ test('opens code references from the project task selected directory', async ({ 
   preview = await orkas.openPreview(() => reply.getByRole('button', { name: 'Agent 组装逻辑', exact: true }).click());
   viewer = preview.locator('.chat-file-viewer');
   await expect(viewer.locator('.chat-file-viewer-body')).toContainText('agent ready');
+  expect(readFileSync(unavailable, 'utf8')).toBe(privateSource);
   await orkas.acknowledgeInvokeFailures('workspace.statPath', 1, deniedReferenceDiagnostics);
+});
+
+
+// Preserve the independent audio-width/playback journey from the retired video
+// drawer against the shared current side panel, without reviving its old model.
+test('keeps narration inside the conversation while the current side panel resizes', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Audio and panel width' })).conversation.conversation_id;
+  await page.evaluate(async id => {
+    await (window as any).loadConversations();
+    await (window as any).setView('conversation', id);
+  }, cid);
+  const listing = await orkas.invoke<{ root: string }>('conversations.files.list', { cid });
+  const narration = path.join(listing.root, 'narration.wav');
+  mkdirSync(listing.root, { recursive: true });
+  writeFileSync(narration, wavBytes());
+  const history = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`);
+  appendFileSync(history, JSON.stringify({
+    id: 'm_audio_panel_width', ts: new Date().toISOString(), from: 'commander', to: ['user'],
+    text: `Narration: [narration](<${narration}>)`, produced: [narration],
+  }) + '\n');
+  await page.evaluate(async id => {
+    await (window as any).setView('new-chat');
+    await (window as any).setView('conversation', id);
+  }, cid);
+  const card = page.locator('#chat-history .chat-message.assistant .chat-md-audio-card');
+  const audio = card.locator('audio');
+  await expect(audio).toBeVisible();
+  const fits = () => card.evaluate(el => {
+    const bounds = el.getBoundingClientRect();
+    const body = el.closest('.markdown-body')!.getBoundingClientRect();
+    const audio = el.querySelector('audio')!.getBoundingClientRect();
+    return bounds.right <= body.right + 1 && bounds.width <= body.width + 1 && audio.right <= bounds.right;
+  });
+  await page.locator('#conversation-info-toggle').click();
+  const panel = page.locator('#conversation-info-panel');
+  await expect(panel).toBeVisible();
+  await page.setViewportSize({ width: 1800, height: 900 });
+  await expect.poll(async () => (await panel.boundingBox())!.width).toBe(540);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect.poll(async () => (await panel.boundingBox())!.width).toBe(400);
+  await expect.poll(fits).toBe(true);
+  const before = (await card.boundingBox())!.width;
+  const grip = (await page.locator('#conversation-info-resize').boundingBox())!;
+  await page.mouse.move(grip.x + grip.width / 2, grip.y + 100);
+  await page.mouse.down();
+  await page.mouse.move(grip.x - 150, grip.y + 100);
+  await page.mouse.up();
+  expect((await panel.boundingBox())!.width).toBeGreaterThan(500);
+  await expect.poll(fits).toBe(true);
+  expect((await card.boundingBox())!.width).toBeLessThan(before);
+  await audio.evaluate(async (el: HTMLAudioElement) => { el.muted = true; await el.play(); });
+  await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeGreaterThan(0);
+  await audio.evaluate((el: HTMLAudioElement) => el.pause());
+  await page.screenshot({ path: testInfo.outputPath('audio-and-current-side-panel.png') });
 });

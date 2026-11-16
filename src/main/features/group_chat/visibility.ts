@@ -185,6 +185,10 @@ export interface GroupMessage {
    * canonical history can recover its task) but hidden from the user view,
    * since the user already saw the plan announcement. */
   dispatch?: boolean;
+  /** Host-owned goal bound to this exact internal source message. Kept out of
+   * dialogue projection; manual retry can restore it without parsing prose.
+   * Optional for compatibility with records predating goal continuity. */
+  orchestration_goal?: string;
   /** Host-owned recovery marker for a synchronous `dispatch_to` source (and
    * user retries derived from it). If that Agent bubble is retried after the
    * original Commander call stack was lost, the completed retry must wake a

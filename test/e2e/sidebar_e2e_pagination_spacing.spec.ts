@@ -31,10 +31,16 @@ test('keeps task pagination close to its rows without losing focus or page navig
   const lists = ['#conversation-list', `[data-pid-children="${project.project_id}"]`, '#project-tasks-list'];
   for (const [language, width, height] of [['zh', 1100, 740], ['en', 900, 600]] as const) {
     await page.setViewportSize({ width, height });
+    const existingMore = page.locator('#conversation-list > .conversation-list-load-more');
+    const originalButton = await existingMore.elementHandle();
+    await existingMore.focus();
     await page.evaluate(async (lang) => { await (window as any).setLang(lang); }, language);
+    await expect(existingMore).toBeFocused();
+    expect(await existingMore.evaluate((button, original) => button === original, originalButton)).toBe(true);
     for (const list of lists) {
       const more = page.locator(`${list} > .conversation-list-load-more`);
       await expect(more).toBeVisible();
+      await expect(more).toHaveText(language === 'zh' ? '显示更多' : 'Show more');
       await more.scrollIntoViewIfNeeded();
       const geometry = await more.evaluate((button) => {
         const row = button.previousElementSibling!;

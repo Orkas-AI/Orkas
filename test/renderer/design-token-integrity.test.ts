@@ -20,6 +20,7 @@ const RUNTIME_INJECTED = new Set([
   '--chat-image-aspect-ratio', // modules/utils.js
   '--chat-image-natural-width', // modules/utils.js
   '--turn-nav-preview-y', // modules/conversation-turn-nav.js
+  '--task-side-panel-header-height', // modules/task-side-panel.js; task_side_panel_e2e_layout.spec.ts
   '--activity-group-height', // modules/web-assist.js, set before `.is-contained` applies it
 ]);
 

@@ -28,13 +28,13 @@ test('first and repeated closes preserve the same renderer and draft; legacy set
     expect(await native.evaluate(win => ({ destroyed: win.isDestroyed(), visible: win.isVisible(), shows: (win as any).__shows })))
       .toEqual({ destroyed: false, visible: false, shows: 0 });
     expect(await trayMenu(electron, i === 0 ? 'click' : 'right-click')).toEqual([
-      { label: 'Open', type: 'normal', enabled: true }, { label: 'Quit', type: 'normal', enabled: true }]);
+      { label: 'Open Orkas', type: 'normal', enabled: true }, { label: 'Quit Orkas', type: 'normal', enabled: true }]);
     await selectTrayItem(electron, 0);
     await expect(page.locator('#new-chat-input')).toHaveText('Preserve this unsent draft');
   }
   expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(legacy);
   await orkas.invoke('config.setLanguage', { language: 'zh' }); await page.reload(); await settings(page);
-  expect((await trayMenu(electron)).map(item => item.label)).toEqual(['打开', '退出']);
+  expect((await trayMenu(electron)).map(item => item.label)).toEqual(['打开 Orkas', '退出 Orkas']);
   await page.setViewportSize({ width: 860, height: 640 });
   await expect(page.locator('#settings-startup-description')).toHaveText('电脑开机后，自动启动 Orkas。');
   const bounds = await page.locator('#settings-startup-row').boundingBox();

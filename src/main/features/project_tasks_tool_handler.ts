@@ -16,9 +16,11 @@ export function createProjectTasksHandler(
   // Aborts once the caller stopped waiting; a later write would contradict the
   // failure it already reported and invite a duplicate retry.
   signal?: AbortSignal,
+  scopeGuard?: () => void,
 ): ProjectTasksToolHandler {
   const beforeWrite = () => {
     if (signal?.aborted) throw new Error('E_BRIDGE_CALL_CANCELLED: the caller stopped waiting for this task operation');
+    scopeGuard?.();
   };
   const toView = (task: projectTasks.ProjectTask) => ({
     ...projectTasks.taskView(task),
@@ -92,7 +94,10 @@ export function createProjectTasksHandler(
     delete: async (taskId) => {
       if (getActiveUserId() !== uid) return { ok: false, error: 'account_changed' };
       beforeWrite();
-      const result = await projectTasks.deleteTask(uid, pid, taskId);
+      const task = await projectTasks.getTask(uid, pid, taskId);
+      beforeWrite();
+      if (!task) return { ok: false, error: 'task_not_found' };
+      const result = await projectTasks.deleteTask(uid, pid, taskId, { beforeWrite });
       if (!result.ok) return result;
       try { onDeleted?.(taskId, pid); } catch { /* withdrawing an offer never fails the delete */ }
       return { ok: true, task_id: taskId, deleted: true };
@@ -100,7 +105,7 @@ export function createProjectTasksHandler(
     addAttachment: async (taskId, sourcePath) => {
       const { addTaskAttachmentFromPath } = await import('./project_task_attachment_tool');
       beforeWrite();
-      const result = await addTaskAttachmentFromPath(uid, pid, cid, taskId, sourcePath, files);
+      const result = await addTaskAttachmentFromPath(uid, pid, cid, taskId, sourcePath, { ...files, beforeWrite });
       return result.ok ? { ok: true, task: savedView(result.task) } : result;
     },
     list: async (query = {}) => {
@@ -136,7 +141,7 @@ export function createProjectTasksHandler(
         ...ownerFields,
         ...(input.due_at !== undefined ? { due_at: input.due_at } : {}),
         created_by: 'agent',
-      });
+      }, { beforeWrite });
       if (!r.ok) return { ok: false, error: (r as { error: string }).error };
       // Link only the first open to-do saved in this conversation.
       let task = r.task;
@@ -160,6 +165,8 @@ export function createProjectTasksHandler(
       return { ok: true, task: savedView(task), alreadyExists: r.alreadyExists };
     },
     update: async (taskId: string, patch: projectTasks.TaskContentInput & { status?: projectTasks.TaskStatus; owner?: string; due_at?: string }) => {
+      const current = await projectTasks.getTask(uid, pid, taskId);
+      if (!current) return { ok: false, error: 'task_not_found' };
       let ownerPatch: { owner_agent?: string; owner_agent_id?: string } = {};
       if (patch.owner !== undefined) {
         if (patch.owner.trim()) {
@@ -180,7 +187,7 @@ export function createProjectTasksHandler(
         ...ownerPatch,
         // An empty string clears, like `owner`.
         ...(patch.due_at !== undefined ? { due_at: patch.due_at === '' ? null : patch.due_at } : {}),
-      });
+      }, { beforeWrite });
       return r.ok === true ? { ok: true, task: savedView(r.task) } : {
         ok: false,
         error: r.error === 'content_required_for_update'
@@ -192,7 +199,7 @@ export function createProjectTasksHandler(
       beforeWrite();
       const r = await projectTasks.updateTask(uid, pid, taskId, {
         status: 'done',
-      });
+      }, { beforeWrite });
       return r.ok ? { ok: true, task: savedView(r.task) } : { ok: false, error: (r as { error: string }).error };
     },
   };

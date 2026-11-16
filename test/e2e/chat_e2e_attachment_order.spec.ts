@@ -50,6 +50,9 @@ test('keeps image selection, bubble, persisted history and model pixels in order
   expect(cid).toBeTruthy();
   page = await modelOrkas.relaunch();
   await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+  // The reopened message bubbles can paint before the lazy turn index settles.
+  // Drain its real request before fixture shutdown closes the history worker.
+  await page.evaluate(id => (window as any).ConversationTurnNav.open({ cid: id }), cid);
   for (const turn of [0, 1]) {
     await expect(page.locator('#chat-history .chat-message.user').nth(turn).locator('.chat-msg-attach .chat-attach-label'))
       .toHaveText([`z-first-${turn}.png`, `a-second-${turn}.png`, `m-third-${turn}.png`]);

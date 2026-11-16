@@ -160,33 +160,6 @@ async function _ensureAutoCurrentDevice() {
   } catch (_) { _autoCurrentDevice = { id: '', name: '' }; }
   return _autoCurrentDevice;
 }
-let _autoCloudSyncEnabled = false;
-function _autoSyncApiAvailable() {
-  return false;
-}
-async function _refreshAutoSyncNotice() {
-  if (!_autoSyncApiAvailable()) {
-    _autoCloudSyncEnabled = false;
-    _paintAutoSyncNotice();
-    return false;
-  }
-  _autoCloudSyncEnabled = false;
-  _paintAutoSyncNotice();
-  return _autoCloudSyncEnabled;
-}
-function _paintAutoSyncNotice() {
-  const listText = t('auto.sync_note_list');
-  const targets = [
-    { id: 'auto-sync-note', text: listText },
-    { id: 'project-auto-sync-note', text: listText },
-  ];
-  for (const item of targets) {
-    const el = document.getElementById(item.id);
-    if (!el) continue;
-    el.hidden = !_autoCloudSyncEnabled;
-    el.textContent = _autoCloudSyncEnabled ? item.text : '';
-  }
-}
 let _autoCurrentRecipient = { kind: 'commander' };
 // Skill / connector pinned to this draft. Mirrors the commander composer's
 // single-chip slot: setting one clears the other (matches the bus-side
@@ -683,7 +656,7 @@ function _autoRenderTaskConvs(taskId, container) {
         .map((c) => _renderConversationSidebarItem(c, { nested: true, hidePin: true }))
         .join('');
   if (page.nextOffset !== null) {
-    html += `<button type="button" class="conversation-list-load-more" data-auto-task-convs-more="1">${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
+    html += `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-auto-task-convs-more="1">${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
   }
   container.innerHTML = html;
   if (typeof _bindConversationSidebarItems === 'function') {
@@ -896,7 +869,6 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
 
 async function loadAutoList(force) {
   if (!document.getElementById('auto-list')) return;
-  await _refreshAutoSyncNotice();
   if (_autoLoadedOnce && !force) { _autoRenderList(); return; }
   // Resolve the shared project metadata and device identity before grouping.
   // The sidebar's project cache is the grouping authority; ask it to load only
@@ -1003,7 +975,6 @@ async function loadProjectAutoList(projectId) {
   const countEl = document.getElementById('project-auto-tab-count');
   if (!listEl) return;
   await _ensureAutoCurrentDevice();
-  await _refreshAutoSyncNotice();
   if (!projectId) {
     listEl.innerHTML = '';
     if (emptyEl) emptyEl.style.display = '';
@@ -1389,7 +1360,6 @@ function _mountAutoForm() {
   _autoFormMounted = true;
   _repaintAutoRecipientChip();
   _autoRepaintLabels();
-  _paintAutoSyncNotice();
   _renderAutoAttachmentChips();
 }
 
@@ -1901,7 +1871,6 @@ function _autoRepaintLabels() {
   if (_autoEndDatePicker) _autoEndDatePicker.repaint();
   _autoSyncFreqRows(_autoFreqSel ? _autoFreqSel.getValue() : 'daily');
   _autoRefreshRunDevicePicker();
-  _paintAutoSyncNotice();
 }
 
 function _autoResetForm() {
@@ -1951,7 +1920,6 @@ function _autoResetForm() {
  *                    Project-detail uses this to refresh its list. */
 function openAutoTaskDialog(opts = {}) {
   if (!_autoFormMounted) _mountAutoForm();
-  _refreshAutoSyncNotice().catch(() => {});
   const task = opts.task || null;
   _autoLockedProjectId = _autoValidProjectId((opts.projectId && typeof opts.projectId === 'string') ? opts.projectId : '');
   _autoOnSaved = (typeof opts.onSaved === 'function') ? opts.onSaved : null;
@@ -1980,7 +1948,6 @@ function openAutoTaskDialog(opts = {}) {
 function _showAutoDialog() {
   const overlay = document.getElementById('auto-task-dialog-overlay');
   if (!overlay) return;
-  _paintAutoSyncNotice();
   overlay.style.display = 'flex';
   overlay.classList.add('open');
   const ta = document.getElementById('auto-task-input');

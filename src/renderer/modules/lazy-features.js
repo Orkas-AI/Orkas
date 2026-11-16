@@ -25,6 +25,7 @@ const _rendererFeatureManifest = Object.freeze({
     { src: './modules/date-picker.js' },
     { src: './modules/project-detail.js' },
     { src: './modules/todos.js' },
+    { src: './modules/todo-cleanup.js' },
   ],
   auto: [
     { src: './modules/date-picker.js' },

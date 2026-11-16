@@ -9,6 +9,9 @@
 //   - - / _                                   → zoom out
 //   - 0                                       → reset to 1× and re-center
 //   - Double-click image                      → toggle 1× / 2×
+//   - Pinch / Ctrl or Cmd + wheel              → zoom inside the preview
+//   - Two-finger swipe (when zoomed)            → pan
+//   - Bottom buttons                           → zoom out / fit / zoom in
 //   - Drag image (when zoomed)                → pan
 //
 // Usage:  openChatImageLightbox(src, alt?)
@@ -37,10 +40,15 @@ let _tx = 0;
 let _ty = 0;
 let _isPanning = false;
 let _panStart = null;
+let _lightboxWheelAnchor = null;
+let _lightboxWheelTimer = null;
+let _lightboxTouch = null;
+let _lightboxZoomActivityTimer = null;
 
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 8;
 const ZOOM_STEP = 1.2;
+const _LIGHTBOX_CONTROLS_IDLE_MS = 2000;
 const _LIGHTBOX_LIBRARY_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 
 function _lightboxExtOf(name) {
@@ -103,13 +111,45 @@ function _applyTransform() {
   if (!_lightboxImg) return;
   _lightboxImg.style.transform = `translate(${_tx}px, ${_ty}px) scale(${_scale})`;
   _lightboxImg.style.cursor = _scale > 1 ? (_isPanning ? 'grabbing' : 'grab') : 'zoom-in';
+  const out = _lightboxEl?.querySelector('.chat-lightbox-zoom-out');
+  const into = _lightboxEl?.querySelector('.chat-lightbox-zoom-in');
+  const level = _lightboxEl?.querySelector('.chat-lightbox-zoom-level');
+  if (out) out.disabled = _scale <= MIN_SCALE;
+  if (into) into.disabled = _scale >= MAX_SCALE;
+  if (level) level.textContent = `${Math.round(_scale * 100)}%`;
 }
 
 function _resetZoom() {
+  _endLightboxGesture();
   _scale = 1;
   _tx = 0;
   _ty = 0;
   _applyTransform();
+  _wakeLightboxZoom();
+}
+
+function _wakeLightboxZoom() {
+  if (!_isOpen()) return;
+  const controls = _lightboxEl.querySelector('.chat-lightbox-zoom');
+  controls.classList.add('is-active');
+  clearTimeout(_lightboxZoomActivityTimer);
+  _lightboxZoomActivityTimer = setTimeout(_clearLightboxZoomActivity, _LIGHTBOX_CONTROLS_IDLE_MS);
+}
+
+function _clearLightboxZoomActivity() {
+  clearTimeout(_lightboxZoomActivityTimer);
+  _lightboxZoomActivityTimer = null;
+  _lightboxEl?.querySelector('.chat-lightbox-zoom')?.classList.remove('is-active');
+}
+
+function _endLightboxGesture() {
+  clearTimeout(_lightboxWheelTimer);
+  _lightboxWheelTimer = null;
+  _lightboxWheelAnchor = null;
+  _lightboxTouch = null;
+  _isPanning = false;
+  _panStart = null;
+  if (_lightboxImg) _lightboxImg.style.transition = '';
 }
 
 function _lightboxLoadingLabel() {
@@ -159,6 +199,7 @@ function _clearLightboxLoadListeners() {
 // — derived by requiring that the image-relative coord under the cursor
 // be invariant across the scale change.
 function _setScale(newScale, fx, fy) {
+  _wakeLightboxZoom();
   const clamped = Math.max(MIN_SCALE, Math.min(MAX_SCALE, newScale));
   if (clamped === _scale) return;
   if (_lightboxImg && fx != null && fy != null) {
@@ -175,18 +216,61 @@ function _setScale(newScale, fx, fy) {
 
 function _onWheel(e) {
   if (!_isOpen()) return;
-  // Wheel-based zoom is intentionally disabled on the lightbox:
-  //   - trackpad pinch (ctrlKey wheel) reports the two-finger centroid
-  //     as clientX/Y, which jitters → cursor-anchored zoom drifts
-  //   - trackpad two-finger swipe (plain wheel) zooms in/out way too
-  //     fast for a seated reader and also feels drifty
-  //   - real mouse wheel works fine, but few users mix mouse + lightbox
-  //     vs. trackpad on this app's typical hardware (laptops)
-  // Users still have +/-/0 keyboard shortcuts and double-click toggle.
-  // We still preventDefault so the chat behind doesn't scroll while
-  // the lightbox is open and so trackpad pinch doesn't trigger the
-  // browser's own page zoom.
+  // Keep both document scrolling and Chromium page zoom out of the preview.
   e.preventDefault();
+  if (e.target.closest?.('button') || _lightboxEl.classList.contains('is-loading')) return;
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? _lightboxEl.clientHeight : 1;
+  _lightboxImg.style.transition = 'none';
+  clearTimeout(_lightboxWheelTimer);
+  if (e.ctrlKey || e.metaKey) {
+    // Lock the focal point for the burst: trackpad centroid coordinates jitter.
+    if (!_lightboxWheelAnchor) _lightboxWheelAnchor = { x: e.clientX, y: e.clientY };
+    _setScale(_scale * Math.exp(Math.max(-20, Math.min(20, -e.deltaY * unit * 0.01))),
+      _lightboxWheelAnchor.x, _lightboxWheelAnchor.y);
+  } else {
+    _lightboxWheelAnchor = null;
+    if (_scale > 1) {
+      _tx -= e.deltaX * unit;
+      _ty -= e.deltaY * unit;
+      _applyTransform();
+    }
+  }
+  _lightboxWheelTimer = setTimeout(() => {
+    _lightboxWheelTimer = null;
+    _lightboxWheelAnchor = null;
+    if (!_isPanning && !_lightboxTouch) _lightboxImg.style.transition = '';
+  }, 180);
+}
+
+function _lightboxTouchPosition(touches) {
+  const a = touches[0], b = touches[1] || a;
+  return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2,
+    distance: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) };
+}
+
+function _onLightboxTouchChange(e) {
+  if (!_isOpen() || e.target.closest?.('button')) return;
+  if (e.cancelable) e.preventDefault();
+  _endLightboxGesture();
+  if (e.touches.length) {
+    _lightboxTouch = _lightboxTouchPosition(e.touches);
+    _lightboxImg.style.transition = 'none';
+  }
+}
+
+function _onLightboxTouchMove(e) {
+  if (!_isOpen() || !_lightboxTouch || !e.touches.length) return;
+  if (e.cancelable) e.preventDefault();
+  const next = _lightboxTouchPosition(e.touches);
+  if (_lightboxTouch.distance > 0 && next.distance > 0) {
+    _setScale(_scale * next.distance / _lightboxTouch.distance, _lightboxTouch.x, _lightboxTouch.y);
+  }
+  if (_scale > 1) {
+    _tx += next.x - _lightboxTouch.x;
+    _ty += next.y - _lightboxTouch.y;
+    _applyTransform();
+  }
+  _lightboxTouch = next;
 }
 
 function _onDblClick(e) {
@@ -401,6 +485,11 @@ function _ensureLightbox() {
         <button type="button" class="modal-close-btn chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">${closeIcon}</button>
       </div>
     </div>
+    <div class="chat-lightbox-zoom">
+      <button type="button" class="chat-lightbox-zoom-out">${window.uiIconHtml?.('minus', 'ui-icon') || '−'}</button>
+      <button type="button" class="chat-lightbox-zoom-reset"><span class="chat-lightbox-zoom-level">100%</span></button>
+      <button type="button" class="chat-lightbox-zoom-in">${window.uiIconHtml?.('plus', 'ui-icon') || '+'}</button>
+    </div>
   `;
   document.body.appendChild(root);
 
@@ -429,12 +518,17 @@ function _ensureLightbox() {
     }
     const loading = _lightboxEl.querySelector('.chat-lightbox-loading-label');
     if (loading) loading.textContent = _lightboxLoadingLabel();
+    _labelLightboxZoom();
     _updateLightboxNavigation();
   });
   _lightboxEl = root;
   _lightboxImg = root.querySelector('.chat-lightbox-img');
   _lightboxAddLibraryBtn = root.querySelector('.chat-lightbox-add-library');
   _lightboxRevealBtn = root.querySelector('.chat-lightbox-reveal');
+  _labelLightboxZoom();
+  root.querySelector('.chat-lightbox-zoom-out').addEventListener('click', () => { _endLightboxGesture(); _setScale(_scale / ZOOM_STEP); });
+  root.querySelector('.chat-lightbox-zoom-in').addEventListener('click', () => { _endLightboxGesture(); _setScale(_scale * ZOOM_STEP); });
+  root.querySelector('.chat-lightbox-zoom-reset').addEventListener('click', _resetZoom);
 
   // × closes; backdrop clicks are ignored to avoid accidental dismissals.
   root.querySelector('.chat-lightbox-close').addEventListener('click', closeChatImageLightbox);
@@ -452,8 +546,23 @@ function _ensureLightbox() {
   // the image still updates and ends cleanly.
   document.addEventListener('mousemove', _onMouseMove);
   document.addEventListener('mouseup', _onMouseUp);
+  const stage = root.querySelector('.chat-lightbox-stage');
+  stage.addEventListener('touchstart', _onLightboxTouchChange, { passive: false });
+  stage.addEventListener('touchmove', _onLightboxTouchMove, { passive: false });
+  stage.addEventListener('touchend', _onLightboxTouchChange, { passive: false });
+  stage.addEventListener('touchcancel', _onLightboxTouchChange, { passive: false });
+  window.addEventListener('blur', () => { _endLightboxGesture(); _clearLightboxZoomActivity(); _applyTransform(); });
 
   return root;
+}
+
+function _labelLightboxZoom() {
+  for (const action of ['in', 'out', 'reset']) {
+    const button = _lightboxEl.querySelector(`.chat-lightbox-zoom-${action}`);
+    const label = t(`chat.lightbox_zoom_${action}`);
+    button.setAttribute('aria-label', label);
+    button.title = label;
+  }
 }
 
 async function _onLightboxReveal(e) {
@@ -538,6 +647,8 @@ function openChatImageLightbox(src, alt, opts) {
   const loadSeq = _lightboxLoadSeq;
   _clearLightboxLoadListeners();
   _resetZoom();
+  // Opening or navigating fits the image without user zoom activity.
+  _clearLightboxZoomActivity();
   _lightboxImg.alt = alt || '';
   const title = el.querySelector('.chat-lightbox-title');
   if (title) title.textContent = alt || '';
@@ -570,6 +681,8 @@ function openChatImageLightbox(src, alt, opts) {
   if (!_lightboxKeyHandler) {
     _lightboxKeyHandler = (e) => {
       if (!_isOpen() || e.isComposing || e.keyCode === 229) return;
+      // A nested dialog owns keys even before its deferred autofocus runs.
+      if (document.querySelector('.modal-overlay.open, .ui-dialog-overlay.open')) return;
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         if (e.target?.closest?.('input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
         e.preventDefault();
@@ -607,6 +720,7 @@ function closeChatImageLightbox(opts) {
   _setLightboxLoading(false);
   _lightboxEl.classList.remove('is-open');
   _lightboxEl.setAttribute('aria-hidden', 'true');
+  _clearLightboxZoomActivity();
   // Drop the <img> src so the browser can release the blob / protocol
   // handle — keeps memory tidy if user opens many large images.
   if (_lightboxImg) {

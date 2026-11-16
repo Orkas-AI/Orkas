@@ -44,6 +44,16 @@ it('keeps intentionally separate apps independent even when titles match', async
   expect(fs.readdirSync(path.dirname(directory(a.artifactId)))).toHaveLength(2);
 });
 
+it.each([undefined, null, '', ' \t\n'])('allocates a new app identity when no revision target is supplied (%s)', async artifactId => {
+  const m = await import('../../../src/main/features/chat_artifacts');
+  const created = await m.createArtifact(uid, cid, agent, { artifactId, files: files('Delivered') });
+  expect(created).toMatchObject({ ok: true, revision: 1 });
+  if (!created.ok) throw new Error(created.error);
+  expect(created.artifactId).toMatch(/^[A-Za-z0-9_-]{12}$/);
+  expect(fs.readdirSync(path.dirname(directory(created.artifactId)))).toEqual([created.artifactId]);
+  expect(fs.readFileSync(path.join(directory(created.artifactId), 'index.html'), 'utf8')).toContain('Delivered');
+});
+
 it('rejects foreign, missing and malformed revision targets and type conversion without creating or changing an app', async () => {
   const m = await import('../../../src/main/features/chat_artifacts');
   const first = await m.createArtifact(uid, cid, agent, { files: files('Keep') });
@@ -51,7 +61,9 @@ it('rejects foreign, missing and malformed revision targets and type conversion 
   for (const [user, chat, actor, id, extra] of [
     [uid, cid, 'other', first.artifactId, {}], [uid, 'other', agent, first.artifactId, {}],
     ['other', cid, agent, first.artifactId, {}], [uid, cid, agent, 'missing', {}],
-    [uid, cid, agent, '../escape', {}], [uid, cid, agent, '', {}],
+    [uid, cid, agent, '../escape', {}], [uid, cid, agent, ' padded ', {}],
+    [uid, cid, agent, false, {}], [uid, cid, agent, 0, {}],
+    [uid, cid, agent, [], {}], [uid, cid, agent, {}, {}],
     [uid, cid, agent, first.artifactId, { appType: 'web' }],
   ] as const) {
     expect(await m.createArtifact(user, chat, actor, { artifactId: id, files: files('Wrong'), ...extra } as any)).toMatchObject({ ok: false });

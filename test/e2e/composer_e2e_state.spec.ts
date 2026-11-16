@@ -1,6 +1,6 @@
 import { COMPOSER_EDIT_LIMIT_MS } from '../helpers/latency-budget';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { expect, test, OrkasTestApp } from './fixtures/orkas';
+import { expect, test, OrkasTestApp, openSidebarEntry } from './fixtures/orkas';
 import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
 import { formatProcessLogSummary } from '../../scripts/model-eval-log-policy.mjs';
 
@@ -105,6 +105,124 @@ test.afterEach(async ({}, info) => {
   writeFileSync(info.outputPath('log-analysis.json'), JSON.stringify(analysis, null, 2));
   expect(analysis.passed, 'Review log-analysis.json for errors or incomplete coverage').toBe(true);
   if (analysis.requiresReview) console.info(formatProcessLogSummary(analysis));
+});
+
+
+for (const locale of ['zh', 'en', 'de', 'ar'] as const) test(`ellipsizes empty composer guidance on one line and preserves authored text wrapping (${locale})`, async ({}, info) => {
+  const app = new OrkasTestApp(info, { configuredModel: false });
+  try {
+    await app.launch();
+    const page = app.page!;
+    const created = await app.invoke<any>('conversations.create', { title: 'Execution guidance' });
+    const project = await app.invoke<any>('projects.create', { name: 'Execution guidance' });
+    await page.evaluate(async () => { await (window as any).loadConversations(); });
+    await openSidebarEntry(page, '#auto-btn');
+    await page.evaluate(async lang => { await (window as any).setLang(lang); }, locale);
+    for (const width of [1280, 600]) {
+      await page.setViewportSize({ width, height: width === 1280 ? 720 : 800 });
+      for (const surface of ['chat', 'project', 'auto']) {
+        await page.evaluate(({ surface, cid, pid }) => {
+          const w = window as any;
+          if (surface === 'auto') w.openAutoTaskDialog();
+          else w.setView(surface === 'project' ? 'project' : 'conversation', surface === 'project' ? pid : cid);
+        }, { surface, cid: created.conversation.conversation_id, pid: project.project.project_id });
+        const id = surface === 'auto' ? 'auto-task-input' : surface === 'project' ? 'project-chat-input' : 'chat-input';
+        const input = page.locator(`#${id}`);
+        await expect(input).toBeVisible();
+        await input.click();
+        if (surface === 'chat') await expect.poll(() => page.evaluate(() =>
+          (window as any).ConversationTurnNav.init().indexReady)).toBe(true);
+        await expect(input).toHaveClass(/\bis-empty\b/);
+        const hint = await input.getAttribute('placeholder');
+        if (locale === 'zh') expect(hint).toBe((surface === 'auto'
+          ? '输入 @ 选择智能体、技能、连接器或资料库文件。'
+          : '输入 @ 选择智能体、技能、连接器或资料库。')
+          + '智能体支持并发执行：@A @B 分析数据；顺序执行：@A 分析数据 @B 撰写报告。');
+        expect(hint).not.toMatch(/[\r\n]/);
+        expect(hint).toContain('@A @B');
+        // Measure the hint independently of clipping, using its real typography.
+        const geometry = await input.evaluate(el => {
+          const editor = el as HTMLElement;
+          const css = getComputedStyle(editor), pseudo = getComputedStyle(editor, '::before');
+          const probe = document.createElement('span');
+          Object.assign(probe.style, { position: 'absolute', visibility: 'hidden', display: 'block',
+            width: `${editor.clientWidth - parseFloat(css.paddingLeft) - parseFloat(css.paddingRight)}px`,
+            font: pseudo.font, lineHeight: pseudo.lineHeight, letterSpacing: pseudo.letterSpacing,
+            direction: pseudo.direction, whiteSpace: pseudo.whiteSpace,
+            wordBreak: pseudo.wordBreak, overflowWrap: pseudo.overflowWrap });
+          probe.textContent = editor.getAttribute('placeholder');
+          document.body.appendChild(probe);
+          const rect = editor.getBoundingClientRect();
+          const result = { textHeight: probe.getBoundingClientRect().height,
+            lineHeight: parseFloat(css.lineHeight), height: rect.height,
+            padding: parseFloat(css.paddingTop) + parseFloat(css.paddingBottom),
+            ellipsis: pseudo.textOverflow,
+            overflowsWidth: probe.scrollWidth > probe.clientWidth + 1,
+            availableHeight: editor.clientHeight - parseFloat(css.paddingTop) - parseFloat(css.paddingBottom),
+            noScroll: editor.scrollHeight <= editor.clientHeight + 1 && editor.scrollWidth <= editor.clientWidth + 1,
+            onScreen: rect.left >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight };
+          probe.remove(); return result;
+        });
+        expect(geometry.textHeight, `${surface}/${locale}/${width}`).toBeLessThanOrEqual(geometry.lineHeight + 1);
+        expect(geometry.ellipsis).toBe('ellipsis');
+        if (surface === 'chat') {
+          expect(geometry.height, 'Keep the original single-line editor height')
+            .toBeLessThan(2 * geometry.lineHeight + geometry.padding);
+          if (width === 600) expect(geometry.overflowsWidth).toBe(true);
+        }
+        expect(geometry.textHeight, `${surface}/${locale}/${width}`).toBeLessThanOrEqual(geometry.availableHeight + 1);
+        expect(geometry.noScroll).toBe(true);
+        expect(geometry.onScreen).toBe(true);
+        await input.screenshot({ path: info.outputPath(`hint-${surface}-${locale}-${width}.png`) });
+        if (locale === 'zh' || locale === 'en') {
+          await page.screenshot({ path: info.outputPath(`surface-${surface}-${locale}-${width}.png`) });
+        }
+        expect(await page.evaluate(id => (window as any).composerText(id), id)).toBe('');
+        await input.fill('中文 draft');
+        await expect(input).not.toHaveClass(/\bis-empty\b/);
+        if (surface === 'chat') {
+          const typing = await input.boundingBox();
+          expect(Math.abs(typing!.height - geometry.height), `Keep height stable when typing: ${locale}/${width}`)
+            .toBeLessThanOrEqual(1);
+          if (locale === 'zh' || locale === 'en') {
+            await page.screenshot({ path: info.outputPath(`typing-${locale}-${width}.png`) });
+          }
+          await input.fill('First line\nSecond line\nThird line');
+          expect((await input.boundingBox())!.height).toBeGreaterThan(typing!.height);
+          const wrapping = await input.evaluate(el => {
+            const css = getComputedStyle(el);
+            return { height: el.getBoundingClientRect().height, lineHeight: parseFloat(css.lineHeight),
+              padding: parseFloat(css.paddingTop) + parseFloat(css.paddingBottom) };
+          });
+          expect(wrapping.height).toBeGreaterThanOrEqual(3 * wrapping.lineHeight + wrapping.padding);
+          const authored = 'Authored text wraps without truncation. '.repeat(12);
+          await input.fill(authored);
+          const wrapped = await input.evaluate(el => ({ height: el.clientHeight,
+            noHorizontalScroll: el.scrollWidth <= el.clientWidth + 1 }));
+          expect(wrapped.height).toBeGreaterThan(typing!.height);
+          expect(wrapped.noHorizontalScroll).toBe(true);
+          expect(await page.evaluate(id => (window as any).composerText(id), id)).toBe(authored);
+          await input.fill(Array(40).fill('Long draft line').join('\n'));
+          const overflow = await input.evaluate(el => ({ height: el.clientHeight, scrollHeight: el.scrollHeight,
+            cap: parseFloat(getComputedStyle(el).maxHeight) }));
+          expect(overflow.height).toBeLessThanOrEqual(overflow.cap);
+          expect(overflow.scrollHeight).toBeGreaterThan(overflow.height);
+          await input.fill('中文 draft');
+        }
+        await input.press('End');
+        await page.keyboard.insertText('!');
+        expect(await page.evaluate(id => (window as any).composerText(id), id)).toBe('中文 draft!');
+        await input.press(`${modifier}+a`);
+        await input.press('Backspace');
+        expect(await page.evaluate(id => (window as any).composerText(id), id)).toBe('');
+        await expect(input).toHaveClass(/\bis-empty\b/);
+        if (surface === 'auto') {
+          await page.locator('#auto-dialog-cancel-btn').click();
+          await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+        }
+      }
+    }
+  } finally { await app.dispose(); }
 });
 
 

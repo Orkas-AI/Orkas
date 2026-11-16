@@ -465,7 +465,10 @@ async function _finishQueueItemEdit(cid, action = 'edit') {
       if (!snapshot.ok) { await uiAlert(t('chat.attach_sync_failed')); return false; }
       resources = { attachments: snapshot.names,
         references: _referenceSnapshotsForQuotes(draft.references),
-        use_selections: selections };
+        use_selections: selections,
+        ...(typeof _appEditSendContext === 'function'
+          ? _appEditSendContext(cid, transformWithChatUse(draft.text), snapshot.names) : {}),
+      };
     }
     const data = await _queueEditRequest(cid, action, { task_id: edit.taskId,
       ...(action === 'edit' ? { instruction: transformWithChatUse(draft.text), expected_instruction: edit.original, resources } : {}) });

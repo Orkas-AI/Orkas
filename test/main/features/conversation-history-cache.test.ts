@@ -75,6 +75,55 @@ afterEach(async () => {
 });
 
 describe('conversation history projection cache', () => {
+  it.each(['once', 'retain'] as const)('keeps %s app history projections and spilled outputs machine-local through reopening and purge', async mode => {
+    const paths = await import('../../../src/main/paths');
+    const cid = `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`;
+    const canonicalRoot = paths.appConversationRoot(TEST_UID, cid)!;
+    const localRoot = paths.appLocalConversationRoot(TEST_UID, cid)!;
+    sourceFile = path.join(canonicalRoot, 'messages.jsonl');
+    fs.mkdirSync(canonicalRoot, { recursive: true });
+    const output = 'Actual app tool result. '.repeat(400);
+    writeRows([toolMessage('app-message', output)]);
+    const canonical = fs.readFileSync(sourceFile);
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const first = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+    expect(first.records[0].id).toBe('app-message');
+    const resultFile = (first.records[0].process![0].event!.data as any).result_path as string;
+    expect(path.relative(localRoot, resultFile)).not.toMatch(/^\.\./);
+    expect(resultFile.startsWith(localRoot + path.sep)).toBe(true);
+    expect(fs.readFileSync(resultFile, 'utf8')).toBe(output);
+    expect(fs.existsSync(cacheRoot())).toBe(false);
+    if (canonicalRoot !== localRoot) expect(fs.existsSync(path.join(canonicalRoot, 'history-cache'))).toBe(false);
+    await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
+    expect((await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1)).records).toEqual(first.records);
+    const peer = path.join(tmpDir, 'ordinary-peer.jsonl');
+    fs.writeFileSync(peer, JSON.stringify(message('peer')) + '\n');
+    await cache.readConversationHistoryPage(TEST_UID, peer, 1);
+    const peerEntries = fs.readdirSync(cacheRoot());
+    await cache.purgeConversationHistoryCache(TEST_UID, sourceFile);
+    expect(fs.existsSync(resultFile)).toBe(false);
+    expect(fs.readdirSync(cacheRoot())).toEqual(peerEntries);
+    expect((await cache.readConversationHistoryPage(TEST_UID, peer, 1)).records[0].id).toBe('peer');
+    expect(fs.readFileSync(sourceFile)).toEqual(canonical);
+    expect((await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1)).records[0].id).toBe('app-message');
+    expect(fs.readFileSync(resultFile, 'utf8')).toBe(output);
+  });
+
+  it.each(['outside-owner', 'wrong-scope', 'other-file'])('keeps %s app-path lookalikes in the ordinary local projection cache', async shape => {
+    const paths = await import('../../../src/main/paths');
+    const key = 'c'.repeat(64), token = 'd'.repeat(32);
+    sourceFile = shape === 'outside-owner' ? path.join(tmpDir, 'web_apps', key, 'sessions', token, 'messages.jsonl')
+      : shape === 'wrong-scope' ? path.join(paths.userCloudRoot(TEST_UID), 'web_apps', key, 'runs', token, 'messages.jsonl')
+      : path.join(paths.appConversationRoot(TEST_UID, `app_${key}_retain_${token}`)!, 'other.jsonl');
+    fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
+    writeRows([message('ordinary')]);
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    expect((await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1)).records[0].id).toBe('ordinary');
+    expect(fs.existsSync(cacheRoot())).toBe(true);
+    expect(fs.existsSync(path.join(path.dirname(sourceFile), 'history-cache'))).toBe(false);
+  });
+
+
   it.each([
     ['local seconds', '2026-10-26T14:31:24', '2026-10-26T14:31:11.226', '2026-10-26T14:31:24.602', 13374, true],
     ['UTC seconds', '2026-10-26T06:31:24Z', '2026-10-26T06:31:11.226Z', '2026-10-26T06:31:24.602Z', 13374, true],

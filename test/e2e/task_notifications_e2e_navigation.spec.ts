@@ -119,7 +119,7 @@ test.describe('task notification navigation', () => {
     await expect(projectDot).toBeVisible();
     await expect(page.locator('#tasks-unread-dot')).toBeVisible();
     await expect(page.locator('#projects-unread-dot')).toBeVisible();
-    await expect(page.locator('.main-content .task-unread-dot')).toHaveCount(0);
+    await expect(page.locator('.main-content .task-unread-dot:visible')).toHaveCount(0);
 
     const layout = await page.evaluate(({ globalCid, projectId }) => {
       const taskRow = document.querySelector(
@@ -130,12 +130,21 @@ test.describe('task notification navigation', () => {
       const projectRowEl = document.querySelector(`.project-row[data-pid="${CSS.escape(projectId)}"]`);
       const projectNameEl = projectRowEl?.querySelector('.project-name');
       const projectDotEl = projectRowEl?.querySelector('.project-unread-dot');
-      if (!taskTitle || !taskDot || !projectNameEl || !projectDotEl) {
+      const settingsButton = document.querySelector('#settings-btn');
+      const settingsLabel = settingsButton?.querySelector('.sidebar-footer-label');
+      if (!taskTitle || !taskDot || !projectNameEl || !projectDotEl || !settingsButton || !settingsLabel) {
         throw new Error('Unread-dot comparison elements are missing');
       }
+      settingsButton.classList.add('has-dot', 'is-red');
+      const settingsStyle = getComputedStyle(settingsLabel, '::after');
       const taskStyle = getComputedStyle(taskDot);
       const projectStyle = getComputedStyle(projectDotEl);
       const result = {
+        settings: {
+          width: settingsStyle.width,
+          height: settingsStyle.height,
+          color: settingsStyle.backgroundColor,
+        },
         task: {
           width: taskStyle.width,
           height: taskStyle.height,
@@ -149,12 +158,16 @@ test.describe('task notification navigation', () => {
         },
         projectGapAfterText: projectDotEl.getBoundingClientRect().left - projectNameEl.getBoundingClientRect().right,
       };
+      settingsButton.classList.remove('has-dot', 'is-red');
       return result;
     }, {
       globalCid: globalConversation.conversation.conversation_id,
       projectId: project.project.project_id,
     });
 
+    expect(layout.task.width).toBe(layout.settings.width);
+    expect(layout.task.height).toBe(layout.settings.height);
+    expect(layout.task.color).toBe(layout.settings.color);
     expect(layout.project).toEqual({
       width: layout.task.width, height: layout.task.height, color: layout.task.color,
     });
@@ -166,7 +179,7 @@ test.describe('task notification navigation', () => {
 
     await projectRow.click();
     await expect(page.locator('#project-detail-title')).toHaveText('E2E Unread Dot Project');
-    await expect(page.locator('.main-content .task-unread-dot')).toHaveCount(0);
+    await expect(page.locator('.main-content .task-unread-dot:visible')).toHaveCount(0);
 
     await projectRow.click();
     const projectTaskRow = page.locator(
@@ -179,7 +192,7 @@ test.describe('task notification navigation', () => {
       return !!title && title.nextElementSibling === dot;
     });
     expect(projectTaskOrder).toBe(true);
-    await expect(page.locator('.main-content .task-unread-dot')).toHaveCount(0);
+    await expect(page.locator('.main-content .task-unread-dot:visible')).toHaveCount(0);
   });
 
   test('rejects a stale account notification while opening one for the active account', async ({ orkas }) => {

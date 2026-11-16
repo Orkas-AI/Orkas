@@ -19,14 +19,6 @@ import {
 
 export type CommanderRuntimeStats = AgentRuntimeStatsFile;
 
-function markCommanderRuntimeStatsDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('commander', 'cloud/commander/runtime_stats.json');
-  } catch { /* features/sync stripped */ }
-}
-
 function statsHasData(stats: AgentRuntimeStatsFile): boolean {
   return !!(
     stats.attempts
@@ -62,6 +54,5 @@ export async function recordCommanderRuntimeStats(
     await writeJson(file, next);
     return next;
   });
-  markCommanderRuntimeStatsDirty();
   return { ok: true, stats: statsFile };
 }

@@ -363,12 +363,13 @@ describe('opening a to-do from a shortcut', () => {
     };
   }
 
-  it.each(['project', 'status'])('switches from %s grouping to the to-do scope, reveals and highlights the row once after loading', async (mode) => {
+  it.each(['project', 'status'])('retains %s grouping while revealing and highlighting the linked row once', async (mode) => {
     const f = backlogFixture();
     vm.runInContext(`_globalTodoMode = '${mode}'; _globalTodoActiveScope = 'a'`, f.context);
     const views: any[] = [];
     const other = todoRow('a1');
     const target = todoRow('b1', true);
+    target.dataset.pid = 'b';
     const host = {
       setAttribute() {},
       querySelectorAll: (selector: string) => (selector === '.project-todo-item[data-tid]' ? [other, target] : []),
@@ -378,7 +379,7 @@ describe('opening a to-do from a shortcut', () => {
 
     f.context.focusTodo('b', 'b1', { entryPoint: 'home' });
     expect(views).toEqual([['todos', null, { entryPoint: 'home' }]]);
-    expect(vm.runInContext('_globalTodoMode', f.context)).toBe('project');
+    expect(vm.runInContext('_globalTodoMode', f.context)).toBe(mode);
     expect(vm.runInContext('_globalTodoActiveScope', f.context)).toBe('b');
     expect(target.classes.size).toBe(0);
 
@@ -422,3 +423,28 @@ describe('opening a to-do from a shortcut', () => {
     expect(notices).toHaveLength(1);
   });
 });
+
+  it('keeps global first and the catalog natural project order after full loads and scope refreshes', async () => {
+    const projects = Object.freeze([
+      { project_id: 's2', name: 'Alpha 2' },
+      { project_id: 's10', name: 'Alpha 10' },
+      { project_id: 'p2', name: 'Zulu 2' },
+      { project_id: 'p10', name: 'Zulu 10' },
+    ]);
+    const h = harness(async (channel, args) => {
+      if (channel === 'projects.list') return { ok: true, projects };
+      if (channel === 'projects.tasks.list') return { ok: true, tasks: [{ id: `task-${args.projectId || 'global'}`, status: 'todo' }] };
+      if (channel === 'agents.list') return { agents: [] };
+      if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [] };
+      return { config: { enabled: false } };
+    });
+    await h.context.loadGlobalTodos();
+    const scopeIds = () => h.groups().map((group: any) => group.project.project_id);
+    expect(scopeIds()).toEqual(['', 's2', 's10', 'p2', 'p10']);
+    expect(h.context._globalTodoContext('s10').projects.map((project: any) => project.project_id))
+      .toEqual(['s2', 's10', 'p2', 'p10']);
+    await h.context._refreshGlobalTodos('s2');
+    expect(scopeIds()).toEqual(['', 's2', 's10', 'p2', 'p10']);
+    expect(h.warnings).toEqual([]);
+  });
+

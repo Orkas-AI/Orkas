@@ -52,12 +52,23 @@ describe('auto_tasks shared tool', () => {
       const accepts = validator.getValidator(schema);
       for (const args of [
         { action: 'create', ...draft },
+        ...[
+          { type: 'weekly', weekday: 'workdays' },
+          { type: 'weekly', weekdays: [0, 1, 2, 3, 4, 5, 6] },
+          { type: 'monthly', days: Array.from({ length: 31 }, (_, i) => i + 1) },
+        ].map(selection => ({ action: 'create', ...draft, schedule: { ...selection, hour: 9, minute: 0 } })),
         { action: 'update', skill: null, connector: null, end_condition: null },
         { action: 'update', skill: { id: 's1', name: 'Skill' }, connector: { id: 'c1', name: 'Connector' } },
         { action: 'update', recipient: { kind: 'agent', id: 'a1', name: 'Agent' } },
       ]) expect(accepts(args).valid).toBe(true);
       for (const fields of [
         { schedule: null }, { schedule: { type: 'daily', hour: 24 } },
+        { schedule: { type: 'weekly', weekday: 'Monday' } },
+        { schedule: { type: 'weekly', weekdays: [] } },
+        { schedule: { type: 'weekly', weekdays: [1, 7] } },
+        { schedule: { type: 'weekly', weekdays: [1, 1] } },
+        { schedule: { type: 'monthly', days: [0, 32] } },
+        { schedule: { type: 'monthly', days: [8, 8] } },
         { recipient: null }, { skill: {} }, { connector: { id: '', name: 'Invalid' } },
         { end_condition: { type: 'count', max_runs: 0 } }, { unknown: true },
       ]) expect(accepts({ action: 'update', ...fields }).valid).toBe(false);
@@ -71,13 +82,44 @@ describe('auto_tasks shared tool', () => {
     { type: 'hourly', interval_hours: 2 },
     { type: 'daily', hour: 9, minute: 5 },
     { type: 'weekly', weekday: 1, hour: 9, minute: 5 },
+    { type: 'weekly', weekday: 0, hour: 9, minute: 5 },
+    { type: 'weekly', weekday: 'workdays', hour: 9, minute: 5 },
+    { type: 'weekly', weekdays: [3, 1], hour: 9, minute: 5 },
+    { type: 'weekly', weekdays: [0], hour: 9, minute: 5 },
     { type: 'monthly', day: 31, hour: 9, minute: 5 },
+    { type: 'monthly', days: [1, 8, 31], hour: 9, minute: 5 },
+    { type: 'monthly', days: [31], hour: 9, minute: 5 },
   ])('saves and reads the $type schedule through the real executor', async schedule => {
     const tool = createTool({ userId: uid, projectId: pid });
     const result = await run(tool, { action: 'create', ...draft, schedule });
     expect(result).toMatchObject({ ok: true, isError: false });
     expect(await tasks.getTask(uid, result.taskId)).toMatchObject({ schedule, enabled: false, project_id: pid });
     expect((await run(tool, { action: 'get', task_id: result.taskId })).task.schedule).toEqual(schedule);
+  });
+
+  it('switches existing schedules between multiple, workday and scalar selections without losing task settings', async () => {
+    const tool = createTool({ userId: uid, projectId: null });
+    const created = await run(tool, { action: 'create', ...draft, end_condition: { type: 'count', max_runs: 3 } });
+    expect(created.ok).toBe(true);
+    for (const selection of [
+      { type: 'weekly', weekdays: [1, 4] },
+      { type: 'weekly', weekday: 'workdays' },
+      { type: 'monthly', days: [1, 19, 31] },
+      { type: 'monthly', day: 31 },
+      { type: 'weekly', weekday: 0 },
+    ]) {
+      const schedule = { ...selection, hour: 9, minute: 0 };
+      expect(await run(tool, { action: 'update', task_id: created.taskId, schedule })).toMatchObject({ ok: true });
+      expect(await run(tool, { action: 'update', task_id: created.taskId, title: 'Renamed report' })).toMatchObject({ ok: true });
+      tasks.stopScheduler();
+      vi.resetModules();
+      tasks = await import('../../../src/main/features/auto_tasks');
+      expect(await tasks.getTask(uid, created.taskId)).toMatchObject({
+        schedule, content: draft.content, enabled: false, end_condition: { type: 'count', max_runs: 3 },
+      });
+      expect((await run(tool, { action: 'list' })).tasks[0].schedule).toEqual(schedule);
+      expect((await run(tool, { action: 'get', task_id: created.taskId })).task.schedule).toEqual(schedule);
+    }
   });
 
   it.each([
@@ -112,6 +154,21 @@ describe('auto_tasks shared tool', () => {
       { schedule: { type: 'daily', hour: 9 } }, { schedule: { type: 'weekly', hour: 9, minute: 0 } },
       { schedule: { type: 'monthly', hour: 9, minute: 0 } },
       { schedule: { type: 'daily', hour: 9, minute: 0, day: 1 } },
+      ...[
+        { type: 'weekly', weekday: 'Monday' },
+        { type: 'weekly', weekdays: [] },
+        { type: 'weekly', weekdays: [1, 7] },
+        { type: 'weekly', weekdays: [1, 1] },
+        { type: 'weekly', weekdays: ['workdays'] },
+        { type: 'weekly', weekday: 'workdays', weekdays: [1, 2, 3, 4, 5] },
+        { type: 'weekly', weekday: 1, weekdays: [3] },
+        { type: 'monthly', days: [] },
+        { type: 'monthly', days: [0, 32] },
+        { type: 'monthly', days: [1, 1] },
+        { type: 'monthly', days: ['8'] },
+        { type: 'monthly', day: 1, days: [8] },
+        { type: 'daily', weekdays: [1] },
+      ].map(selection => ({ schedule: { ...selection, hour: 9, minute: 0 } })),
       { end_condition: { type: 'count' } }, { end_condition: { type: 'date' } },
       { end_condition: { type: 'count', max_runs: 2, date: '2099-01-01' } },
       { recipient: { kind: 'agent' } }, { recipient: { kind: 'commander', id: 'unrelated' } },
@@ -119,6 +176,8 @@ describe('auto_tasks shared tool', () => {
     ]) {
       expect((await run(tool, { action: 'update', task_id: created.taskId, ...fields })).isError).toBe(true);
       expect(await tasks.getTask(uid, created.taskId)).toEqual(before);
+      expect((await run(tool, { action: 'create', ...draft, ...fields })).isError).toBe(true);
+      expect((await tasks.listTasks(uid)).map(task => task.id)).toEqual([created.taskId]);
     }
     expect((await run(tool, { action: 'update', task_id: created.taskId, end_condition: { type: 'date', date: '2099-01-01' } })).ok).toBe(true);
     expect(await tasks.getTask(uid, created.taskId)).toMatchObject({ end_condition: { type: 'date', date: '2099-01-01' } });
@@ -162,6 +221,23 @@ describe('auto_tasks shared tool', () => {
     expect(deleted.ok).toBe(true);
     expect(saved).toEqual(before);
     expect(deletedIds).toEqual([created.taskId]);
+  });
+
+  it('binds an automation to the conversation that created it, and an edit from elsewhere leaves that binding alone', async () => {
+    const creating = createTool({ userId: uid, cid: 'cid-created-here' });
+    const created = await run(creating, { action: 'create', ...draft });
+    expect(created.ok).toBe(true);
+    expect((await tasks.getTask(uid, created.taskId))?.conversation_id).toBe('cid-created-here');
+    // The binding is host bookkeeping: the model-facing task view is unchanged.
+    expect(created.task).not.toHaveProperty('conversation_id');
+    expect((await run(creating, { action: 'get', task_id: created.taskId })).task).not.toHaveProperty('conversation_id');
+
+    const elsewhere = createTool({ userId: uid, cid: 'cid-other-chat' });
+    expect((await run(elsewhere, { action: 'update', task_id: created.taskId, title: 'Renamed' })).ok).toBe(true);
+    expect((await tasks.getTask(uid, created.taskId))?.conversation_id).toBe('cid-created-here');
+    // A host with no conversation saves an unbound automation, like the Auto editor.
+    const unbound = await run(createTool({ userId: uid }), { action: 'create', ...draft });
+    expect(await tasks.getTask(uid, unbound.taskId)).not.toHaveProperty('conversation_id');
   });
 
   it('keeps scoped and global automation creation independent across rejection, edit and deletion', async () => {

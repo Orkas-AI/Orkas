@@ -71,6 +71,23 @@ async function at<T>(iso: string, write: () => Promise<T>): Promise<T> {
 }
 
 describe('projects.tasks.listOpen', () => {
+  it('returns only the earliest open deadline per scope for attention, without copying private task content', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const tasks = await import('../../../src/main/features/project_tasks');
+    const project = await projects.createProject(TEST_UID, 'Attention');
+    if (!project.ok) throw new Error('createProject failed');
+    const pid = project.project.project_id;
+    for (const input of [
+      { content: 'Private dated content', due_at: '2026-11-08' },
+      { content: 'Earlier private content', due_at: '2026-11-07' },
+      { content: 'Already complete', due_at: '2026-11-01', status: 'done' as const },
+      { content: 'Undated content' },
+    ]) expect((await tasks.createTask(TEST_UID, pid, input)).ok).toBe(true);
+    expect((await tasks.createTask(TEST_UID, '', { content: 'Global deadline', due_at: '2026-11-09' })).ok).toBe(true);
+    const res = await invoke('projects.tasks.listOpen', { dueSummary: true });
+    expect(res.tasks).toEqual([{ project_id: pid, due_at: '2026-11-07' }, { project_id: '', due_at: '2026-11-09' }]);
+    expect(JSON.stringify(res)).not.toContain('content');
+  });
   it('lists unfinished to-dos across the global scope and every project, newest first', async () => {
     const projects = await import('../../../src/main/features/projects');
     const tasks = await import('../../../src/main/features/project_tasks');

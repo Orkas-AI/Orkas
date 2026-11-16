@@ -101,7 +101,6 @@ describe('task completion notifications', () => {
       },
       createNotification,
       openConversation,
-      openTodo: vi.fn(),
     };
     stopTaskNotifications = startTaskNotifications(runtime, (next) => {
       listener = next;
@@ -127,6 +126,21 @@ describe('task completion notifications', () => {
     clickListener!();
     expect(setBadgeCount).toHaveBeenLastCalledWith(0);
     expect(openConversation).toHaveBeenCalledWith('c1', status, 'u1');
+  });
+
+  it.each(['once', 'retain'])('keeps %s app execution terminals and interventions private while ordinary app-named tasks still notify', (mode) => {
+    const conversation_id = `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`;
+    for (const status of ['completed', 'stopped', 'failed', 'waiting_input'] as const) {
+      listener({ ...terminal(status), conversation_id });
+    }
+    interventionListener({ attention_id: 'connector_permission:app-scope', user_id: 'u1', conversation_id, kind: 'connector_permission' });
+    expect(createNotification).not.toHaveBeenCalled();
+    expect(setBadgeCount.mock.calls.map(([count]) => count)).toEqual([0]);
+    listener({ ...terminal('completed'), conversation_id: 'app_notes' });
+    expect(createNotification).toHaveBeenCalledOnce();
+    expect(setBadgeCount).toHaveBeenLastCalledWith(1);
+    clickListener!();
+    expect(openConversation).toHaveBeenCalledWith('app_notes', 'completed', 'u1');
   });
 
   it('names an automation run by kind so it is not mistaken for a chat task', () => {

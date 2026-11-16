@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 
 const source = fs.readFileSync(path.join(__dirname, '../../../src/main/ipc/index.ts'), 'utf8');
@@ -164,5 +165,64 @@ describe('conversation history anchored on a quoted message id', () => {
     expect(s.context.chats.getMessagesPageAtIndex).toHaveBeenCalledExactlyOnceWith('u1', 'c1', 23, 10, null);
     expect(s.context.chats.getMessagesPageAtMessageId).toHaveBeenCalledExactlyOnceWith('u1', 'c1', 'm23', 10, null);
     expect(result).toMatchObject({ history: s.quoted.history, page_start: 40, history_indexes: [41] });
+  });
+});
+
+
+// Execute the actual generic invoke boundary. A typed deliberate close is a
+// recoverable cancellation; an identical code/message on a crash is not.
+describe('history close attribution at the real invoke boundary', () => {
+  class Closed extends Error { readonly code = 'E_HISTORY_CLOSED'; }
+  function invokeBoundary(reason?: Error) {
+    const tree = ts.createSourceFile('ipc.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    let callback = '';
+    function visit(node: ts.Node): void {
+      if (ts.isCallExpression(node) && node.expression.getText(tree) === 'ipcMain.handle'
+        && ts.isStringLiteral(node.arguments[0]) && node.arguments[0].text === 'orkas.invoke') callback = node.arguments[1].getText(tree);
+      ts.forEachChild(node, visit);
+    }
+    visit(tree);
+    if (!callback) throw Error('Missing actual invoke boundary');
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const invoke = vm.runInNewContext(ts.transpileModule(`(${callback})`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+    }).outputText, {
+      ConversationHistoryClosedError: Closed, log,
+      isTrustedIpcSender: () => true, parseInvokeEnvelope: (value: unknown) => value,
+      previewWindows: { isPreviewContents: () => false },
+      resolveContext: async () => ({ userId: 'local-user' }),
+      isPrivateAppConversationPayload: async () => false,
+      invokeHandlers: { 'conversations.history': async () => { if (reason) throw reason; return { history: [] }; } },
+      normalizeAppError: () => ({ error: 'Operation unavailable', code: 'E_INTERNAL' }),
+      logErrorSummary: () => ({ kind: 'controlled' }),
+      attachmentAddChannels: new Set(),
+      marketplace: { getMarketplaceInstallErrorInfo: () => ({}) },
+      logInvokeResultFailure: () => { throw Error('Unexpected result failure path'); },
+    });
+    const sender = { mainFrame: {} };
+    return { log, run: () => invoke({ sender, senderFrame: sender.mainFrame },
+      { channel: 'conversations.history', payload: { cid: 'private-conversation' } }) };
+  }
+  it('keeps typed close as a failed cancellation without misreporting a runtime error', async () => {
+    const s = invokeBoundary(new Closed('Deliberate closure'));
+    expect(await s.run()).toEqual({ ok: false, code: 'E_HISTORY_CLOSED', error: 'Operation unavailable' });
+    expect(s.log.error).not.toHaveBeenCalled();
+    expect(s.log.warn).toHaveBeenCalledExactlyOnceWith('conversation history request cancelled on close',
+      { channel: 'conversations.history', code: 'E_HISTORY_CLOSED' });
+    expect(JSON.stringify(s.log.warn.mock.calls)).not.toContain('private-conversation');
+  });
+  it.each(['ordinary-crash', 'code-lookalike'])('retains the error severity and failure result for %s', async shape => {
+    const error = new Error('Conversation history worker stopped');
+    if (shape === 'code-lookalike') Object.assign(error, { code: 'E_HISTORY_CLOSED' });
+    const s = invokeBoundary(error);
+    expect(await s.run()).toEqual({ ok: false, code: shape === 'code-lookalike' ? 'E_HISTORY_CLOSED' : 'E_INTERNAL', error: 'Operation unavailable' });
+    expect(s.log.warn).not.toHaveBeenCalled();
+    expect(s.log.error).toHaveBeenCalledOnce();
+  });
+  it('preserves successful history without cancellation or error diagnostics', async () => {
+    const s = invokeBoundary();
+    expect(await s.run()).toEqual({ ok: true, history: [] });
+    expect(s.log.warn).not.toHaveBeenCalled();
+    expect(s.log.error).not.toHaveBeenCalled();
   });
 });

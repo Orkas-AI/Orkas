@@ -8,7 +8,7 @@ matrix states required outcomes; it does not certify every case as executed.
 | --- | --- | --- |
 | Create/edit/enable/disable/delete | Current content and schedule survive full relaunch; cancellation preserves data | `test/e2e/automation_e2e_crud.spec.ts`, `test/main/features/auto_tasks.test.ts` |
 | Local project scope | Reject nonexistent projects before writing; moving to Global migrates config and attachments without restoring old membership after restart | Same suites |
-| Dispatch and history | Due execution creates exactly one conversation with inline Skill/Connector chips and original attachments; UI receives its real notification without manual refresh | CRUD suite, `test/renderer/auto-events.test.ts` |
+| Dispatch and history | A task continues in its creating or first-run conversation; missing or mismatched-scope conversations are replaced. Preserve inline Skill/Connector chips, complete attachments and live notification without manual refresh | CRUD suite, `test/renderer/auto-events.test.ts` |
 | Agent recipient | Stable Agent identity survives rename/relaunch; later messages retain the chosen recipient until explicitly changed | CRUD suite |
 | Manual run | Opens a run without changing enabled state, device binding, last scheduled boundary or scheduled-run count | CRUD and scheduler suites |
 | Partial update | Change only the requested fields; retain content, attachments and project scope; ambiguous deletion cannot guess an id | `test/main/features/auto_tasks_tool.test.ts` |
@@ -39,6 +39,27 @@ records have no scalar fallback: update the execution device before using them.
 - `test/main/features/auto_tasks.test.ts` owns calculations, persisted outcomes,
   clock simulation and duplicate-execution rejection. Real Windows/macOS timezone,
   sleep/wake and native background verification remain separate platform checks.
+
+Agent and CLI tools use the same schedule contract: weekly `weekday` (including
+`workdays`) or `weekdays`, monthly `day` or `days`, and exactly one selector.
+Keep scalar callers and union-free discovery. Native tool and both MCP protocol
+eras cover actual create/update/read/reopen, five CLI adapters, project/global
+isolation and invalid-selector rejection before writes or host RPC.
+
+## Continued run ownership
+
+A task created in a conversation runs there; a task created in Auto opens its
+conversation on the first run and continues there. Deleted or mismatched project
+conversations require a new one. Busy conversations queue the run without moving
+the user's reply target. Grant the task handoff directory alongside existing tool
+roots. Failed dispatch may delete only a new empty conversation. Keep attachments
+complete and collision-safe; preserve earlier user bytes.
+
+Only an actually running automation temporarily owns an ordinary conversation's
+run guidance. A terminal or cancellation clears that run's marker, even if the
+automation was deleted or its terminal record cannot be persisted. Keep the last
+durable record and warning on write failure; an older terminal cannot settle a
+newer same-task run. Source-created automation conversations retain their origin.
 
 ## Cards, localization and interaction
 
