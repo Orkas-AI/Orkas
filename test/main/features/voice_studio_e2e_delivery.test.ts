@@ -79,6 +79,25 @@ it('attenuates music during speech and restores it during a pause, only when duc
     for(let i=0;i<n;i++){const s=b.readInt16LE(i*2);a+=s*Math.cos(i*2*Math.PI*220/48000);c+=s*Math.sin(i*2*Math.PI*220/48000);}
     return Math.hypot(a,c)/n;
   };
+  // Compare independent full-file windows with seeked extraction when a codec
+  // platform disagrees about release recovery; retain the original assertions.
+  const windows = (file: string) => {
+    const bytes = ff(['-i',file,'-ac','1','-ar','48000','-f','s16le','-']);
+    return [.2,1.8,3.7].map(start => {
+      const first = Math.round(start * 48000), n = Math.min(14400, bytes.length / 2 - first); let re = 0, im = 0;
+      for(let i=0;i<n;i++){const sample=bytes.readInt16LE((first+i)*2);re+=sample*Math.cos(i*2*Math.PI*220/48000);im+=sample*Math.sin(i*2*Math.PI*220/48000);}
+      return { frames:n,amplitude:Math.hypot(re,im)/n };
+    });
+  };
+  const seekRatios = [.2,1.8,3.7].map(start => amplitude(ducked,start)/amplitude(plain,start));
+  const plainWindows = windows(plain), duckedWindows = windows(ducked);
+  if(seekRatios[0] <= .95 || seekRatios[1] >= .4 || seekRatios[2] <= .8) {
+    console.info('Audio release diagnostic',JSON.stringify({
+      ffmpeg:spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!,['-version'],{encoding:'utf8',timeout:10000}).stdout.split('\n')[0],
+      plainDuration:probe(plain).format.duration,duckedDuration:probe(ducked).format.duration,
+      seekRatios,plainWindows,duckedWindows,
+    }));
+  }
   expect(amplitude(ducked,1.8)/amplitude(plain,1.8)).toBeLessThan(.4);
   expect(amplitude(ducked,3.7)/amplitude(plain,3.7)).toBeGreaterThan(.8);
   expect(amplitude(ducked,.2)/amplitude(plain,.2)).toBeGreaterThan(.95);
