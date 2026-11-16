@@ -27,7 +27,11 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { fileEditLock } from './locks';
+import { acquireWithAbort, fileEditLock } from './locks';
+
+// Reserve collision-selected names too: a writer of x can choose x-2 while a
+// different caller explicitly requests x-2. Only live writes retain entries.
+const reservedWritePaths = new Set<string>();
 
 export interface UniquifyResult {
   finalPath: string;
@@ -42,13 +46,14 @@ const MAX_ATTEMPTS = 10000;
 export async function uniquifyPath(
   absPath: string,
   isMine: (p: string) => boolean,
+  unavailable?: ReadonlySet<string>,
 ): Promise<UniquifyResult> {
-  if (isMine(absPath)) return { finalPath: absPath, renamed: false };
-  if (!(await pathExists(absPath))) return { finalPath: absPath, renamed: false };
+  if (!unavailable?.has(absPath) && (isMine(absPath) || !(await pathExists(absPath)))) return { finalPath: absPath, renamed: false };
 
   const { dir, name, ext } = path.parse(absPath);
   for (let n = 2; n < MAX_ATTEMPTS; n++) {
     const candidate = path.join(dir, `${name}-${n}${ext}`);
+    if (unavailable?.has(candidate)) continue;
     if (isMine(candidate)) return { finalPath: candidate, renamed: true };
     if (!(await pathExists(candidate))) return { finalPath: candidate, renamed: true };
   }
@@ -72,10 +77,24 @@ export async function uniquifyPathForWrite<T>(
   absPath: string,
   isMine: (p: string) => boolean,
   write: (decision: UniquifyResult) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return fileEditLock(path.resolve(absPath)).runExclusive(async () => (
-    write(await uniquifyPath(absPath, isMine))
-  ));
+  const requested = path.resolve(absPath);
+  const lock = fileEditLock(requested);
+  const release = signal ? await acquireWithAbort(() => lock.acquire(), signal) : await lock.acquire();
+  let decision: UniquifyResult | undefined;
+  try {
+    // Hold the directory lock only for allocation, never generation/write.
+    await fileEditLock(path.dirname(requested)).runExclusive(async () => {
+      signal?.throwIfAborted();
+      decision = await uniquifyPath(requested, isMine, reservedWritePaths);
+      reservedWritePaths.add(decision.finalPath);
+    });
+    return await write(decision!);
+  } finally {
+    if (decision) reservedWritePaths.delete(decision.finalPath);
+    release();
+  }
 }
 
 async function pathExists(p: string): Promise<boolean> {

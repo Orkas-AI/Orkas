@@ -25,10 +25,14 @@ const SENSITIVE_FIELD =
 const SENSITIVE_QUERY_FIELD =
   '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|(?:proxy[-_]?)?authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)';
 
-const JSON_SECRET_FIELD_RE = new RegExp(
-  `(["'])(${SENSITIVE_FIELD})\\1(\\s*:\\s*)(["'])(.*?)\\4`,
+// Node's inspected log objects have bare keys and may use backtick strings.
+// Escapes belong to the value: an escaped quote must not end redaction early.
+const QUOTED_SECRET_FIELD_RE = new RegExp(
+  String.raw`(?<![\w$])(["']?)(${SENSITIVE_FIELD})\1(\s*:\s*)(["'\x60])(?:\\[^\r\n]|(?!\4)[^\\\r\n])*\4`,
   'gi',
 );
+
+const QUOTED_ID_FIELD_RE = /(?<![\w$])(["']?)(uid|user_id|userId)\1(\s*:\s*)(["'`])([A-Za-z0-9_-]{9,})\4/g;
 
 const KV_SECRET_FIELD_RE = new RegExp(
   `\\b(${SENSITIVE_FIELD})(\\s*=\\s*)([^\\s,;&"']+)`,
@@ -91,15 +95,17 @@ export function sanitizeLogTextForUpload(text: string): string {
       (Buffer.from(token, 'base64').toString('latin1').includes(':') ? 'Basic ***' : m))
     // JWT — three base64url segments, first two starting "eyJ" (base64 of "{").
     .replace(/\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/g, '***JWT***')
-    // JSON-ish secret fields, preserving the original quote style.
-    .replace(JSON_SECRET_FIELD_RE, (_m, q1: string, key: string, sep: string, q2: string) =>
+    // JSON and inspected object fields, preserving the original quote style.
+    .replace(QUOTED_SECRET_FIELD_RE, (_m, q1: string, key: string, sep: string, q2: string) =>
       `${q1}${key}${q1}${sep}${q2}***${q2}`)
     // Plain key=value fragments in exception messages / HTTP client output.
     .replace(KV_SECRET_FIELD_RE, (_m, key: string, sep: string) => `${key}${sep}***`)
     // URL query params. `code` / `state` are masked only when query-shaped.
     .replace(QUERY_SECRET_FIELD_RE, (_m, prefix: string) => `${prefix}***`)
     // User ids are not secrets, but they are user-private identifiers.
-    .replace(/\b(uid|user_id|userId)(\s*=\s*)([A-Za-z0-9_-]{9,})/g, (_m, key: string, sep: string, id: string) =>
+    .replace(QUOTED_ID_FIELD_RE, (_m, q1: string, key: string, sep: string, q2: string, id: string) =>
+      `${q1}${key}${q1}${sep}${q2}${maskLogId(id)}${q2}`)
+    .replace(/\b(uid|user_id|userId|user)(\s*=\s*)([A-Za-z0-9_-]{9,})/g, (_m, key: string, sep: string, id: string) =>
       `${key}${sep}${maskLogId(id)}`)
     // Common provider token prefixes. Keep the broad random-hex space intact.
     .replace(/\b(?:sk|rk)-[A-Za-z0-9][A-Za-z0-9_-]{12,}\b/g, '***TOKEN***')

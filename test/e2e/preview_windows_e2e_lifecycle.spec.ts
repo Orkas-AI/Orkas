@@ -34,6 +34,14 @@ for (const locale of ['zh', 'en']) {
     const image = preview.locator('.chat-lightbox-img');
     await expect.poll(() => image.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(640);
     await expect(preview.locator('.chat-lightbox-share')).toHaveCount(0);
+  const fitted = (await image.boundingBox())!;
+  await preview.locator('.chat-lightbox-zoom-in').click();
+  await expect.poll(async () => (await image.boundingBox())!.width).toBeGreaterThan(fitted.width);
+  await expect(preview.locator('.chat-lightbox-zoom-level')).toHaveText('120%');
+  expect(await preview.evaluate(() => window.visualViewport!.scale)).toBe(1);
+  await preview.locator('.chat-lightbox-zoom-reset').click();
+  await expect(image).toHaveCSS('transform', 'matrix(1, 0, 0, 1, 0, 0)');
+
     for (const name of images.keys()) {
       if (name === 'second.png') await preview.locator('.chat-lightbox-next').click();
       await expect(image).toHaveAttribute('src', source(name));
@@ -58,12 +66,18 @@ for (const locale of ['zh', 'en']) {
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
       expect(box.y + box.height).toBeLessThanOrEqual(height);
+    const zoom = (await preview.locator('.chat-lightbox-zoom').boundingBox())!;
+    expect(zoom.x).toBeGreaterThanOrEqual(0);
+    expect(zoom.x + zoom.width).toBeLessThanOrEqual(width);
+    expect(zoom.y + zoom.height).toBeLessThanOrEqual(height);
+
       await preview.screenshot({ path: info.outputPath(`attachment-actions-${locale}-${width}.png`) });
     }
     await orkas.page!.evaluate(src => (window as any).openChatImageLightbox(src, 'Display only'), `data:image/png;base64,${png.toString('base64')}`);
     await expect(preview).toHaveTitle('Display only');
     await expect(image).toBeVisible();
     await expect(preview.locator('.chat-lightbox-actions')).toBeHidden();
+    await expect(preview.locator('.chat-lightbox-zoom')).toBeVisible();
     await preview.screenshot({ path: info.outputPath(`image-without-actions-${locale}.png`) });
     await orkas.electronApp!.evaluate(({ shell }) => { shell.showItemInFolder = (process as any).originalReveal; });
   });
@@ -392,13 +406,17 @@ test('saving from an app preview retains its original bundle after task navigati
     (window as any).openChatArtifactViewer(source), { cid, artifactId: artifact.artifactId, title: 'Keep this app' }));
   await expect(preview.frameLocator('.chat-artifact-viewer-frame').locator('h1')).toHaveText('Bundle loaded');
   await page.evaluate(async () => { await (window as any).setView('apps'); });
+  const beforeSave: any = await orkas.invoke('savedApps.list');
+  const beforeIds = new Set(beforeSave.apps.map((app: any) => app.id));
   const save = preview.locator('.chat-artifact-viewer-save');
   await expect(save).toHaveAccessibleName('Save as app');
   await save.click();
-  await expect(page.locator('.app-card-name')).toHaveText('Keep this app');
+  const savedCard = page.locator('[data-app-source="custom"] .app-card').filter({ has: page.getByText('Keep this app', { exact: true }) });
+  await expect(savedCard).toBeVisible();
   const saved: any = await orkas.invoke('savedApps.list');
-  expect(saved.apps).toHaveLength(1);
-  const savedPreview = await orkas.openPreview(() => page.locator('.app-card').click());
+  expect(saved.apps).toHaveLength(beforeIds.size + 1);
+  expect(saved.apps.filter((app: any) => !beforeIds.has(app.id))).toMatchObject([{ title: 'Keep this app' }]);
+  const savedPreview = await orkas.openPreview(() => savedCard.click());
   await expect(savedPreview.frameLocator('.saved-app-viewer-frame').locator('h1')).toHaveText('Bundle loaded');
   await preview.screenshot({ path: info.outputPath('artifact-save-window.png') });
   await orkas.electronApp!.evaluate((_electron, args) => {
@@ -410,7 +428,7 @@ test('saving from an app preview retains its original bundle after task navigati
   await save.click();
   await expect(preview.locator('.ui-dialog-overlay:visible')).toContainText('Could not save');
   await expect(save).toBeEnabled();
-  expect((await orkas.invoke<any>('savedApps.list')).apps).toHaveLength(1);
+  expect((await orkas.invoke<any>('savedApps.list')).apps.map((app: any) => app.id).sort()).toEqual(saved.apps.map((app: any) => app.id).sort());
 });
 
 test('video uses the full window and restores floating actions on pointer, keyboard and pause', async ({ orkas }, info) => {

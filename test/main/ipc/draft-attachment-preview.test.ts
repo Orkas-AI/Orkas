@@ -5,6 +5,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
+import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 
 type InvokeFn = (
   event: unknown,
@@ -81,6 +82,80 @@ function call(channel: string, payload: unknown): ReturnType<InvokeFn> {
 }
 
 describe('IPC draft attachment preview scope', () => {
+  it('lists the whole task attachment pool without restoring sent files into the composer', async () => {
+    const cid = 'attachment-inventory';
+    await uploadAndResolve(cid, 'sent.txt', 'sent');
+    await uploadAndResolve(cid, 'pending.txt', 'pending');
+    await uploadAndResolve('other-attachment-task', 'foreign.txt', 'foreign');
+    const chatsDir = path.join(tempRoot, TEST_UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(path.join(chatsDir, `${cid}.jsonl`), JSON.stringify({
+      role: 'user', attachments: ['sent.txt'], text: 'Earlier upload',
+    }) + '\n');
+    const pending = await call('conversations.attachments.list', { cid });
+    expect(pending.ok).toBe(true);
+    expect((pending.items as any[]).map(item => item.name)).toEqual(['pending.txt']);
+    const all = await call('conversations.attachments.list', { cid, scope: 'all' });
+    expect(all.ok).toBe(true);
+    expect((all.items as any[]).map(item => item.name)).toEqual(['pending.txt', 'sent.txt']);
+    expect((all.items as any[]).every(item => item.bytes > 0)).toBe(true);
+    const again = await call('conversations.attachments.list', { cid });
+    expect((again.items as any[]).map(item => item.name)).toEqual(['pending.txt']);
+  });
+
+  it('rejects relative or malformed preview paths and preview requests from child frames', async () => {
+    for (const channel of ['workspace.statPath', 'produced.readText', 'produced.officePreviewHtml', 'produced.grantHtmlPreviewAssets']) {
+      for (const path of ['relative.md', 'file:///tmp/report.md', '/tmp/bad\0.md']) {
+        expect(await call(channel, { path })).toMatchObject({ ok: false });
+      }
+      const sender = trustedIpcSender({ mainFrame: {} });
+      expect(await invokeHandler!({ sender, senderFrame: {} }, { channel, payload: { path: '/tmp/report.md' } }))
+        .toMatchObject({ ok: false, code: 'E_IPC_SENDER' });
+    }
+  });
+
+  it('reads an unregistered external Unicode file without granting writes or deletion', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-external-preview-'));
+    try {
+      const file = path.join(outside, '交接 100% #1.md');
+      const body = '# External preview\r\n完整内容\r\n';
+      fs.writeFileSync(file, body);
+      expect(await call('workspace.statPath', { path: file })).toMatchObject({ ok: true, exists: true, isFile: true, readOnly: true });
+      expect(await call('produced.readText', { path: file })).toMatchObject({ ok: true, text: body });
+      for (const [channel, extra] of [
+        ['produced.writeText', { content: 'overwrite' }], ['workspace.deletePath', {}],
+      ] as const) {
+        expect(await call(channel, { path: file, ...extra })).toMatchObject({ ok: false });
+        expect(fs.readFileSync(file, 'utf8')).toBe(body);
+      }
+      const workspace = (await import('../../../src/main/features/user_workspace')).getWorkspacePath(TEST_UID);
+      fs.mkdirSync(workspace, { recursive: true });
+      const editable = path.join(workspace, 'editable.txt');
+      fs.writeFileSync(editable, 'before');
+      expect(await call('workspace.statPath', { path: editable })).toMatchObject({ ok: true, readOnly: false });
+      expect(await call('produced.writeText', { path: editable, content: 'after' })).toMatchObject({ ok: true });
+      expect(fs.readFileSync(editable, 'utf8')).toBe('after');
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+
+  it('keeps external Office previews, missing files and text size limits on their existing result paths', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-external-formats-'));
+    try {
+      const doc = path.join(outside, 'brief.docx');
+      fs.writeFileSync(doc, makeMinimalDocx({ paragraphs: ['External document evidence'] }));
+      const result = await call('produced.officePreviewHtml', { path: doc });
+      expect(result).toMatchObject({ ok: true, kind: 'word' });
+      expect(result.html).toContain('External document evidence');
+      const missing = path.join(outside, 'missing.md');
+      expect(await call('workspace.statPath', { path: missing })).toMatchObject({ ok: true, exists: false });
+      expect(await call('produced.readText', { path: missing })).toMatchObject({ ok: false, error: 'not_found' });
+      const large = path.join(outside, 'large.txt');
+      fs.writeFileSync(large, Buffer.alloc(2 * 1024 * 1024 + 1, 65));
+      expect(await call('produced.readText', { path: large })).toMatchObject({ ok: false, error: 'too_large', cap: 2 * 1024 * 1024 });
+      expect(fs.statSync(large).size).toBe(2 * 1024 * 1024 + 1);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+
   it.each(['global', 'project', 'draft'] as const)('previews a %s todo attachment through the real read-only IPC chain', async (scope) => {
     const pt = await import('../../../src/main/features/project_tasks');
     const project = scope === 'global' ? null : await call('projects.create', { name: `Todo preview ${scope}` });
