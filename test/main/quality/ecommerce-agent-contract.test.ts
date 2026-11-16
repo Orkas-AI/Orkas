@@ -73,20 +73,21 @@ describe('ecommerce identity and effective Agent handoff', () => {
     expect(output).toMatch(/return this formula as the advancement rule rather than substituting illustrative numbers/);
   });
 
-  it('lets Writer execute and continue its local copy constructor without interactive CLI or merchant access', () => {
-    const writer = agents.find(agent => agent.name === 'ECommerceWriter');
+  it('lets Writer execute and continue its local copy constructor without interactive CLI or media generation', () => {
+    const writer = JSON.parse(fs.readFileSync(path.join(agentsRoot, '173d4235a431/agent.json'), 'utf8'));
     const tools = toolNamesForAgentGroups(writer.tool_list);
     expect(tools).toContain('bash');
     expect(tools).toContain('write_file');
     expect(tools).toContain('publish_outputs');
     expect(tools).toContain('process_session');
     expect(tools).not.toContain('interactive_cli');
-    expect(tools).not.toContain('call_connector_tool');
+    expect(tools).not.toContain('generate_image');
+    expect(writer.workflow).toMatch(/no store writes/i);
     expect(toolNamesForAgentGroups(writer.tool_list.filter((id: string) => id !== 'workspace.execute.command'))).not.toContain('bash');
     expect(toolNamesForAgentGroups(writer.tool_list.filter((id: string) => id !== 'workspace.execute.command'))).not.toContain('process_session');
   });
   it('keeps dependency IDs and standards through production normalization and prompt assembly', async () => {
-    expect(agents).toHaveLength(5);
+    expect(agents).toHaveLength(4);
     for (const raw of agents) {
       const normalized = normalizeAgent(raw, 'marketplace');
       expect(normalized?.agent_id).toBe(raw.agent_id);

@@ -8,13 +8,15 @@ import type { ChatSnippet } from './snippet';
 const log = createLogger('search');
 interface Reader {
   worker?: Worker;
+  ready: boolean;
   unavailableUntil: number;
   pending: Map<number, {
     resolve: (rows: Map<number, ChatSnippet | undefined>) => void;
     reject: (error: Error) => void;
+    dispatch?: () => void;
   }>;
 }
-const readers: Reader[] = Array.from({ length: 2 }, () => ({ unavailableUntil: 0, pending: new Map() }));
+const readers: Reader[] = Array.from({ length: 2 }, () => ({ ready: false, unavailableUntil: 0, pending: new Map() }));
 // Stable source affinity reuses each worker's bounded projection/offset cache.
 // Two workers cap simultaneous large-record parsing; four in-flight requests
 // bound dispatch overhead without opening one worker per matching history.
@@ -52,8 +54,19 @@ function requestSnippets(reader: Reader, file: string, indexes: ReadonlySet<numb
       execArgv: [], env: { ...process.env, ORKAS_WORKSPACE_ROOT: WS_ROOT },
     });
     reader.worker = current;
+    reader.ready = false;
     current.on('message', (message) => {
       if (reader.worker !== current) return;
+      if (message.ready === true) {
+        reader.ready = true;
+        for (const request of reader.pending.values()) {
+          const dispatch = request.dispatch;
+          delete request.dispatch;
+          dispatch?.();
+        }
+        if (!reader.pending.size) current.unref();
+        return;
+      }
       const request = reader.pending.get(message.id);
       reader.pending.delete(message.id);
       request?.resolve(new Map(message.rows));
@@ -84,23 +97,37 @@ function requestSnippets(reader: Reader, file: string, indexes: ReadonlySet<numb
       // Parsing one oversized JSON record cannot yield. Stop an unused worker
       // immediately, but keep unrelated requests alive on a shared reader.
       if (!reader.pending.size && reader.worker === current) {
-        reader.worker = undefined;
-        void current.terminate();
+        if (reader.ready) {
+          reader.worker = undefined;
+          void current.terminate();
+        } else {
+          // No parser has started. Killing Electron during node_init can emit
+          // a native failure; retain this bounded, unreferenced bootstrap for
+          // the next query. Cancelled requests are never posted to the worker.
+          current.unref();
+        }
+      }
+    };
+    // Admission owns a detached command while bootstrap is pending.
+    const command = { id, file, indexes: [...indexes], tokens: [...tokens],
+      source: source && { ...source }, cancellation: cancellation.buffer };
+    const dispatch = () => {
+      try { current.postMessage(command); }
+      catch {
+        cleanup();
+        reader.pending.delete(id);
+        if (!reader.pending.size) current.unref();
+        reject(new Error('Chat snippet reader unavailable'));
       }
     };
     reader.pending.set(id, {
       resolve: rows => { cleanup(); resolve(rows); },
       reject: error => { cleanup(); reject(error); },
+      ...(!reader.ready ? { dispatch } : {}),
     });
     signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) { cancel(); return; }
-    try { current.postMessage({ id, file, indexes: [...indexes], tokens, source, cancellation: cancellation.buffer }); }
-    catch {
-      cleanup();
-      reader.pending.delete(id);
-      if (!reader.pending.size) current.unref();
-      reject(new Error('Chat snippet reader unavailable'));
-    }
+    if (reader.ready) dispatch();
   });
 }
 

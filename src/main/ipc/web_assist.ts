@@ -10,6 +10,7 @@ import {
   handBackWebAssist,
   resetWebAssistPermissions,
   answerWebAssistPermission,
+  answerWebAssistDialog,
   setWebAssistOverlayState,
   layoutWebAssist,
   navigateWebAssist,
@@ -81,6 +82,8 @@ export const invokeHandlers = {
   'webAssist.resetPermissions': async (payload: { tabId?: unknown }, ctx: WebAssistIpcContext) => resetWebAssistPermissions(ctx.sender, payload?.tabId),
 
   'webAssist.permissionResponse': async (payload: { tabId?: unknown; requestId?: unknown; allowed?: unknown }, ctx: WebAssistIpcContext) => answerWebAssistPermission(ctx.sender, payload || {}),
+
+  'webAssist.dialogResponse': async (payload: { tabId?: unknown; requestId?: unknown; accepted?: unknown; value?: unknown; editing?: unknown }, ctx: WebAssistIpcContext) => answerWebAssistDialog(ctx.sender, payload || {}),
 
   'webAssist.handback': async (payload: { tabId?: unknown }, ctx: WebAssistIpcContext) => handBackWebAssist(ctx.sender, payload?.tabId),
 

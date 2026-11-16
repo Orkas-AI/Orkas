@@ -808,7 +808,7 @@ async function _onSaveAppClick(mode = 'auto') {
     if (seq === _viewerRenderSeq) _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
     if (typeof uiToast === 'function') uiToast(doneLabel, { variant: 'success' });
     else if (typeof uiAlert === 'function') await uiAlert(doneLabel);
-    if (typeof loadSavedApps === 'function') loadSavedApps(true);
+    if (typeof loadSavedApps === 'function') loadSavedApps(true, { localOnly: true });
   } catch (_) {
     _viewerLogFailure('file_preview_save_app_presentation', {
       error_type: 'presentation',
@@ -1411,14 +1411,13 @@ async function _showUnsupportedDialog(absPath, cid, projectId, opts) {
 }
 
 async function _ensureViewerFileExists(absPath, cid, projectId) {
-  if (!window.orkas || typeof window.orkas.invoke !== 'function') return true;
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') return {};
   try {
     const payload = { path: absPath };
     if (cid) payload.cid = cid;
     if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('workspace.statPath', payload);
-    if (res && res.ok && res.exists && res.isFile !== false) return true;
-    if (res && res.ok && res.exists && res.isFile === false) return true;
+    if (res && res.ok && res.exists) return { readOnly: res.readOnly === true };
     const name = String(absPath || '').split(/[\\/]/).pop() || String(absPath || '');
     if (!res || !res.ok) {
       await _showUnsupportedDialog(absPath, cid, projectId, {
@@ -1438,7 +1437,7 @@ async function _ensureViewerFileExists(absPath, cid, projectId) {
     return false;
   } catch {
     _viewerLog.warn('statPath failed', { error_code: 'stat_failed' });
-    return true;
+    return {};
   }
 }
 
@@ -1451,6 +1450,9 @@ async function openChatFileViewer(absPath, displayName, opts) {
   const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
   const exists = await _ensureViewerFileExists(absPath, cid, projectId);
   if (!exists) return;
+  // Main's write boundary is authoritative; a caller may request stricter
+  // read-only behavior, but cannot re-enable editing for an external file.
+  if (exists.readOnly) opts = { ...opts, readOnly: true };
   const kind = _kindOf(absPath);
   // Unsupported files need only the owner dialog, never a preview window.
   if (kind === 'unsupported') return _showUnsupportedDialog(absPath, cid, projectId, {});

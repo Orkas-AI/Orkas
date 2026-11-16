@@ -29,6 +29,8 @@ vi.mock('../../../../src/main/features/office/office_engine', () => {
   }
   return {
     OfficeCliError: MockOfficeCliError,
+    OFFICECLI_DEFAULT_MAX_OUTPUT_BYTES: 16 * 1024 * 1024,
+    OFFICECLI_DEFAULT_TIMEOUT_MS: 60_000,
     officeCliAvailable: () => h.engineAvailable,
     runOfficeCli: (...args: unknown[]) => h.runOfficeCli(...args),
     closeOfficeFile: (...args: unknown[]) => h.closeOfficeFile(...args),
@@ -40,14 +42,19 @@ vi.mock('../../../../src/main/features/office/office_page_renderer', () => ({
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
-vi.mock('../../../../src/main/util/log-redact', () => ({
-  logErrorRef: (error: unknown) => String(error),
+vi.mock('../../../../src/main/util/log-redact', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../../src/main/util/log-redact')>(),
   logPathRef: (value: unknown) => String(value),
   maskId: (value: unknown) => String(value),
 }));
 
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
+import { OfficeCliError } from '../../../../src/main/features/office/office_engine';
+import { OfficeCreationJournal, OfficeCreationStateError } from '../../../../src/main/features/office/office_creation';
+import { wrapToolWithCap } from '../../../../src/main/util/tool-result-cap';
 import { unassessedTextCollision } from '../../../../src/main/features/office/pptx_text_collision';
+import { runProgramWithTools } from '../../../helpers/programmatic-tools';
+import * as officeLocks from '../../../../src/main/util/locks';
 
 describe('Office built-in tools', () => {
   let tmpDir = '';
@@ -88,6 +95,7 @@ describe('Office built-in tools', () => {
       cid: 'conversation-1',
       onFileWritten,
       hasProducedPath: (absPath) => produced.has(path.resolve(absPath)),
+      creationStateDir: path.join(tmpDir, 'office-creation-state'),
     });
   }
 
@@ -97,9 +105,409 @@ describe('Office built-in tools', () => {
     return found;
   }
 
+  it('advertises the native DOCX header/footer creation boundary', () => {
+    const definition = getTool('edit_office').inputSchema as any;
+    const type = definition.properties.operations.items.properties.type.description;
+    expect(type).toMatch(/header/);
+    expect(type).toMatch(/footer/);
+    expect(type).toContain('parent "/"');
+    expect(type).toContain('text/align');
+  });
+
   function ctx(overrides: Record<string, unknown> = {}) {
     return { workingDir: h.workspace, state: {}, ...overrides } as any;
   }
+
+  it.each([
+    ['create_docx', { path: 'report.docx', paragraphs: [{ text: 'Quarterly report' }] }],
+    ['create_xlsx', { path: 'report.xlsx', sheets: [{ name: 'Report', rows: [['Revenue', 42]] }] }],
+    ['create_pptx', { path: 'report.pptx', slides: [{ title: 'Quarterly report' }] }],
+    ['edit_office', { path: 'source.docx', output_path: 'report.docx', preview: true,
+      operations: [{ action: 'set', path: '/body/p[1]', props: { text: 'Quarterly report' } }] }],
+  ] as const)('delivers %s through a program with its native preview available to the next model round', async (name, input) => {
+    const source = path.join(h.workspace, 'source.docx');
+    fs.writeFileSync(source, 'user-owned-source');
+    const result = await runProgramWithTools([getTool(name)], `
+      const document = await tools.${name}(${JSON.stringify(input)});
+      if (!document.ok) throw Error(document.content);
+      text('Document prepared for review.');
+    `, h.workspace);
+    expect(result.isError).not.toBe(true);
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+    const finalPath = onFileWritten.mock.calls[0][0];
+    expect(fs.existsSync(finalPath)).toBe(true);
+    expect(fs.readFileSync(source, 'utf8')).toBe('user-owned-source');
+    const images = result.requests[1].messages.flatMap((message: any) =>
+      Array.isArray(message.content) ? message.content.flatMap((block: any) =>
+        block.type === 'tool_result' ? block.images ?? [] : []) : []);
+    expect(images).toEqual([expect.objectContaining({ data: Buffer.from('png-bytes').toString('base64'), mediaType: 'image/png' })]);
+  });
+
+  function creationReceipt(result: { content: string }) {
+    const receipt = /<office-creation>(.+)<\/office-creation>/.exec(result.content)?.[1];
+    expect(receipt).toBeDefined();
+    return JSON.parse(receipt!);
+  }
+
+  function atomicRejection(options: { stdin: string }, code = 'invalid_value', rolledBack = true) {
+    const operations = JSON.parse(options.stdin);
+    return { code: 1, stderr: '', stdout: JSON.stringify({ success: false, data: {
+      results: operations.map((_: unknown, index: number) => ({ index,
+        success: index !== operations.length - 1,
+        ...(index === operations.length - 1 ? { code, error: 'Rejected parameter' } : {}),
+      })),
+      summary: { total: operations.length, executed: operations.length, succeeded: operations.length - 1,
+        failed: 1, skipped: 0, atomicRolledBack: rolledBack },
+    } }) };
+  }
+
+  // A rejected initial document is recoverable; a deleted delivered document
+  // is not. Observe actual final files and native dispatches, not just receipts.
+  it.each([
+    ['create_docx', 'invalid_value'], ['create_xlsx', 'invalid_value'], ['create_pptx', 'invalid_value'],
+    ['create_pptx', 'unsupported_type'],
+  ])('%s permits one corrected unpublished %s attempt across factory rebuilds', async (name, code) => {
+    const extension = name.slice('create_'.length);
+    const initial = { path: `recovery.${extension}`, preview: false,
+      paragraphs: [{ text: 'Original' }], sheets: [{ name: 'Sheet1', rows: [['Original']] }],
+      slides: [{ title: 'Original' }] };
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      fs.writeFileSync(args[1], 'private-candidate');
+      return { code: 0, stdout: '', stderr: '' };
+    }).mockImplementationOnce((_args: string[], options: { stdin: string }) => atomicRejection(options, code));
+    const first = await getTool(name).execute(initial, ctx());
+    const failed = creationReceipt(first);
+    expect(failed).toMatchObject({ publication: 'not_published', retry_available: true });
+    expect(fs.existsSync(path.join(h.workspace, initial.path))).toBe(false);
+    const corrected = { ...initial, paragraphs: [{ text: 'Corrected' }],
+      sheets: [{ name: 'Sheet1', rows: [['Corrected']] }], slides: [{ title: 'Corrected' }],
+      retry_of: failed.operation_id };
+    const recovered = await getTool(name).execute(corrected, ctx());
+    expect(recovered.isError).toBeUndefined();
+    expect(creationReceipt(recovered)).toMatchObject({ operation_id: failed.operation_id,
+      publication: 'published', retry_available: false, attempt: 2 });
+    expect(fs.readFileSync(path.join(h.workspace, initial.path), 'utf8')).toBe('created-office-file');
+    const calls = h.runOfficeCli.mock.calls.length;
+    fs.unlinkSync(path.join(h.workspace, initial.path));
+    const resurrected = await getTool(name).execute(corrected, ctx());
+    expect(resurrected.isError).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(path.join(h.workspace, initial.path))).toBe(false);
+  });
+
+  it.each(['create_docx', 'create_xlsx', 'create_pptx'])('%s preserves a late independent file appearing during private construction', async name => {
+    const requested = `late-file.${name.slice('create_'.length)}`;
+    const final = path.join(h.workspace, requested);
+    const native = h.runOfficeCli.getMockImplementation()!;
+    h.runOfficeCli.mockImplementation(async (args: string[], options: unknown) => {
+      const result = await native(args, options);
+      // An outside writer is not coordinated by the app's in-process file lock.
+      if (args[0] === 'create') fs.writeFileSync(final, 'late-independent-bytes');
+      return result;
+    });
+    const result = await getTool(name).execute({ path: requested, preview: false,
+      paragraphs: [{ text: 'New document' }], sheets: [{ name: 'Sheet1', rows: [['New workbook']] }],
+      slides: [{ title: 'New deck' }],
+    }, ctx());
+    expect(fs.readFileSync(final, 'utf8')).toBe('late-independent-bytes');
+    expect(result.isError).toBeUndefined();
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+    const published = onFileWritten.mock.calls[0][0];
+    expect(published).not.toBe(final);
+    expect(fs.readFileSync(published, 'utf8')).toBe('created-office-file');
+  });
+
+  it.each(['docx', 'xlsx', 'pptx'])('preserves a late independent %s edit-copy destination', async extension => {
+    const source = path.join(h.workspace, `source.${extension}`);
+    const destination = path.join(h.workspace, `copy.${extension}`);
+    fs.writeFileSync(source, 'source-bytes');
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'batch') {
+        fs.writeFileSync(args[1], 'edited-bytes');
+        fs.writeFileSync(destination, 'independent-bytes');
+      }
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    const result = await getTool('edit_office').execute({ path: source, output_path: destination,
+      operations: [{ action: 'set', path: '/body/p[1]', props: { text: 'Updated' } }],
+    }, ctx());
+    expect(result.isError).toBeUndefined();
+    expect(fs.readFileSync(source, 'utf8')).toBe('source-bytes');
+    expect(fs.readFileSync(destination, 'utf8')).toBe('independent-bytes');
+    const published = onFileWritten.mock.calls[0][0];
+    expect(published).not.toBe(destination);
+    expect(fs.readFileSync(published, 'utf8')).toBe('edited-bytes');
+  });
+
+  it('preserves an independent replacement of a prior owned Word output during construction', async () => {
+    const final = path.join(h.workspace, 'owned.docx');
+    fs.writeFileSync(final, 'prior-owned-bytes'); produced.add(final);
+    const native = h.runOfficeCli.getMockImplementation()!;
+    h.runOfficeCli.mockImplementation(async (args: string[], options: unknown) => {
+      const result = await native(args, options);
+      if (args[0] === 'create') {
+        const replacement = path.join(h.workspace, 'outside.docx');
+        fs.writeFileSync(replacement, 'independent-replacement');
+        fs.renameSync(replacement, final);
+      }
+      return result;
+    });
+    const result = await getTool('create_docx').execute({ path: final, preview: false, paragraphs: [{ text: 'New word' }] }, ctx());
+    expect(result.isError).toBeUndefined();
+    expect(fs.readFileSync(final, 'utf8')).toBe('independent-replacement');
+    expect(fs.readFileSync(onFileWritten.mock.calls[0][0], 'utf8')).toBe('created-office-file');
+  });
+
+  it('survives a collision after journal binding without retaining false ownership of the occupied suffix', async () => {
+    const final = path.join(h.workspace, 'raced.pptx');
+    fs.writeFileSync(final, 'original-user-file');
+    const bind = OfficeCreationJournal.prototype.bindFinal;
+    let occupied = '';
+    vi.spyOn(OfficeCreationJournal.prototype, 'bindFinal').mockImplementation(async function (operation, selected) {
+      await bind.call(this, operation, selected);
+      if (!occupied) { occupied = selected; fs.writeFileSync(selected, 'external-race'); }
+    });
+    const result = await getTool('create_pptx').execute({ path: final, preview: false, slides: [{ title: 'New deck' }] }, ctx());
+    expect(result.isError).toBeUndefined();
+    expect(fs.readFileSync(final, 'utf8')).toBe('original-user-file');
+    expect(fs.readFileSync(occupied, 'utf8')).toBe('external-race');
+    const published = onFileWritten.mock.calls[0][0];
+    expect(published).not.toBe(occupied);
+    expect(fs.readFileSync(published, 'utf8')).toBe('created-office-file');
+    fs.unlinkSync(occupied);
+    const independent = await getTool('create_pptx').execute({ path: occupied, preview: false, slides: [{ title: 'Independent deck' }] }, ctx());
+    expect(independent.isError).toBeUndefined();
+    expect(fs.existsSync(occupied)).toBe(true);
+    fs.unlinkSync(published);
+    expect((await getTool('create_pptx').execute({ path: published, preview: false, slides: [{ title: 'Do not replay' }] }, ctx())).isError).toBe(true);
+  });
+
+  it('bounds a continuous external publication collision without replacing any outside file or replaying native creation', async () => {
+    const bind = OfficeCreationJournal.prototype.bindFinal;
+    const outside = new Set<string>();
+    vi.spyOn(OfficeCreationJournal.prototype, 'bindFinal').mockImplementation(async function (operation, selected) {
+      await bind.call(this, operation, selected);
+      outside.add(selected); fs.writeFileSync(selected, 'outside-file');
+    });
+    const result = await getTool('create_pptx').execute({ path: 'busy.pptx', preview: false, slides: [{ title: 'One deck' }] }, ctx());
+    expect(result.isError).toBe(true);
+    expect(outside.size).toBeGreaterThan(1);
+    expect(outside.size).toBeLessThanOrEqual(100);
+    for (const file of outside) expect(fs.readFileSync(file, 'utf8')).toBe('outside-file');
+    expect(h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'create')).toHaveLength(1);
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(creationReceipt(result)).toMatchObject({ publication: 'unknown', retry_available: false });
+  });
+
+  it('preserves an outside replacement while waiting for the prior owned output lock', async () => {
+    const file = path.join(h.workspace, 'queued.docx');
+    fs.writeFileSync(file, 'prior-owned'); produced.add(file);
+    const owner = officeLocks.fileEditLock;
+    const release = await owner(file).acquire();
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(officeLocks, 'fileEditLock').mockImplementation(abs => {
+      const handle = owner(abs);
+      if (abs === file) {
+        const acquire = handle.acquire.bind(handle);
+        handle.acquire = priority => { entered(); return acquire(priority); };
+      }
+      return handle;
+    });
+    const pending = getTool('create_docx').execute({ path: file, preview: false, paragraphs: [{ text: 'New draft' }] }, ctx());
+    try {
+      await waiting;
+      const outside = path.join(h.workspace, 'outside-queued.docx');
+      fs.writeFileSync(outside, 'outside-during-lock-wait');
+      fs.renameSync(outside, file);
+    } finally { release(); }
+    const result = await pending;
+    expect(result.isError).toBeUndefined();
+    expect(fs.readFileSync(file, 'utf8')).toBe('outside-during-lock-wait');
+    const published = onFileWritten.mock.calls[0][0];
+    expect(published).not.toBe(file);
+    expect(fs.readFileSync(published, 'utf8')).toBe('created-office-file');
+  });
+
+  it('does not resurrect a successfully created deck without a retry reference, including its collision-safe path', async () => {
+    fs.writeFileSync(path.join(h.workspace, 'delivered.pptx'), 'user-source');
+    const input = { path: 'delivered.pptx', slides: [{ title: 'Delivered' }], preview: false };
+    const first = await getTool('create_pptx').execute(input, ctx());
+    expect(first.isError).toBeUndefined();
+    const delivered = path.join(h.workspace, 'delivered-2.pptx');
+    fs.unlinkSync(delivered);
+    const calls = h.runOfficeCli.mock.calls.length;
+    for (const target of ['delivered.pptx', 'delivered-2.pptx']) {
+      const repeated = await getTool('create_pptx').execute({ ...input, path: target }, ctx());
+      expect(repeated.isError).toBe(true);
+      expect(creationReceipt(repeated)).toMatchObject({ publication: 'published', retry_available: false });
+    }
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.readFileSync(path.join(h.workspace, 'delivered.pptx'), 'utf8')).toBe('user-source');
+    expect(fs.existsSync(delivered)).toBe(false);
+  });
+
+  it('consumes correction before dispatch and cannot reset it through another failure or a renamed retry', async () => {
+    const input = { path: 'twice.xlsx', sheets: [{ name: 'Sheet1', rows: [['Original']] }], preview: false };
+    h.runOfficeCli.mockImplementation(async (args: string[], options: { stdin: string }) => {
+      if (args[0] === 'create') fs.writeFileSync(args[1], 'private');
+      return args[0] === 'batch'
+        ? atomicRejection(options)
+        : { code: 0, stdout: '', stderr: '' };
+    });
+    const failed = creationReceipt(await getTool('create_xlsx').execute(input, ctx()));
+    const calls = h.runOfficeCli.mock.calls.length;
+    for (const retry of [{ ...input }, { ...input, retry_of: failed.operation_id }, { ...input, retry_of: 'forged' },
+      { ...input, path: 'renamed.xlsx', retry_of: failed.operation_id }]) {
+      expect((await getTool('create_xlsx').execute(retry, ctx())).isError).toBe(true);
+    }
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    const corrected = { ...input, sheets: [{ name: 'Sheet1', rows: [['Changed']] }], retry_of: failed.operation_id };
+    const results = await Promise.all([getTool('create_xlsx').execute(corrected, ctx()), getTool('create_xlsx').execute(corrected, ctx())]);
+    expect(results.every(result => result.isError)).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls + 2);
+    expect(creationReceipt(await getTool('create_xlsx').execute({ ...corrected, sheets: [{ name: 'Sheet1', rows: [['Third']] }] }, ctx())))
+      .toMatchObject({ retry_available: false, attempt: 2 });
+    expect(fs.existsSync(path.join(h.workspace, input.path))).toBe(false);
+  });
+
+  it('withholds correction after an unclassified failure even when no output file exists', async () => {
+    h.runOfficeCli.mockRejectedValueOnce(new OfficeCliError('E_OFFICE_TIMEOUT', 'native operation timed out'));
+    const input = { path: 'unknown.docx', paragraphs: [{ text: 'Draft' }], preview: false };
+    const first = creationReceipt(await getTool('create_docx').execute(input, ctx()));
+    expect(first).toMatchObject({ publication: 'unknown', retry_available: false });
+    const calls = h.runOfficeCli.mock.calls.length;
+    expect((await getTool('create_docx').execute({ ...input, retry_of: first.operation_id }, ctx())).isError).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(path.join(h.workspace, input.path))).toBe(false);
+  });
+
+  it.each(['untyped', 'not-rolled-back', 'wrong-error', 'incomplete'])('does not infer correction authority from a %s native failure', async shape => {
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      fs.writeFileSync(args[1], 'private');
+      return { code: 0, stdout: '', stderr: '' };
+    }).mockImplementationOnce((_args: string[], options: { stdin: string }) => {
+      if (shape === 'untyped') return { code: 1, stdout: 'invalid_value; atomic: no changes were applied', stderr: '' };
+      const result = atomicRejection(options, shape === 'wrong-error' ? 'internal_error' : 'invalid_value', shape !== 'not-rolled-back');
+      if (shape === 'incomplete') {
+        const json = JSON.parse(result.stdout); json.data.results = [];
+        result.stdout = JSON.stringify(json);
+      }
+      return result;
+    });
+    const input = { path: 'unverified.pptx', slides: [{ title: 'Draft' }], preview: false };
+    const failed = creationReceipt(await getTool('create_pptx').execute(input, ctx()));
+    expect(failed).toMatchObject({ retry_available: false, publication: 'unknown' });
+    const calls = h.runOfficeCli.mock.calls.length;
+    expect((await getTool('create_pptx').execute({ ...input, slides: [{ title: 'Changed' }], retry_of: failed.operation_id }, ctx())).isError).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(path.join(h.workspace, input.path))).toBe(false);
+  });
+
+  // Successful publication is independently useful even when subsequent
+  // bookkeeping fails. Keep the error and no-replay boundary as well as bytes.
+  it.each(['create_docx', 'create_xlsx', 'create_pptx'])('%s registers a saved file before a publication-record failure', async name => {
+    const finish = OfficeCreationJournal.prototype.finish;
+    vi.spyOn(OfficeCreationJournal.prototype, 'finish').mockImplementation(async function (operation, status) {
+      if (status === 'published') throw new OfficeCreationStateError();
+      return finish.call(this, operation, status);
+    });
+    const input = { path: `retained.${name.slice('create_'.length)}`, preview: false,
+      paragraphs: [{ text: 'Retained content' }], sheets: [{ name: 'Sheet1', rows: [['Retained content']] }],
+      slides: [{ title: 'Retained content' }] };
+    const output = path.join(h.workspace, input.path);
+    const result = await getTool(name).execute(input, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_OFFICE_CREATION_STATE_UNAVAILABLE');
+    expect(creationReceipt(result)).toMatchObject({ publication: 'published', retry_available: false, artifact_path: output });
+    expect(fs.readFileSync(output, 'utf8')).toBe('created-office-file');
+    expect(onFileWritten).toHaveBeenCalledExactlyOnceWith(output);
+    expect([...produced]).toEqual([output]);
+    const calls = h.runOfficeCli.mock.calls.length;
+    expect((await getTool(name).execute(input, ctx())).isError).toBe(true);
+    fs.unlinkSync(output);
+    expect((await getTool(name).execute(input, ctx())).isError).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('retains publication when a later callback removes the output before the success receipt can be built', async () => {
+    onFileWritten.mockImplementationOnce((file: string) => fs.unlinkSync(file));
+    const input = { path: 'lost-after-publish.pptx', slides: [{ title: 'Published' }], preview: false };
+    const first = await getTool('create_pptx').execute(input, ctx());
+    expect(first.isError).toBe(true);
+    expect(creationReceipt(first)).toMatchObject({ publication: 'published', retry_available: false });
+    const calls = h.runOfficeCli.mock.calls.length;
+    expect((await getTool('create_pptx').execute(input, ctx())).isError).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(path.join(h.workspace, input.path))).toBe(false);
+  });
+
+  it('preserves a file that appeared after rejection, even if another tool registered it as conversation-produced', async () => {
+    const input = { path: 'arrived.xlsx', sheets: [{ name: 'Sheet1', rows: [['Initial']] }], preview: false };
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      fs.writeFileSync(args[1], 'private'); return { code: 0, stdout: '', stderr: '' };
+    }).mockImplementationOnce((_args: string[], options: { stdin: string }) => atomicRejection(options));
+    const first = creationReceipt(await getTool('create_xlsx').execute(input, ctx()));
+    const arrived = path.join(h.workspace, input.path);
+    fs.writeFileSync(arrived, 'newer-independent-file'); produced.add(arrived);
+    const retry = await getTool('create_xlsx').execute({ ...input,
+      sheets: [{ name: 'Sheet1', rows: [['Corrected']] }], retry_of: first.operation_id }, ctx());
+    expect(retry.isError).toBeUndefined();
+    expect(fs.readFileSync(arrived, 'utf8')).toBe('newer-independent-file');
+    expect(fs.readFileSync(path.join(h.workspace, 'arrived-2.xlsx'), 'utf8')).toBe('created-office-file');
+    expect(creationReceipt(retry).operation_id).toBe(first.operation_id);
+  });
+
+  it('preserves Word replacement and independent workbooks while keeping their creation identities separate', async () => {
+    const word = { path: 'editable.docx', paragraphs: [{ text: 'First' }], preview: false };
+    const first = await getTool('create_docx').execute(word, ctx());
+    const second = await getTool('create_docx').execute({ ...word, paragraphs: [{ text: 'Second' }] }, ctx());
+    expect(second.isError).toBeUndefined();
+    expect(creationReceipt(second).operation_id).not.toBe(creationReceipt(first).operation_id);
+    for (const name of ['report-a.xlsx', 'report-b.xlsx']) {
+      const result = await getTool('create_xlsx').execute({ path: name, sheets: [{ name: 'Sheet1', rows: [[name]] }], preview: false }, ctx());
+      expect(result.isError).toBeUndefined();
+      expect(fs.existsSync(path.join(h.workspace, name))).toBe(true);
+    }
+  });
+
+  it('refuses new writes when retained creation evidence is corrupt or unavailable', async () => {
+    const input = { path: 'retained.pptx', slides: [{ title: 'Delivered' }], preview: false };
+    const first = await getTool('create_pptx').execute(input, ctx());
+    const state = path.join(tmpDir, 'office-creation-state');
+    fs.writeFileSync(path.join(state, `operation-${creationReceipt(first).operation_id}.json`), '{corrupt');
+    fs.unlinkSync(path.join(h.workspace, input.path));
+    const calls = h.runOfficeCli.mock.calls.length;
+    expect((await getTool('create_pptx').execute(input, ctx())).content).toContain('E_OFFICE_CREATION_STATE_UNAVAILABLE');
+    const unavailable = path.join(tmpDir, 'not-a-directory');
+    fs.writeFileSync(unavailable, 'regular-file');
+    const tool = createOfficeTools({ userId: 'user-1', creationStateDir: unavailable }).find(tool => tool.name === 'create_pptx')!;
+    expect((await tool.execute({ ...input, path: 'new.pptx' }, ctx())).isError).toBe(true);
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(path.join(h.workspace, 'new.pptx'))).toBe(false);
+  });
+
+  it('reserves initial work before awaiting native completion, so a rebuilt caller cannot duplicate it', async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      entered(); await blocked; fs.writeFileSync(args[1], 'one-deck');
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    const input = { path: 'in-flight.pptx', slides: [{ title: 'One deck' }], preview: false };
+    const first = getTool('create_pptx').execute(input, ctx());
+    await started;
+    const duplicate = await getTool('create_pptx').execute(input, ctx());
+    expect(duplicate.isError).toBe(true);
+    expect(creationReceipt(duplicate)).toMatchObject({ publication: 'unknown', retry_available: false });
+    release();
+    expect((await first).isError).toBeUndefined();
+    expect(h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'create')).toHaveLength(1);
+    expect(fs.readFileSync(path.join(h.workspace, input.path), 'utf8')).toBe('one-deck');
+  });
 
   it('does not expose Office tools without a user-scoped workspace', () => {
     expect(createOfficeTools()).toEqual([]);
@@ -203,7 +611,7 @@ describe('Office built-in tools', () => {
       additionalProperties: false,
       required: ['path', 'sheets'],
     });
-    expect(Object.keys(schema.properties)).toEqual(['path', 'sheets', 'preview']);
+    expect(Object.keys(schema.properties)).toEqual(['path', 'retry_of', 'sheets', 'preview']);
     const sheetProps = schema.properties.sheets.items.properties;
     const cellObjectSchema = sheetProps.rows.items.items;
     const cellProps = cellObjectSchema.properties;
@@ -295,14 +703,19 @@ describe('Office built-in tools', () => {
     const tool = getTool('create_pptx');
     const schema = tool.inputSchema as any;
     const slideProps = schema.properties.slides.items.properties;
-    expect(tool.description).toContain('native editable charts');
+    expect(tool.description).toContain('editable PPTX');
+    expect(tool.description).toContain('charts/diagrams are native');
     expect(slideProps.shapes.items.properties.gradient).toBeDefined();
     expect(slideProps.shapes.items.properties.margin).toBeDefined();
     expect(slideProps.shapes.items.properties.shadow).toMatchObject({
       type: ['string', 'boolean'],
     });
     expect(slideProps.shapes.items.properties.shadow.description).toContain('preset names are unsupported');
-    expect(slideProps.images.items.properties.crop).toBeDefined();
+    expect(slideProps.images.description).toMatch(/Crop edges: percent/i);
+    expect(slideProps.images.description).toContain('left,top,right,bottom');
+    expect(slideProps.charts.description).toContain('anchor: x,y,width,height lengths');
+    expect(slideProps.charts.description).toContain('gridlines: hex color');
+    expect(slideProps.charts.description).toContain('Source external data visibly');
     expect(slideProps.charts.items.properties.type.enum).toContain('waterfall');
     expect(slideProps.tables.items.properties.headerFill).toBeDefined();
 
@@ -316,7 +729,7 @@ describe('Office built-in tools', () => {
           text: '增长概览', x: '0.7in', y: '0.55in', width: '4in', height: '0.55in',
           gradient: '#5B5BD6-#8957E5-25', margin: '0.08in', line: '#FFFFFF', lineWidth: '1pt',
         }],
-        images: [{ src: imagePath, x: '9.5in', y: '0.5in', width: '3in', height: '2in', crop: 'cover', alt: '产品界面' }],
+        images: [{ src: imagePath, x: '9.5in', y: '0.5in', width: '3in', height: '2in', crop: '10,5,10,5', alt: '产品界面' }],
         charts: [{
           type: 'column', data: '营收:32,48,66;利润:8,14,21', categories: 'Q1,Q2,Q3',
           x: '0.7in', y: '1.5in', width: '7.6in', height: '4.8in', colors: '#5B5BD6,#22A06B',
@@ -341,13 +754,162 @@ describe('Office built-in tools', () => {
     expect(operations).toContainEqual({
       command: 'add', parent: '/slide[1]', type: 'picture',
       props: {
-        src: imagePath, x: '9.5in', y: '0.5in', width: '3in', height: '2in', crop: 'cover', alt: '产品界面',
+        src: imagePath, x: '9.5in', y: '0.5in', width: '3in', height: '2in', crop: '10,5,10,5', alt: '产品界面',
       },
     });
     expect(operations).toContainEqual(expect.objectContaining({
       command: 'add', parent: '/slide[1]', type: 'table',
       props: expect.objectContaining({ headerFill: '#111827', firstRow: 'true' }),
     }));
+  });
+
+  it('creates the requested canvas, theme and native diagram in one initial transaction', async () => {
+    const tool = getTool('create_pptx');
+    const props = (tool.inputSchema as any).properties;
+    expect(props.canvas.properties.size.enum).toContain('standard');
+    expect(props.theme.properties['bodyFont.ea']).toBeDefined();
+    expect(props.slides.items.properties.diagrams.items.properties.render).toBeUndefined();
+    const result = await tool.execute({ path: 'diagram.pptx', preview: false,
+      canvas: { size: 'standard' }, theme: { accent1: '#7C3AED', bodyFont: 'Arial' },
+      slides: [{ diagrams: [{ mermaid: 'flowchart LR; A[Input] --> B[Result]', x: '1in', y: '1in', width: '8in', height: '4in' }] }],
+    }, ctx());
+    expect(result.isError).toBeUndefined();
+    expect(h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'create')).toHaveLength(1);
+    const batches = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
+    expect(batches).toHaveLength(1);
+    expect(JSON.parse(batches[0][1].stdin)).toEqual([
+      { command: 'set', path: '/', props: { slideSize: 'standard' } },
+      { command: 'set', path: '/theme', props: { accent1: '#7C3AED', bodyFont: 'Arial' } },
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      { command: 'add', parent: '/slide[1]', type: 'diagram', props: {
+        mermaid: 'flowchart LR; A[Input] --> B[Result]', render: 'native', poster: 'false', x: '1in', y: '1in', width: '8in', height: '4in',
+      } },
+    ]);
+  });
+
+  it('exposes optional placeholder styles and applies them in the initial transaction', async () => {
+    const tool = getTool('create_pptx');
+    const fields = (tool.inputSchema as any).properties.slides.items.properties;
+    expect(fields.titleStyle.type).toBe('object');
+    expect(fields.bodyStyle.type).toBe('object');
+    const result = await tool.execute({ path: 'styled.pptx', preview: false, slides: [{
+      title: 'Working title', body: 'Supporting copy',
+      titleStyle: { size: '28', height: '0.6in', color: '#FFFFFF' },
+      bodyStyle: { y: '1.4in', size: '18' },
+    }] }, ctx());
+    expect(result.isError).toBeUndefined();
+    const batches = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
+    expect(batches).toHaveLength(1);
+    expect(JSON.parse(batches[0][1].stdin)).toContainEqual({ command: 'set', path: '/slide[1]/shape[1]',
+      props: { size: '28', height: '0.6in', color: '#FFFFFF' } });
+  });
+
+  it('appends a complete page atomically with sandboxed local assets while preserving the source', async () => {
+    const source = path.join(h.workspace, 'existing.pptx');
+    const image = path.join(h.attachments, 'diagram.png');
+    fs.writeFileSync(source, 'original-deck');
+    fs.writeFileSync(image, 'local-picture');
+    const result = await getTool('edit_office').execute({ path: source, operations: [{
+      action: 'add', parent: '/', type: 'slide', props: { title: 'New page',
+        titleStyle: { size: '28' }, shapes: [{ text: 'Detail', x: '1in' }],
+        images: [{ src: image, x: '2in' }],
+        diagrams: [{ mermaid: 'flowchart LR; A --> B', x: '1in', y: '3in', width: '8in', height: '2in' }],
+      },
+    }] }, ctx());
+    expect(result.isError).toBeUndefined();
+    expect(fs.readFileSync(source, 'utf8')).toBe('original-deck');
+    const batches = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
+    expect(batches).toHaveLength(1);
+    expect(JSON.parse(batches[0][1].stdin)).toContainEqual({ command: 'add', parent: '/slide[last()]', type: 'picture',
+      props: { src: image, x: '2in' } });
+    expect(h.runOfficeCli.mock.calls.some(([args]) => args[0] === 'create')).toBe(false);
+  });
+
+  it.each(['titleStyle', 'bodyStyle'])('uses the existing unit contract for %s before creating a file', async field => {
+    const result = await getTool('create_pptx').execute({ path: 'units.pptx', slides: [{
+      title: 'Title', body: 'Body', [field]: { x: '0.8' },
+    }] }, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain(`slides[0].${field}.x`);
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+  });
+
+  it.each(['https://example.com/image.png', '/outside/private.png'])('keeps complete-page asset reads inside the existing sandbox: %s', async src => {
+    const file = path.join(h.workspace, 'source.pptx');
+    fs.writeFileSync(file, 'unchanged');
+    const result = await getTool('edit_office').execute({ path: file, operations: [{
+      action: 'add', parent: '/', type: 'slide', props: { images: [{ src }] },
+    }] }, ctx());
+    expect(result.isError).toBe(true);
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('unchanged');
+    expect(fs.readdirSync(h.workspace)).toEqual(['source.pptx']);
+  });
+
+  it.each([
+    { canvas: { width: '12in' } },
+    { canvas: { size: 'standard', width: '12in', height: '7in' } },
+    { canvas: { width: '-12in', height: '7in' } },
+    { canvas: { size: { toString: 1 } } },
+    { theme: { unexpected: 'value' } },
+    { slides: [{ diagrams: [{ mermaid: '' }] }] },
+    { slides: [{ diagrams: [{ mermaid: 'flowchart LR; A --> B', render: 'image' }] }] },
+    { slides: [{ diagrams: [{ mermaid: 'flowchart LR; A --> B', src: '/outside/private.mmd' }] }] },
+  ])('rejects invalid or unsafe new creation options before dispatch: %j', async (options) => {
+    const result = await getTool('create_pptx').execute({ path: 'rejected.pptx', preview: false, ...options }, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BAD_INPUT');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(h.workspace, 'rejected.pptx'))).toBe(false);
+  });
+
+  it.each([[15, true], [16, true], [17, false]])('bounds native graph count at the declared resource limit: %i', async (count, allowed) => {
+    const graph = { mermaid: 'flowchart LR; A --> B', x: '1in', y: '1in', width: '8in', height: '4in' };
+    const result = await getTool('create_pptx').execute({ path: 'bounded.pptx', preview: false,
+      slides: [{ diagrams: Array.from({ length: count }, () => graph) }],
+    }, ctx());
+    expect(!!result.isError).toBe(!allowed);
+    expect(h.runOfficeCli.mock.calls.some(([args]) => args[0] === 'create')).toBe(allowed);
+  });
+
+  it.each([[15999, true], [16000, true], [16001, false]])('bounds native graph source size before dispatch: %i', async (characters, allowed) => {
+    const source = 'flowchart LR; A --> B'.padEnd(characters);
+    const result = await getTool('create_pptx').execute({ path: 'bounded.pptx', preview: false,
+      slides: [{ diagrams: [{ mermaid: source, x: '1in', y: '1in', width: '8in', height: '4in' }] }],
+    }, ctx());
+    expect(!!result.isError).toBe(!allowed);
+    expect(h.runOfficeCli.mock.calls.some(([args]) => args[0] === 'create')).toBe(allowed);
+  });
+
+  it.each(['shapes', 'images', 'charts', 'tables'])('locates unitless decimal geometry before creating a file: %s', async (group) => {
+    const image = path.join(h.workspace, 'unit-fixture.png');
+    fs.writeFileSync(image, Buffer.from('png-fixture'));
+    const content = { shapes: { text: 'Source label' }, images: { src: image },
+      charts: { type: 'column', data: 'Series:1,2' }, tables: { rows: [['Source', 'Value']] } };
+    const result = await getTool('create_pptx').execute({ path: 'units.pptx', preview: false,
+      slides: [{ [group]: [{ ...content[group as keyof typeof content], x: '0.8', y: '1in', width: '2in', height: '1in' }] }],
+    }, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain(`slides[0].${group}[0].x`);
+    expect(result.content).toContain('unitless decimal');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
+    // An input-only refusal must leave the initial creation available.
+    const fixed = await getTool('create_pptx').execute({ path: 'units.pptx', preview: false,
+      slides: [{ shapes: [{ text: 'Corrected', x: '0.8in' }] }],
+    }, ctx());
+    expect(fixed.isError).toBeUndefined();
+    expect(creationReceipt(fixed).attempt).toBe(1);
+  });
+
+  it.each(['0', '914400', '1e6', '1.5e2', '0.8in', ' 2.54cm ', '-1mm', '0.5pt'])('preserves native coordinate meanings without guessing a unit: %s', async x => {
+    const result = await getTool('create_pptx').execute({ path: 'units.pptx', preview: false,
+      slides: [{ shapes: [{ text: 'Native coordinate', x }] }],
+    }, ctx());
+    expect(result.isError).toBeUndefined();
+    const batch = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
+    expect(JSON.parse(batch![1].stdin)).toContainEqual({ command: 'add', parent: '/slide[1]', type: 'shape', props: { text: 'Native coordinate', x } });
   });
 
   it('allows intentionally repeated placeholder and shape copy', async () => {
@@ -468,12 +1030,13 @@ describe('Office built-in tools', () => {
     expect(fs.readdirSync(h.workspace)).toEqual([]);
   });
 
-  it('keeps a prior conversation-produced workbook intact when a recreate batch fails', async () => {
+  it('keeps a delivered workbook intact by rejecting recreation before another batch', async () => {
     const tool = getTool('create_xlsx');
     const first = await tool.execute({path: 'stable.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['original']] }]}, ctx());
     expect(first.isError).toBeUndefined();
     const stable = path.join(h.workspace, 'stable.xlsx');
     const before = fs.readFileSync(stable);
+    const calls = h.runOfficeCli.mock.calls.length;
 
     h.runOfficeCli.mockImplementation(async (args: string[]) => {
       if (args[0] === 'create' && args[1]) {
@@ -489,7 +1052,8 @@ describe('Office built-in tools', () => {
     const failed = await tool.execute({path: 'stable.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['replacement']] }]}, ctx());
 
     expect(failed).toMatchObject({ isError: true });
-    expect(failed.content).toContain('E_OFFICE_BATCH_FAILED');
+    expect(failed.content).toContain('E_OFFICE_RETRY_NOT_ALLOWED');
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
     expect(fs.readFileSync(stable)).toEqual(before);
     expect(fs.readdirSync(h.workspace).some((name) => name.startsWith('.orkas-office-create-')))
       .toBe(false);
@@ -512,7 +1076,9 @@ describe('Office built-in tools', () => {
       targets: Array.from({ length: 33 }, (_, index) => `/body/p[${index + 1}]`),
     }, ctx());
 
-    expect(text.content).toBe('ok');
+    expect(JSON.parse(text.content)).toMatchObject({ status: 'partial',
+      unread_sections: ['/footnotes', '/endnotes'], sections: [{ target: '/body', content: 'ok' },
+        { target: '/footnotes', status: 'unavailable' }, { target: '/endnotes', status: 'unavailable' }] });
     expect(outline.content).toBe('ok');
     expect(JSON.parse(get.content)).toEqual({
       status: 'complete',
@@ -530,6 +1096,8 @@ describe('Office built-in tools', () => {
     expect(tooMany.content).toContain('1 to 32');
     expect(h.runOfficeCli.mock.calls.map(([args]) => args)).toEqual([
       ['view', file, 'text'],
+      ['get', file, '/footnotes', '--json'],
+      ['get', file, '/endnotes', '--json'],
       ['view', file, 'outline'],
       ['get', file, '/body/p[1]', '--json'],
       ['query', file, 'p.title', '--json'],
@@ -538,6 +1106,152 @@ describe('Office built-in tools', () => {
     const schema = read.inputSchema as any;
     expect(schema.properties.target).toBeUndefined();
     expect(schema.properties.targets).toMatchObject({ type: 'array', minItems: 1, maxItems: 32 });
+  });
+
+  // A content review must retain facts outside the body and disclose incomplete scope.
+  function docxReadFixture(noteFailure?: 'failure' | 'malformed' | 'overflow') {
+    const file = path.join(h.workspace, 'annotated.docx');
+    fs.writeFileSync(file, 'protected source bytes');
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'view') return { code: 0, stdout: '[/body/p[1]] Body fact 418', stderr: '' };
+      if (args[2] === '/footnotes' && noteFailure === 'overflow') {
+        throw new OfficeCliError('E_OFFICE_OUTPUT_LIMIT', 'private source diagnostic');
+      }
+      if (args[2] === '/footnotes' && noteFailure) return {
+        code: noteFailure === 'failure' ? 3 : 0,
+        stdout: noteFailure === 'malformed' ? 'not JSON' : '', stderr: 'private source diagnostic',
+      };
+      const kind = args[2] === '/footnotes' ? 'footnote' : 'endnote';
+      return { code: 0, stderr: '', stdout: JSON.stringify({ success: true, data: {
+        matches: 1, results: [{ path: args[2], type: kind + 's', children: [
+          { path: args[2] + '/' + kind + '[3]', type: kind,
+            format: { id: kind === 'footnote' ? 7 : 12 }, text: kind + ' fact 529' },
+        ] }],
+      } }) };
+    });
+    return file;
+  }
+
+  it('default DOCX content includes separate body, footnote and endnote identities without writes', async () => {
+    const file = docxReadFixture();
+    const result = await getTool('office_read').execute({ path: file }, ctx());
+    const payload = JSON.parse(result.content);
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({ status: 'complete', scope: ['/body', '/footnotes', '/endnotes'],
+      other_regions: 'not_read', source_truncated: false, unread_sections: [], sections: [
+        { target: '/body', status: 'complete', content: '[/body/p[1]] Body fact 418' },
+        { target: '/footnotes', status: 'complete', data: { results: [{ children: [
+          { path: '/footnotes/footnote[3]', type: 'footnote', format: { id: 7 }, text: 'footnote fact 529' },
+        ] }] } },
+        { target: '/endnotes', status: 'complete', data: { results: [{ children: [
+          { path: '/endnotes/endnote[3]', type: 'endnote', format: { id: 12 }, text: 'endnote fact 529' },
+        ] }] } },
+      ] });
+    expect(fs.readFileSync(file, 'utf8')).toBe('protected source bytes');
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(3);
+  });
+
+  it('marks authoritatively absent DOCX notes as absent rather than unread', async () => {
+    const file = docxReadFixture();
+    h.runOfficeCli.mockImplementation(async (args: string[]) => args[0] === 'view'
+      ? { code: 0, stdout: 'Body', stderr: '' }
+      : { code: 1, stdout: JSON.stringify({ success: false, error: { code: 'not_found' } }), stderr: '' });
+    const p = JSON.parse((await getTool('office_read').execute({ path: file }, ctx())).content);
+    expect(p.status).toBe('complete');
+    expect(p.unread_sections).toEqual([]);
+    expect(p.sections.slice(1)).toEqual([
+      { target: '/footnotes', status: 'absent' }, { target: '/endnotes', status: 'absent' },
+    ]);
+  });
+
+  it.each(['failure', 'malformed'] as const)('retains readable sections and discloses a %s note read without private errors', async failure => {
+    const file = docxReadFixture(failure);
+    const result = await getTool('office_read').execute({ path: file }, ctx());
+    const p = JSON.parse(result.content);
+    expect(result.isError).toBeUndefined();
+    expect(p).toMatchObject({ status: 'partial', unread_sections: ['/footnotes'], source_truncated: false });
+    expect(p.sections[0].content).toContain('Body fact 418');
+    expect(p.sections[1]).toEqual({ target: '/footnotes', status: 'unavailable', error: 'E_OFFICE_READ_FAILED' });
+    expect(p.sections[2].data.results[0].children[0].text).toBe('endnote fact 529');
+    expect(result.content).not.toContain('private source diagnostic');
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares the source byte budget and reports overflow plus unattempted notes without replay', async () => {
+    const file = docxReadFixture('overflow');
+    const p = JSON.parse((await getTool('office_read').execute({ path: file }, ctx())).content);
+    expect(p).toMatchObject({ status: 'partial', source_truncated: true, unread_sections: ['/footnotes', '/endnotes'] });
+    expect(p.sections.slice(1)).toEqual([
+      { target: '/footnotes', status: 'truncated', error: 'E_OFFICE_OUTPUT_LIMIT' },
+      { target: '/endnotes', status: 'not_read', error: 'E_OFFICE_OUTPUT_LIMIT' },
+    ]);
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
+    expect(h.runOfficeCli.mock.calls[1][1].maxOutputBytes).toBeLessThan(h.runOfficeCli.mock.calls[0][1].maxOutputBytes);
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses one monotonic source deadline and names sections not started before expiry', async () => {
+    const file = docxReadFixture();
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const readNative = h.runOfficeCli.getMockImplementation()!;
+    h.runOfficeCli.mockImplementation(async (args: string[], opts: unknown) => {
+      const result = await readNative(args, opts);
+      clock.mockReturnValue(args[0] === 'view' ? 59_500 : 60_001);
+      return result;
+    });
+    const p = JSON.parse((await getTool('office_read').execute({ path: file }, ctx())).content);
+    expect(p).toMatchObject({ status: 'partial', unread_sections: ['/endnotes'], source_truncated: false });
+    expect(p.sections[2]).toEqual({ target: '/endnotes', status: 'not_read', error: 'E_OFFICE_TIMEOUT' });
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
+    expect(h.runOfficeCli.mock.calls[1][1].timeoutMs).toBe(500);
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops source reads on cancellation and still releases the resident', async () => {
+    const file = docxReadFixture();
+    const abort = new AbortController();
+    h.runOfficeCli.mockImplementationOnce(async () => {
+      abort.abort(); return { code: 0, stdout: 'Body', stderr: '' };
+    });
+    await expect(getTool('office_read').execute({ path: file }, ctx({ signal: abort.signal })))
+      .rejects.toMatchObject({ code: 'E_OFFICE_ABORTED' });
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(1);
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed scoped read when no section was acquired instead of claiming an empty document', async () => {
+    const file = docxReadFixture();
+    h.runOfficeCli.mockResolvedValue({ code: 3, stdout: '', stderr: 'private source diagnostic' });
+    const result = await getTool('office_read').execute({ path: file }, ctx());
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ status: 'failed',
+      unread_sections: ['/body', '/footnotes', '/endnotes'] });
+    expect(result.content).not.toContain('private source diagnostic');
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+    expect(onFileWritten).not.toHaveBeenCalled();
+  });
+
+  it('retains late DOCX notes losslessly when the complete receipt exceeds inline capacity', async () => {
+    const file = docxReadFixture();
+    h.runOfficeCli.mockImplementationOnce(async () => ({ code: 0,
+      stdout: '[/body/p[1]] ' + 'Long body text. '.repeat(2000), stderr: '' }));
+    const dir = path.join(tmpDir, 'result-store');
+    const tool = wrapToolWithCap(getTool('office_read'), { maxInlineTokens: 1000, toolResultsDir: dir });
+    const result = await tool.execute({ path: file }, ctx());
+    expect(result.content).toContain('<persisted-output');
+    expect(result.content).toContain('source_truncated="false"');
+    expect(result.persistedOutput?.ref).toMatch(/^office_read\.[a-f0-9]{64}$/);
+    const complete = JSON.parse(fs.readFileSync(path.join(dir, result.persistedOutput!.ref + '.txt'), 'utf8'));
+    expect(complete.status).toBe('complete');
+    expect(complete.sections[0].content).toBe('[/body/p[1]] ' + 'Long body text. '.repeat(2000));
+    expect(complete.sections[1].data.results[0].children[0].text).toBe('footnote fact 529');
+    expect(complete.sections[2].data.results[0].children[0].text).toBe('endnote fact 529');
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(3);
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+    expect(onFileWritten).not.toHaveBeenCalled();
   });
 
   it('returns successful formula evidence when one batched target fails', async () => {
@@ -1257,6 +1971,21 @@ describe('Office built-in tools', () => {
     });
   });
 
+  it.each(['check', 'check_and_render'])('reports incomplete PPTX contrast coverage for %s without changing the document', async (action) => {
+    const file = path.join(h.workspace, 'unreviewed.pptx');
+    fs.writeFileSync(file, 'original-document');
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"success":true,"data":{"count":0,"issues":[]}}', stderr: '' })
+      .mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'Synthetic contrast scan unavailable' });
+    h.renderOfficePageToPng.mockResolvedValueOnce(Buffer.from('png-bytes'));
+    const result = await getTool('office_review').execute({ action, path: file }, ctx());
+    const body = action === 'check' ? result.content : result.content.match(/<office-check>\n([\s\S]*?)\n<\/office-check>/)![1];
+    expect(JSON.parse(body)).toMatchObject({ valid: true, contrast_scan_ok: false, structural_review_status: 'indeterminate' });
+    expect(fs.readFileSync(file, 'utf8')).toBe('original-document');
+    expect(h.closeOfficeFile).toHaveBeenCalledWith(file, h.workspace);
+  });
+
   it('supplements the PPTX issue scan with theme-aware contrast findings', async () => {
     const file = path.join(h.workspace, 'existing.pptx');
     fs.writeFileSync(file, 'fixture');
@@ -1442,6 +2171,7 @@ describe('Office built-in tools', () => {
     expect(reviewed.images).toHaveLength(1);
     expect(reviewed.content).toContain('<office-check>');
     expect(reviewed.content).toContain('E_OFFICE_RENDER_FAILED');
+    expect(reviewed.content).toContain('page 2 render failed');
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
     expect(h.closeOfficeFile).toHaveBeenCalledWith(file, path.dirname(file));
   });
@@ -1528,6 +2258,7 @@ describe('Office built-in tools', () => {
     expect(result.content).toContain('<office-render page="1">');
     expect(result.content).toContain('<office-render page="2">');
     expect(result.content).toContain('E_OFFICE_RENDER_FAILED');
+    expect(result.content).toContain('page 2 render failed');
     expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(2);
     expect(h.runOfficeCli).not.toHaveBeenCalled();
     // Render-only reviews name the source file once instead of echoing the
@@ -1536,6 +2267,75 @@ describe('Office built-in tools', () => {
     expect(result.content).toContain(`path="${file}"`);
     expect(result.content.split('<office-render page').slice(1).join('')).not.toContain('artifact_sha256=');
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { error: Object.assign(new Error('Resident main pipe busy or unresponsive'), { exitCode: 3 }),
+      expected: { message: 'Resident main pipe busy or unresponsive', exit_code: 3 } },
+    { error: new OfficeCliError('E_OFFICE_TIMEOUT', 'OfficeCLI timed out after 60000ms: view'),
+      expected: { message: 'OfficeCLI timed out after 60000ms: view', source_code: 'E_OFFICE_TIMEOUT' } },
+    // Error-looking prose is evidence only; it must not become a guessed code.
+    { error: new Error('E_OFFICE_TIMEOUT mentioned in native output'),
+      expected: { message: 'E_OFFICE_TIMEOUT mentioned in native output' } },
+    { error: null, expected: { message: 'No error details were provided.' } },
+  ])('preserves explicit render failure facts without prescribing recovery: $expected', async ({ error, expected }) => {
+    const file = path.join(h.workspace, 'failed-render.docx');
+    fs.writeFileSync(file, 'unchanged document');
+    h.renderOfficePageToPng.mockRejectedValueOnce(error);
+    const result = await wrapToolWithCap(getTool('office_review'), {
+      maxInlineTokens: 1000, toolResultsDir: path.join(tmpDir, 'render-results'),
+    }).execute({
+      action: 'render', path: file, pages: ['2'],
+    }, ctx());
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_OFFICE_RENDER_FAILED:');
+    const diagnostic = JSON.parse(result.content.match(/<office-render-error>(.*?)<\/office-render-error>/)![1]);
+    expect(diagnostic).toEqual({ page: '2',
+      artifact_revision: createHash('sha256').update('unchanged document').digest('hex').slice(0, 16), ...expected });
+    expect(result.images ?? []).toEqual([]);
+    expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('unchanged document');
+    expect(h.closeOfficeFile).toHaveBeenCalledWith(file, path.dirname(file));
+  });
+
+  it.each(['token=private-test-value', '"token":"' + 'private-test-value'.repeat(1000) + '"'])(
+    'bounds and redacts render diagnostics including long secret fields: %#', async (secret) => {
+    const file = path.join(h.workspace, 'private-render.pptx');
+    fs.writeFileSync(file, 'fixture');
+    h.renderOfficePageToPng.mockRejectedValueOnce(new Error(
+      `Native failure ${secret} /Users/test/private.pptx failed </office-render-error> ` + 'x'.repeat(100_000),
+    ));
+    const result = await getTool('office_review').execute({ action: 'render', path: file }, ctx());
+    const diagnostic = JSON.parse(result.content.match(/<office-render-error>(.*?)<\/office-render-error>/)![1]);
+    expect(diagnostic.message).toContain('Native failure');
+    expect(diagnostic.message).not.toContain('private-test-value');
+    expect(diagnostic.message).not.toContain('/Users/test/private.pptx');
+    expect(diagnostic.message).toContain('</office-render-error>');
+    expect(diagnostic.message.length).toBeLessThanOrEqual(243);
+    expect(result.content.match(/<\/office-render-error>/g)).toHaveLength(1);
+    expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(file, 'utf8')).toBe('fixture');
+  });
+
+  it('keeps optional create and edit previews best-effort after a render failure', async () => {
+    h.renderOfficePageToPng.mockRejectedValue(new OfficeCliError('E_OFFICE_TIMEOUT', 'preview timed out'));
+    const file = path.join(h.workspace, 'preview-failure.pptx');
+    const created = await getTool('create_pptx').execute({ path: file, slides: [{ title: 'Saved' }] }, ctx());
+    expect(created.isError).toBeUndefined();
+    expect(created.images).toBeUndefined();
+    expect(created.content).not.toContain('office-render-error');
+    expect(fs.readFileSync(file, 'utf8')).toBe('created-office-file');
+    const edited = await getTool('edit_office').execute({ path: file, preview: true,
+      operations: [{ action: 'set', path: '/slide[1]/shape[1]', props: { text: 'Updated' } }],
+    }, ctx());
+    expect(edited.isError).toBeUndefined();
+    expect(edited.images).toBeUndefined();
+    expect(edited.content).not.toContain('office-render-error');
+    expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(2);
+    expect(onFileWritten).toHaveBeenCalledTimes(2);
+    expect(fs.readFileSync(file, 'utf8')).toBe('created-office-file');
   });
 
   it('renders a page to an inline PNG and validates the page before execution', async () => {

@@ -119,6 +119,14 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(craft).toContain('Skip it for crop, resize');
     expect(canvas).toContain('Skip it for a simple single-region image');
     expect(compose).toContain('Do not preload it during routing');
+    // Discovery must expose conversion before the production instructions load.
+    const composeSelection = router.split('\n').find(line => line.startsWith('- Add `image-compose`'))!;
+    for (const entry of [composeSelection, compose.split('\n').find(line => line.startsWith('description_en:'))!,
+      compose.split('\n').find(line => line.startsWith('Read this skill'))!]) {
+      expect(entry).toMatch(/SVG\/HTML conversion/);
+      expect(entry).toMatch(/requested vector PDF delivery/);
+    }
+    expect(compose.split('\n').find(line => line.startsWith('description_zh:'))).toMatch(/SVG\/HTML.*矢量 PDF/);
     expect(generate).toContain('Do not load it for `COMPOSE`');
     expect(review).toContain('Never load it at task start');
   });
@@ -226,21 +234,59 @@ describe('ImageStudio built-in agent evaluation', () => {
     const standards = agent.standards.join('\n');
 
     expect(standards).toMatch(/set preserves the approved anchor identity/i);
-    // The reference mechanics moved into image-design-review, which is read at
-    // the point they apply. `review` is already loaded above.
-    expect(review).toMatch(/reference_intent\.mode:\s*"guide"/i);
-    expect(review).toMatch(/reference_intent\.minimum_score` to at least 85/i);
-    expect(review).toMatch(/reference_intent\.minimum_score` to at least 85/i);
-    expect(review).toContain('inspect all final images side by side');
-    expect(review).toMatch(/individual scores are not evidence of set-level consistency/i);
+    const contract = fs.readFileSync(path.join(agentDir, 'skills', 'image-compose', 'references', 'multi-image-sets.md'), 'utf8');
+    // The same requirements must be available before pixels exist and still
+    // govern actual review; relocating them does not lower acceptance.
+    expect(contract).toMatch(/reference_intent\.mode:\s*"guide"/i);
+    expect(contract).toMatch(/reference_intent\.minimum_score` to at least 85/i);
+    expect(contract).toContain('inspect all final images side by side');
+    expect(contract).toMatch(/individual scores are not evidence of set-level consistency/i);
     expect(craft).toContain('define this art direction once for the set');
     expect(craft).toMatch(/authored compositions follow the current artifact review handoff/i);
-    expect(review).toMatch(/multiple non-generation images as one set/i);
-    expect(compose).toContain('do not redesign the visual system per image');
-    expect(review).toContain('role:"style"');
-    expect(review).toContain('reference_intent.mode:"guide"');
-    expect(review).toContain('Use the existing `reference_fidelity` score as the style-consistency score');
-    expect(review).toContain('Separate high individual scores are not evidence of set-level consistency');
+    expect(contract).toMatch(/multiple non-generation images as one set/i);
+    expect(contract).toContain('do not redesign the visual system per image');
+    expect(contract).toContain('role:"style"');
+    expect(contract).toContain('Use the existing `reference_fidelity` score as the style-consistency score');
+    for (const body of [compose, review]) {
+      expect(body).toContain('multi-image-sets.md)');
+      expect(body).not.toContain('reference_intent.minimum_score` to at least 85');
+    }
+  });
+
+  it('makes the authored-set contract reachable for planning while keeping review evidence-gated', () => {
+    const skills = path.join(agentDir, 'skills');
+    const owners = ['image-router', 'image-compose', 'image-design-review'];
+    const targets = owners.map(owner => {
+      const body = fs.readFileSync(path.join(skills, owner, 'SKILL.md'), 'utf8');
+      const link = [...body.matchAll(/\]\(([^)]+multi-image-sets\.md)\)/g)];
+      expect(link, `${owner} must route to the shared contract`).toHaveLength(1);
+      const reference = link[0][1];
+      // Cross-Skill links use the advertised logical namespace; local links
+      // remain relative to their owning Skill.
+      const target = reference.startsWith('@skill/')
+        ? path.resolve(skills, reference.slice('@skill/'.length))
+        : path.resolve(skills, owner, reference);
+      expect(fs.statSync(target).isFile(), `${owner} contract must exist`).toBe(true);
+      return target;
+    });
+    expect(new Set(targets).size).toBe(1);
+    expect(targets[0]).toBe(path.resolve(skills, 'image-compose/references/multi-image-sets.md'));
+    const router = fs.readFileSync(path.join(skills, 'image-router/SKILL.md'), 'utf8');
+    expect(router).toMatch(/After route lock[^\n]*non-generation[^\n]*plan[^\n]*multi-image-sets\.md/i);
+    expect(router).toMatch(/planning-only[^\n]*read-only/i);
+    const review = fs.readFileSync(path.join(skills, 'image-design-review/SKILL.md'), 'utf8');
+    expect(review).toMatch(/Read this skill only after[\s\S]*visual_evidence\.attached:true/);
+    expect(review).toMatch(/Never use it for a host-verified `is_generation:true` artifact/);
+  });
+
+  it('grounds the set fidelity score in visible agreement and deviations rather than a percentage claim', () => {
+    const shared = fs.readFileSync(path.join(agentDir, 'skills/image-compose/references/multi-image-sets.md'), 'utf8');
+    expect(shared).toMatch(/review_scope[\s\S]*observed[\s\S]*preserved.*axes/i);
+    expect(shared).toMatch(/review_findings[\s\S]*fix/i);
+    expect(shared).toMatch(/85[\s\S]*not[\s\S]*similarity percentage/i);
+    expect(shared).toMatch(/same.*palette[\s\S]*new content/i);
+    expect(shared).toMatch(/changed.*stroke[\s\S]*fix/i);
+    expect(shared).toContain('reference_intent.minimum_score` to at least 85');
   });
 
   it('keeps external workflow execution private, host-bound, and budgeted', () => {

@@ -27,7 +27,7 @@ const _HOME_FIRST_PAINT_FALLBACK_MS = 1500;
 // the last painted state until the new lookup replaces it.
 let _homeState = 'pending';
 let _homeData = { todos: [], todoTotal: 0, automations: [], tasks: [] };
-let _homeLoadSeq = 0; // { startedAt, reported }
+let _homeLoadSeq = 0;
 let _homeRefreshTimer = null;
 let _homeBound = false;
 const _homeExpanded = new Set();
@@ -228,7 +228,7 @@ const _HOME_STATUS_ICONS = {
   stopped: 'stop',
 };
 
-function _homeRowHtml({ attrs, status, icon, title, source, details, action }) {
+function _homeRowHtml({ attrs, status, icon, title, source, details, action, dueTask }) {
   const attributes = Object.entries(attrs)
     .map(([name, value]) => ` ${name}="${escapeHtml(String(value))}"`)
     .join('');
@@ -237,7 +237,8 @@ function _homeRowHtml({ attrs, status, icon, title, source, details, action }) {
   return `<button type="button" class="home-row"${attributes}>`
     + `<span class="home-row-status is-${kind}" aria-hidden="true">${_homeIcon(icon || _HOME_STATUS_ICONS[kind] || 'dot', 'home-row-status-icon')}</span>`
     + '<span class="home-row-main">'
-    + `<span class="home-row-title">${escapeHtml(title)}</span>`
+    + (dueTask && window.TodoDue ? `<span class="home-row-heading"><span class="home-row-title">${escapeHtml(title)}</span>${window.TodoDue.dotHtml(dueTask)}</span>`
+      : `<span class="home-row-title">${escapeHtml(title)}</span>`)
     + `<span class="home-row-meta"><span class="home-row-source">${escapeHtml(source)}</span>${meta}</span>`
     + '</span>'
     + `<span class="home-row-action">${escapeHtml(action)}${_homeIcon('chevron-right', 'home-row-action-icon')}</span>`
@@ -258,6 +259,7 @@ function _homeTodoRowHtml(task, index) {
     },
     status,
     icon: 'clipboard-list',
+    dueTask: task,
     title: content || t('new_chat.home.untitled'),
     source: pid
       ? t('new_chat.home.source.project_todo', { project: task.project_name || _homeProjectName(pid) })

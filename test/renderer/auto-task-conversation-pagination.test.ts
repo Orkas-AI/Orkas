@@ -48,8 +48,8 @@ describe('automation execution-history pagination', () => {
     expect(ipcSource).toContain("'conversations.autoTaskCounts'");
   });
 
-  it('puts the project create action on the tab row and the sync note above the cards', () => {
+  it('keeps the project create action on the tab row and local history on its panel', () => {
     expect(html).toMatch(/<div class="project-tab-tools" data-project-tools="auto" hidden>\s*<button[^>]*id="project-auto-add-btn"/);
-    expect(html).toMatch(/data-project-panel="auto" hidden>\s*<div class="auto-sync-note" id="project-auto-sync-note" hidden><\/div>\s*<div class="auto-list" id="project-auto-list">/);
+    expect(html).toMatch(/data-project-panel="auto" hidden>\s*<div class="auto-list" id="project-auto-list">/);
   });
 });

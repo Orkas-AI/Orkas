@@ -6,8 +6,8 @@ import type { NativeImage as ElectronNativeImage } from 'electron';
 
 import { hardenedWebPreferences } from '../util/window-security';
 import { isPathAllowed } from '../util/path-sandbox';
-import { encodeImage, imageMetadata } from '../util/sharp-runtime';
-import { isImageStudioGeneration, type ImageStudioGenerationOutput } from './image_studio_provenance';
+import { encodeImage, imageMetadata, matchesPsdPreview } from '../util/sharp-runtime';
+import { imageStudioFileHash, isImageStudioGeneration, type ImageStudioGenerationOutput } from './image_studio_provenance';
 import {
   extractCssImports,
   extractCssUrls,
@@ -170,6 +170,7 @@ export function requiredCopyLayoutIssues(
 }
 
 export interface ImageStudioInspection {
+  page?: import('./image_studio_document').ImageStudioPageContext;
   ok: boolean;
   route?: ImageStudioRoute;
   signature?: string;
@@ -185,6 +186,7 @@ export interface ImageStudioInspection {
 }
 
 export interface ImageStudioEvidenceState {
+  page_id?: string;
   schema_version: 1;
   project_dir: string;
   route: ImageStudioRoute;
@@ -196,6 +198,7 @@ export interface ImageStudioEvidenceState {
   /** Missing legacy provenance never establishes a generation exemption. */
   is_generation?: boolean;
   source_kind?: 'html' | 'raster';
+  exported_png?: { path: string; sha256: string; signature: string };
   review?: {
     verdict: ImageStudioReviewVerdict;
     scope: string;
@@ -863,12 +866,12 @@ async function collectManifestReferenceResources(
   return resources;
 }
 
-async function sha256Files(parts: Array<{ label: string; absPath: string }>): Promise<string> {
+async function sha256Files(parts: Array<{ label: string; absPath: string; content?: string }>): Promise<string> {
   const hash = crypto.createHash('sha256');
   for (const part of parts.sort((a, b) => a.label.localeCompare(b.label))) {
     hash.update(part.label);
     hash.update('\0');
-    hash.update(await fs.readFile(part.absPath));
+    hash.update(part.content ?? await fs.readFile(part.absPath));
     hash.update('\n');
   }
   return hash.digest('hex');
@@ -881,18 +884,38 @@ async function nativeImageFromPath(absPath: string): Promise<ElectronNativeImage
   return image;
 }
 
-async function readManifest(projectDirAbs: string): Promise<{
+async function readManifest(projectDirAbs: string, pageId?: string): Promise<{
   manifestPath: string;
   manifest?: ImageStudioManifest;
+  page?: import('./image_studio_document').ImageStudioPageContext;
+  signatureSource?: string;
   blockers: ImageStudioIssue[];
 }> {
   const manifestPath = path.join(projectDirAbs, 'image-manifest.json');
   let raw = '';
-  try { raw = await fs.readFile(manifestPath, 'utf8'); }
+  try {
+    if (pageId && (await fs.stat(manifestPath)).size > 1_048_576)
+      return { manifestPath, blockers: [{ code: 'E_IMAGE_DOCUMENT_MANIFEST', message: 'Document manifest exceeds 1 MiB.' }] };
+    raw = await fs.readFile(manifestPath, 'utf8');
+  }
   catch { return { manifestPath, blockers: [{ code: 'E_MANIFEST_MISSING', message: 'image-manifest.json is required.' }] }; }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); }
   catch { return { manifestPath, blockers: [{ code: 'E_MANIFEST_JSON', message: 'image-manifest.json must be valid JSON.' }] }; }
+  if (pageId || (parsed as any)?.schema_version === 2 || (parsed as any)?.document !== undefined) {
+    try {
+      if (Buffer.byteLength(raw) > 1_048_576) throw new Error('E_IMAGE_DOCUMENT_MANIFEST: document manifest exceeds 1 MiB.');
+      const { compileImageStudioDocument, imageStudioDocumentPage } = await import('./image_studio_document');
+      const document = compileImageStudioDocument(parsed, validateImageStudioManifest);
+      if (!document) throw new Error('E_IMAGE_DOCUMENT_PAGE_UNEXPECTED: page_id requires a version 2 document.');
+      if (!pageId) throw new Error('E_IMAGE_DOCUMENT_PAGE_REQUIRED: select a stable page identifier for per-page work.');
+      const selected = imageStudioDocumentPage(document, pageId);
+      return { manifestPath, manifest: selected.manifest, page: selected.context, signatureSource: selected.signatureSource, blockers: [] };
+    } catch (error) {
+      const message = (error as Error).message;
+      return { manifestPath, blockers: [{ code: message.split(':', 1)[0], message }] };
+    }
+  }
   const validated = validateImageStudioManifest(parsed);
   return { manifestPath, manifest: validated.manifest, blockers: validated.issues };
 }
@@ -900,9 +923,10 @@ async function readManifest(projectDirAbs: string): Promise<{
 export async function inspectImageStudioProject(
   projectDirAbs: string,
   explicitRasterAbsPath?: string,
+  pageId?: string,
 ): Promise<ImageStudioInspection> {
   const projectDir = path.resolve(projectDirAbs);
-  const read = await readManifest(projectDir);
+  const read = await readManifest(projectDir, pageId);
   const blockers = [...read.blockers];
   const advisories: ImageStudioIssue[] = [];
   if (!read.manifest) return { ok: false, blockers, advisories, resources: [] };
@@ -922,6 +946,11 @@ export async function inspectImageStudioProject(
     const resources = html ? await collectHtmlResources(projectDir, entryAbs, html, blockers) : [];
     if (html) {
       const structure = parseHtmlStructure(html);
+      const numberSlots = structure.tags.filter(tag => 'data-image-page-number' in tag.attrs || 'data-image-page-count' in tag.attrs);
+      if (read.page && ((read.page.number !== undefined && !numberSlots.some(tag => 'data-image-page-number' in tag.attrs))
+        || (read.page.number === undefined && numberSlots.length))) {
+        pushIssue(blockers, 'E_IMAGE_DOCUMENT_NUMBER_SLOT', 'Enabled page numbering needs a data-image-page-number element; numbering slots require document.page_numbers.');
+      }
       const visible = normalizedVisibleText(structure.textContent);
       for (const copy of manifest.brief.required_copy) {
         if (!visible.includes(normalizedVisibleText(copy))) {
@@ -951,7 +980,7 @@ export async function inspectImageStudioProject(
       ...referenceResources.map((item) => item.absPath),
     ])].sort();
     const signature = blockers.length ? undefined : await sha256Files([
-      { label: 'image-manifest.json', absPath: read.manifestPath },
+      { label: 'image-manifest.json', absPath: read.manifestPath, content: read.signatureSource },
       { label: entryRef, absPath: entryAbs },
       ...resources.map((absPath) => ({
         label: serializedProjectRelativePath(projectDir, absPath),
@@ -963,6 +992,7 @@ export async function inspectImageStudioProject(
       ok: blockers.length === 0,
       route: manifest.route,
       source_kind: 'html',
+      ...(read.page ? { page: read.page } : {}),
       is_generation: false,
       ...(signature ? { signature } : {}),
       blockers,
@@ -1028,6 +1058,22 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
+/** Fit both rounded CSS viewport axes without disguising a clipped canvas. */
+export function imageStudioViewportZoom(
+  viewport: { width: number; height: number },
+  canvas: ImageStudioManifest['canvas'],
+): number | undefined {
+  if (![viewport.width, viewport.height, canvas.width, canvas.height].every(Number.isFinite)
+    || canvas.width <= 1 || canvas.height <= 1) return undefined;
+  const width = Math.round(viewport.width), height = Math.round(viewport.height);
+  if (width < canvas.width || width > canvas.width + 1
+    || height < canvas.height || height > canvas.height + 1) return undefined;
+  if (width === canvas.width && height === canvas.height) return 1;
+  const lower = Math.max(1, viewport.width / (canvas.width + 0.5), viewport.height / (canvas.height + 0.5));
+  const upper = Math.min(viewport.width / (canvas.width - 0.5), viewport.height / (canvas.height - 0.5));
+  return lower < upper ? (lower + upper) / 2 : undefined;
+}
+
 /** Browser capture pixels follow display density; the manifest specifies the
  * delivered raster dimensions. Normalize before hashing/review so the reviewed
  * pixels and the exported pixels are the same on every display. */
@@ -1051,10 +1097,13 @@ export async function normalizeImageStudioSnapshot(
   return data;
 }
 
-async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioManifest, outputAbsPath: string): Promise<{
+async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioManifest, outputAbsPath: string, pdf?: { expectedImageHash: string; footerText?: string; deadline?: number; signal?: AbortSignal }, page?: import('./image_studio_document').ImageStudioPageContext): Promise<{
+  pdfBytes?: Buffer;
   image?: ReturnType<typeof analyzeNativeImage>;
   layoutBlockers: ImageStudioIssue[];
 }> {
+  const deadline = Math.min(performance.now() + IMAGE_STUDIO_LOAD_TIMEOUT_MS, pdf?.deadline ?? Infinity);
+  const timeoutMs = () => pdf ? Math.max(1, deadline - performance.now()) : IMAGE_STUDIO_LOAD_TIMEOUT_MS;
   const electron = await import('electron');
   if (!electron.BrowserWindow) throw new Error('E_IMAGE_STUDIO_BROWSER_UNAVAILABLE: Electron BrowserWindow is unavailable.');
   const partition = `image-studio-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -1071,12 +1120,40 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
     backgroundColor: '#00000000',
     webPreferences: hardenedWebPreferences({ session: ses, backgroundThrottling: false }),
   });
+  const abort = () => { try { win.destroy(); } catch { /* already closed */ } };
+  pdf?.signal?.addEventListener('abort', abort, { once: true });
   try {
+    pdf?.signal?.throwIfAborted();
     // Constructor centering on Windows/Linux can constrain the viewport to the
     // display work area. Restore the canvas before loading, as VideoStudio does.
     win.setContentSize(manifest.canvas.width, manifest.canvas.height);
     const entryAbs = path.resolve(projectDirAbs, manifest.entry || 'index.html');
-    await withTimeout(win.loadURL(pathToFileURL(entryAbs).toString()), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_LOAD_TIMEOUT: HTML entry did not finish loading.');
+    await withTimeout(win.loadURL(pathToFileURL(entryAbs).toString()), timeoutMs(), 'E_IMAGE_STUDIO_LOAD_TIMEOUT: HTML entry did not finish loading.');
+    const viewport = await withTimeout(win.webContents.executeJavaScript('({ width: window.visualViewport?.width ?? innerWidth, height: window.visualViewport?.height ?? innerHeight })'),
+      timeoutMs(), 'E_IMAGE_STUDIO_READY_TIMEOUT: canvas viewport did not become ready.');
+    // Fractional display density can round a native viewport up by one DIP.
+    // This window has its own session; correct only that rounding locally.
+    // The exact layout and proportional capture checks below remain required.
+    const zoom = imageStudioViewportZoom(viewport, manifest.canvas);
+    if (zoom !== undefined && zoom !== 1) win.webContents.setZoomFactor(zoom);
+    if (page?.number !== undefined) {
+      await withTimeout(win.webContents.executeJavaScript(`(() => {
+        for (const element of document.querySelectorAll('[data-image-page-number]')) element.textContent = ${JSON.stringify(String(page.number))};
+        for (const element of document.querySelectorAll('[data-image-page-count]')) element.textContent = ${JSON.stringify(String(page.total))};
+      })()`), timeoutMs(), 'E_IMAGE_DOCUMENT_TIMEOUT: page numbering timed out.');
+    }
+    if (pdf) {
+      win.webContents.debugger.attach('1.3');
+      await withTimeout(win.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { media: 'print' }), timeoutMs(), 'E_IMAGE_PDF_TIMEOUT: print preparation timed out.');
+      await win.webContents.insertCSS(`@page{size:${manifest.canvas.width}px ${manifest.canvas.height}px;margin:0} @media print{html,body{margin:0!important} *{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}}`, { cssOrigin: 'user' });
+      const ready = await withTimeout(win.webContents.executeJavaScript(`(async () => {
+        await document.fonts.ready;
+        return !Array.from(document.fonts).some(font => font.status === 'error')
+          && !Array.from(document.images).some(img => img.complete && !img.naturalWidth)
+          && document.getAnimations().length === 0;
+      })()`), timeoutMs(), 'E_IMAGE_PDF_TIMEOUT: print resources did not become ready.');
+      if (!ready) throw new Error('E_IMAGE_PDF_RESOURCES: repair failed fonts or images and freeze animations before PDF export.');
+    }
     const requiredCopyLiteral = JSON.stringify(JSON.stringify(manifest.brief.required_copy));
     const layout = await withTimeout(win.webContents.executeJavaScript(`(async () => {
       if (document.fonts && document.fonts.ready) await document.fonts.ready;
@@ -1171,7 +1248,7 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
         };
       });
       return { viewport: { width: innerWidth, height: innerHeight }, scrollingAreas, requiredCopyLayouts };
-    })()`, true), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_READY_TIMEOUT: fonts or local images did not become ready.');
+    })()`, true), timeoutMs(), 'E_IMAGE_STUDIO_READY_TIMEOUT: fonts or local images did not become ready.');
     if (layout.viewport.width !== manifest.canvas.width || layout.viewport.height !== manifest.canvas.height) {
       throw new Error(`E_IMAGE_STUDIO_VIEWPORT_MISMATCH: Expected a ${manifest.canvas.width}x${manifest.canvas.height} canvas viewport; got ${layout.viewport.width}x${layout.viewport.height}. No image was written.`);
     }
@@ -1181,11 +1258,30 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
         message: `The image composition has ${layout.scrollingAreas} scrolling area(s). Fit the complete layout inside the declared canvas before taking another snapshot.`,
       }] };
     }
-    const captured = await withTimeout(win.webContents.capturePage(), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_CAPTURE_TIMEOUT: screenshot capture timed out.');
+    const captured = await withTimeout(win.webContents.capturePage(), timeoutMs(), 'E_IMAGE_STUDIO_CAPTURE_TIMEOUT: screenshot capture timed out.');
     const bytes = await normalizeImageStudioSnapshot(captured.toPNG(), manifest.canvas);
+    const image = electron.nativeImage.createFromBuffer(bytes);
+    if (pdf) {
+      if (analyzeNativeImage(image).hash !== pdf.expectedImageHash) {
+        throw new Error('E_IMAGE_PDF_PREVIEW_MISMATCH: print layout differs from the current reviewed preview; repair print styles and recapture.');
+      }
+      if (pdf.footerText) {
+        // Reuse the host's document-output label without changing canvas geometry.
+        await withTimeout(win.webContents.executeJavaScript(`(() => {
+          const footer = document.createElement('div');
+          footer.textContent = ${JSON.stringify(pdf.footerText)};
+          footer.style.cssText = 'position:fixed;left:0;right:0;bottom:8px;text-align:center;font:10px sans-serif;color:rgba(0,0,0,.48);pointer-events:none;z-index:2147483647';
+          document.body.appendChild(footer);
+        })()`), timeoutMs(), 'E_IMAGE_PDF_TIMEOUT: PDF output preparation timed out.');
+      }
+      const pdfBytes = await withTimeout(win.webContents.printToPDF({ printBackground: true, preferCSSPageSize: false,
+        pageSize: { width: manifest.canvas.width / 96, height: manifest.canvas.height / 96 },
+        margins: { top: 0, bottom: 0, left: 0, right: 0 }, displayHeaderFooter: false, scale: 1 }),
+      timeoutMs(), 'E_IMAGE_PDF_TIMEOUT: PDF export timed out.');
+      return { image: analyzeNativeImage(image), layoutBlockers: requiredCopyLayoutIssues(layout.requiredCopyLayouts), pdfBytes };
+    }
     await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
     await fs.writeFile(outputAbsPath, bytes);
-    const image = electron.nativeImage.createFromBuffer(bytes);
     return {
       image: analyzeNativeImage(image),
       layoutBlockers: requiredCopyLayoutIssues(
@@ -1193,6 +1289,7 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
       ),
     };
   } finally {
+    pdf?.signal?.removeEventListener('abort', abort);
     try { win.destroy(); } catch { /* best effort */ }
   }
 }
@@ -1252,9 +1349,10 @@ export async function snapshotImageStudioProject(input: {
   projectDirAbs: string;
   outputAbsPath: string;
   stateAbsPath: string;
+  pageId?: string;
 }): Promise<ImageStudioInspection> {
   const previous = await readImageStudioEvidenceState(input.stateAbsPath);
-  const inspection = await inspectImageStudioProject(input.projectDirAbs);
+  const inspection = await inspectImageStudioProject(input.projectDirAbs, undefined, input.pageId);
   if (!inspection.ok || !inspection.manifest || !inspection.signature) return inspection;
   if (inspection.source_kind !== 'html') {
     return {
@@ -1263,7 +1361,7 @@ export async function snapshotImageStudioProject(input: {
       blockers: [...inspection.blockers, { code: 'E_SNAPSHOT_ROUTE', message: 'project.snapshot requires an HTML entry; use project.inspect for the final raster.' }],
     };
   }
-  const rendered = await renderHtmlSnapshot(path.resolve(input.projectDirAbs), inspection.manifest, path.resolve(input.outputAbsPath));
+  const rendered = await renderHtmlSnapshot(path.resolve(input.projectDirAbs), inspection.manifest, path.resolve(input.outputAbsPath), undefined, inspection.page);
   if (!rendered.image) {
     return { ...inspection, ok: false, blockers: [...inspection.blockers, ...rendered.layoutBlockers] };
   }
@@ -1280,6 +1378,7 @@ export async function snapshotImageStudioProject(input: {
     });
   const state: ImageStudioEvidenceState = {
     schema_version: 1,
+    ...(input.pageId ? { page_id: input.pageId } : {}),
     project_dir: path.resolve(input.projectDirAbs),
     route: inspection.route,
     signature: inspection.signature,
@@ -1332,10 +1431,10 @@ export async function recordRasterEvidence(input: {
   return { ...inspection, is_generation: isGeneration };
 }
 
-async function assertCurrentEvidence(stateAbsPath: string): Promise<{ state: ImageStudioEvidenceState; inspection: ImageStudioInspection }> {
+export async function assertCurrentEvidence(stateAbsPath: string): Promise<{ state: ImageStudioEvidenceState; inspection: ImageStudioInspection }> {
   const state = await readImageStudioEvidenceState(stateAbsPath);
   if (!state) throw new Error('E_IMAGE_REVIEW_EVIDENCE_REQUIRED: inspect or snapshot the current image first.');
-  const inspection = await inspectImageStudioProject(state.project_dir, state.source_path);
+  const inspection = await inspectImageStudioProject(state.project_dir, state.source_path, state.page_id);
   if (!inspection.ok || inspection.signature !== state.signature) {
     throw new Error('E_IMAGE_REVIEW_EVIDENCE_STALE: project sources changed after the evidence was captured.');
   }
@@ -1403,17 +1502,103 @@ export async function submitImageStudioDesignReview(input: {
 export async function exportImageStudioProject(input: {
   stateAbsPath: string;
   outputAbsPath: string;
-  format: 'png' | 'jpeg';
+  format: 'png' | 'jpeg' | 'psd' | 'pdf';
+  inputAbsPath?: string;
+  footerText?: string;
+  signal?: AbortSignal;
+  deadline?: number;
+  finalizeOutput?: (absPath: string) => Promise<void>;
 }): Promise<{ output_path: string; signature: string; is_generation: boolean; image: ReturnType<typeof analyzeNativeImage> }> {
-  const { state } = await assertCurrentEvidence(input.stateAbsPath);
+  const { state, inspection } = await assertCurrentEvidence(input.stateAbsPath);
   if (!imageStudioEvidenceIsGeneration(state)
     && (!state.review || state.review.verdict !== 'passed' || state.review.signature !== state.signature)) {
     throw new Error('E_IMAGE_REVIEW_PASS_REQUIRED: the exact current evidence needs a passing design review before export.');
   }
   const image = await nativeImageFromPath(state.evidence_path);
+  if (input.format === 'pdf') {
+    if (inspection.source_kind !== 'html' || !inspection.manifest) {
+      throw new Error('E_IMAGE_PDF_SOURCE_REQUIRED: use the current HTML/SVG design source for vector PDF delivery.');
+    }
+    const rendered = await renderHtmlSnapshot(state.project_dir, inspection.manifest, input.outputAbsPath,
+      { expectedImageHash: state.image_hash, footerText: input.footerText, signal: input.signal, deadline: input.deadline }, inspection.page);
+    if (!rendered.pdfBytes || rendered.layoutBlockers.length) throw new Error('E_IMAGE_PDF_LAYOUT: repair the current layout before PDF export.');
+    const { inspectImageStudioPdf, normalizeImageStudioPdfCanvas } = await import('./image_studio_pdf');
+    const pdfBytes = await normalizeImageStudioPdfCanvas(rendered.pdfBytes, inspection.manifest.canvas);
+    await inspectImageStudioPdf(pdfBytes, inspection.manifest.canvas, { allowRaster: !!inspection.page });
+    const current = await assertCurrentEvidence(input.stateAbsPath);
+    if (current.state.signature !== state.signature || current.state.image_hash !== state.image_hash) {
+      throw new Error('E_IMAGE_PDF_SOURCE_CHANGED: the current design changed during PDF export; export the new reviewed revision.');
+    }
+    await fs.mkdir(path.dirname(input.outputAbsPath), { recursive: true });
+    await fs.writeFile(input.outputAbsPath, pdfBytes, { flag: 'wx' });
+    try {
+      await input.finalizeOutput?.(input.outputAbsPath);
+      const published = await fs.stat(input.outputAbsPath);
+      if (published.size !== pdfBytes.length || !(await fs.readFile(input.outputAbsPath)).equals(pdfBytes)) {
+        throw new Error('E_IMAGE_PDF_FINALIZED_MISMATCH: PDF output changed after verification; preserve the source and export again.');
+      }
+      if (input.finalizeOutput) {
+        const finalized = await assertCurrentEvidence(input.stateAbsPath);
+        if (finalized.state.signature !== state.signature || finalized.state.image_hash !== state.image_hash) {
+          throw new Error('E_IMAGE_PDF_SOURCE_CHANGED: the current design changed during PDF export; export the new reviewed revision.');
+        }
+      }
+    } catch (error) { await fs.rm(input.outputAbsPath, { force: true }); throw error; }
+    return { output_path: input.outputAbsPath, signature: state.signature, is_generation: false, image: analyzeNativeImage(image) };
+  }
+  if (input.format === 'psd') {
+    const png = state.exported_png;
+    if (!png || png.signature !== state.signature
+      || await imageStudioFileHash(png.path).catch(() => '') !== png.sha256) {
+      throw new Error('E_IMAGE_PSD_PNG_REQUIRED: export a PNG from the current evidence before finalizing the PSD candidate.');
+    }
+    const source = input.inputAbsPath && path.resolve(input.inputAbsPath);
+    if (!source || !isPathAllowed(source, [state.project_dir]) || source === path.resolve(input.outputAbsPath)) {
+      throw new Error('E_IMAGE_PSD_INPUT_REQUIRED: use a distinct project-local PSD candidate as input_path.');
+    }
+    const stat = await fs.stat(source);
+    if (!stat.isFile() || stat.size > 134_217_728) throw new Error('E_IMAGE_PSD_INVALID: PSD candidate exceeds the supported size.');
+    const bytes = await fs.readFile(source);
+    const canvas = inspection.manifest!.canvas;
+    let matches: boolean;
+    try { matches = await matchesPsdPreview(bytes, await fs.readFile(state.evidence_path), canvas); }
+    catch (error) {
+      if ((error as { code?: string }).code !== 'E_IMAGE_PROCESS') throw error;
+      throw new Error('E_IMAGE_PSD_INVALID: use a verified 8-bit RGB PSD candidate from the layered source.');
+    }
+    if (!matches) {
+      throw new Error('E_IMAGE_PSD_PREVIEW_MISMATCH: regenerate the PSD from the exact current image before delivery.');
+    }
+    // Recheck after decoding, before publishing; never reconstruct PSD layers.
+    const current = await assertCurrentEvidence(input.stateAbsPath);
+    if (current.state.signature !== state.signature || current.state.image_hash !== state.image_hash) {
+      throw new Error('E_IMAGE_PSD_SOURCE_CHANGED: the current design changed during PSD export; export the new reviewed revision.');
+    }
+    await fs.mkdir(path.dirname(input.outputAbsPath), { recursive: true });
+    await fs.writeFile(input.outputAbsPath, bytes, { flag: 'wx' });
+    try {
+      await input.finalizeOutput?.(input.outputAbsPath);
+      const published = await fs.stat(input.outputAbsPath);
+      if (published.size !== bytes.length || !(await fs.readFile(input.outputAbsPath)).equals(bytes)) {
+        throw new Error('E_IMAGE_PSD_FINALIZED_MISMATCH: PSD output changed after verification; preserve the source and export again.');
+      }
+      if (input.finalizeOutput) {
+        const finalized = await assertCurrentEvidence(input.stateAbsPath);
+        if (finalized.state.signature !== state.signature || finalized.state.image_hash !== state.image_hash) {
+          throw new Error('E_IMAGE_PSD_SOURCE_CHANGED: the current design changed during PSD export; export the new reviewed revision.');
+        }
+      }
+    } catch (error) { await fs.rm(input.outputAbsPath, { force: true }); throw error; }
+    return { output_path: input.outputAbsPath, signature: state.signature, is_generation: imageStudioEvidenceIsGeneration(state), image: analyzeNativeImage(image) };
+  }
   const bytes = input.format === 'jpeg' ? image.toJPEG(92) : image.toPNG();
   await fs.mkdir(path.dirname(input.outputAbsPath), { recursive: true });
   await fs.writeFile(input.outputAbsPath, bytes);
+  await input.finalizeOutput?.(input.outputAbsPath);
   const outputImage = await nativeImageFromPath(input.outputAbsPath);
+  if (input.format === 'png') {
+    await writeEvidenceState(input.stateAbsPath, { ...state,
+      exported_png: { path: path.resolve(input.outputAbsPath), sha256: await imageStudioFileHash(input.outputAbsPath), signature: state.signature } });
+  }
   return { output_path: input.outputAbsPath, signature: state.signature, is_generation: imageStudioEvidenceIsGeneration(state), image: analyzeNativeImage(outputImage) };
 }

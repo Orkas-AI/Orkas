@@ -30,12 +30,10 @@ is not listed below or the account/build differs.
 ## Supported input boundary
 
 Task attachments accept text and code files, PDF, modern Word/Excel/PowerPoint,
-legacy Excel (.xls), common raster images, video, and audio. They also accept a ZIP only as an
-opaque, path-only input for the dedicated Skill-package importer: the archive
-body is not added to model context. To import a Skill ZIP, attach it in
+legacy Excel (.xls), common images, video, and audio. ZIP attachments are only for importing Skills; they cannot be read as ordinary documents. To import a Skill ZIP, attach it in
 **Commander** and explicitly ask Orkas to import that Skill. Library accepts
 text and code files, PDF, modern Word/Excel/PowerPoint, legacy Excel (.xls),
-and common raster images. Project Library also accepts common video files.
+and common images. Project Library also accepts common video files.
 
 Legacy Excel input supports reading cell data and a content preview. It does
 not run macros or recalculate formulas; save updated formula results in Excel
@@ -45,7 +43,7 @@ When a reply is already running, a completed task attachment can remain on the
 new message while that message waits in the task's send queue. An attachment
 that is still uploading must finish before the message can be sent or queued.
 
-ZIP is not ordinary document context, and Library or Project Library does not
+ZIP is only for Skill import, and Library or Project Library does not
 accept it. Other archive formats are not accepted through these entry points.
 For ordinary source material, ask the user to extract the archive on their
 device and add the relevant supported files. Use the dedicated setup flow for

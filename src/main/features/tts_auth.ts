@@ -16,6 +16,8 @@ import {
   ORKAS_API_TTS_MODEL,
 } from './orkas_api';
 
+import { aliyunTtsBaseUrl, DOUBAO_TTS_FORMATS, TTS_MODELS, ttsModelPreset, type TtsModelPreset } from './tts_catalog';
+
 const log = createLogger('tts-auth');
 
 const DOUBAO_TTS_BASE_URL = 'https://openspeech.bytedance.com';
@@ -68,6 +70,7 @@ export interface AddTtsProfileInput {
   apiKey?: string;
   provider?: string;
   resourceId?: string;
+  workspaceId?: string;
   voice?: string;
   format?: string;
   label?: string;
@@ -76,14 +79,24 @@ export interface AddTtsProfileInput {
 export function addTtsProfile(input: AddTtsProfileInput): { ok: true; id: string } | { ok: false; error: string } {
   const provider = String(input.provider || 'custom').trim() || 'custom';
   const apiKey = String(input.apiKey || '').trim();
-  const voice = String(input.voice || '').trim();
-  const format = String(input.format || '').trim();
+  let voice = String(input.voice || '').trim();
+  let format = String(input.format || '').trim();
 
   if (provider === 'orkas-voice') return { ok: false, error: 'provider unavailable in open-source build' };
   if (provider === 'doubao') return addDoubaoProfile({ apiKey, voice, format, input });
 
-  const baseUrl = normalizeBaseUrl(input.baseUrl || '');
-  const model = String(input.model || '').trim();
+  const preset = listTtsProviderPresets().find(entry => entry.id === provider);
+  if (!preset) return { ok: false, error: 'Unsupported speech provider' };
+  const model = String(input.model || preset.defaultModel || '').trim();
+  const nativeModel = ttsModelPreset(provider, model);
+  if (['minimax', 'aliyun', 'google'].includes(provider) && !nativeModel) return { ok: false, error: 'Unsupported speech model' };
+  voice ||= nativeModel ? nativeModel.defaultVoice || '' : preset.defaultVoice || '';
+  format ||= nativeModel?.formats[0] || preset.defaultFormat || DEFAULT_TTS_FORMAT;
+  if (!voice) return { ok: false, error: 'Voice ID required' };
+  if (nativeModel && !nativeModel.formats.includes(format)) return { ok: false, error: 'Unsupported speech format' };
+  const workspaceId = String(input.workspaceId || '').trim();
+  const baseUrl = provider === 'aliyun' ? aliyunTtsBaseUrl(workspaceId)
+    : normalizeBaseUrl(provider === 'custom' ? input.baseUrl || '' : preset.baseUrl);
   if (!baseUrl) return { ok: false, error: 'baseUrl required (http(s)://...)' };
   if (!model) return { ok: false, error: 'model required' };
   if (!apiKey) return { ok: false, error: 'apiKey required' };
@@ -93,6 +106,7 @@ export function addTtsProfile(input: AddTtsProfileInput): { ok: true; id: string
     baseUrl,
     model,
     apiKey,
+    ...(provider === 'aliyun' ? { workspaceId } : {}),
     ...(voice ? { voice } : {}),
     ...(format ? { format } : {}),
     label: sanitizeLabel(input.label || provider),
@@ -103,6 +117,7 @@ function addDoubaoProfile(args: { apiKey: string; voice: string; format: string;
   { ok: true; id: string } | { ok: false; error: string } {
   const { apiKey, voice, format, input } = args;
   if (!apiKey) return { ok: false, error: 'API key required' };
+  if (format && !DOUBAO_TTS_FORMATS.includes(format)) return { ok: false, error: 'Unsupported speech format' };
   const resourceId = String(input.resourceId || '').trim();
   return persistTtsProfile({
     provider: 'doubao',
@@ -149,6 +164,7 @@ export function reorderTtsProfiles(orderedIds: string[]): { ok: boolean } {
 export function listTtsProviderPresets(): Array<{
   id: string; label: string; baseUrl: string;
   defaultModel?: string; defaultVoice?: string; defaultFormat?: string; docs?: string;
+  models?: readonly TtsModelPreset[];
 }> {
   return [
     {
@@ -161,8 +177,11 @@ export function listTtsProviderPresets(): Array<{
       docs: ORKAS_API_KEYS_URL,
     },
     { id: 'doubao', label: 'DouBao · Voice', baseUrl: DOUBAO_TTS_BASE_URL, defaultVoice: DOUBAO_DEFAULT_VOICE, defaultFormat: DEFAULT_TTS_FORMAT, docs: 'https://www.volcengine.com/docs/6561/1598757' },
-    { id: 'elevenlabs', label: 'ElevenLabs', baseUrl: 'https://api.elevenlabs.io/v1', defaultModel: 'eleven_multilingual_v2', docs: 'https://elevenlabs.io/docs' },
-    { id: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', defaultModel: 'tts-1', defaultVoice: 'alloy', defaultFormat: DEFAULT_TTS_FORMAT, docs: 'https://platform.openai.com/api-keys' },
+    { id: 'minimax', label: 'MiniMax', baseUrl: 'https://api.minimax.cn/v1', defaultModel: TTS_MODELS.minimax[0].id, defaultVoice: TTS_MODELS.minimax[0].defaultVoice, models: TTS_MODELS.minimax, docs: 'https://platform.minimax.cn/docs/api-reference/speech-t2a-http' },
+    { id: 'aliyun', label: 'Alibaba Cloud', baseUrl: '', defaultModel: TTS_MODELS.aliyun[0].id, defaultVoice: TTS_MODELS.aliyun[0].defaultVoice, models: TTS_MODELS.aliyun, docs: 'https://help.aliyun.com/zh/model-studio/qwen-audio-tts-http-api' },
+    { id: 'google', label: 'Google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', defaultModel: TTS_MODELS.google[0].id, defaultVoice: 'Kore', defaultFormat: 'wav', models: TTS_MODELS.google, docs: 'https://aistudio.google.com/docs/speech-generation' },
+    { id: 'elevenlabs', label: 'ElevenLabs', baseUrl: 'https://api.elevenlabs.io/v1', defaultModel: TTS_MODELS.elevenlabs[0].id, models: TTS_MODELS.elevenlabs, docs: 'https://elevenlabs.io/docs' },
+    { id: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', defaultModel: TTS_MODELS.openai[0].id, defaultVoice: 'alloy', defaultFormat: DEFAULT_TTS_FORMAT, models: TTS_MODELS.openai, docs: 'https://developers.openai.com/api/docs/guides/text-to-speech' },
     { id: 'custom', label: 'Custom (OpenAI-compatible)', baseUrl: '', docs: '' },
   ];
 }

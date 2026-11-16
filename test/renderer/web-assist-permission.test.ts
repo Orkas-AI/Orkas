@@ -32,7 +32,12 @@ describe('site permission browser chrome', () => {
     expect(context.permissionPromptEl.hidden).toBe(true);
     context.selected = first; context.panelTab = 'files'; context.renderPermissionPrompt();
     expect(context.permissionPromptEl.hidden).toBe(true);
-    context.panelTab = 'browser'; context.renderPermissionPrompt();
+    context.panelTab = 'browser';
+    (first as any).page_dialog = { id: 'page-message' };
+    context.renderPermissionPrompt();
+    expect(context.permissionPromptEl.hidden).toBe(true);
+    delete (first as any).page_dialog;
+    context.renderPermissionPrompt();
     expect(context.permissionPromptEl.hidden).toBe(false);
     expect(context.activityBtn.disabled).toBe(true);
     expect(element('.web-assist-permission-message').textContent).toContain('notifications');

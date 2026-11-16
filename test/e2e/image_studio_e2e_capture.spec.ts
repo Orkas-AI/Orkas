@@ -1,11 +1,148 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
+import { inspectPsdBytes } from '../../eval/model-eval/regression/psd-inspection';
+import { bayerDng } from '../../eval/model-eval/regression/raw-fixture';
 
 const modulePath = path.resolve(__dirname, '../../src/main/features/image_studio.ts');
 const scores = { intent_alignment: 90, composition: 90, craft: 90, text_legibility: 90, defect_freedom: 90, specificity: 90 };
+
+test('runs bundled RAW development through the real Electron Skill environment and resumes the batch', async ({ sdkOrkas: orkas }) => {
+  const project = path.dirname(orkas.createWorkspaceFile('raw-photos/request.json', JSON.stringify({ op: 'batch', raw: { exposure_ev: 1, white_balance: 'camera' },
+    items: [{ input_path: 'original.dng', output_path: 'out/photo.png' }] })));
+  const original = bayerDng(); writeFileSync(path.join(project, 'original.dng'), original);
+  const result = await orkas.electronApp!.evaluate(async (_, args) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const runtime = require(args.runtime), child = require('node:child_process'), path = require('node:path');
+    const env = { ...process.env, ...runtime.bundledRuntimeEnv(), ORKAS_PC_DIR: args.pcRoot, ORKAS_RUN_SKILL_DIR: args.skillDir };
+    const run = () => new Promise<any>((resolve, reject) => {
+      child.execFile(runtime.bundledNodeExecutable(), [path.join(args.pcRoot, 'bin/run-skill.cjs'), 'image-compose', 'image_asset', '--',
+        '--project', args.project, '--request', 'request.json'], { env, timeout: 30_000, windowsHide: true }, (error: any, stdout: string, stderr: string) => {
+        if (error || stderr) reject(new Error('RAW Skill child failed or emitted diagnostics')); else resolve(JSON.parse(stdout));
+      });
+    });
+    const first = await run(), resumed = await run();
+    return { engineResolved: !!env.ORKAS_LIBRAW, first: { completed: first.completed, failed: first.failed }, resumed: { reused: resumed.reused, failed: resumed.failed } };
+  }, { project, pcRoot: path.resolve(__dirname, '../..'), runtime: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'),
+    skillDir: path.resolve(__dirname, '../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose') });
+  expect(result).toEqual({ engineResolved: true, first: { completed: 1, failed: 0 }, resumed: { reused: 1, failed: 0 } });
+  expect(await sharp(path.join(project, 'out/photo.png')).metadata()).toMatchObject({ width: 256, height: 192, hasProfile: true });
+  expect(readFileSync(path.join(project, 'original.dng'))).toEqual(original);
+});
+
+test('keeps a generated PSD score-free and restores review after local text authoring', async ({ sdkOrkas: orkas }) => {
+  const skills = path.resolve(__dirname, '../../resources/builtin/marketplace/agents/814b61b027f0/skills');
+  const project = path.dirname(orkas.createWorkspaceFile('generated-psd/design.json', JSON.stringify({
+    schema_version: 1, canvas: { width: 128, height: 128 }, layers: [{ id: 'base', type: 'image', name: 'Generated original', path: 'original.png' }],
+  })));
+  const original = await sharp({ create: { width: 128, height: 128, channels: 4,
+    background: { r: 32, g: 64, b: 96, alpha: 80 / 255 } } }).png().toBuffer();
+  writeFileSync(path.join(project, 'original.png'), original);
+  const manifest = JSON.parse(readFileSync(path.join(skills, 'image-router/SKILL.md'), 'utf8').match(/```json\s*([\s\S]*?)\s*```/)![1]);
+  manifest.route = 'generate'; manifest.generation_budget.max_calls = 1;
+  manifest.canvas = { width: 128, height: 128 }; manifest.raster_source = 'original.png'; manifest.brief.required_copy = [];
+  orkas.createWorkspaceFile('generated-psd/image-manifest.json', JSON.stringify(manifest));
+  const result = await orkas.electronApp!.evaluate(async (_, args) => {
+    const studio = (process as any).mainModule.require(args.modulePath);
+    const provenance = (process as any).mainModule.require(args.provenance);
+    const layered = (process as any).mainModule.require(args.helper);
+    const fs = (process as any).mainModule.require('node:fs'), path = (process as any).mainModule.require('node:path');
+    async function invoke(request: object) {
+      fs.writeFileSync(path.join(args.project, 'request.json'), JSON.stringify(request));
+      return layered({ args: ['--project', args.project, '--request', 'request.json'] });
+    }
+    const stateAbsPath = path.join(args.project, 'native-state.json');
+    const source = path.join(args.project, 'original.png');
+    // Model only the isolated successful provider record, not a paid request or verdict.
+    const generationOutputs = [{ output_path: source, output_sha256: await provenance.imageStudioFileHash(source) }];
+    await invoke({ op: 'render', document_path: 'design.json', output_path: 'preview.png' });
+    await invoke({ op: 'export_psd', document_path: 'design.json', preview_path: 'preview.png', output_path: 'candidate.psd' });
+    const initial = await studio.recordRasterEvidence({ projectDirAbs: args.project, stateAbsPath, generationOutputs });
+    await studio.exportImageStudioProject({ stateAbsPath, format: 'png', outputAbsPath: path.join(args.project, 'original-final.png') });
+    await studio.exportImageStudioProject({ stateAbsPath, format: 'psd', inputAbsPath: path.join(args.project, 'candidate.psd'), outputAbsPath: path.join(args.project, 'original-final.psd') });
+    const before = await studio.readImageStudioEvidenceState(stateAbsPath);
+    const document = JSON.parse(fs.readFileSync(path.join(args.project, 'design.json'), 'utf8'));
+    document.layers.push({ id: 'title', type: 'text', name: 'Title', text: 'New', left: 8, top: 8,
+      width: 112, height: 40, font_family: 'Arial', font_postscript_name: 'ArialMT', font_size: 20, color: '#ff0000' });
+    fs.writeFileSync(path.join(args.project, 'edited.json'), JSON.stringify(document));
+    await invoke({ op: 'render', document_path: 'edited.json', output_path: 'edited.png' });
+    await invoke({ op: 'export_psd', document_path: 'edited.json', preview_path: 'edited.png', output_path: 'edited-candidate.psd' });
+    const manifest = JSON.parse(fs.readFileSync(path.join(args.project, 'image-manifest.json'), 'utf8'));
+    manifest.raster_source = 'edited.png'; fs.writeFileSync(path.join(args.project, 'image-manifest.json'), JSON.stringify(manifest));
+    const authored = await studio.recordRasterEvidence({ projectDirAbs: args.project, stateAbsPath, generationOutputs });
+    let rejected = false;
+    try { await studio.exportImageStudioProject({ stateAbsPath, format: 'psd', inputAbsPath: path.join(args.project, 'edited-candidate.psd'), outputAbsPath: path.join(args.project, 'blocked.psd') }); }
+    catch (error) { rejected = String(error).includes('E_IMAGE_REVIEW_PASS_REQUIRED'); }
+    return { generated: initial.is_generation, generationHasReview: !!before.review, authored: authored.is_generation, rejected,
+      blockedFileExists: fs.existsSync(path.join(args.project, 'blocked.psd')) };
+  }, { modulePath, provenance: path.resolve(__dirname, '../../src/main/features/image_studio_provenance.ts'),
+    helper: path.join(skills, 'image-compose/scripts/layered_document.js'), project });
+  expect(result).toEqual({ generated: true, generationHasReview: false, authored: false, rejected: true, blockedFileExists: false });
+  const parsed = inspectPsdBytes(readFileSync(path.join(project, 'original-final.psd')));
+  expect(parsed.layers).toHaveLength(1); expect(parsed.layers[0].text).toBeUndefined();
+  expect(readFileSync(path.join(project, 'original-final.psd'))).toEqual(readFileSync(path.join(project, 'candidate.psd')));
+  expect(readFileSync(path.join(project, 'original.png'))).toEqual(original);
+});
+
+for (const route of ['compose', 'edit']) test(`exports documented layered ${route} through real native PNG review before PSD`, async ({ sdkOrkas: orkas }) => {
+  const skills = path.resolve(__dirname, '../../resources/builtin/marketplace/agents/814b61b027f0/skills');
+  const reference = readFileSync(path.join(skills, 'image-compose/references/layered-documents.md'), 'utf8');
+  const examples = [...reference.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]));
+  const document = examples.find(value => value.layers);
+  const requests = examples.filter(value => value.op);
+  const original = structuredClone(document); original.layers[1].children[1].text = 'Draft notes';
+  const project = path.dirname(orkas.createWorkspaceFile(`layered-${route}/design.json`, JSON.stringify(document)));
+  orkas.createWorkspaceFile(`layered-${route}/original-design.json`, JSON.stringify(original));
+  const manifest = JSON.parse(readFileSync(path.join(skills, 'image-router/SKILL.md'), 'utf8').match(/```json\s*([\s\S]*?)\s*```/)![1]);
+  manifest.route = route; manifest.canvas = document.canvas; manifest.raster_source = 'out/preview.png';
+  manifest.brief.required_copy = ['Field notes'];
+  if (route === 'edit') Object.assign(manifest, examples.find(value => value.reference_intent));
+  orkas.createWorkspaceFile(`layered-${route}/image-manifest.json`, JSON.stringify(manifest));
+  mkdirSync(path.join(project, 'assets'));
+  const assets = new Map<string, Buffer>([
+    ['base.png', await sharp({ create: { width: 320, height: 240, channels: 4, background: '#f2ede4' } }).png().toBuffer()],
+    ['badge.png', await sharp({ create: { width: 64, height: 32, channels: 4, background: '#326496' } }).png().toBuffer()],
+    ['badge-mask.png', await sharp(Buffer.alloc(64 * 32, 128), { raw: { width: 64, height: 32, channels: 1 } }).png().toBuffer()],
+  ]);
+  for (const [file, bytes] of assets) writeFileSync(path.join(project, 'assets', file), bytes);
+  const result = await orkas.electronApp!.evaluate(async (_, args) => {
+    const studio = (process as any).mainModule.require(args.modulePath);
+    const layered = (process as any).mainModule.require(args.helper);
+    const fs = (process as any).mainModule.require('node:fs');
+    const path = (process as any).mainModule.require('node:path');
+    async function invoke(request: object) {
+      fs.writeFileSync(path.join(args.project, 'request.json'), JSON.stringify(request));
+      return layered({ args: ['--project', args.project, '--request', 'request.json'] });
+    }
+    if (args.route === 'edit') await invoke({ op: 'render', document_path: 'original-design.json', output_path: 'out/original.png' });
+    await invoke(args.requests[0]); await invoke(args.requests[1]);
+    const stateAbsPath = path.join(args.project, 'native-state.json');
+    const inspection = await studio.recordRasterEvidence({ projectDirAbs: args.project, stateAbsPath });
+    if (!inspection.ok) return { ok: false, blockers: inspection.blockers.map((issue: any) => issue.code) };
+    const outputAbsPath = path.join(args.project, 'out/final.png');
+    let rejectedBeforeReview = false;
+    try { await studio.exportImageStudioProject({ stateAbsPath, outputAbsPath, format: 'png' }); }
+    catch (error) { rejectedBeforeReview = String(error).includes('E_IMAGE_REVIEW_PASS_REQUIRED'); }
+    // Fixture scores prove the native state transition, not visual quality.
+    await studio.submitImageStudioDesignReview({ stateAbsPath, evidenceAbsPath: inspection.evidence_path,
+      verdict: 'passed', scope: 'Synthetic native state-transition fixture', findings: [],
+      qualityScores: { ...args.scores, ...(args.route === 'edit' ? { reference_fidelity: 90 } : {}) } });
+    await studio.exportImageStudioProject({ stateAbsPath, outputAbsPath, format: 'png' });
+    const psd = await invoke(args.requests[2]);
+    await studio.exportImageStudioProject({ stateAbsPath, format: 'psd',
+      inputAbsPath: path.join(args.project, 'out/candidate.psd'), outputAbsPath: path.join(args.project, 'out/design.psd') });
+    return { ok: true, rejectedBeforeReview, verified: psd.structure_verified, externalEditorVerified: psd.external_editor_verified };
+  }, { modulePath, helper: path.join(skills, 'image-compose/scripts/layered_document.js'), project, route, requests, scores });
+  expect(result).toEqual({ ok: true, rejectedBeforeReview: true, verified: true, externalEditorVerified: false });
+  const decoded = await sharp(path.join(project, 'out/final.png')).ensureAlpha().raw().toBuffer();
+  const psd = inspectPsdBytes(readFileSync(path.join(project, 'out/design.psd')));
+  expect(psd.rgba).toEqual(decoded);
+  expect(psd.layers.find(layer => layer.name === 'Headline')?.text).toBe('Field notes');
+  expect(psd.layers.find(layer => layer.name === 'Badge')?.channels.get(-2)).toEqual(Buffer.alloc(64 * 32, 128));
+  for (const [file, bytes] of assets) expect(readFileSync(path.join(project, 'assets', file))).toEqual(bytes);
+});
 
 function createPoster(orkas: { createWorkspaceFile(name: string, content: string): string }, name: string, content: string, height = 1080) {
   const entry = orkas.createWorkspaceFile(`${name}/index.html`, `<!doctype html><html><head><style>
@@ -25,6 +162,137 @@ function createPoster(orkas: { createWorkspaceFile(name: string, content: string
   return { projectDirAbs: path.dirname(entry), outputAbsPath: path.join(path.dirname(entry), 'evidence.png'),
     stateAbsPath: path.join(path.dirname(entry), 'state.json') };
 }
+
+test('exports a six-member authored set only from current reference-bound reviews', async ({ sdkOrkas: orkas }) => {
+  const inputs = Array.from({ length: 6 }, (_, i) => createPoster(orkas, `set-${i + 1}`, `<p>Session ${i + 1}</p>`));
+  const result = await orkas.electronApp!.evaluate(async (_, args) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const studio = require(args.modulePath), fs = require('node:fs'), path = require('node:path');
+    const failures: string[] = [], members: any[] = [];
+    const reject = async (label: string, operation: () => Promise<unknown>) => {
+      try { await operation(); failures.push(`${label}:unexpected-success`); }
+      catch (error) { failures.push(`${label}:${String(error).match(/E_[A-Z_]+/)?.[0] ?? 'unknown'}`); }
+    };
+    for (let i = 0; i < args.inputs.length; i++) {
+      const input = args.inputs[i], manifestPath = path.join(input.projectDirAbs, 'image-manifest.json');
+      const outputAbsPath = path.join(input.projectDirAbs, 'final.png');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest.brief.required_copy.push(`Session ${i + 1}`);
+      if (i > 0) {
+        fs.copyFileSync(members[0].outputAbsPath, path.join(input.projectDirAbs, 'anchor.png'));
+        manifest.references = [{ id: 'anchor', path: 'anchor.png', role: 'style', required: true, strength: 1,
+          preserve: ['palette', 'typography', 'spacing/grid', 'shape/icon/stroke', 'material', 'signature'],
+          may_change: ['session content'], region_ids: [] }];
+        manifest.reference_intent = { mode: 'guide', basis: 'user', instructions: [], minimum_score: 85 };
+      }
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      const entry = path.join(input.projectDirAbs, 'index.html'), original = fs.readFileSync(entry, 'utf8');
+      // Controlled scores test the native lifecycle, not model visual judgement.
+      // The second member has an actual palette deviation, followed by a real repair.
+      if (i === 1) fs.writeFileSync(entry, original.replace('#f6efdc', '#bb0000'));
+      let evidence = await studio.snapshotImageStudioProject(input);
+      if (!evidence.ok) throw new Error('Set candidate did not produce valid native evidence');
+      const submit = (verdict: string, fidelity: number, findings: string[] = []) => studio.submitImageStudioDesignReview({
+        stateAbsPath: input.stateAbsPath, evidenceAbsPath: input.outputAbsPath,
+        verdict, scope: 'Controlled native execution fixture; no model visual certification', findings,
+        qualityScores: { ...args.scores, ...(i > 0 ? { reference_fidelity: fidelity } : {}) },
+      });
+      const exportImage = () => studio.exportImageStudioProject({ stateAbsPath: input.stateAbsPath, outputAbsPath, format: 'png' });
+      if (i === 1) {
+        fs.copyFileSync(input.outputAbsPath, path.join(input.projectDirAbs, 'palette-deviation.png'));
+        await reject('unreviewed-export', exportImage);
+        await reject('below-floor', () => submit('passed', 84));
+        await reject('high-score-with-fix', () => submit('passed', 99, ['fix: paper palette changed to red']));
+        await submit('repair', 84, ['fix: restore the anchor paper palette']);
+        await reject('score-only-retry', () => submit('passed', 99));
+        if (fs.existsSync(outputAbsPath)) throw new Error('Rejected candidate leaked a final export');
+        fs.writeFileSync(entry, original);
+        evidence = await studio.snapshotImageStudioProject(input);
+        if (!evidence.ok) throw new Error('Repaired member did not recapture');
+        await reject('recaptured-without-review', exportImage);
+      }
+      await submit('passed', i === 1 ? 85 : 86);
+      if (i === 4) {
+        const anchor = path.join(input.projectDirAbs, 'anchor.png');
+        fs.copyFileSync(members[1].outputAbsPath, anchor);
+        await reject('changed-anchor', exportImage);
+        // Restoring exact approved bytes restores the original signature.
+        fs.copyFileSync(members[0].outputAbsPath, anchor);
+      }
+      await exportImage();
+      const persisted = await studio.readImageStudioEvidenceState(input.stateAbsPath);
+      members.push({ outputAbsPath, signatureBound: persisted.review.signature === evidence.signature,
+        mode: manifest.reference_intent?.mode, minimum: manifest.reference_intent?.minimum_score,
+        anchorRequired: manifest.references?.[0].required, anchorRole: manifest.references?.[0].role,
+        fidelity: persisted.review.quality_scorecard.reference_fidelity, isGeneration: persisted.is_generation });
+    }
+    return { failures, members };
+  }, { modulePath, inputs, scores });
+  expect(result.failures).toEqual([
+    'unreviewed-export:E_IMAGE_REVIEW_PASS_REQUIRED', 'below-floor:E_IMAGE_REFERENCE_FIDELITY_BELOW_FLOOR',
+    'high-score-with-fix:E_IMAGE_REVIEW_PASS_FINDINGS', 'score-only-retry:E_IMAGE_REVIEW_REPAIR_REQUIRED',
+    'recaptured-without-review:E_IMAGE_REVIEW_PASS_REQUIRED', 'changed-anchor:E_IMAGE_REVIEW_EVIDENCE_STALE',
+  ]);
+  expect(result.members).toHaveLength(6);
+  let anchorPixel: number[] = [];
+  for (let i = 0; i < result.members.length; i++) {
+    expect(result.members[i]).toMatchObject({ signatureBound: true, isGeneration: false,
+      ...(i > 0 ? { mode: 'guide', minimum: 85, anchorRequired: true, anchorRole: 'style', fidelity: i === 1 ? 85 : 86 } : {}) });
+    const pixels = await sharp(result.members[i].outputAbsPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(pixels.info).toMatchObject({ width: 1080, height: 1080 });
+    const center = (540 * 1080 + 540) * 4;
+    // Compare with the actual approved anchor under the same browser/display
+    // color management, not an assumed CSS-to-export channel identity.
+    if (i === 0) anchorPixel = [...pixels.data.subarray(center, center + 4)];
+    expect([...pixels.data.subarray(center, center + 4)]).toEqual(anchorPixel);
+  }
+  const drift = path.join(inputs[1].projectDirAbs, 'palette-deviation.png');
+  const driftPixel = await sharp(drift).extract({ left: 540, top: 540, width: 1, height: 1 }).ensureAlpha().raw().toBuffer();
+  expect([...driftPixel]).not.toEqual(anchorPixel);
+  expect(driftPixel[0]).toBeGreaterThan(driftPixel[1] * 2);
+  const report = process.env.ORKAS_IMAGE_SET_EXECUTION_REPORT;
+  if (report) writeFileSync(report, JSON.stringify({ kind: 'real-electron-set-execution',
+    members: result.members.map(({ outputAbsPath, ...member }: any) => member),
+    rejectedOperations: result.failures, repairedPalette: true,
+    limitation: 'Controlled review scores verify native execution gates; they do not establish model visual scoring or semantic whole-set acceptance.' }, null, 2));
+});
+
+test('recovers fragmented poster copy and exports it without accepting missing word spaces', async ({ sdkOrkas: orkas }) => {
+  const input = createPoster(orkas, 'fragmented-copy', [
+    '<h1 style="font-size:60px">让协作<br><span>更简单</span></h1>',
+    '<p>co<em>operate</em></p><p><span>&yen;</span><span>99</span></p>',
+    '<p>Orkas<em>Studio</em></p>',
+  ].join(''));
+  const manifestPath = path.join(input.projectDirAbs, 'image-manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  manifest.brief.required_copy = ['让协作更简单', 'cooperate', '¥99', 'Orkas Studio'];
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const output = path.join(input.projectDirAbs, 'final.png');
+  const result = await orkas.electronApp!.evaluate(async (_, args) => {
+    const studio = (process as any).mainModule.require(args.modulePath);
+    const fs = (process as any).mainModule.require('node:fs'), path = (process as any).mainModule.require('node:path');
+    const invalid = await studio.snapshotImageStudioProject(args.input);
+    const createdInvalidEvidence = fs.existsSync(args.input.outputAbsPath) || fs.existsSync(args.input.stateAbsPath);
+    const htmlPath = path.join(args.input.projectDirAbs, 'index.html');
+    const html = fs.readFileSync(htmlPath, 'utf8').replace('Orkas<em>', 'Orkas <em>');
+    fs.writeFileSync(htmlPath, html);
+    const repaired = await studio.snapshotImageStudioProject(args.input);
+    if (!repaired.ok) throw new Error('Repaired fragmented copy must be capturable: ' + repaired.blockers.map((x: any) => x.code).join(','));
+    // Scores exercise the existing native review/export gate, not visual quality.
+    await studio.submitImageStudioDesignReview({ stateAbsPath: args.input.stateAbsPath, evidenceAbsPath: args.input.outputAbsPath,
+      verdict: 'passed', scope: 'Synthetic copy recovery state transition', findings: [], qualityScores: args.scores });
+    await studio.exportImageStudioProject({ stateAbsPath: args.input.stateAbsPath, outputAbsPath: args.output, format: 'png' });
+    const evidence = fs.readFileSync(args.input.outputAbsPath), state = fs.readFileSync(args.input.stateAbsPath), final = fs.readFileSync(args.output);
+    fs.writeFileSync(htmlPath, html.replace('更简单', '更简'));
+    const missingGlyph = await studio.snapshotImageStudioProject(args.input);
+    return { initialBlockers: invalid.blockers.map((x: any) => x.code), createdInvalidEvidence,
+      missingCopy: missingGlyph.blockers.map((x: any) => x.code), preserved: evidence.equals(fs.readFileSync(args.input.outputAbsPath))
+        && state.equals(fs.readFileSync(args.input.stateAbsPath)) && final.equals(fs.readFileSync(args.output)) };
+  }, { input, modulePath, scores, output });
+  expect(result).toEqual({ initialBlockers: ['E_REQUIRED_COPY_MISSING'], createdInvalidEvidence: false,
+    missingCopy: ['E_REQUIRED_COPY_MISSING'], preserved: true });
+  expect(await sharp(output).metadata()).toMatchObject({ width: 1080, height: 1080 });
+});
 
 test('exports all poster corners after the host initially constrains the capture window', async ({ sdkOrkas: orkas }) => {
   // Real Chromium pixels are the oracle. The event simulates work-area clamping

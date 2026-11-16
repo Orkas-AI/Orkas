@@ -76,6 +76,12 @@
     }
   });
   const api = { version: 1, call };
+  // Installed only for trusted packaged identities, never the public SDK catalog.
+  if (/* BUILTIN_APP */ false) {
+    api.openConnectors = () => call('__builtin.openConnectors', {});
+    api.configureModels = kind => call('__builtin.configureModels', {kind});
+    api.presentTaskInput = (requestId, labels) => __orkasPresentTaskInput(api, requestId, labels);
+  }
   for (const name of /* HOST_METHOD_NAMES */ []) {
     const [group, method] = name.split('.');
     if (!api[group]) api[group] = {};

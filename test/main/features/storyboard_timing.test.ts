@@ -37,7 +37,7 @@ describe('shared narration estimate for script-only work', () => {
   it('keeps legacy exports on the same implementation and preserves packaged calculations', () => {
     expect(legacy.estimateNarrationDuration).toBe(estimateNarrationDuration);
     expect(legacy.measureNarrationUnits).toBe(measureNarrationUnits);
-    for (const text of ['', 'A fresh start.', '350 mL 陶瓷杯，适合咖啡和茶。', 'GPT-5.5: version 2.0!\nNext — now…']) {
+    for (const text of ['', 'A fresh start.', '350 mL 陶瓷杯，适合咖啡和茶。', 'GPT-5.5: version 2.0!\nNext — now…', 'Não há complicação.', 'Ứng dụng mới của chúng tôi.', 'Наше новое приложение.', 'تطبيقنا الجديد، متاح الآن.', 'แอปใหม่ของเรา', '새로운 앱이 출시되었습니다.']) {
       for (const speed of [0, 0.5, 1, 1.5, 2, Number.NaN]) {
         expect(bundled.estimateNarrationDuration(text, speed)).toEqual(estimateNarrationDuration(text, speed));
       }

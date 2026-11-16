@@ -1,4 +1,9 @@
 {
+  "local.delete_file.user_continue": "Suppression confirmée. Veuillez continuer.",
+  "apps.builtin_listing_title": "Espace e-commerce",
+  "apps.builtin_listing_description": "Connectez vos boutiques et créez des textes produit, images et vidéos",
+  "apps.builtin_content_title": "Atelier de contenu",
+  "apps.builtin_content_description": "Partez d’une idée ou de vos médias",
   "errors.conversation_recovery_conflict": "Cette tâche doit être restaurée avant de pouvoir être ouverte. Les copies existantes ont été conservées. Contactez l’assistance.",
   "connectors.account_choice.title": "Choisir le compte à connecter",
   "connectors.account_choice.message": "Sélectionnez le compte ou la boutique autorisée pour cette connexion.",
@@ -135,7 +140,6 @@
   "errors.model_currently_unavailable": "Ce modèle est actuellement indisponible",
   "errors.model_config_unavailable": "Un modèle est configuré, mais son identifiant d’accès n’est pas utilisable actuellement. Vérifiez la clé API, l’état de connexion ou le modèle de repli dans les paramètres.",
   "errors.model_oauth_expired": "L’autorisation {provider} a expiré. Autorisez à nouveau ce compte dans les paramètres ou passez à un modèle de repli.",
-  "errors.model_credits_insufficient": "Crédits insuffisants : la tâche s’est arrêtée. Après avoir ajouté des crédits, revenez à cette tâche et écrivez « Continuer » pour reprendre là où elle s’est arrêtée. Vous pouvez aussi choisir un modèle disponible dans les paramètres.",
   "errors.custom_endpoint_suspect": "Votre point d’accès de modèle personnalisé a échoué plusieurs fois de suite (HTTP {status}) ; il est peut-être hors service ou a changé d’adresse. Vérifiez l’URL de l’API et la clé dans Paramètres → Modèles ou choisissez un autre modèle pour continuer.",
   "errors.model_output_cap_repeated": "Ce modèle a atteint plusieurs fois de suite sa limite de sortie par réponse ; elle est peut-être trop basse pour cette tâche. Choisissez un modèle avec une limite de sortie plus élevée dans les paramètres ou divisez la tâche.",
   "errors.model_provider_balance_insufficient": "Le solde de votre compte chez le fournisseur du modèle configuré est épuisé (il ne s’agit pas des crédits Orkas). Rechargez ce compte ou changez de modèle dans les paramètres.",
@@ -168,10 +172,8 @@
   "agent.run_failed": "⚠️ Échec de l’exécution de l’Agent : {message}",
   "model.retrying": "Nouvelle tentative",
   "model.retrying_n": "Tentative {attempt}",
-  "model.dev_marker": "[DEV]",
   "model.credential_fallback": "L’identifiant d’accès du modèle {provider} n’est plus valide. Passage à un modèle de repli pour poursuivre la tâche ; renouvelez l’autorisation ou mettez à jour l’identifiant plus tard dans les paramètres.",
   "model.timeout_fallback": "Le modèle {provider} n’a pas commencé à répondre à temps. Passage à un modèle de repli pour poursuivre la tâche.",
-  "model.server_model_fallback": "{from} est temporairement indisponible. Passage à {to}.",
   "model.tool_loop_limit_reached": "(Limite de tours de la boucle d’outils atteinte)",
   "model.run_aborted": "Exécution interrompue",
   "model.max_retries_exceeded": "Nombre maximal de tentatives dépassé",
@@ -367,6 +369,11 @@
   "errors.model_request_rejected_repeated": "Cette requête a été rejetée plusieurs fois de suite : la relancer telle quelle ne changera rien. Choisissez un autre modèle dans les paramètres et réessayez, ou retirez les images ou pièces jointes avant de renvoyer.",
   "errors.provider_reply_detail": "Réponse du fournisseur : {detail}",
   "cli_agent.repeated_failure_hint": "« {name} » a de nouveau échoué. Vous pouvez demander à @Commander de prendre le relais sur cette tâche.",
-  "desktop.open": "Ouvrir",
-  "desktop.exit": "Quitter"
+  "desktop.open": "Ouvrir Orkas",
+  "desktop.exit": "Quitter Orkas",
+  "video_budget.own_key_notice": "{count} fichier(s) générés avec votre propre compte de service, qui vous facture directement.",
+  "errors.model_request_rejected_no_retry": "Le service du modèle a refusé cette requête. Les nouvelles tentatives automatiques ont été arrêtées.",
+  "errors.model_context_capacity_insufficient": "Le contexte actuel dépasse la capacité sûre des modèles sélectionnés. Cet appel au modèle n’a pas été envoyé. Choisissez un modèle avec une fenêtre de contexte plus grande ou démarrez une nouvelle conversation.",
+  "video.delivery_retained": "Pièce jointe {index} : la version livrée {version} est conservée.",
+  "video.delivery_later_edits": "Les modifications ultérieures ne sont pas incluses dans cette version."
 }

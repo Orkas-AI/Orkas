@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
-import { checkLatencyBudget, LATENCY_LIMIT_MS } from '../helpers/latency-budget';
+import { checkLatencyBudget, LATENCY_LIMIT_MS, INTERACTIVE_MAIN_GAP_LIMIT_MS } from '../helpers/latency-budget';
 
 // Real renderer -> IPC -> main -> SDK, using the existing isolated local model.
 // The second case proves a main-process stall cannot hide behind a fast cached paint.
@@ -124,14 +124,14 @@ for (const injectedStallMs of [0, LATENCY_LIMIT_MS + 100]) {
     console.log('[send-responsiveness]', JSON.stringify({ switch_ms: switchMs, scheduled_click_ms: timing.clickDelayMs, history_ms: timing.historyMs, main_loop_gap_ms: pulse.maxGapMs, injected_stall_ms: injectedStallMs }));
     if (injectedStallMs) {
       expect(pulse.injected).toBe(true);
-      expect(() => checkLatencyBudget('main loop response negative control', { elapsedMs: pulse.maxGapMs }))
-        .toThrow(`budget ${LATENCY_LIMIT_MS} ms`);
+      expect(() => checkLatencyBudget('main loop response negative control', { elapsedMs: pulse.maxGapMs }, INTERACTIVE_MAIN_GAP_LIMIT_MS))
+        .toThrow(`budget ${INTERACTIVE_MAIN_GAP_LIMIT_MS} ms`);
     } else {
       checkLatencyBudget('send A then open B', { elapsedMs: switchMs, phases: [
         { phase: 'scheduled_click', ms: timing.clickDelayMs },
         { phase: 'history_render', ms: timing.historyMs },
       ] });
-      checkLatencyBudget('main loop response during send', { elapsedMs: pulse.maxGapMs });
+      checkLatencyBudget('main loop response during send', { elapsedMs: pulse.maxGapMs }, INTERACTIVE_MAIN_GAP_LIMIT_MS);
     }
   });
 }

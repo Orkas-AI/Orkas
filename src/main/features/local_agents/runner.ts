@@ -1,3 +1,4 @@
+import { appConversationOwner } from '../../paths';
 /**
  * Run a local CLI agent for one dispatch.
  *
@@ -53,6 +54,7 @@ import {
   type LocalEvent,
 } from './backends/base.js';
 import * as persist from './persist.js';
+import { LocalRunHealth, type RunHealthReader } from './run_health.js';
 import * as cliPermissions from './cli_permissions.js';
 import * as cliUserInput from './cli_user_input.js';
 import { sessionToolResultsDir } from '../../paths.js';
@@ -1186,6 +1188,8 @@ export interface RunCliAgentOpts {
   /** Active native-turn ingress lifecycle. The runner forwards backend
    * readiness and guarantees a final clear even when a backend throws. */
   onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
+  /** Current dispatch only; revoked at settlement, never persisted. */
+  onDiagnostics?: (read: RunHealthReader | null) => void;
   /** Conversation-owned persistence for non-secret native question replies. */
   saveUserInput?: (text: string, inputId: string) => Promise<void>;
   onOutputsPublished?: (paths: string[]) => string[];
@@ -1241,6 +1245,11 @@ let backgroundMediaReservedBytes = 0;
 /** Read-only app-lifecycle signal, including work that outlives a conversation turn. */
 export function hasBackgroundWork(): boolean {
   return backgroundRuns.size > 0 || backgroundMediaDownloads.size > 0;
+}
+
+/** App output archival must include delayed native media downloads. */
+export function hasConversationBackgroundMedia(uid: string, cid: string): boolean {
+  return [...backgroundMediaDownloads.values()].some(entry => entry.uid === uid && entry.cid === cid);
 }
 
 function linkedAbortSignal(...parents: AbortSignal[]): { signal: AbortSignal; cleanup: () => void } {
@@ -1402,6 +1411,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   });
   const startedAtMs = Date.now();
   const runDiagnostics = createLocalAgentRunLogDiagnostics(startedAtMs);
+  const runHealth = new LocalRunHealth(opts.cli);
   const startedAtIso = new Date(startedAtMs).toISOString();
   runLogContext = localAgentRunContextForLog({
     uid: opts.uid,
@@ -1448,7 +1458,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   } | null = null;
   // CLI dispatch session id. The per-session spill dir is anchored on this
   // so sweep / read paths can find the file again.
-  const cliSessionId = `cli-${opts.cli}-${handle.runId}`;
+  const cliSessionId = appConversationOwner(opts.cid) ? `cli-${opts.cid}-${opts.cli}-${handle.runId}` : `cli-${opts.cli}-${handle.runId}`;
   const spillDir = sessionToolResultsDir(opts.uid, cliSessionId);
   const toolStartedAtByCallId = new Map<string, number>();
   const materializedMediaKeys = new Set<string>();
@@ -1564,6 +1574,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         toolStartedAtByCallId.delete(callId);
       }
     }
+    runHealth.event(e, toolStartedAtByCallId.size);
     // Codex app-server returns `imageGeneration.result` as a bare Base64 PNG,
     // not a path. Materialize it into the active conversation's synced media
     // pool before the generic oversized-result spill can turn those bytes into
@@ -2049,7 +2060,11 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         configDir: handle.dir,
         sandboxEnv: buildSkillSandboxEnv(opts.uid, opts.agentId),
         onCallObserved: opts.onBridgeCallObserved,
-        onPermissionWaitStart: () => activityClock.pause(),
+        onPermissionWaitStart: () => {
+          const resumeClock = activityClock.pause();
+          const endWait = runHealth.beginWait('waiting_approval');
+          return () => { endWait(); resumeClock(); };
+        },
         onPermissionWaiting: elapsedMs => onEvent({
           type: 'status',
           status: 'waiting-approval',
@@ -2137,7 +2152,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         customArgs: opts.customArgs,
         ...adaptCliRuntimeOverrides(opts.cli, { ...opts, cliFlags }),
         permissionPolicy,
-        requestPermission: request => activityClock.waitForUser(() => cliPermissions.requestPermission({
+        requestPermission: request => runHealth.wait('waiting_approval', () => activityClock.waitForUser(() => cliPermissions.requestPermission({
           uid: opts.uid,
           cid: opts.cid,
           runId: handle.runId,
@@ -2157,8 +2172,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
             // so the hang watchdog keeps its real-activity clock.
             synthetic: true,
           }),
-        })),
-        requestUserInput: request => activityClock.waitForUser(() => cliUserInput.requestUserInput({
+        }))),
+        requestUserInput: request => runHealth.wait('waiting_input', () => activityClock.waitForUser(() => cliUserInput.requestUserInput({
           uid: opts.uid,
           cid: opts.cid,
           runId: handle.runId,
@@ -2175,7 +2190,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
             heartbeat: true,
             synthetic: true,
           }),
-        })),
+        }))),
         resumeSessionId: attempt.resumeSessionId,
         signal: opts.signal,
         onEvent,
@@ -2197,7 +2212,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         // progress can suppress false UI warnings without extending a wedged
         // process indefinitely.
         lastEventAt: activityClock.lastEventAt,
-        onActivity: () => activityClock.progress(),
+        onActivity: () => { activityClock.progress(); runHealth.activity(); },
         ...(bridge ? {
           bridge: {
             mcpConfigPath: bridge.mcpConfigPath,
@@ -2226,6 +2241,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
 
   let commanderHandoff: CommanderHandoffRequest | null = null;
   try {
+    opts.onDiagnostics?.(runHealth.read);
     await runBackendAttempt({
       prompt: opts.prompt,
       resumeSessionId: opts.resumeSessionId,
@@ -2365,6 +2381,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       }
     }
   } finally {
+    runHealth.close();
+    try { opts.onDiagnostics?.(null); } catch { /* caller already gone */ }
     cliPermissions.cancelForRun(handle.runId);
     cliUserInput.cancelForRun(handle.runId);
     if (bridge) {

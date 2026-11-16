@@ -168,6 +168,7 @@ describe('wrapToolWithCap', () => {
     const { createConfig } = await import('../../../src/core-agent/src/config/loader');
     const { ProviderRegistry } = await import('../../../src/core-agent/src/providers/registry');
     const bodies = sizes.map((tokens, i) => String.fromCharCode(97 + i).repeat(tokens * 4));
+    const webSourceUrl = 'https://example.test/host-only-source';
     const requests: import('../../../src/core-agent/src/providers/base').CompletionParams[] = [];
     const provider: import('../../../src/core-agent/src/providers/base').LLMProvider = {
       id: 'mock', name: 'Mock',
@@ -206,7 +207,7 @@ describe('wrapToolWithCap', () => {
         async execute(input) {
           if (++started === bodies.length) release();
           await allStarted;
-          return { content: bodies[Number(input.index)], ...(skill ? { verbatimDocument: true } : {}) };
+          return { content: bodies[Number(input.index)], webSourceUrl, ...(skill ? { verbatimDocument: true } : {}) };
         },
       }],
       transformToolResult(name, raw, context) {
@@ -221,6 +222,9 @@ describe('wrapToolWithCap', () => {
     for await (const event of runner.runStream({ message: 'Compare the reports.' })) events.push(event);
     expect(started).toBe(bodies.length);
     expect(requests).toHaveLength(2);
+    expect(results.every(result => result.webSourceUrl === webSourceUrl)).toBe(true);
+    expect(JSON.stringify(requests)).not.toContain('webSourceUrl');
+    expect(JSON.stringify(requests)).not.toContain(webSourceUrl);
     const delivered = requests[1].messages.flatMap((message) => message.content)
       .filter((item) => item.type === 'tool_result');
     expect(delivered.map((item) => item.toolUseId)).toEqual(bodies.map((_, i) => `call_${i}`));

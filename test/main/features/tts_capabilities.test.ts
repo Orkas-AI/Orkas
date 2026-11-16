@@ -214,6 +214,29 @@ describe('TTS runtime capabilities', () => {
 // prompted the projection was every speech.capabilities call spilling out of
 // the model's inline budget, so the catalog reached it as a searchable stub.
 describe('Agent-facing voice listing', () => {
+  it('finds a dedicated voice from the regional tag a plan carries', () => {
+    const voice = (voiceRef: string, nativeLocale: string) => ({
+      voiceRef,
+      displayName: voiceRef,
+      locale: nativeLocale,
+      nativeLocale,
+      supportedLocales: [nativeLocale],
+      mixedLanguageSupport: false,
+      languageConfidence: 'verified' as const,
+      styleTags: [],
+      useCases: ['general'],
+      isDefault: false,
+    });
+    const catalog = [voice('vivi', 'zh-CN'), voice('sam', 'pt-BR'), voice('jay', 'ko'), voice('marcos', 'es-MX')];
+    const refs = (language: string) => listableTtsVoices(catalog, { language }).voices.map((item) => item.voiceRef);
+
+    expect(refs('pt-BR')).toEqual(['sam']);
+    expect(refs('pt-PT')).toEqual(['sam']);
+    expect(refs('ko-KR')).toEqual(['jay']);
+    expect(refs('es-419')).toEqual(['marcos']);
+    expect(refs('hi-IN')).toEqual([]);
+  });
+
   const catalogVoice = (index: number, over: Partial<PublicTtsVoiceCapability> = {}) => ({
     voiceRef: `managed:orkas-voice:voice:v${index}`,
     displayName: `Voice ${index}`,

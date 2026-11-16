@@ -2368,6 +2368,7 @@ function _renderRecipientChip(target) {
   if (typeof _syncComposerModelChipAvailability === 'function') {
     _syncComposerModelChipAvailability(target);
   }
+  if (!target || target === 'conversation') _updateConvInputPlaceholder(currentCid);
 }
 
 // Hooks called by setView (boot.js) so the chip mirrors the active context.
@@ -2419,7 +2420,7 @@ const _SCENARIO_CATALOG = {
     taskKey: 'new_chat.quick.task.video',
     deliverableKey: 'new_chat.quick.deliver.video',
     subjectKey: 'new_chat.quick.subject.video',
-    subjectFallback: 'AI trends',
+    subjectFallback: 'portable blender',
     icon: 'film',
     group: 'content-creation',
     agentNames: ['VideoStudio'],
@@ -2525,7 +2526,7 @@ const _SCENARIO_TEMPLATES_FALLBACK_EN = {
   office: 'Create a sales report with sample data and charts for an ecommerce store.',
   ppt: 'Create an editable 8-slide product presentation for an AI office assistant.',
   creation: 'Write a social post about an AI office assistant.',
-  video: 'Create an explainer video about AI trends.',
+  video: 'Make a 20-second vertical sales video for this portable blender.',
   image: 'Design an event poster for the City Summer Coffee Festival.',
   ui_design: 'Design a sign-in and sign-up UI for a personal finance app.',
   rnd: 'Build a portfolio website for a product designer changing careers.',
@@ -2785,6 +2786,32 @@ function _refreshChatHeader() {
       }
     }
     metaEl.innerHTML = parts.join('');
+  }
+  const taskLinksEl = document.getElementById('chat-header-task-links');
+  if (taskLinksEl) {
+    const links = Array.isArray(conv?.task_links) ? conv.task_links : [];
+    // Keep the same buttons mounted during background identity refreshes so
+    // keyboard focus and an in-flight navigation remain intact.
+    const signature = JSON.stringify(links.map(task => [task.kind, task.task_id, task.project_id, task.title,
+      t(task.kind === 'automation' ? 'sidebar.auto' : 'project.todo.title')]));
+    if (taskLinksEl.dataset.signature !== signature) {
+      taskLinksEl.dataset.signature = signature;
+      taskLinksEl.replaceChildren();
+      for (const task of links) {
+        const page = t(task.kind === 'automation' ? 'sidebar.auto' : 'project.todo.title');
+        const label = task.title ? `${page} · ${task.title}` : page;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'chat-recipient-chip is-task-link';
+        button.dataset.headerTaskId = task.task_id;
+        button.title = t('chat.app_nav_open', { name: label });
+        button.setAttribute('aria-label', button.title);
+        button.innerHTML = `<span aria-hidden="true">${_uiIconHtml(task.kind === 'automation' ? 'clock' : 'clipboard-list', 'ui-icon')}</span><span class="chat-recipient-name">${escapeHtml(label)}</span>`;
+        _bindSavedTaskChipNavigation(button, task);
+        taskLinksEl.appendChild(button);
+      }
+    }
+    taskLinksEl.hidden = !links.length;
   }
   // Reflect drawer-open state on the details button (existing toggle id is
   // reused; _syncChrome in conversation-info toggles is-active automatically).
@@ -3694,7 +3721,7 @@ if (typeof window !== 'undefined') {
   } else {
     initChip();
   }
-  window.addEventListener('i18n-change', () => { _renderRecipientChip(); _renderQuotePreview(); _refreshChatHeader(); });
+  window.addEventListener('i18n-change', () => { _renderRecipientChip(); _renderQuotePreview(); _refreshChatHeader(); _updateConvInputPlaceholder(currentCid); });
 }
 
 // ─── Group-chat translation layer ─────────────────────────────────────────
@@ -5522,6 +5549,7 @@ function _mountSavedTaskChips(msg, tasks) {
   if (msg) msg._inlineSavedTasks = tasks;
   if (bubble) _hydrateInlineTaskReferences(msg, tasks);
   if (!bubble || !Array.isArray(tasks)) return;
+  if (tasks.length) _scheduleConversationTaskLinksRefresh();
   for (const task of tasks.slice(0, 100)) {
     if (!task || !['automation', 'todo'].includes(task.kind)
         || typeof task.task_id !== 'string' || !task.task_id) continue;
@@ -5801,6 +5829,18 @@ function _initNewChatAttachInput() {
 
 let _loadConversationsInFlight = null;
 let _loadConversationsMode = '';
+let _conversationTaskLinksRefreshTimer = null;
+
+function _scheduleConversationTaskLinksRefresh() {
+  if (_conversationTaskLinksRefreshTimer) clearTimeout(_conversationTaskLinksRefreshTimer);
+  const uid = currentUserId;
+  _conversationTaskLinksRefreshTimer = setTimeout(() => {
+    _conversationTaskLinksRefreshTimer = null;
+    if (uid !== currentUserId) return;
+    loadConversations({ fresh: true });
+  }, 150);
+}
+
 let _conversationRemovalRevision = 0;
 let _conversationRemovalRenderPending = false;
 const _loadedConversationProjectIds = new Set();
@@ -5837,6 +5877,15 @@ function _startupConversationParams() {
 }
 
 function _replaceConversationSlice(rows, shouldReplace) {
+  const previous = new Map((Array.isArray(conversations) ? conversations : [])
+    .filter(row => row?.conversation_id).map(row => [row.conversation_id, row]));
+  rows = (Array.isArray(rows) ? rows : []).map(row => {
+    if (!row?.conversation_id) return row;
+    const cached = previous.get(row.conversation_id);
+    return !Array.isArray(row.task_links) && cached?.task_links
+      && (cached.project_id || '') === (row.project_id || '')
+      ? { ...row, task_links: cached.task_links } : row;
+  });
   conversations = (Array.isArray(conversations) ? conversations : []).filter((c) => !shouldReplace(c));
   _appendConversationSlice(rows);
 }
@@ -5949,6 +5998,7 @@ async function loadConversations(options = {}) {
           _unprojectedConversationPage.loading = false;
         }
         renderConversationList();
+        _refreshChatHeader();
       }
     } catch (e) {
       _convLog.error('load conversations failed', e);
@@ -6044,14 +6094,6 @@ window.addEventListener('sidebar-section-toggle', (event) => {
     _convLog.warn('reset unprojected conversations after section expand failed', err);
   });
 });
-
-// Keep the subscription hook stable for callers; the open-source build has no
-// remote conversation activity channel to bind here.
-let _relayActivityWatchStarted = false;
-function startRelayActivitySubscription() {
-  if (_relayActivityWatchStarted) return;
-  _relayActivityWatchStarted = true;
-}
 
 // `timeBucket` + `_BUCKET_ORDER` live in modules/conv-bucket.js (loaded
 // ahead of this file in index.html). Kept as a separate file so its pure
@@ -6149,9 +6191,10 @@ function _renderConversationTimeBucketList(items, itemOpts = {}) {
 const _CONV_ROW_STATUSES = ['failed', 'in_progress', 'in_review', 'blocked', 'done', 'cancelled'];
 // Only "attention" states get a text label; normal states stay unadorned so the
 // list reads clean and troubled entries stand out (screenshot spec).
-const _CONV_ROW_LABEL_STATUSES = new Set(['failed', 'blocked']);
+const _CONV_ROW_LABEL_STATUSES = new Set(['waiting', 'failed', 'blocked']);
 function _convRowStatus(c) {
   const cid = c && c.conversation_id;
+  if (cid && window.CliAsyncInput?.waitingCount(cid) > 0) return 'waiting';
   // A live reply, canonical terminal, or reopened persisted history describes
   // a newer user journey than the optional index status. Keep its neutral
   // states authoritative as well as failure; otherwise deleting `_failedConvs`
@@ -6166,6 +6209,7 @@ function _convRowStatus(c) {
   return _CONV_ROW_STATUSES.includes(raw) ? raw : 'idle';
 }
 function _convRowStatusKey(status) {
+  if (status === 'waiting') return 'sidebar.conv_waiting_answer';
   // `failed` is a conversation-level state with its own copy; the task-vocab
   // states reuse the To-do status strings.
   return status === 'failed' ? 'chat.status.failed_short' : `project.todo.status_${status}`;
@@ -6268,15 +6312,22 @@ function _renderConversationSidebarItem(c, opts = {}) {
   const title = escapeHtml(c.title || t('chat.new_conv_title'));
   const editing = _conversationRowRendersRenameInput(c.conversation_id, opts.listId);
   const isPinned = !!c.pinned_at;
-  const isFromAuto = !!c.origin_auto_task_id;
+  const isFromAuto = !!c.origin_auto_task_id || (Array.isArray(c.task_links) && c.task_links.some(task => task.kind === 'automation'));
+  const isFromTodo = Array.isArray(c.task_links) && c.task_links.some(task => task.kind === 'todo');
   const hidePin = !!opts.hidePin;
   const menuTitle = escapeHtml(t('project.menu.more_actions'));
+  const pinIconHtml = isPinned
+    ? `<span class="conv-item-pin-icon" title="${escapeHtml(t('chat.conv_pin_title'))}" aria-label="${escapeHtml(t('chat.conv_pin_title'))}">${_uiIconHtml('pin', 'conv-item-pin-icon-svg') || ''}</span>`
+    : '';
   // Auto-fired conversations get the same clock icon as the sidebar
   // "Automation" tab, rendered to the LEFT of the title text. Visible in
   // the sidebar conv list AND the project-detail conversations list (both
   // reuse this renderer).
   const autoIconHtml = isFromAuto
     ? `<span class="conv-item-auto-icon" title="${escapeHtml(t('auto.title'))}" aria-label="${escapeHtml(t('auto.title'))}">${_uiIconHtml('clock', 'conv-item-auto-icon-svg') || ''}</span>`
+    : '';
+  const todoIconHtml = isFromTodo
+    ? `<span class="conv-item-todo-icon" title="${escapeHtml(t('project.todo.title'))}" aria-label="${escapeHtml(t('project.todo.title'))}">${_uiIconHtml('clipboard-list', 'conv-item-auto-icon-svg') || ''}</span>`
     : '';
   const titleNode = editing
     ? `<input type="text" class="conv-item-title-input" data-conv-rename-cid="${cid}"
@@ -6288,6 +6339,7 @@ function _renderConversationSidebarItem(c, opts = {}) {
     currentCid === c.conversation_id ? 'active' : '',
     isPinned ? 'is-pinned' : '',
     isFromAuto ? 'is-from-auto' : '',
+    isFromTodo ? 'is-from-todo' : '',
     hidePin ? 'no-pin' : '',
   ].filter(Boolean).join(' ');
   const actionsHtml = `
@@ -6301,7 +6353,9 @@ function _renderConversationSidebarItem(c, opts = {}) {
     <div class="${classes}" data-cid="${cid}">
       <div class="conv-item-row">
         ${statusDotHtml}
+        ${pinIconHtml}
         ${autoIconHtml}
+        ${todoIconHtml}
         ${titleNode}
         ${statusLabelHtml}
         ${actionsHtml}
@@ -7638,6 +7692,7 @@ async function loadConversationHistory(cid, opts = {}) {
   const perfStartedAt = performance.now();
   const container = document.getElementById('chat-history');
   if (!container || cid !== currentCid) return;
+  if (!opts.preserveScroll) _scheduleConversationTaskLinksRefresh();
   container._conversationDisplayCid = cid;
   const previousLoad = _conversationHistoryLoad;
   const load = {
@@ -9339,7 +9394,7 @@ function _resolveAgentFormMount(existing, next) {
   return {
     stale: false,
     becomesActive: true,
-    flipPrevious: !!(existing && existing.formId !== next.formId),
+    flipPrevious: !!(existing && !existing.submitted && existing.formId !== next.formId),
   };
 }
 
@@ -9356,7 +9411,11 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
   const agentKey = form.agent_id ? `${cid}::${form.agent_id}` : '';
   const mountTs = Date.parse(message.ts || '') || Date.now();
   const existingMount = agentKey ? _agentFormMounts.get(agentKey) : null;
-  const decision = _resolveAgentFormMount(existingMount, {
+  const decision = _resolveAgentFormMount(existingMount ? {
+    formId: existingMount.formId,
+    ts: existingMount.ts,
+    submitted: !!existingMount.message?.form?.submitted,
+  } : null, {
     formId: form.form_id || '',
     ts: mountTs,
     submitted: !!form.submitted,
@@ -9428,6 +9487,10 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
       // class is the reconcile pass this pipeline deliberately removed.
       const formHost = msgDiv.querySelector('.chat-input-form');
       if (formHost) formHost.classList.add('is-submitted');
+      // Replay can mount the next question before it returns. Its predecessor
+      // is already answered durably and must not be redrawn as expired.
+      const previousSubmitted = message.form.submitted;
+      message.form.submitted = true;
       const extra = (Array.isArray(attachments) && attachments.length)
         ? { attachments }
         : undefined;
@@ -9438,8 +9501,18 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
         if (replayResult?.started === false && replayResult?.queued !== true) {
           throw new Error(t('chat.form.submit_failed'));
         }
+        // Nothing rebuilds this bubble, so what it holds has to say so too: a later
+        // form from this Agent would otherwise redraw it as expired.
+        message.form.values = values;
+        message.form.submitted_at = new Date().toISOString();
+        if (agentKey && _agentFormMounts.get(agentKey)?.formId === form.form_id) _agentFormMounts.delete(agentKey);
       }
       catch (err) {
+        message.form.submitted = previousSubmitted;
+        // The backend mark is durable, but this mounted widget must remain
+        // retryable when the normal send stream never starts. Undo only the
+        // optimistic visual state here; the widget owns re-enabling its fields
+        // when this rejection crosses back through `onSubmit`.
         if (formHost) formHost.classList.remove('is-submitted');
         const reason = _processStatusDetail(err && err.message ? err.message : '', 160)
           || t('chat.form.submit_failed');
@@ -9701,7 +9774,16 @@ const _APP_NAV_SURFACES = {
       return req.action === 'open';
     }),
   },
-  apps: { nameKey: 'sidebar.apps', fallback: 'Apps', actions: ['open'], open: () => { setView('apps'); return true; } },
+  apps: {
+    nameKey: 'sidebar.apps', fallback: 'Apps', actions: ['open', 'configure'],
+    configureKey: 'chat.app_nav_open', configureTargetKey: 'chat.app_nav_open_app',
+    open: (req) => {
+      if (req.action === 'open') { setView('apps'); return true; }
+      const user = currentUserId;
+      return _appNavLoadFeature('apps', () => user === currentUserId && typeof window.openSavedAppById === 'function'
+        ? window.openSavedAppById(req.target_id) : false);
+    },
+  },
   marketplace: {
     nameKey: 'marketplace.title',
     fallback: 'Marketplace',
@@ -9833,6 +9915,11 @@ function _mountAppNavRequests(host, message) {
 const _appNavProjectRefreshes = new Set();
 
 function _appNavConfigureTarget(surfaceId, targetId) {
+  if (surfaceId === 'apps') {
+    const user = currentUserId;
+    return _appNavLoadFeature('apps').then(() => user === currentUserId && typeof window.loadSavedAppNavTarget === 'function'
+      ? window.loadSavedAppNavTarget(targetId) : null).catch(() => null);
+  }
   if (surfaceId === 'connectors') {
     let now = null;
     try {
@@ -9859,7 +9946,12 @@ function _appNavConfigureTarget(surfaceId, targetId) {
 }
 
 function _paintAppNavButton(btn, label, iconSvg) {
-  btn.textContent = label;
+  btn.textContent = '';
+  btn.title = label;
+  const text = document.createElement('span');
+  text.className = 'chat-msg-created-agent-label';
+  text.textContent = label;
+  btn.appendChild(text);
   if (!iconSvg && typeof window.uiIconHtml !== 'function') return;
   const pageIcon = document.createElement('span');
   pageIcon.className = iconSvg ? 'chat-app-nav-btn-page-icon is-brand' : 'chat-app-nav-btn-page-icon';
@@ -10436,16 +10528,13 @@ function _attachBubbleRetryBtn(actions, msgDiv) {
   actions.appendChild(retryBtn);
 }
 
-// Assistant feedback reporting is hosted-service-only. Preserve the shared
-// action renderer's hook without exposing a dead control in the open build.
-function _attachBubbleReportBtn() {}
-
 function _attachFailedAssistantActions(msgDiv, getContent) {
   if (!msgDiv) return;
   msgDiv.dataset.failed = '1';
   _attachBubbleActions(msgDiv, getContent, {
     archive: false,
     retry: true,
+    compact: msgDiv.dataset.messageActions === 'errors-only',
   });
   const code = msgDiv.dataset.failureCode;
   if (code === 'version_too_old'
@@ -10470,7 +10559,6 @@ function _attachInterruptedAssistantActions(msgDiv, getContent, opts) {
   _attachBubbleActions(msgDiv, getContent, {
     archive: !opts || opts.archive !== false,
     retry: true,
-    report: true,
     compact: msgDiv.dataset.messageActions === 'errors-only',
   });
 }
@@ -10986,13 +11074,12 @@ function _syncBubbleReferenceActionState(msgDiv) {
 function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   const includeArchive = opts.archive !== false;
   const includeRetry = opts.retry === true;
-  const includeReport = opts.report === true;
   const compact = opts.compact === true;
   const mode = compact
     ? 'failure-only'
     : includeRetry
     ? (includeArchive ? 'assistant-retry' : 'failed')
-    : (includeReport ? (includeArchive ? 'assistant' : 'assistant-feedback') : (includeArchive ? 'assistant' : 'user'));
+    : (includeArchive ? 'assistant' : 'user');
   // Functional controls live in the dedicated `.chat-msg-actions` row below
   // the bubble. Content/resource chips stay inside `.chat-bubble`. Lazily
   // create the action row if a streaming placeholder did not allocate one.
@@ -11018,7 +11105,6 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     actions.innerHTML = '<span class="chat-bubble-direct-actions"></span>';
     const directActions = actions.querySelector('.chat-bubble-direct-actions');
     if (includeRetry) _attachBubbleRetryBtn(directActions, msgDiv);
-    if (includeReport) _attachBubbleReportBtn(directActions, msgDiv, getContent);
     actionsRow.appendChild(actions);
     return;
   }
@@ -11469,6 +11555,22 @@ async function handleNewChatSubmit() {
   }
 }
 
+// Edit framing stays out of the authored draft and visible message. Reuse the
+// existing model_text transport only when the source is part of this send, so
+// later turns and ordinary tasks do not repeat the opening instruction.
+function _appEditingSource(cid) {
+  const conversation = typeof conversations !== 'undefined' && Array.isArray(conversations)
+    ? conversations.find(item => item && item.conversation_id === cid) : null;
+  return conversation?.assistance?.kind === 'app_editing' ? conversation.assistance : null;
+}
+function _appEditSendContext(cid, content, attachments) {
+  const source = _appEditingSource(cid);
+  if (!source || !attachments.includes(source.sourceFileName)) return {};
+  // Model-only context uses English independently of the UI language.
+  const prefix = `Modify the interactive app "${source.title}". Source: attached "${source.sourceFileName}":`;
+  return { model_text: `${prefix}\n${content}` };
+}
+
 async function handleChatSubmit() {
   // A repeated submit shares the in-flight send, not an attachment upload.
   if (_chatAttachIsSending(currentCid)) return;
@@ -11538,6 +11640,7 @@ async function handleChatSubmit() {
     attachments = attachmentSnapshot.names;
 
     const references = _referenceSnapshotsForQuotes(quotes);
+    const editContext = _appEditSendContext(cid, content, attachments);
     _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
 
     // Queue absorption (task-board plan P2 UI half): a busy conversation no
@@ -11564,6 +11667,7 @@ async function handleChatSubmit() {
           body: JSON.stringify({
             content,
             ...commanderDisplay,
+            ...editContext,
             ...(attachments.length ? { attachments } : {}),
             ...(useSelections.length ? { use_selections: useSelections } : {}),
             ...(references.length ? { references } : {}),
@@ -11639,6 +11743,7 @@ async function handleChatSubmit() {
       ...(useSelections.length ? { use_selections: useSelections } : {}),
       ...(references.length ? { references } : {}),
       ...commanderDisplay,
+      ...editContext,
     };
     return sendInConversation(cid, content, Object.keys(extra).length ? extra : undefined, {
       restoreComposerOnFailure: true,
@@ -14433,7 +14538,6 @@ function createChatController(config) {
           try {
             const ev = JSON.parse(dataLines.join('\n'));
             if (ev.type === 'send_accepted' && pending) pending.accepted = true;
-            _recordControllerState(ev);
             // Post-abort events can still arrive while main's for-await drains
             // its buffer — drop them so the bubble stays frozen at the "stopped" state
             // instead of accumulating more deltas / a final reply behind it.
@@ -14529,35 +14633,6 @@ function createChatController(config) {
       if (features.queue) _qDispatchNext();
     }
     return terminalResult;
-  }
-
-  function _recordControllerState(ev) {
-    if (!pending || !ev || typeof ev !== 'object') return;
-    if (ev.type === 'final') pending.sawFinal = true;
-    if ((ev.type === 'delta' || ev.type === 'final') && String(ev.text || '').trim()) {
-      pending.sawOutput = true;
-    }
-    if (ev.type === 'progress' || ev.type === 'event') pending.sawOutput = true;
-    let event = ev.event && typeof ev.event === 'object' ? ev.event : null;
-    if (event && event.stream === 'group' && event.data?.type === 'process') {
-      const processData = event.data.data;
-      event = processData?.type === 'event' && processData.event
-        ? processData.event
-        : processData;
-    }
-    if (!event || typeof event !== 'object') return;
-    const data = event.data && typeof event.data === 'object' ? event.data : {};
-    if (event.stream === 'runtime' && data.phase === 'end'
-        && data.terminal_status === 'waiting_input' && data.result === 'success'
-        && !data.aborted && !data.errored) {
-      pending.waitingForInput = true;
-    }
-    const cliType = event.stream === 'cli' ? String(data.type || '').toLowerCase() : '';
-    const phase = String(data.phase || data.status || '').toLowerCase();
-    if ((event.stream === 'tool' || cliType === 'tool-event')
-        && /^(start|running|request|call|begin)$/.test(phase)) {
-      pending.toolCallCount += 1;
-    }
   }
 
   function abort(options = {}) {
@@ -15699,6 +15774,12 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     window.CliAsyncInput?.observe(cid, evData.msg);
     _rememberHistoryLoadMessage(cid, evData.msg, !!evData.turn_end);
   }
+  if (evData.type === 'state_changed') {
+    window.CliAsyncInput?.setActiveTurns(cid, Array.isArray(evData.active_turns)
+      ? _normaliseActiveTurns(evData.active_turns) : undefined);
+  } else if (evData.type === 'aborted') {
+    window.CliAsyncInput?.setActiveTurns(cid, []);
+  }
   if (
     evData.type === 'process'
     || evData.type === 'artifact_created'
@@ -15733,7 +15814,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       );
       // Video review panel: production state only changes through agent
       // turns, so refresh (debounced, current-conversation-only) here.
-      try { window.VideoReviewPanel?.notifyTurnEnd?.(cid); } catch (_) { /* optional surface */ }
+      try { window.VideoCanvas?.notifyTurnEnd?.(cid); } catch (_) { /* optional surface */ }
     }
     _bumpConvToTop(cid, evData.msg.ts);
     if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid);
@@ -17333,9 +17414,31 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   _stickBottomFromMsg(msg);
 }
 
-// Toggle send/stop button appearance. While a reply is streaming the button
-// shows the stop icon and a click aborts — regardless of the queue. New
-// messages typed in during the stream go to the queue via plain Enter.
+function _updateConvInputPlaceholder(cid) {
+  if (!cid || cid !== currentCid) return;
+  const input = document.getElementById('chat-input');
+  if (!input || input.disabled || input.getAttribute?.('aria-disabled') === 'true') return;
+  if (typeof _isQueueItemEditing === 'function' && _isQueueItemEditing(cid)) return;
+  // Request/observer lifetime is broader than execution. Match the selected
+  // actor against runtime state, including suspended executions in in_flight.
+  const actors = new Set(_latestInFlight.get(cid) || []);
+  for (const turn of _latestActiveTurns.get(cid) || []) actors.add(turn.actor);
+  if (!isConvPending(cid) || !actors.size) {
+    const source = _appEditingSource(cid);
+    const initialEdit = source && _chatAttachList(cid).some(item => item.name === source.sourceFileName && !item.reused);
+    composerSetPlaceholder(input, t(initialEdit ? 'skills.chat_input_placeholder' : 'chat.input_placeholder'));
+    return;
+  }
+  const recipient = _activeRecipient('conversation');
+  const actor = recipient.kind === 'agent' ? recipient.id : 'commander';
+  const agent = recipient.kind === 'agent'
+    ? _recipientPrefixName(recipient) : t('chat.recipient_commander');
+  composerSetPlaceholder(input, t(actors.has(actor)
+    ? 'chat.input_placeholder_queue' : 'chat.input_placeholder_immediate', { agent }));
+}
+
+// While any reply is streaming, clicking Stop aborts the conversation. Enter
+// still sends normally; the scheduler owns execution and queue admission.
 function _updateConvSendUI(cid) {
   if (cid !== currentCid) return;
   const sendBtn = document.getElementById('chat-send-btn');
@@ -17380,9 +17483,7 @@ function _updateConvSendUI(cid) {
   sendBtn.classList.toggle('streaming', pending);
   sendBtn.disabled = false;
   sendBtn.title = pending ? t('chat.stop_reply') : t('chat.send_title');
-  if (input) {
-    composerSetPlaceholder(input, pending ? t('chat.input_placeholder_queue') : t('chat.input_placeholder'));
-  }
+  _updateConvInputPlaceholder(cid);
   if (!pending) focusChatComposerIfIdle(input);
 }
 
@@ -17597,8 +17698,10 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
   // the bubble already shows the "stopped" state so the streaming badge would lie.
   const state = pendingConvs.get(cid);
   const pending = isConvPending(cid) && !(state && state.aborted);
-  if (!pending) {
-    // No live badge → reflect the resting abnormal status (failed / backend).
+  const conv = snapshot ? snapshot.conversation : conversations.find(c => c.conversation_id === cid);
+  const status = _convRowStatus(conv || { conversation_id: cid });
+  if (!pending || status === 'waiting') {
+    // Waiting for an answer takes the row's status slot ahead of the live pulse.
     // The failed mark is maintained by the structured hooks
     // (`_finalizeActorPlaceholder`, history sync, onDone) — nothing to derive here.
     items.forEach((item) => item.querySelector('.conv-status-badge')?.remove());
@@ -17606,6 +17709,7 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
     return;
   }
   items.forEach((item) => {
+    item.querySelector('.conv-item-status-label')?.remove();
     const existing = item.querySelector('.conv-status-badge');
     // Preserve an unchanged running indicator and its breathing animation.
     if (existing?.classList.contains('is-streaming')) return;
@@ -17642,17 +17746,20 @@ function _refreshAllConvBadges() {
   if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators();
 }
 
+window.addEventListener('cli-waiting-changed', _refreshAllConvBadges);
+window.addEventListener('i18n-change', _refreshAllConvBadges);
+
 function _sidebarRunningConversationIds() {
   const ids = new Set();
   pendingConvs.forEach((state, cid) => {
-    if (!(state && state.aborted)) ids.add(cid);
+    if (!(state && state.aborted) && !(window.CliAsyncInput?.waitingCount(cid) > 0)) ids.add(cid);
   });
   // Group runtime activity can become visible just before a request-backed
   // pending entry is attached (for example during recovery). Include it so
   // project and Commander counts do not briefly disappear in that window.
   groupBusyConvs.forEach((_busy, cid) => {
     const state = pendingConvs.get(cid);
-    if (!(state && state.aborted)) ids.add(cid);
+    if (!(state && state.aborted) && !(window.CliAsyncInput?.waitingCount(cid) > 0)) ids.add(cid);
   });
   return ids;
 }
@@ -17807,660 +17914,14 @@ function _logConversationManageResult(action, startedAt, result, errorCode = '',
   } catch (_) {}
 }
 
-// Build the mention-highlight portion of the textarea mirror. Escapes
-// everything EXCEPT `@<token>` matches, which become accent-coloured spans.
-function _buildMentionMirrorHtml(text) {
-  if (!text) return '';
-  const re = _buildMentionRe();
-  let html = '';
-  let last = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const beforeStart = last;
-    const beforeEnd = m.index + m[1].length;
-    if (beforeEnd > beforeStart) html += escapeHtml(text.slice(beforeStart, beforeEnd));
-    html += `<span class="msg-mention">${escapeHtml(m[2])}</span>`;
-    last = re.lastIndex;
-  }
-  if (last < text.length) html += escapeHtml(text.slice(last));
-  return html;
-}
-
-const _chatRichComposers = new Map();
-
-function _chatRichInputId(inputOrId) {
-  if (!inputOrId) return '';
-  if (typeof inputOrId === 'string') return inputOrId;
-  return inputOrId.id || inputOrId.dataset?.richInputId || '';
-}
-
-function syncChatRichComposerFromTextarea(inputOrId) {
-  const id = _chatRichInputId(inputOrId);
-  const api = id ? _chatRichComposers.get(id) : null;
-  if (!api) return false;
-  api.renderFromTextarea();
-  return true;
-}
-
-function _chatRichSerializeNode(node, isRoot = true) {
-  if (!node) return '';
-  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
-  if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return '';
-  if (node.nodeType === Node.ELEMENT_NODE) {
-    const el = node;
-    if (el.dataset?.chatUseChip === '1') return el.dataset.token || '';
-    // A "bogus" <br> is a display-only filler that renders the trailing empty
-    // line contenteditable would otherwise collapse; it carries no value, so a
-    // render→serialize round-trip must not turn it back into a newline.
-    if (el.tagName === 'BR') return el.dataset?.chatBogus === '1' ? '' : '\n';
-  }
-  let out = '';
-  node.childNodes.forEach((child) => { out += _chatRichSerializeNode(child, false); });
-  // The DIV/P newline separates *sibling* blocks (e.g. browser line-wrapping
-  // divs). It must not fire for the root editor itself, or every non-empty
-  // value would gain a phantom trailing "\n" that (a) makes "abc" and "abc\n"
-  // serialize identically and (b) can't be told apart from a real trailing
-  // newline when we decide whether to render a filler line.
-  if (!isRoot && node.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || '')) {
-    if (out && !out.endsWith('\n')) out += '\n';
-  }
-  return out;
-}
-
-function _chatRichTextLength(node) {
-  return _chatRichSerializeNode(node).length;
-}
-
-function _chatRichRangeLength(editor, container, offset) {
-  try {
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    range.setEnd(container, offset);
-    const len = _chatRichSerializeNode(range.cloneContents()).length;
-    if (typeof range.detach === 'function') range.detach();
-    return len;
-  } catch (_) {
-    return editor ? _chatRichSerializeNode(editor).length : 0;
-  }
-}
-
-function _chatRichSelectionIndexes(editor) {
-  const sel = window.getSelection ? window.getSelection() : null;
-  if (!sel || sel.rangeCount < 1) return null;
-  const range = sel.getRangeAt(0);
-  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return null;
-  const start = _chatRichRangeLength(editor, range.startContainer, range.startOffset);
-  const end = _chatRichRangeLength(editor, range.endContainer, range.endOffset);
-  return { start: Math.min(start, end), end: Math.max(start, end) };
-}
-
-function _chatRichFindPosition(root, index) {
-  let left = Math.max(0, Number(index) || 0);
-  const visit = (node) => {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const len = (node.nodeValue || '').length;
-      if (left <= len) return { type: 'text', node, offset: left };
-      left -= len;
-      return null;
-    }
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      const el = node;
-      if (el.dataset?.chatUseChip === '1' || el.tagName === 'BR') {
-        const len = _chatRichTextLength(el);
-        if (left <= len) return left <= len / 2
-          ? { type: 'before', node: el }
-          : { type: 'after', node: el };
-        left -= len;
-        return null;
-      }
-    }
-    for (const child of Array.from(node.childNodes || [])) {
-      const found = visit(child);
-      if (found) return found;
-    }
-    return null;
-  };
-  return visit(root) || { type: 'end', node: root };
-}
-
-function _chatRichApplyBoundary(range, boundary, which) {
-  const fn = which === 'start' ? 'setStart' : 'setEnd';
-  if (!boundary || boundary.type === 'end') {
-    range[fn](boundary?.node || range.commonAncestorContainer, (boundary?.node || range.commonAncestorContainer).childNodes.length);
-  } else if (boundary.type === 'text') {
-    range[fn](boundary.node, boundary.offset);
-  } else if (boundary.type === 'before') {
-    which === 'start' ? range.setStartBefore(boundary.node) : range.setEndBefore(boundary.node);
-  } else if (boundary.type === 'after') {
-    which === 'start' ? range.setStartAfter(boundary.node) : range.setEndAfter(boundary.node);
-  }
-}
-
-function _chatRichSetSelection(editor, start, end = start) {
-  if (!editor || !window.getSelection) return;
-  const range = document.createRange();
-  const startPos = _chatRichFindPosition(editor, start);
-  const endPos = _chatRichFindPosition(editor, end);
-  _chatRichApplyBoundary(range, startPos, 'start');
-  _chatRichApplyBoundary(range, endPos, 'end');
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
-}
-
-// contenteditable + `white-space: pre-wrap` collapses a trailing newline: a
-// value ending in "\n" (or a lone "\n" just typed) renders no empty last line,
-// so the caret can't sit on it and the box never grows/scrolls to reveal it.
-// Browsers solve this with a filler <br>; we mirror that with a marked "bogus"
-// <br> that serialization drops (see _chatRichSerializeNode). Keep exactly one,
-// always at the very end, and only when the content actually ends in a newline.
-function _chatRichHasAuthoredContent(node) {
-  if (!node) return false;
-  if (node.nodeType === Node.TEXT_NODE) return !!(node.nodeValue || '');
-  if (node.nodeType === Node.ELEMENT_NODE && node.dataset?.chatUseChip === '1') return true;
-  return Array.from(node.childNodes || []).some((child) => _chatRichHasAuthoredContent(child));
-}
-
-function _chatRichEnsureTrailingBreak(editor) {
-  if (!editor) return;
-  const stale = editor.querySelector ? editor.querySelector('br[data-chat-bogus="1"]') : null;
-  if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
-  // Chromium represents an emptied contenteditable as <br> (and sometimes
-  // <div><br></div>) so the caret still has a line box. That node is browser
-  // chrome, not user input: serializing it as "\n" makes an emptied composer
-  // one line taller and persists a phantom newline in the hidden textarea.
-  // Real newlines in this editor are text nodes created by render/keydown/paste,
-  // so they count as authored content and remain intact.
-  if (!_chatRichHasAuthoredContent(editor)) {
-    if (editor.childNodes?.length) editor.textContent = '';
-    return;
-  }
-  if (_chatRichSerializeNode(editor).endsWith('\n')) {
-    const br = document.createElement('br');
-    br.dataset.chatBogus = '1';
-    editor.appendChild(br);
-  }
-}
-
-/** Reconcile every non-IME native edit before serializing it. The display-only trailing filler can
- * become stale when the user types after a trailing newline or deletes that newline with Backspace;
- * leaving it in the DOM creates a phantom visual line even though serialization correctly drops it. */
-function _chatRichHandleEditorInput(api) {
-  if (!api || api.composing) return;
-  api.ensureTrailingBreak();
-  api.syncFromEditor(true);
-}
-
-function _chatRichChipsMatchValue(editor, value) {
-  const tokens = _findChatComposerTokens(value, editor.dataset.richInputId);
-  const chips = Array.from(editor.querySelectorAll('[data-chat-use-chip="1"]'));
-  return chips.length === tokens.length && chips.every((chip, i) => {
-    const token = tokens[i];
-    return chip.dataset.token === token.raw && chip.dataset.kind === token.selection.kind
-      && chip.dataset.itemId === (token.selection.id || token.selection.name || '')
-      && chip.dataset.name === (token.selection.name || token.selection.id || '');
-  });
-}
-
-function _chatRichRenderValue(editor, value) {
-  const src = String(value || '');
-  editor.textContent = '';
-  const tokens = _findChatComposerTokens(src, editor.dataset.richInputId);
-  let last = 0;
-  tokens.forEach((token) => {
-    if (token.start > last) editor.appendChild(document.createTextNode(src.slice(last, token.start)));
-    editor.appendChild(_chatRichCreateUseChip(token.selection, token.raw));
-    last = token.end;
-  });
-  if (last < src.length) editor.appendChild(document.createTextNode(src.slice(last)));
-  _chatRichEnsureTrailingBreak(editor);
-}
-
-function _chatRichInsertText(editor, text) {
-  const sel = window.getSelection ? window.getSelection() : null;
-  if (!sel || sel.rangeCount < 1 || !editor.contains(sel.anchorNode)) {
-    editor.focus();
-    _chatRichSetSelection(editor, _chatRichSerializeNode(editor).length);
-  }
-  const range = window.getSelection().getRangeAt(0);
-  range.deleteContents();
-  const node = document.createTextNode(String(text || ''));
-  range.insertNode(node);
-  range.setStart(node, node.nodeValue.length);
-  range.setEnd(node, node.nodeValue.length);
-  const next = window.getSelection();
-  next.removeAllRanges();
-  next.addRange(range);
-}
-
-function _chatRichCreateApi(textarea, editor) {
-  const nativeSetSelectionRange = typeof textarea.setSelectionRange === 'function'
-    ? textarea.setSelectionRange.bind(textarea)
-    : null;
-  const nativeFocus = typeof textarea.focus === 'function' ? textarea.focus.bind(textarea) : null;
-  const api = {
-    input: textarea,
-    editor,
-    lastValue: null,
-    pendingSelection: null,
-    syncingFromEditor: false,
-    // True between compositionstart/compositionend (IME). While composing we
-    // must not rebuild the editor DOM or thrash its layout, or the in-flight
-    // composition gets dropped and the user has to retype — hence the guards in
-    // renderFromTextarea/the input listeners and a single reconcile on end.
-    composing: false,
-    focus() {
-      editor.focus();
-      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : (textarea.value || '').length;
-      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
-      _chatRichSetSelection(editor, start, end);
-    },
-    setTextareaSelection(start, end = start, opts = {}) {
-      const next = { start, end: typeof end === 'number' ? end : start };
-      if (nativeSetSelectionRange) {
-        try { nativeSetSelectionRange(next.start, next.end); } catch (_) {}
-      } else {
-        textarea.selectionStart = next.start;
-        textarea.selectionEnd = next.end;
-      }
-      if (!opts || opts.pending !== false) {
-        this.pendingSelection = next;
-      }
-    },
-    syncTextareaSelectionFromEditor() {
-      const sel = _chatRichSelectionIndexes(editor);
-      if (!sel) return;
-      // This mirrors the browser-owned contenteditable caret into the hidden
-      // textarea. It must not schedule a reverse editor selection update,
-      // otherwise normal ArrowLeft/ArrowRight movement gets snapped back by
-      // the next sync tick.
-      this.setTextareaSelection(sel.start, sel.end, { pending: false });
-    },
-    renderFromTextarea(opts = {}) {
-      // Rebuilding the contenteditable mid-composition drops the IME buffer;
-      // compositionend runs one reconcile once the text has committed.
-      if (this.composing) return;
-      const value = String(textarea.value || '');
-      const changed = value !== this.lastValue || !_chatRichChipsMatchValue(editor, value);
-      let shouldAutoGrow = !!(opts && opts.forceHeight);
-      if (changed) {
-        shouldAutoGrow = true;
-        this.lastValue = value;
-        const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
-        const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
-        _chatRichRenderValue(editor, value);
-        // Restoring a DOM selection also focuses contenteditable in Chromium.
-        // Panel edits keep their focus; apply the pending caret on editor focus.
-        if (document.activeElement === editor) {
-          const sel = this.pendingSelection || { start, end };
-          _chatRichSetSelection(editor, sel.start, sel.end);
-          this.pendingSelection = null;
-        }
-      } else if (this.pendingSelection && document.activeElement === editor) {
-        _chatRichSetSelection(editor, this.pendingSelection.start, this.pendingSelection.end);
-        this.pendingSelection = null;
-      }
-      if (shouldAutoGrow) this.autoGrow(_chatRichAutoGrowMax(textarea.id));
-    },
-    syncFromEditor(emit) {
-      const selection = _chatRichSelectionIndexes(editor);
-      const value = _chatRichSerializeNode(editor);
-      if (value === this.lastValue && !emit) return;
-      this.lastValue = value;
-      textarea.value = value;
-      // Assigning textarea.value moves its caret to the end. Preserve the
-      // native editor selection before normalizing typed/pasted @ mentions.
-      if (selection) this.setTextareaSelection(selection.start, selection.end, { pending: false });
-      this.syncingFromEditor = true;
-      if (emit) {
-        try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
-      }
-      this.syncingFromEditor = false;
-      this.renderFromTextarea();
-      this.autoGrow(_chatRichAutoGrowMax(textarea.id));
-    },
-    autoGrow(maxPx) {
-      const max = Number(maxPx) || _chatRichAutoGrowMax(textarea.id);
-      editor.style.height = 'auto';
-      const next = Math.min(editor.scrollHeight || 0, max);
-      if (next > 0) editor.style.height = `${next}px`;
-      const overflow = (editor.scrollHeight || 0) > max;
-      editor.style.overflowY = overflow ? 'auto' : 'hidden';
-      // Once the editor scrolls internally, growing/wrapping no longer keeps the
-      // caret in view on its own (resetting height to 'auto' above also resets
-      // scrollTop), so the newly typed line ends up clipped below the fold.
-      if (overflow && document.activeElement === editor) this.scrollCaretIntoView();
-    },
-    // Keep the caret's line inside the scroll viewport. Range client rects are
-    // empty exactly at a trailing <br> boundary (the just-created empty line),
-    // so fall back to scrolling to the bottom when the caret is at content end.
-    scrollCaretIntoView() {
-      const sel = window.getSelection ? window.getSelection() : null;
-      if (!sel || sel.rangeCount < 1) return;
-      const range = sel.getRangeAt(0);
-      if (!editor.contains(range.endContainer)) return;
-      const editorRect = editor.getBoundingClientRect();
-      const rects = range.getClientRects();
-      let rect = rects && rects.length ? rects[rects.length - 1] : null;
-      if (!rect || !rect.height) {
-        const bounding = range.getBoundingClientRect();
-        if (bounding && bounding.height) rect = bounding;
-      }
-      if (rect && rect.height) {
-        if (rect.bottom > editorRect.bottom) editor.scrollTop += (rect.bottom - editorRect.bottom) + 2;
-        else if (rect.top < editorRect.top) editor.scrollTop -= (editorRect.top - rect.top) + 2;
-        return;
-      }
-      const idx = _chatRichSelectionIndexes(editor);
-      if (idx && idx.end >= _chatRichSerializeNode(editor).length) editor.scrollTop = editor.scrollHeight;
-    },
-    ensureTrailingBreak() {
-      _chatRichEnsureTrailingBreak(editor);
-    },
-    insertUse(selection) {
-      if (typeof _chatUseTokenFor !== 'function') return false;
-      const token = _chatUseTokenFor(selection);
-      if (!token) return false;
-      this.syncTextareaSelectionFromEditor();
-      const value = String(textarea.value || '');
-      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
-      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
-      const before = value.slice(0, start);
-      const after = value.slice(end);
-      const leading = before && !/\s$/.test(before) ? ' ' : '';
-      const trailing = after && /^\s/.test(after) ? '' : ' ';
-      const replacement = `${leading}${token}${trailing}`;
-      textarea.value = `${before}${replacement}${after}`;
-      const caret = start + replacement.length;
-      this.setTextareaSelection(caret, caret);
-      this.lastValue = null;
-      this.renderFromTextarea();
-      try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
-      return true;
-    },
-  };
-
-  textarea.addEventListener('input', () => {
-    if (api.syncingFromEditor || api.composing) return;
-    api.renderFromTextarea();
-  });
-  editor.addEventListener('input', () => {
-    // Native IME keeps mutating the editor while composing; stay out of its way
-    // and reconcile once on compositionend.
-    _chatRichHandleEditorInput(api);
-  });
-  editor.addEventListener('compositionstart', () => { api.composing = true; });
-  editor.addEventListener('compositionend', () => {
-    api.composing = false;
-    // The committed text is now in the editor DOM; mirror it into the textarea
-    // and recompute height/scroll exactly once.
-    api.ensureTrailingBreak();
-    api.syncFromEditor(true);
-  });
-  editor.addEventListener('focus', () => {
-    api.renderFromTextarea();
-    api.syncTextareaSelectionFromEditor();
-  });
-  editor.addEventListener('keyup', () => api.syncTextareaSelectionFromEditor());
-  editor.addEventListener('mouseup', () => api.syncTextareaSelectionFromEditor());
-  editor.addEventListener('paste', (e) => {
-    const cd = e.clipboardData;
-    if (cd?.files?.length && _chatRichUploadPasteFiles(textarea.id, cd.files)) {
-      e.preventDefault();
-      return;
-    }
-    const text = cd?.getData ? cd.getData('text/plain') : '';
-    if (!text) return;
-    e.preventDefault();
-    _chatRichInsertText(editor, text);
-    api.ensureTrailingBreak();
-    api.syncFromEditor(true);
-  });
-  editor.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
-    api.syncTextareaSelectionFromEditor();
-    if ((e.key === 'Backspace' || e.key === 'Delete') && typeof _deleteChatUseTokenAtCaret === 'function') {
-      const direction = e.key === 'Delete' ? 'forward' : 'backward';
-      if (_deleteChatUseTokenAtCaret(textarea, direction)) {
-        e.preventDefault();
-        return;
-      }
-    }
-    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey
-        && typeof _moveChatUseTokenCaret === 'function') {
-      const direction = e.key === 'ArrowRight' ? 'forward' : 'backward';
-      if (_moveChatUseTokenCaret(textarea, direction)) {
-        e.preventDefault();
-        api.pendingSelection = {
-          start: textarea.selectionStart || 0,
-          end: textarea.selectionEnd || textarea.selectionStart || 0,
-        };
-        api.renderFromTextarea();
-        return;
-      }
-    }
-    if (e.key !== 'Enter') return;
-    if (textarea.id === 'auto-task-input') return;
-    if (e.shiftKey || e.metaKey || e.ctrlKey) {
-      e.preventDefault();
-      _chatRichInsertText(editor, '\n');
-      // A lone trailing "\n" renders no line; add the filler <br> before we
-      // measure height so the new line shows and the caret scrolls into view.
-      api.ensureTrailingBreak();
-      api.syncFromEditor(true);
-      return;
-    }
-    if (e.altKey) return;
-    e.preventDefault();
-    if (textarea.id === 'new-chat-input' && typeof handleNewChatSubmit === 'function') handleNewChatSubmit();
-    else if (textarea.id === 'project-chat-input' && typeof _submitProjectChat === 'function') _submitProjectChat();
-    else if (typeof handleChatSubmit === 'function') handleChatSubmit();
-  });
-
-  if (nativeFocus) {
-    try {
-      textarea.focus = function focus(options) {
-        if (editor.isConnected) {
-          api.focus();
-          return;
-        }
-        nativeFocus(options);
-      };
-    } catch (_) {}
-  }
-  if (nativeSetSelectionRange) {
-    try {
-      textarea.setSelectionRange = function setSelectionRange(start, end, direction) {
-        nativeSetSelectionRange(start, end, direction);
-        api.pendingSelection = { start, end: typeof end === 'number' ? end : start };
-        if (document.activeElement === editor) {
-          _chatRichSetSelection(editor, api.pendingSelection.start, api.pendingSelection.end);
-          api.pendingSelection = null;
-        }
-      };
-    } catch (_) {}
-  }
-  return api;
-}
-
-// Replace the old transparent-textarea mirror with a real rich editor. The
-// textarea remains the source-of-truth compatibility layer for send/draft/
-// voice code; the visible caret and chip blocks now belong to contenteditable
-// DOM, so browser selection can cross non-editable chips atomically.
-function _initMentionMirror(textarea) {
-  if (!textarea || textarea.dataset.mentionMirror === '1') return;
-  if (!textarea.parentNode) return;
-  textarea.dataset.mentionMirror = '1';
-
-  const wrap = document.createElement('div');
-  wrap.className = 'chat-input-rich-wrap';
-  const editor = document.createElement('div');
-  editor.className = 'chat-rich-editor';
-  editor.contentEditable = 'true';
-  editor.setAttribute('role', 'textbox');
-  editor.setAttribute('aria-multiline', 'true');
-  editor.dataset.richInputId = textarea.id || '';
-  editor.dataset.placeholder = textarea.getAttribute('placeholder') || '';
-
-  // Insert wrap in place of textarea, move textarea inside.
-  textarea.parentNode.insertBefore(wrap, textarea);
-  wrap.appendChild(editor);
-  wrap.appendChild(textarea);
-  textarea.classList.add('chat-rich-source');
-
-  let lastPlaceholder = '';
-  const api = _chatRichCreateApi(textarea, editor);
-  _chatRichComposers.set(textarea.id, api);
-  const sync = () => {
-    const placeholder = textarea.getAttribute('placeholder') || '';
-    if (placeholder !== lastPlaceholder) {
-      lastPlaceholder = placeholder;
-      editor.dataset.placeholder = placeholder;
-    }
-    api.renderFromTextarea();
-  };
-  window.addEventListener('i18n-change', () => {
-    api.lastValue = null;
-    sync();
-  });
-  const chipId = _chatRichRecipientChipId(textarea.id);
-  if (chipId && typeof bindRecipientAnchor === 'function') {
-    try { bindRecipientAnchor(chipId, textarea.id); } catch (_) {}
-  }
-  // Programmatic value changes (send-clears the input, agent-picker
-  // inserts `@<name>`, draft restore on conv switch) don't fire `input`
-  // natively. Most call sites dispatch one explicitly, but a 100ms
-  // safety poll catches any we missed without per-callsite plumbing.
-  // String-compare cost is negligible; we only do real work when the
-  // value actually drifted from the last paint.
-  setInterval(sync, 100);
-  sync();
-}
-
-// Set up rich composers for the chat panels that participate in the group-
-// chat `@` semantics. Other chat panels (skill-edit, agent-edit) don't route
-// via the bus's mention parser, so they keep the plain textarea.
-function _initAllMentionMirrors() {
-  const chatInput = document.getElementById('chat-input');
-  if (chatInput) _initMentionMirror(chatInput);
-  const newChatInput = document.getElementById('new-chat-input');
-  if (newChatInput) _initMentionMirror(newChatInput);
-  const projectChatInput = document.getElementById('project-chat-input');
-  if (projectChatInput) _initMentionMirror(projectChatInput);
-  const autoTaskInput = document.getElementById('auto-task-input');
-  if (autoTaskInput) _initMentionMirror(autoTaskInput);
-}
-
-function _quickStartThumbHtml(thumb) {
-  switch (thumb) {
-    case 'web':
-      return `
-        <span class="quick-thumb-art quick-thumb-web">
-          <span class="quick-thumb-browser-bar"><i></i><i></i><i></i></span>
-          <span class="quick-thumb-web-hero">
-            <i class="quick-thumb-web-title"></i>
-            <i class="quick-thumb-web-copy"></i>
-            <i class="quick-thumb-web-button"></i>
-          </span>
-          <span class="quick-thumb-web-menu"><i></i><i></i><i></i></span>
-        </span>`;
-    case 'research':
-      return `
-        <span class="quick-thumb-art quick-thumb-research">
-          <span class="quick-thumb-paper">
-            <i class="quick-thumb-paper-title"></i>
-            <i class="quick-thumb-paper-line is-wide"></i>
-            <i class="quick-thumb-paper-line is-medium"></i>
-            <i class="quick-thumb-paper-line is-short"></i>
-          </span>
-          <i class="quick-thumb-research-lens"></i>
-        </span>`;
-    case 'login':
-      return `
-        <span class="quick-thumb-art quick-thumb-login">
-          <span class="quick-thumb-window-bar"><i></i><i></i><i></i></span>
-          <i class="quick-thumb-login-visual"></i>
-          <span class="quick-thumb-login-form">
-            <i class="quick-thumb-login-title"></i>
-            <i class="quick-thumb-login-field"></i>
-            <i class="quick-thumb-login-field"></i>
-            <i class="quick-thumb-login-button"></i>
-          </span>
-        </span>`;
-    case 'video':
-      return `
-        <span class="quick-thumb-art quick-thumb-video">
-          <i class="quick-thumb-video-glow"></i>
-          <i class="quick-thumb-video-subject"></i>
-          <i class="quick-thumb-play">${_uiIconHtml('play-triangle', 'quick-thumb-play-icon')}</i>
-          <i class="quick-thumb-video-caption"></i>
-          <span class="quick-thumb-video-progress"><i></i></span>
-        </span>`;
-    case 'chart':
-      return `
-        <span class="quick-thumb-art quick-thumb-chart">
-          <span class="quick-thumb-chart-head"><i></i><b></b></span>
-          <span class="quick-thumb-chart-bars"><i></i><i></i><i></i><i></i><i></i></span>
-          <i class="quick-thumb-chart-trend"></i>
-        </span>`;
-    case 'presentation':
-      return `
-        <span class="quick-thumb-art quick-thumb-presentation">
-          <span class="quick-thumb-presentation-rail"><i></i><i></i><i></i></span>
-          <span class="quick-thumb-presentation-slide">
-            <i class="quick-thumb-presentation-title"></i>
-            <i class="quick-thumb-presentation-copy"></i>
-            <span class="quick-thumb-presentation-chart"><i></i><i></i><i></i></span>
-          </span>
-        </span>`;
-    case 'poster':
-      return `
-        <span class="quick-thumb-art quick-thumb-poster">
-          <i class="quick-thumb-poster-orb"></i>
-          <i class="quick-thumb-poster-product"></i>
-          <span class="quick-thumb-poster-copy"><i></i><i></i></span>
-          <i class="quick-thumb-poster-tag"></i>
-        </span>`;
-    case 'article':
-      return `
-        <span class="quick-thumb-art quick-thumb-article">
-          <i class="quick-thumb-article-cover"></i>
-          <span class="quick-thumb-article-body">
-            <i class="quick-thumb-article-kicker"></i>
-            <i class="quick-thumb-article-title"></i>
-            <i class="quick-thumb-article-line"></i>
-            <i class="quick-thumb-article-line is-short"></i>
-          </span>
-        </span>`;
-    case 'seo':
-      return `
-        <span class="quick-thumb-art quick-thumb-seo">
-          <span class="quick-thumb-search-bar"><i></i><b></b></span>
-          <span class="quick-thumb-search-result"><i></i><i></i></span>
-          <span class="quick-thumb-search-result is-second"><i></i><i></i></span>
-          <span class="quick-thumb-rank"><i></i><b></b><em></em></span>
-        </span>`;
-    default:
-      return `
-        <span class="quick-thumb-art quick-thumb-research">
-          <span class="quick-thumb-paper">
-            <i class="quick-thumb-paper-title"></i>
-            <i class="quick-thumb-paper-line is-wide"></i>
-            <i class="quick-thumb-paper-line is-medium"></i>
-          </span>
-        </span>`;
-  }
-} // { cid, selected:Set<string> }
-
-function _selectedMessageElements() {
-  if (!_messageSelectionState || _messageSelectionState.cid !== currentCid) return [];
-  return Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'))
-    .filter((msg) => _messageSelectionState.selected.has(msg.dataset.msgId || ''));
-}
 
 try {
   if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     window.orkas.onPushEvent('conversation:media_materialized', _conversationMediaHandleMaterialized);
-    window.orkas.onPushEvent('conversation:task_terminal', _taskTerminalHandlePresentation);
+    window.orkas.onPushEvent('conversation:task_terminal', (payload) => {
+      _taskTerminalHandlePresentation(payload);
+      _scheduleConversationTaskLinksRefresh();
+    });
+    window.orkas.onPushEvent('projects:tasks-changed', _scheduleConversationTaskLinksRefresh);
   }
 } catch (_) {}

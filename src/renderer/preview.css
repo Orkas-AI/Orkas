@@ -26,11 +26,7 @@
 .preview-window .chat-file-viewer-actions,
 .preview-window .chat-lightbox-actions {
   position: absolute; top: 12px; right: 12px; --orkas-ui-layer: chrome; z-index: 4;
-  gap: 6px; padding: 6px; border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 12px; background: rgba(248, 250, 252, 0.94);
-  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.12);
-  opacity: 0.5;
-  transition: opacity 180ms ease; -webkit-app-region: no-drag;
+  gap: 6px; padding: 6px;
 }
 .preview-window .chat-file-viewer-actions:hover,
 .preview-window .chat-file-viewer-actions:focus-within,
@@ -40,7 +36,6 @@
 .preview-window .chat-lightbox-actions > button {
   width: 28px; height: 28px; background: transparent; box-shadow: none;
 }
-.preview-window .chat-lightbox-actions > button:hover:not(:disabled) { background: #e2e8f0; }
 .preview-window .chat-file-viewer.is-video-idle .chat-file-viewer-actions:not(:hover):not(:focus-within) {
   opacity: 0; pointer-events: none;
 }

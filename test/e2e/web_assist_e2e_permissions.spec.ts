@@ -34,7 +34,7 @@ test('website permission stays with its tab, grants only its trusted answer, and
       return webContents.fromId(args.id)!.executeJavaScript(args.script, true);
     }, { id: contentsId, script });
     await run('window.permissionResult="pending"; void Notification.requestPermission().then(result => window.permissionResult=result); true');
-    const prompt = page.locator('.web-assist-permission-prompt');
+    const prompt = page.locator('.web-assist-permission-prompt:not(.web-assist-page-dialog)');
     await expect(prompt).toBeVisible();
     await expect(prompt).toContainText(origin);
     await expect(prompt).toContainText('通知');

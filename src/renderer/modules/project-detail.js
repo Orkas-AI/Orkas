@@ -65,18 +65,6 @@ function _projectDetailFailure(errLike, fallback) {
   return { error_code: errorCode, error_type: _projectDetailFailureType(errLike, errorCode) };
 }
 
-function _projectFileUploadPayload(fileList, source, targetDir) {
-  const files = Array.from(fileList || []);
-  let totalBytes = 0;
-  for (const file of files) totalBytes += Number((file && (file.size || file.bytes)) || 0);
-  return {
-    source,
-    file_count: files.length,
-    total_bytes: totalBytes,
-    has_target_dir: !!targetDir,
-  };
-}
-
 let _projectLibraryScopeGeneration = 0;
 let _projectDetailPid = '';     // pid currently rendered in the panel
 let _projectDetailMeta = null;  // { project, agentDetails, files, libraryStatus? }
@@ -333,6 +321,7 @@ function _renderProjectDetail({ hydrateSecondary = true, refreshMemory = hydrate
   _renderProjectMemoryList();
   _bindProjectDetailTabs();
   _bindProjectSideTabs();
+  window.TodoDue?.paint();
   _bindProjectAutoAddBtn();
   _bindProjectInstructions();
   _bindProjectMemory();
@@ -802,6 +791,7 @@ function _onProjectInstructionsChanged(payload) {
 }
 
 function _onProjectTasksChanged(payload) {
+  if (window.TodoCleanup?.deferRefresh()) return;
   const pid = payload && payload.projectId;
   if (typeof _scheduleGlobalTodosRefresh === 'function') _scheduleGlobalTodosRefresh(pid);
   if (!pid || pid !== _projectDetailPid || currentView !== 'project' || !_projectDetailMeta) return;
@@ -1280,7 +1270,7 @@ async function _loadProjectTodos(pid) {
     const res = await window.orkas.invoke('projects.tasks.list', { projectId: pid });
     if (!res?.ok || !Array.isArray(res.tasks)) throw new Error('load_failed');
     nextTodos = res.tasks;
-    if (pid === _projectDetailPid && loadSeq === _projectTodoLoadSeq) _setTodoLoadError(false);
+    if (isCurrent()) _setTodoLoadError(false);
   } catch (err) {
     _projectDetailLog.warn('load project todos failed');
     if (isCurrent()) _setTodoLoadError(true);
@@ -1522,6 +1512,7 @@ function _renderTodoCard(task, context) {
     const due = document.createElement('span');
     due.className = 'project-todo-due' + (overdue ? ' is-overdue' : '');
     due.textContent = t(overdue ? 'project.todo.due_overdue' : 'project.todo.due_on', { date: _todoDueLabel(task.due_at) });
+    if (window.TodoDue) due.appendChild(window.TodoDue.createDot(task));
     appendMeta(due);
   }
 
@@ -1555,10 +1546,9 @@ function _renderTodoCard(task, context) {
     let clear = null;
     if (task.owner_agent_id || task.owner_agent) {
       const ownerAgent = _findProjectAgent(task.owner_agent_id, task.owner_agent, context.agents);
-      const label = (ownerAgent && ownerAgent.name) || task.owner_agent || '';
-      const avatarHtml = (ownerAgent && typeof renderAvatarHtml === 'function')
-        ? renderAvatarHtml(ownerAgent.icon, ownerAgent.color, { size: 18, seed: ownerAgent.agent_id })
-        : '';
+      const label = (ownerAgent && ownerAgent.name) || task.owner_agent || task.owner_agent_id || '';
+      const avatarHtml = typeof uiIconHtml === 'function'
+        ? `<span class="project-todo-agent-icon">${uiIconHtml('users', 'project-todo-assign-icon')}</span>` : '';
       assign.innerHTML = `${avatarHtml}<span class="project-todo-assign-name">${escapeHtml(label)}</span>`;
       assign.title = t('project.todo.assigned_to', { name: label });
       assignee.classList.add('is-assigned');
@@ -1613,7 +1603,10 @@ function _updateProjectTodoEditor() {
     if (projectDisabled) _todoEditorProjectSelect?.close?.();
   }
   const agentTrigger = document.getElementById('project-todo-agent')?.querySelector?.('.ai-select-trigger');
-  if (agentTrigger) agentTrigger.disabled = busy || _todoEditorAgentLoading;
+  if (agentTrigger) {
+    agentTrigger.disabled = busy || _todoEditorAgentLoading;
+    if (agentTrigger.disabled) _todoEditorAgentSelect?.close?.();
+  }
 }
 
 function _ensureTodoEditorSelects() {
@@ -1948,6 +1941,7 @@ function _closeProjectTodoEditor() {
   if (input) input.value = '';
   if (editor) editor.hidden = true;
   _updateProjectTodoEditor();
+  if (typeof _applyPendingTodoGrouping === 'function') _applyPendingTodoGrouping();
 }
 
 async function _todoMutate(fn, pid = _projectDetailPid) {
@@ -1980,6 +1974,7 @@ async function _todoMutate(fn, pid = _projectDetailPid) {
   } finally {
     _projectTodoMutating = false;
     _updateProjectTodoEditor();
+    if (typeof _applyPendingTodoGrouping === 'function') _applyPendingTodoGrouping();
   }
   return { ok, failure };
 }
@@ -2008,7 +2003,6 @@ async function _saveProjectTodoEditor() {
   const due = taskId
     ? (dueValue !== (_todoEditorInitial?.due_at || '') ? { due_at: dueValue } : {})
     : (dueValue ? { due_at: dueValue } : {});
-  const startedAt = Date.now();
   // Create passes the pre-allocated draft id when files were staged so the
   // persisted task adopts them. Edits update the existing task in place.
   const outcome = await _todoMutate(async () => {
@@ -2072,9 +2066,9 @@ function _openTodoStatusMenu(evt, tid, context = _projectTodoContext()) {
 
 async function _setTodoStatus(tid, status, context = _projectTodoContext()) {
   const task = (context.tasks || []).find((x) => x && x.id === tid);
+  if (!task) return;
   const fromStatus = (task && task.status) || 'todo';
   if (fromStatus === status) return;
-  const startedAt = Date.now();
   const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.update', {
     projectId: context.pid,
     taskId: tid,
@@ -2121,7 +2115,6 @@ function _findProjectAgent(agentId, name, list = _projectDetailMeta?.agentDetail
 // owner clears both fields. Passing agent=null unassigns.
 async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
   if (!_todoContextHasScope(context)) return;
-  const startedAt = Date.now();
   const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.update', {
     projectId: context.pid,
     taskId: tid,
@@ -2148,7 +2141,6 @@ async function _runTodoTask(tid, context = _projectTodoContext()) {
   if (_projectTodoRunning || !task || task.status === 'done') return;
   if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
   _projectTodoRunning = true;
-  const startedAt = Date.now();
   let ok = false;
   let cid = '';
   let conversation = null;
@@ -2200,11 +2192,11 @@ async function _deleteTodoTask(tid, context = _projectTodoContext()) {
     dangerLabel: t('project.todo.delete'),
   });
   if (!confirmed || account !== currentUserId) return;
-  const startedAt = Date.now();
   const outcome = await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', {
     projectId: context.pid,
     taskId: tid,
   }), context.pid);
+  if (!outcome.ok) _projectLogFailure('project_todo_action', { action: 'delete', ...outcome.failure });
 }
 
 // Row overflow ("…") menu: process an open task, edit, delete. Uses the
@@ -2214,7 +2206,7 @@ function _openTodoRowMenu(evt, tid, context = _projectTodoContext()) {
   const task = (context.tasks || []).find((x) => x && x.id === tid);
   if (!task) return;
   const status = task.status || 'todo';
-  const runnable = status === 'todo' || status === 'progress' || status === 'review';
+  const runnable = status !== 'done';
   const items = [];
   if (runnable) {
     items.push({ label: t('project.todo.run'), onClick: () => _runTodoTask(tid, context) });
@@ -2520,7 +2512,6 @@ function _bindProjectDriver() {
     _projectDriverMutating = true;
     btn.disabled = true;
     ++_projectDriverLoadSeq;
-    const startedAt = Date.now();
     let ok = false;
     try {
       const res = await window.orkas.invoke('projects.driver.set', { projectId: pid, enabled: next });
@@ -2699,7 +2690,6 @@ function _onProjectAgentMenuKeyDown(ev) {
 async function _removeProjectAgent(agentId) {
   if (!_projectDetailPid || !agentId) return;
   const projectId = _projectDetailPid;
-  const startedAt = performance.now();
   let removed = false;
   try {
     const res = await window.orkas.invoke('projects.bindings.remove', {
@@ -3639,8 +3629,6 @@ async function _reprocessProjectFile(name) {
   const account = typeof currentUserId === 'string' ? currentUserId : '';
   const isAccountCurrent = () => account === (typeof currentUserId === 'string' ? currentUserId : '');
   const isCurrent = () => projectId === _projectDetailPid && isAccountCurrent();
-
-  const startedAt = performance.now();
   try {
     _projectKbStatusByName[name] = {
       ...(_projectKbStatusByName[name] || {}),
@@ -3678,8 +3666,6 @@ async function _deleteProjectFile(name) {
     : t('contexts.file.del_confirm', { name: _projectBasename(name) });
   if (!(await uiConfirm(prompt))) return;
   if (!isCurrent()) return;
-
-  const startedAt = performance.now();
   let res;
   try {
     res = await window.orkas.invoke('projects.files.delete', {
@@ -4032,7 +4018,6 @@ async function _createProjectTextFile(parentDir = '') {
   const projectId = _projectDetailPid;
   const stem = t('contexts.new.untitled_stem');
   const fullPath = _projectJoinPath(parentDir, `${stem}.md`);
-  const startedAt = performance.now();
   let createdName = fullPath;
   try {
     const res = await window.orkas.invoke('projects.files.createText', {
@@ -4069,7 +4054,6 @@ async function _createProjectDir(parentDir = '') {
     return;
   }
   const rel = _projectJoinPath(parentDir, nameRaw);
-  const startedAt = performance.now();
   let createdPath = rel;
   try {
     const res = await window.orkas.invoke('projects.files.mkdir', {
@@ -4158,7 +4142,6 @@ async function _handleProjectLibraryMove(srcName, targetDir) {
   }
   const row = _findProjectFileRow(srcName) || _findProjectDirRow(srcName);
   const entryType = row?.dataset?.type || 'file';
-  const startedAt = performance.now();
   let actual = next;
   try {
     const res = await window.orkas.invoke('projects.files.rename', {
@@ -4210,7 +4193,6 @@ async function _renameProjectFile(name) {
   const next = _projectJoinPath(parentDir, nextBase);
   const row = _findProjectFileRow(name);
   const kind = row?.dataset?.projectFileKind || '';
-  const startedAt = performance.now();
   let failureKey = 'contexts.entry.rename_failed';
   let actual = next;
   try {
@@ -4364,8 +4346,6 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   const files = Array.from(fileList).filter(Boolean);
   if (!files.length) return;
   if (targetDir) _projectLibraryExpanded.add(targetDir);
-  const payload = _projectFileUploadPayload(files, source, targetDir);
-  const startedAt = performance.now();
   _setProjectFilesStatus(t('project.files.uploading'));
   const hiddenRejected = files
     .filter((file) => _projectUploadHasHiddenPath(file))
@@ -4461,8 +4441,6 @@ async function _uploadProjectFilesNative(targetDir = '') {
   const isCurrent = () => _projectDetailPid === uploadProjectId && isAccountCurrent();
 
   if (targetDir) _projectLibraryExpanded.add(targetDir);
-  const payload = { source: 'picker', has_target_dir: !!targetDir };
-  const startedAt = performance.now();
   _setProjectFilesStatus(t('project.files.uploading'));
   let data;
   try {
@@ -4536,7 +4514,6 @@ async function _submitProjectChat() {
   let draftItems = (typeof _chatAttachList === 'function')
     ? _chatAttachList(draftCid)
     : [];
-  let intendedAttachmentCount = draftItems.filter((item) => item && item.status !== 'error').length;
   if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) {
     return;
   }
@@ -4560,7 +4537,6 @@ async function _submitProjectChat() {
       return;
     }
     draftItems = attachmentSnapshot.items;
-    intendedAttachmentCount = draftItems.length;
     const references = (typeof _referenceSnapshotsForQuotes === 'function')
       ? _referenceSnapshotsForQuotes(quotes)
       : [];
@@ -4868,7 +4844,6 @@ async function _openAddPicker() {
         const id = row.dataset.id;
         const k = row.dataset.kind;
         const projectId = _projectDetailPid;
-        const startedAt = performance.now();
         btn.disabled = true;
         btn.textContent = t('common.processing');
         try {
@@ -4968,7 +4943,6 @@ async function _commitRename(newName) {
   }
   let code = '';
   let failure = null;
-  const startedAt = performance.now();
   _projectRenameCommitInFlight = true;
   try {
     let res;

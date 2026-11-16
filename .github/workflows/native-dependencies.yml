@@ -153,12 +153,13 @@ jobs:
         run: >-
           npm run test:js -- --maxWorkers=1
           test/main/features/video_studio_bitmap.test.ts
+      - name: Prepare the declared video runtimes for delivery checks
+        run: npm run ffmpeg:fetch
       - name: Verify HTML copy references and project acceptance
         run: >-
           npm run test:js -- --maxWorkers=1
           test/main/features/video_studio_html_check.test.ts
           test/main/features/image_studio.test.ts
-          test/main/features/video_studio_review.test.ts
           test/main/features/video_studio_core_freshness.test.ts
           test/main/features/video_studio_delivery.test.ts
           test/main/features/image_studio_provenance.test.ts

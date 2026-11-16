@@ -169,7 +169,6 @@ async function bootApp() {
 }
 
 async function _stampSettingsVersion() {
-  _bindSidebarVersionUpdate();
   if (!window.orkas || typeof window.orkas.env !== 'function') return;
   try {
     const env = await window.orkas.env();
@@ -204,7 +203,6 @@ function _renderSidebarVersionUpdate() {
   el.classList.remove('is-actionable', 'is-progress');
 }
 
-function _bindSidebarVersionUpdate() {}
 
 // One-shot rename of legacy brand-prefixed localStorage keys
 // (`orkas_*` / `orkas.*`). Rationale lives in
@@ -314,7 +312,6 @@ function _lazyFeaturePanel(view) {
     : view === 'todos' ? 'panel-todos'
     : view === 'auto' ? 'panel-auto'
     : view === 'marketplace' ? 'panel-marketplace'
-    : view === 'devtools' ? 'panel-devtools'
     : null;
   return panelId ? document.getElementById(panelId) : null;
 }
@@ -350,7 +347,7 @@ function _restoreLastView() {
   }
   // Restart policy: only `conversation` view is remembered across launches.
   // Every other tab (agents / skills / contexts / connectors / apps / settings
-  // / project detail / marketplace / devtools) intentionally falls back to
+  // / project detail / marketplace) intentionally falls back to
   // the commander (new-chat) — the user always lands on a known starting
   // point and doesn't accidentally resume a settings / inventory tab they
   // wandered into before quitting.
@@ -380,6 +377,7 @@ async function initUser() {
       currentUserId = data.user_id;
       try { globalThis.currentUserId = currentUserId; } catch (_) {}
       if (typeof _restoreUnreadTaskState === 'function') _restoreUnreadTaskState();
+      void window.TodoDue?.init();
       _bootLog.info('user init', { user_id: currentUserId });
     }
   } catch (e) {
@@ -423,8 +421,7 @@ function setView(view, cid, opts = {}) {
                 : view === 'apps' ? 'panel-apps'
                 : view === 'settings' ? 'panel-settings'
                 : view === 'memory' ? 'panel-memory'
-                : view === 'devtools' ? 'panel-devtools'
-                : view === 'project' ? 'panel-project'
+                            : view === 'project' ? 'panel-project'
                 : view === 'todos' ? 'panel-todos'
                 : view === 'marketplace' ? 'panel-marketplace'
                 : 'panel-conversation';
@@ -439,7 +436,6 @@ function setView(view, cid, opts = {}) {
   document.getElementById('contexts-btn')?.classList.toggle('active', view === 'contexts');
   document.getElementById('apps-btn')?.classList.toggle('active', view === 'apps');
   document.getElementById('settings-btn')?.classList.toggle('active', view === 'settings');
-  document.getElementById('devtools-btn')?.classList.toggle('active', view === 'devtools');
   document.querySelectorAll('.conv-item').forEach(it => {
     it.classList.toggle('active', view === 'conversation' && it.dataset.cid === cid);
   });
@@ -458,14 +454,14 @@ function setView(view, cid, opts = {}) {
     // Opening the task is the read boundary for its completed reply. This also
     // runs when the already-selected row is clicked again.
     if (typeof _markConversationRead === 'function') _markConversationRead(cid);
-    // Bind the video review drawer to the conversation being shown, here rather
+    // Bind the video canvas to the conversation being shown, here rather
     // than inside loadConversationHistory. Only one of the three branches below
     // loads history: a freshly created conversation takes `skipLoad`, so the
-    // drawer never re-bound and stayed pointed at the previous conversation —
+    // canvas never re-bound and stayed pointed at the previous conversation —
     // and because notifyTurnEnd drops events whose cid is not the bound one, it
     // then ignored every update the new conversation produced and never
     // recovered.
-    try { window.VideoReviewPanel?.probe?.(cid); } catch (_) { /* optional surface */ }
+    try { window.VideoCanvas?.probe?.(cid); } catch (_) { /* optional surface */ }
     if (typeof onEnterConversationView === 'function') onEnterConversationView();
     // If this conversation has an in-flight stream and its bubble is still
     // attached to #chat-history (sidebar tab toggle didn't wipe it), skip

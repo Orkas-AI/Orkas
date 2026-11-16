@@ -22,6 +22,7 @@ vi.mock('../../../src/main/features/auth', () => ({
 }));
 
 vi.mock('../../../src/main/features/generation_reference_assets', () => ({
+  withReferencePreparation: async (signal: AbortSignal | undefined, work: (signal: AbortSignal | undefined) => unknown) => work(signal),
   prepareReferenceUrls: vi.fn(async ({ urls }: { urls?: string[] }) => [...(urls || [])]),
   registerGeneratedMediaUrl: mocks.registerGeneratedMediaUrl,
 }));

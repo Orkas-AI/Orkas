@@ -113,6 +113,7 @@
 | User journey | Independent acceptance | Execution evidence |
 | --- | --- | --- |
 | Discover and select a usable CLI | Missing/non-executable/old candidates fail; replacement and reinstall invalidate identity caches; model eligibility stays separate from version support. | Registry, which/version/compatibility/runtime-option cases plus real binary detection. |
+| Auxiliary model task: complete a read or scoped edit | Exact seeded facts or requested delta; adjacent files and values stay unchanged; unapproved high-impact changes stop. | The public local-agent benchmark supports all five CLIs, source/Skill edits, edit-before-install and project-task state scenarios; deterministic scorer contracts do not establish a live model result. |
 | Access current history and Skills after changing model | Actual Orkas Bridge calls retrieve facts absent from workspace/current input; no cross-conversation search or unnecessary handoff. | ACP model-switch cases restore MCP with advertised `session/load` before the first prompt; rejection/missing capability cannot submit model work. Real Hermes runs cover this repaired path. |
 | Deliver and reopen a reply | One terminal, no later events, public text event, matching metadata/status/session; archive equals the actual text stream or final-only fallback. | Shared live acceptance helpers with missing/duplicate/corrupt evidence controls, wired into smoke and quality runs. |
 | Decode native OpenClaw output | One Unicode reply from stdout or stderr; protocol envelope is absent from text/diagnostics; structured failure remains failure even with zero exit status. | Real-child cases split UTF-8 one byte at a time; native stderr diagnostics stay visible. |
@@ -298,7 +299,7 @@ Native warnings remain a separate review result. Real permission UI, other-platf
 npm run benchmark:local-agents -- --agents codex --k 1 --no-save
 ```
 
-完整方法与 scorecard 字段见 the separately authorized model canary。
+`scripts/local-agent-live-support.mjs` owns the scenario inventory and bounded scorecard fields. Run `npm test -- test/eval/local-agent-quality-benchmark.test.ts` to verify their deterministic contract; a live model run requires separate provider authorization.
 
 ## 准备
 

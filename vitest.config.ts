@@ -16,6 +16,11 @@ const testWorkers = Math.max(1, Math.min(process.platform === 'win32' ? 1 : 2, l
 export default defineConfig({
   test: {
     globals: false,
+    // Worker analysis owns console warnings/errors. Do not replay their RPC
+    // copies onto the audited native FD; retain normal stdout diagnostics.
+    onConsoleLog(_log, type) {
+      if (process.env.ORKAS_TEST_PROCESS_REPORT && type === 'stderr') return false;
+    },
     include: ['test/**/*.test.ts', 'src/core-agent/test/**/*.test.ts'],
     // Each test file gets a fresh module graph — important because several of
     // our modules cache state (storage line counts, prompts cache, paths

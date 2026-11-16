@@ -26,11 +26,16 @@ async function setup(page: Page, count: number) {
     window.currentCid=null; window.currentView='conversation'; window.conversations=[];
     window.pendingConvs=new Map(); window.groupBusyConvs=new Map();
     window.isConvPending=cid=>pendingConvs.has(cid)||groupBusyConvs.has(cid);
-    window.orkas={onPushEvent(){return ()=>{};}};
+    window.setGroupConversationBusy=(cid,busy)=>busy ? groupBusyConvs.set(cid,true) : groupBusyConvs.delete(cid);
+    window.pushHandlers=new Map();
+    window.orkas={onPushEvent(name,fn){pushHandlers.set(name,fn);return ()=>{};}};
     </script><script src="modules/icons.js"></script><script src="modules/utils.js"></script>
     <script src="vendor/prosemirror/prosemirror.min.js"></script>
     <script src="modules/composer-input.js"></script>
-    <script src="modules/conversation.js"></script></head><body>
+    <script src="modules/conv-bucket.js"></script>
+    <script src="modules/cli_async_input.js"></script>
+    <script src="modules/local_agent_user_input.js"></script>
+    <script src="modules/conversation.js"></script><script src="modules/projects.js"></script></head><body>
     <span id="commander-running-chip"></span><span id="tasks-running-chip"></span>
     <span data-project-running-chip="project"></span>
     <div id="today-list"></div><div id="conversation-list"></div>
@@ -123,6 +128,97 @@ test('repeated refresh preserves live indicators, rename focus and status transi
     w._updateConvSidebarBadge('c2');
   });
   await expect(page.locator('[data-cid="c2"] .conv-status-badge')).toHaveCount(2);
+});
+
+test('background CLI questions show attention in every sidebar copy and clear after answer, withdrawal or stop', async ({ page }, info) => {
+  await setup(page, 8);
+  const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
+  const sidebar = index.slice(index.indexOf('<aside class="sidebar">'), index.indexOf('</aside>') + 8);
+  const locales = Object.fromEntries(['en', 'zh'].map(lang => [lang,
+    JSON.parse(fs.readFileSync(path.join(renderer, 'locales', `${lang}.json`), 'utf8'))]));
+  await page.evaluate(({ sidebar, locales }) => {
+    const w = window as any;
+    document.body.innerHTML = `<div class="app-container">${sidebar}<main class="main-content"><div id="chat-cli-questions" hidden></div></main></div>`;
+    w.lang = 'zh';
+    w.t = (key: string, args: any) => {
+      const value = locales[w.lang][key] || key;
+      return value.replace(/\{(\w+)\}/g, (_: string, name: string) => String(args?.[name] ?? ''));
+    };
+    w.localizeSidebar = () => document.querySelectorAll('[data-i18n]').forEach(el => {
+      el.textContent = w.t((el as HTMLElement).dataset.i18n);
+    });
+    w.localizeSidebar();
+    w.orkas.invoke = async (_: string, data: any) => ({ ok: true, message: {
+      cli_answer: { message_id: data.message_id, answers: data.answers },
+    } });
+    w.conversations = [
+      { conversation_id: 'a', title: '需要确认的任务 · A very long task title for sidebar clipping checks', last_active_at: new Date().toISOString() },
+      { conversation_id: 'b', title: 'Another running task', last_active_at: new Date().toISOString() },
+      { conversation_id: 'p', title: 'Project task', project_id: 'project', last_active_at: new Date().toISOString() },
+      { conversation_id: 'old', title: 'Historical unanswered question', created_at: '2020-01-01' },
+    ];
+    const render = (rows: any[]) => rows.map(c => w._renderConversationSidebarItem(c)).join('');
+    document.getElementById('today-list')!.innerHTML = render(w.selectRecentConversations(w.conversations));
+    document.getElementById('conversation-list')!.innerHTML = render(w.conversations.filter((c: any) => !c.project_id));
+    document.getElementById('projects-list')!.innerHTML = w._renderProjectRow({ project_id: 'project', name: 'CLI project' }, []);
+    w.pendingConvs.clear();
+    for (const cid of ['a', 'b', 'p']) w.pendingConvs.set(cid, { aborted: false });
+    w.CliAsyncInput.showConversation('b');
+    w.question = { id: 'q', from: 'agent', turn_id: 'turn', cli_question: { questions: [{ title: 'Which scope?', options: ['Current'] }] } };
+    w.CliAsyncInput.observe('old', w.question);
+    w._handleGroupBusEvent('a', null, { type: 'state_changed', state: { status: 'running', in_flight: ['agent'] },
+      active_turns: [{ actor: 'agent', turn_id: 'turn', steerable: true }] });
+    w._handleGroupBusEvent('a', null, { type: 'message', msg: w.question });
+  }, { sidebar, locales });
+  const labels = page.locator('[data-cid="a"] .conv-item-status-label.is-waiting');
+  await expect(labels).toHaveCount(2);
+  await expect(labels.first()).toHaveText('待回答');
+  await expect(page.locator('[data-cid="a"] .conv-status-badge')).toHaveCount(0);
+  await expect(page.locator('[data-cid="old"] .conv-item-status-label.is-waiting')).toHaveCount(0);
+  await expect(page.locator('#today-running-chip')).toHaveCount(0);
+  await expect(page.locator('#tasks-running-chip')).toHaveText('执行中 1');
+  await expect(page.locator('.sidebar-btn-running-chip.is-waiting')).toHaveCount(0);
+  await expect(page.locator('#commander-running-chip')).toHaveText('执行中 2');
+  expect(await page.evaluate(() => [...(window as any)._sidebarRunningConversationIds()])).toEqual(['b', 'p']);
+  for (const [lang, width, height] of [['zh', 1280, 800], ['en', 800, 600]] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(lang => {
+      const w = window as any;
+      w.lang = lang; w.localizeSidebar(); window.dispatchEvent(new CustomEvent('i18n-change'));
+    }, lang);
+    await expect(labels.first()).toHaveText(lang === 'zh' ? '待回答' : 'Needs answer');
+    await expect(page.locator('.sidebar-section-toggle, .project-row, #new-chat-btn')
+      .filter({ hasText: lang === 'zh' ? '待回答' : 'Needs answer' })).toHaveCount(0);
+    await page.screenshot({ path: info.outputPath(`waiting-${lang}.png`) });
+  }
+  await page.evaluate(() => {
+    const w = window as any;
+    document.getElementById('today-list')!.hidden = true;
+    w.CliAsyncInput.showConversation('a');
+    w.CliAsyncInput.showQuestion(w.question, { cid: 'a' });
+  });
+  await page.locator('#chat-cli-questions textarea').fill('Current folder');
+  await page.locator('#chat-cli-questions .btn-primary').click();
+  await expect(labels).toHaveCount(0);
+  await expect(page.locator('[data-cid="a"] .conv-status-badge.is-streaming')).toHaveCount(2);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.pushHandlers.get('local-agent:user-input')({ cid: 'p', request_id: 'blocking', questions: [{ id: 'q', question: 'Which branch?' }] });
+  });
+  await expect(page.locator('[data-project-running-chip]')).toBeHidden();
+  await expect(page.locator('[data-cid="p"] .conv-item-status-label.is-waiting')).toHaveText('Needs answer');
+  await page.evaluate(() => { document.getElementById('today-list')!.hidden = false; });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.screenshot({ path: info.outputPath('waiting-project-en.png') });
+  await page.evaluate(() => (window as any).pushHandlers.get('local-agent:user-input_cancelled')({ request_ids: ['blocking'] }));
+  await expect(page.locator('[data-project-running-chip]')).toHaveText('1 running');
+  await page.evaluate(() => {
+    const w = window as any;
+    w.CliAsyncInput.observe('a', { ...w.question, id: 'q2' });
+    w._handleGroupBusEvent('a', null, { type: 'aborted' });
+  });
+  await expect(labels).toHaveCount(0);
+  await expect(page.locator('#tasks-running-chip')).toHaveText('2 running');
 });
 
 test('task status stays at the trailing edge beside the menu when replies become unread', async ({ page }, info) => {

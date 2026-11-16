@@ -8,10 +8,13 @@
  * pre-staged by the user). Each task owns its config, attachments and handoff
  * files; deletion removes that complete directory.
  *
- * Fire path: `chats.createConversation({projectId})` → copy attachments
- * into the new conv's resolved `chat_attachments/<cid>/` → `groupChat.send({text,
+ * Fire path: every run goes to the task's run conversation — the one the
+ * task was created from, else the one its first run opened. A conversation
+ * that is gone or in another scope is replaced by a new
+ * `chats.createConversation({projectId})`. Attachments are copied into the
+ * conversation's resolved `chat_attachments/<cid>/` → `groupChat.send({text,
  * attachments})`. Same single-dispatch bus entry as a manual send (per
- * PC/CLAUDE.md §5).
+ * PC/CLAUDE.md §5); a message to a busy conversation queues behind its work.
  *
  * Schedule shapes (Schedule union):
  *   - one_time: { at: ISO datetime }       fires once; after fire enabled=false
@@ -41,6 +44,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import {
+  userCloudRoot,
   userLocalRoot,
   projectMetaFile,
 } from '../paths';
@@ -57,6 +61,8 @@ import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from '../util/log-redact';
 import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
 import { sha256OfFileStream } from '../util/sha256';
+import { copyLocalFileAtomic } from '../util/file-import';
+import { isPathAllowed } from '../util/path-sandbox';
 import { t as translate } from '../i18n';
 import {
   getCurrentDevice as getLegacyDeviceFingerprint,
@@ -69,6 +75,7 @@ import { getActiveUserId, hasActiveUser } from './users';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import * as agents from './agents';
 import * as chats from './chats';
+import { isAgentEnabled } from './component_enabled';
 import * as groupChat from './group_chat';
 
 const log = createLogger('auto-tasks');
@@ -156,6 +163,11 @@ export interface AutoTask {
   created_at: string;
   updated_at: string;
   last_run_at?: string;
+  /** Conversation every run is sent to: the one the task was created from,
+   *  else the one its first run opened. Absent on tasks saved before it
+   *  existed, which continue in `last_run.cid`. Host bookkeeping, not shown
+   *  to the model. */
+  conversation_id?: string;
   /** Runs started (scheduled and manual) since this field existed. */
   run_count?: number;
   /** The most recent run and the one before it. A run stays `running` until
@@ -354,7 +366,6 @@ function _isValidTaskShape(t: any): t is AutoTask {
 // ── File IO (serialised per uid) ──────────────────────────────────────────
 
 const _tails = new Map<string, Promise<unknown>>();
-
 let _markRanFailureForTest: Error | null = null;
 
 export function _setMarkRanFailureForTest(error: Error | null): void {
@@ -431,7 +442,6 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
     : null
   );
   if (prev && prev.dir !== loc.dir && fs.existsSync(prev.dir)) {
-
     const retired = path.join(path.dirname(prev.dir), `.${task.id}.moved-${crypto.randomUUID()}`);
     await replaceDirectoryAtomically(loc.dir, async (staged) => {
       if (fs.existsSync(loc.dir)) fs.cpSync(loc.dir, staged, { recursive: true });
@@ -448,14 +458,11 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
     });
     try { fs.rmSync(retired, { recursive: true, force: true }); }
     catch (err) { log.warn('task migration source cleanup failed', logErrorSummary(err)); }
-
     return;
   }
   fs.mkdirSync(loc.dir, { recursive: true });
   await writeJson(loc.configFile, task);
-
 }
-
 
 function _hasMatchingLocalLegacyClaim(uid: string, task: AutoTask): boolean {
   const assignedId = String(task.device_id || '').toLowerCase();
@@ -712,6 +719,8 @@ export async function getTask(uid: string, taskId: string): Promise<AutoTask | n
 
 export async function createTask(
   uid: string, draft: TaskDraft,
+  /** The conversation where the task was requested becomes its run conversation. */
+  provenance: { conversationId?: string } = {},
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   const norm = _normaliseDraft(draft);
   if (!norm.ok) return { ok: false, error: (norm as { error: TaskError }).error };
@@ -741,6 +750,8 @@ export async function createTask(
       device_name: device.name,
       created_at: now,
       updated_at: now,
+      ...(provenance.conversationId && safeId(provenance.conversationId)
+        ? { conversation_id: provenance.conversationId } : {}),
     };
     await _writeOne(uid, task);
     log.info(`task created uid=${maskId(uid)} id=${task.id} type=${task.schedule.type} project=${task.project_id || '-'} attachments=${(task.attachments || []).length}`);
@@ -856,10 +867,8 @@ export async function deleteTask(uid: string, taskId: string, expectedProjectId?
     if (expectedProjectId !== undefined && ((await _readOne(uid, taskId))?.project_id ?? null) !== expectedProjectId) return { ok: false };
     const loc = findAutoTaskLocation(uid, taskId);
     if (!loc || !fs.existsSync(loc.dir)) return { ok: false };
-
     try {
       fs.rmSync(loc.dir, { recursive: true, force: true });
-
       _removeFireBoundaryClaimDir(uid, taskId);
       log.info(`task deleted uid=${maskId(uid)} id=${taskId}`);
       _onTaskMutated(uid, null, taskId);
@@ -923,6 +932,9 @@ export interface AutoTaskMutationOptions {
   sourceAttachmentCid?: string;
   /** Host-bound scope: null is global, undefined preserves Commander selection. */
   projectId?: string | null;
+  /** Conversation the mutation was made in. A created task runs there;
+   *  an update leaves the run conversation unchanged. */
+  conversationId?: string;
 }
 
 function _autoTaskResultTitle(task: AutoTask | null | undefined, fallbackId: string): string {
@@ -949,6 +961,9 @@ export async function applyAutoTaskMutation(
       const result = await createTask(
         uid,
         { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft,
+        {
+          ...(opts.conversationId ? { conversationId: opts.conversationId } : {}),
+        },
       );
       if (!result.ok) return { ok: false, error: (result as { error: string }).error };
       await _stageMutationAttachments(uid, result.task.id, mutation, opts);
@@ -1020,7 +1035,6 @@ async function _stageMutationAttachments(
     if (!fs.existsSync(src)) continue;
     try {
       fs.copyFileSync(src, path.join(destDir, name));
-
     } catch (err) {
       log.warn(`attachment stage failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     }
@@ -1060,11 +1074,12 @@ async function _markRan(
 
 // ── Run facts and handoff ────────────────────────────────────────────────
 //
-// A run opens a fresh conversation, so by itself it knows nothing about the
-// runs before it. The task record keeps a run count and the last two runs,
-// and each task owns one `handoff/` directory a run may read and write for
-// the next one. The turn guidance reads both; nothing else in the task
-// directory is writable from a run.
+// Runs continue in one conversation, but its history can be compacted or the
+// conversation replaced, so a run is also told about the runs before it. The
+// task record keeps a run count and the last two runs, and each task owns one
+// `handoff/` directory a run may read and write for the next one. The turn
+// guidance reads both; nothing else in the task directory is writable from a
+// run.
 
 export const AUTO_TASK_HANDOFF_NOTE = 'note.md';
 const RUN_STATUSES: ReadonlySet<string> = new Set<AutoRunStatus>([
@@ -1089,6 +1104,31 @@ function _dropMalformedRunFacts(raw: Record<string, unknown>): void {
   for (const key of ['last_run', 'previous_run'] as const) {
     if (raw[key] !== undefined && !_isValidRun(raw[key])) delete raw[key];
   }
+  if (raw.conversation_id !== undefined
+      && !(typeof raw.conversation_id === 'string' && safeId(raw.conversation_id))) delete raw.conversation_id;
+}
+
+// Runs in progress, by account and conversation. A conversation the run did
+// not create is an automation run only while this lasts; after a restart the
+// run is gone and the conversation is ordinary chat again. Pinned on
+// globalThis like the bus registries, so every loaded copy of this module
+// sees the same runs.
+const _ACTIVE_RUNS_KEY = Symbol.for('orkas.auto_tasks.active_runs');
+type ActiveRun = { taskId: string; startedAt: string };
+const _activeRuns: Map<string, ActiveRun> = ((globalThis as Record<symbol, unknown>)[_ACTIVE_RUNS_KEY] as Map<string, ActiveRun>)
+  || ((globalThis as Record<symbol, unknown>)[_ACTIVE_RUNS_KEY] = new Map<string, ActiveRun>());
+
+function _activeRunKey(uid: string, cid: string): string { return `${uid}\u0000${cid}`; }
+
+function _endActiveRun(uid: string, cid: string, taskId: string, startedAt: string): void {
+  const key = _activeRunKey(uid, cid);
+  const active = _activeRuns.get(key);
+  if (active?.taskId === taskId && active.startedAt === startedAt) _activeRuns.delete(key);
+}
+
+/** The task whose run is in progress in this conversation, or ''. */
+export function activeRunTaskId(uid: string, cid: string): string {
+  return _activeRuns.get(_activeRunKey(uid, cid))?.taskId || '';
 }
 
 /** The handoff note a run reads first and rewrites before it ends. */
@@ -1096,8 +1136,9 @@ export function handoffNotePath(uid: string, task: Pick<AutoTask, 'id' | 'projec
   return path.join(autoTaskLocationForTask(uid, task.id, task.project_id).handoffDir, AUTO_TASK_HANDOFF_NOTE);
 }
 
-/** Count the run and remember its conversation. The run before it moves to
- *  `previous_run` so the new run can be told how that one ended. */
+/** Count the run and remember its conversation, which later runs continue
+ *  in. The run before it moves to `previous_run` so the new run can be told
+ *  how that one ended. */
 export async function recordRunStart(uid: string, taskId: string, cid: string, startedAt: string): Promise<void> {
   if (!_isValidTaskId(taskId) || !safeId(cid)) return;
   await _runExclusive(uid, async () => {
@@ -1105,71 +1146,88 @@ export async function recordRunStart(uid: string, taskId: string, cid: string, s
     if (!cur) return;
     const next: AutoTask = {
       ...cur,
+      conversation_id: cid,
       run_count: (cur.run_count || 0) + 1,
       ...(cur.last_run ? { previous_run: cur.last_run } : {}),
       last_run: { cid, started_at: startedAt, status: 'running' },
     };
     await _writeOne(uid, next);
+    _activeRuns.set(_activeRunKey(uid, cid), { taskId, startedAt });
   });
 }
 
-/** Close the run on record with the terminal of its own conversation. A
- *  terminal for another conversation, or for a run no longer on record, is
- *  ignored. */
+/** Close the run on record with the terminal of its own run. A terminal for
+ *  another conversation, or for a run no longer on record (`startedAt`
+ *  names which run ended; runs share a conversation), is ignored. Canonical handoff files stay under their task owner. */
 export async function recordRunTerminal(
-  uid: string, taskId: string, cid: string, status: AutoRunStatus, endedAt: string,
+  uid: string, taskId: string, cid: string, status: AutoRunStatus, endedAt: string, startedAt?: string,
 ): Promise<void> {
   if (!_isValidTaskId(taskId) || !safeId(cid)) return;
   await _runExclusive(uid, async () => {
     const cur = await _readOne(uid, taskId);
     if (!cur?.last_run || cur.last_run.cid !== cid) return;
+    if (startedAt !== undefined && cur.last_run.started_at !== startedAt) return;
     await _writeOne(uid, { ...cur, last_run: { ...cur.last_run, status, ended_at: endedAt } });
-
+    _endActiveRun(uid, cid, taskId, cur.last_run.started_at);
   });
 }
 
-/** Let the run's conversation write the task's handoff directory. The rest
- *  of the task directory stays behind the automation tool. */
+/** Let the run's conversation write the task's handoff directory, besides
+ *  whatever it could already write. The rest of the task directory stays
+ *  behind the automation tool. */
 async function _grantHandoffRoot(uid: string, task: AutoTask, cid: string): Promise<void> {
   const loc = autoTaskLocationForTask(uid, task.id, task.project_id);
   try {
     fs.mkdirSync(loc.handoffDir, { recursive: true });
     const state = await import('./group_chat/state');
-    await state.setToolExtraRoots(uid, cid, [loc.handoffDir]);
+    await state.addToolExtraRoots(uid, cid, [loc.handoffDir]);
   } catch (err) {
     log.warn(`handoff root grant failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
   }
 }
 
-/** Observe before dispatch, but persist a terminal only after the admitted
- *  run's start is durable. A fast run can finish before send returns. */
-function _watchRunTerminal(uid: string, taskId: string, cid: string): { admit(): void; cancel(): void } {
+/** Observe from before dispatch and close the run with the terminal of the
+ *  bus run its message belongs to — named at admission, since the message
+ *  may join a run already in progress there. The terminal is persisted only
+ *  after the run's start is durable: a fast run can finish before send
+ *  returns. */
+function _watchRunTerminal(uid: string, taskId: string, cid: string): {
+  join(runId: string): void; joined(): boolean; admit(startedAt: string): void; cancel(): void;
+} {
   const subscribe = (groupChat as { subscribeTaskTerminals?: typeof import('./group_chat/bus').subscribeTaskTerminals })
     .subscribeTaskTerminals;
-  if (typeof subscribe !== 'function') return { admit() {}, cancel() {} };
-  let admitted = false;
+  if (typeof subscribe !== 'function') return { join() {}, joined: () => true, admit() {}, cancel() {} };
+  let runId = '';
+  let startedAt = '';
   let pending: (() => void) | undefined;
   const unsubscribe = subscribe((event) => {
-    // Each fire owns a newly created conversation. Its first terminal belongs
-    // to this admitted run; later chat can only finish after that terminal.
-    if (event.user_id !== uid || event.conversation_id !== cid) return;
+    if (!runId || event.run_id !== runId || event.user_id !== uid || event.conversation_id !== cid) return;
     unsubscribe();
     const status = RUN_STATUSES.has(event.status) ? event.status as AutoRunStatus : 'unknown';
     const finish = () => {
-      recordRunTerminal(uid, taskId, cid, status, new Date(event.finished_at_ms).toISOString())
+      // Actual run ownership ends even if its task was deleted or terminal
+      // persistence fails. A late terminal must not clear a newer run.
+      _endActiveRun(uid, cid, taskId, startedAt);
+      recordRunTerminal(uid, taskId, cid, status, new Date(event.finished_at_ms).toISOString(), startedAt)
         .catch((err) => log.warn(`run terminal record failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err)));
     };
-    if (admitted) finish();
+    if (startedAt) finish();
     else pending = finish;
   });
   return {
-    admit() {
-      admitted = true;
+    join(id) { runId = id; },
+    joined: () => !!runId,
+    admit(at) {
+      startedAt = at;
       const finish = pending;
       pending = undefined;
       finish?.();
     },
-    cancel() { unsubscribe(); pending = undefined; },
+    cancel() {
+      unsubscribe();
+      pending = undefined;
+      _endActiveRun(uid, cid, taskId, startedAt);
+    },
   };
 }
 
@@ -1201,7 +1259,6 @@ export async function uploadAttachment(
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, safe), buf);
-
     log.info(`attachment uploaded uid=${maskId(uid)} id=${taskId} bytes=${buf.length}`);
     return { ok: true, name: safe };
   } catch (err) {
@@ -1218,7 +1275,6 @@ export async function deleteAttachment(uid: string, taskId: string, name: string
   const target = path.join(loc.attachmentsDir, safe);
   try {
     if (fs.existsSync(target)) fs.unlinkSync(target);
-
     return { ok: true };
   } catch (err) {
     log.warn(`attachment delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
@@ -1566,22 +1622,43 @@ async function _bindTaskBrowserWindow(uid: string, cid: string, taskId: string):
   }
 }
 
-async function _buildFireSeedText(task: AutoTask): Promise<string> {
+/** Seed text plus the actor the run is for: the task's Agent while it
+ *  exists and is enabled, otherwise Commander, as an unresolved `@name`
+ *  falls back to Commander in routing. */
+async function _buildFireSeed(uid: string, task: AutoTask): Promise<{ text: string; recipientId: string }> {
+  const { COMMANDER_ID } = await import('./group_chat/state');
   const recipient = task.recipient;
-  if (!recipient || recipient.kind !== 'agent') return _buildSeedText(task);
+  if (!recipient || recipient.kind !== 'agent') return { text: _buildSeedText(task), recipientId: COMMANDER_ID };
   try {
     const current = await agents.getAgent(recipient.id);
+    const recipientId = current && isAgentEnabled(uid, current.agent_id) ? current.agent_id : COMMANDER_ID;
     const currentName = current?.name?.trim();
     if (currentName && currentName !== recipient.name) {
-      return _buildSeedText({
-        ...task,
-        recipient: { ...recipient, name: currentName },
-      });
+      return {
+        text: _buildSeedText({ ...task, recipient: { ...recipient, name: currentName } }),
+        recipientId,
+      };
     }
+    return { text: _buildSeedText(task), recipientId };
   } catch (err) {
     log.warn(`fire recipient lookup failed id=${task.id} agent=${recipient.id}`, logErrorSummary(err));
   }
-  return _buildSeedText(task);
+  return { text: _buildSeedText(task), recipientId: COMMANDER_ID };
+}
+
+/** The conversation this run continues in: the task's run conversation, or
+ *  for a task saved before that existed, its latest run's. It must still
+ *  exist and share the task's scope; otherwise the run opens a new one. */
+async function _runConversation(uid: string, task: AutoTask): Promise<string> {
+  const cid = task.conversation_id || task.last_run?.cid || '';
+  if (!cid) return '';
+  try {
+    const conv = await chats.getConversationMetadata(uid, cid);
+    if (conv && (conv.project_id || '') === (task.project_id || '')) return cid;
+  } catch (err) {
+    log.warn(`fire conversation lookup failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+  }
+  return '';
 }
 
 function _buildFireTitle(task: AutoTask, catchUp = false): string {
@@ -1633,44 +1710,52 @@ async function _fireTask(
       duration_ms: Math.max(0, Date.now() - startedAt),
     });
   };
-  try {
-    const conv = await chats.createConversation(uid, {
-      kind: 'normal',
-      title,
-      ...(task.project_id ? { projectId: task.project_id } : {}),
-      originAutoTaskId: task.id,
-    });
-    cid = conv.conversation_id;
-  } catch (err) {
-    log.error(`fire conv-create failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
-    emitFailure('conv_create_failed');
-    return { ok: false, error: 'conv_create_failed' };
+  cid = await _runConversation(uid, task);
+  const reused = !!cid;
+  if (!reused) {
+    try {
+      const conv = await chats.createConversation(uid, {
+        kind: 'normal',
+        title,
+        ...(task.project_id ? { projectId: task.project_id } : {}),
+        originAutoTaskId: task.id,
+      });
+      cid = conv.conversation_id;
+    } catch (err) {
+      log.error(`fire conv-create failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+      emitFailure('conv_create_failed');
+      return { ok: false, error: 'conv_create_failed' };
+    }
   }
   // The run may keep files for the next run in the task's handoff directory;
   // grant it before the first turn so the turn's tools can already write there.
   await _grantHandoffRoot(uid, task, cid);
-  // Copy attachments into the new conversation's chat_attachments dir
-  // BEFORE dispatch. The originals stay under the task's attachments/ so
-  // recurring schedules re-use them next fire.
+  // Copy attachments into the conversation's chat_attachments dir BEFORE
+  // dispatch. The originals stay under the task's attachments/ so recurring
+  // schedules re-use them next fire.
   const attachmentNames = await _copyAttachmentsForFire(uid, task, cid);
-  const text = await _buildFireSeedText(task);
+  const seed = await _buildFireSeed(uid, task);
+  // Only a conversation opened for this run is removed when the run cannot
+  // be sent; a conversation runs continue in is never deleted.
   const rollbackEmptyConv = async (reason: string): Promise<void> => {
+    if (reused) return;
     try { await chats.deleteConversation(uid, cid, task.project_id || null); }
     catch (e) { log.warn(`fire rollback failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} reason=${reason}`, logErrorSummary(e)); }
   };
-  // The conversation was just created here, so no renderer send has bound it to
-  // a window. Without that binding every task-browser call fails, so an
-  // automation that reads a page has no way to run at all. Binding stays out of
-  // the foreground: the tab this fire opens must not take over the view.
+  // A conversation that no renderer send has bound to a window cannot use the
+  // task browser, so an automation that reads a page has no way to run at all.
+  // Binding stays out of the foreground: this fire must not take over the view.
   await _bindTaskBrowserWindow(uid, cid, task.id);
   const terminal = _watchRunTerminal(uid, task.id, cid);
   let preparingRun: Promise<void> | undefined;
-  const prepareRun = (): Promise<void> => preparingRun ||= (async () => {
+  const prepareRun = (run?: { runId: string }): Promise<void> => preparingRun ||= (async () => {
     // The accepted send prepares its facts before recipient work is queued:
     // native and CLI context assembly can both run before send() returns.
+    if (run?.runId) terminal.join(run.runId);
+    const runStartedAt = new Date(startedAt).toISOString();
     try {
-      await recordRunStart(uid, task.id, cid, new Date(startedAt).toISOString());
-      terminal.admit();
+      await recordRunStart(uid, task.id, cid, runStartedAt);
+      terminal.admit(runStartedAt);
     } catch (err) {
       terminal.cancel();
       log.warn(`run start record failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
@@ -1678,9 +1763,12 @@ async function _fireTask(
   })();
   try {
     const res = await groupChat.send({
-      userId: uid, cid, text,
-      beforeDispatch: prepareRun,
+      userId: uid, cid, text: seed.text,
       notificationKind: 'automation',
+      beforeDispatch: prepareRun,
+      // A conversation the run did not just open has its own reply target;
+      // the run still goes to the task's recipient and leaves that target.
+      ...(reused ? { forceTo: [seed.recipientId] } : {}),
       ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
     });
     if (!res.ok) {
@@ -1690,10 +1778,12 @@ async function _fireTask(
       emitFailure('send_not_ok');
       return { ok: false, error: 'send_not_ok' };
     }
-    log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} attachments=${attachmentNames.length}${catchUp ? ' catch_up=1' : ''}`);
+    log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} reused=${reused ? 1 : 0} attachments=${attachmentNames.length}${catchUp ? ' catch_up=1' : ''}`);
     // A successful send without recipient dispatch still counts as before.
     // The shared promise prevents recording an ordinary dispatch twice.
     await prepareRun();
+    // Without dispatch no bus run was named, so no terminal can close it.
+    if (!terminal.joined()) terminal.cancel();
     _emitFire({
       type: 'conv_created',
       source,
@@ -1750,6 +1840,10 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
   const srcDir = autoTaskLocationForTask(uid, task.id, task.project_id).attachmentsDir;
   if (!fs.existsSync(srcDir)) return [];
   const destDir = chatAttachmentDirForConversation(uid, cid, task.project_id);
+  if (!isPathAllowed(destDir, [userCloudRoot(uid)])) {
+    log.warn(`attachment destination out of scope uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`);
+    return [];
+  }
   try { fs.mkdirSync(destDir, { recursive: true }); } catch (_) { /* ignore */ }
   const copied: string[] = [];
   for (const name of want) {
@@ -1758,8 +1852,40 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
     const src = path.join(srcDir, safe);
     if (!fs.existsSync(src)) continue;
     try {
-      fs.copyFileSync(src, path.join(destDir, safe));
-      copied.push(safe);
+      const sourceStat = await fs.promises.lstat(src);
+      if (!sourceStat.isFile()) continue;
+      const hash = await sha256OfFileStream(src);
+      const ext = path.extname(safe);
+      const stem = path.basename(safe, ext);
+      // At most three candidates: the original name, a stable distinct copy,
+      // then a fresh name if that copy has itself been edited. Never overwrite
+      // a historical attachment or follow a leaf link while comparing bytes.
+      const candidates = [safe, `${stem}-${hash.slice(0, 12)}${ext}`, `${stem}-${crypto.randomBytes(6).toString('hex')}${ext}`];
+      const copiedBefore = copied.length;
+      for (const name of candidates) {
+        const target = path.join(destDir, name);
+        try {
+          const existing = await fs.promises.lstat(target).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (existing) {
+            if (existing.isFile() && existing.size === sourceStat.size && await sha256OfFileStream(target) === hash) {
+              copied.push(name);
+              break;
+            }
+            continue;
+          }
+          if (!isPathAllowed(destDir, [userCloudRoot(uid)])) throw new Error('attachment destination out of scope');
+          await copyLocalFileAtomic(src, target, { bytes: sourceStat.size, mtimeMs: sourceStat.mtimeMs });
+          copied.push(name);
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'E_IMPORT_TARGET_EXISTS') continue;
+          throw error;
+        }
+      }
+      if (copied.length === copiedBefore) throw new Error('attachment copy destination unavailable');
     } catch (err) {
       log.warn(`attachment copy failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
     }

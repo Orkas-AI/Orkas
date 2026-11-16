@@ -29,12 +29,14 @@ import {
   buildDocxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, serializeOfficeBatch,
   type DocxParagraphSpec, type DocxTableSpec, type DocxImageSpec,
   buildXlsxCellProps, type XlsxCell, type XlsxCellProperties, type XlsxSheetSpec,
-  type PptxSlideSpec, type PptxImageSpec,
+  type PptxSlideSpec, type PptxImageSpec, type PptxCreationOptions, PPTX_THEME_KEYS,
   type EditOp, type OfficeBatchOp, OfficeEditInputError,
 } from './office-batch';
 import { createLogger } from '../../logger';
-import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
+import { logErrorRef, logPathRef, maskId, sanitizeLogText } from '../../util/log-redact';
 import { auditPptxContrast } from './pptx-contrast';
+import { readDocxText } from './docx-read';
+import { OfficeCreationJournal, OfficeCreationStateError, officeCreationReceipt, type OfficeCreation } from '../../features/office/office_creation';
 
 const log = createLogger('office-tools');
 
@@ -175,6 +177,8 @@ function compactXlsxStats(value: unknown): {
 }
 
 export interface OfficeToolsOpts {
+  /** Host-bound retained state; never an artifact-directory or model input. */
+  creationStateDir?: string;
   /** Active uid — used to resolve the workspace + attachment sandbox roots. */
   userId?: string;
   /** Current conversation id — adds its attachment dir to the writable scope. */
@@ -190,6 +194,12 @@ export interface OfficeToolsOpts {
   hasProducedPath?: (absPath: string) => boolean;
 }
 
+const creationJournals = new WeakMap<OfficeToolsOpts, OfficeCreationJournal>();
+
+function withCreation(result: ToolResult, operation?: OfficeCreation): ToolResult {
+  return operation ? { ...result, content: result.content + officeCreationReceipt(operation) } : result;
+}
+
 function errResult(code: string, msg: string): ToolResult {
   return { content: `${code}: ${msg}`, isError: true };
 }
@@ -200,13 +210,33 @@ function isResidentDeliveryFailure(result: { stdout: string; stderr: string }): 
     .test(message);
 }
 
+/** Only the native batch protocol can certify an authoring rejection. Error
+ * prose and a nonzero exit alone are not correction authority. */
+function isAtomicInputRejection(stdout: string, operationCount: number): boolean {
+  try {
+    const result = JSON.parse(stdout);
+    const summary = result?.data?.summary;
+    const rows = result?.data?.results;
+    if (result?.success !== false || !summary || summary.atomicRolledBack !== true
+      || summary.total !== operationCount || summary.executed !== operationCount || summary.skipped !== 0
+      || !Number.isInteger(summary.failed) || summary.failed < 1
+      || !Number.isInteger(summary.succeeded) || summary.succeeded < 0
+      || summary.failed + summary.succeeded !== operationCount
+      || !Array.isArray(rows) || rows.length !== operationCount) return false;
+    const failed = rows.filter(row => row?.success === false);
+    return failed.length === summary.failed
+      && rows.every((row, index) => row?.index === index && typeof row.success === 'boolean')
+      && failed.every(row => row.code === 'invalid_value' || row.code === 'unsupported_type');
+  } catch { return false; }
+}
+
 /** Workspace + attachment + extra roots for the current (uid, cid). Mirrors
  *  `local-tools.ts::allowedRootsFor`. */
 function allowedRootsFor(opts: OfficeToolsOpts): string[] {
   const roots: string[] = [];
   if (opts.userId) {
     try {
-      const ws = getWorkspacePath(opts.userId, opts.projectId);
+      const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
       if (ws) roots.push(ws);
     } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
     if (opts.cid) {
@@ -452,17 +482,64 @@ async function acquireFileLocks(absPaths: readonly string[]): Promise<() => void
   };
 }
 
-/** Render one page to a PNG and return it as a tool-result image. Best-effort
- *  for the create-preview path; the caller decides whether a null is fatal. */
-async function renderToImage(file: string, cwd: string, page: string, signal?: AbortSignal, onTextCollisionAudit?: (audit: TextCollisionAudit) => void): Promise<ToolResultImage | null> {
+/** Keep the original failure for explicit review; optional create/edit previews
+ * remain best-effort. No retry or recovery decision belongs to this boundary. */
+async function renderToImage(file: string, cwd: string, page: string, signal?: AbortSignal, onTextCollisionAudit?: (audit: TextCollisionAudit) => void): Promise<
+  { image: ToolResultImage; error?: never } | { image?: never; error: ReturnType<typeof officeRenderFailure> }
+> {
   try {
     const png = onTextCollisionAudit
       ? await renderOfficePageToPng(file, cwd, page, signal, { onTextCollisionAudit })
       : await renderOfficePageToPng(file, cwd, page, signal);
-    return { data: png.toString('base64'), mediaType: 'image/png' };
+    return { image: { data: png.toString('base64'), mediaType: 'image/png' } };
   } catch (err) {
-    log.warn('render error', { error: logErrorRef(err) });
-    return null;
+    const error = logErrorRef(err);
+    log.warn('render error', { error });
+    return { error: officeRenderFailure(err, error.message) };
+  }
+}
+
+function officeRenderFailure(error: unknown, message: unknown): { message: string; source_code?: string; exit_code?: number } {
+  const details = error instanceof Error ? error as Error & { code?: unknown; exitCode?: unknown } : undefined;
+  // Reuse the existing bounded, redacted log message without scanning it again.
+  // Cutting raw text before redaction can expose an incomplete quoted secret.
+  // Codes come from structured fields only, never from error-looking prose.
+  return {
+    message: typeof message === 'string' && message ? message : 'No error details were provided.',
+    ...(typeof details?.code === 'string' && details.code ? { source_code: sanitizeLogText(details.code).slice(0, 64) } : {}),
+    ...(typeof details?.exitCode === 'number' && Number.isSafeInteger(details.exitCode) ? { exit_code: details.exitCode } : {}),
+  };
+}
+
+/** A private, complete file is linked exclusively into a fresh destination.
+ * External writers do not participate in our mutex; EEXIST must select another
+ * name rather than replacing their bytes. Cap continuous collision storms. */
+async function publishNewOfficeFile(
+  workPath: string, requestedPath: string, signal?: AbortSignal,
+  beforePublish?: (selected: string) => Promise<void>,
+): Promise<string> {
+  const occupied = new Set<string>();
+  for (let attempt = 0; attempt < 32; attempt++) {
+    signal?.throwIfAborted();
+    const { finalPath } = await uniquifyPath(requestedPath, () => false, occupied);
+    await beforePublish?.(finalPath);
+    signal?.throwIfAborted();
+    try { fs.linkSync(workPath, finalPath); return finalPath; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      occupied.add(finalPath);
+    }
+  }
+  throw new Error('Office output could not be saved because destination names kept changing.');
+}
+
+function officeFileIdentity(file: string): string | undefined {
+  try {
+    const stat = fs.lstatSync(file, { bigint: true });
+    return stat.isFile() ? [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':') : undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return undefined;
   }
 }
 
@@ -480,6 +557,7 @@ async function runCreate(
     noun: string;
     unit: string;
     unitCount: number;
+    retryOf?: unknown;
   },
 ): Promise<ToolResult> {
   // Resolve inside the try so a uniquify failure (collision exhaustion) returns
@@ -491,10 +569,23 @@ async function runCreate(
   let tempDir = '';
   let workPath = '';
   let releaseLocks: (() => void) | null = null;
+  let operation: OfficeCreation | undefined;
+  let published = false;
+  let replacementIdentity: string | undefined;
+  const journal = creationJournals.get(opts)!;
   try {
-    ({ finalPath, renamed } = await uniquifyPath(args.inputAbs, isMineFor(opts)));
+    const fingerprint = createHash('sha256').update(JSON.stringify([args.createFlags, args.ops])).digest('hex');
+    const admission = await journal.begin(args.inputAbs, fingerprint, args.retryOf, path.extname(args.inputAbs).toLowerCase() === '.docx');
+    if (admission.error) return withCreation(errResult('E_OFFICE_RETRY_NOT_ALLOWED', admission.error), admission.operation);
+    operation = admission.operation!;
+    // A corrected attempt has never published a file. Even conversation-owned
+    // bytes that appeared meanwhile belong to other work and must survive.
+    ({ finalPath, renamed } = await uniquifyPath(args.inputAbs, args.retryOf === undefined ? isMineFor(opts) : () => false));
     cwd = path.dirname(finalPath);
     fs.mkdirSync(cwd, { recursive: true });
+    // Capture ownership before waiting: an outside replacement during lock
+    // admission is independent work, just like a replacement during creation.
+    if (args.retryOf === undefined && isMineFor(opts)(finalPath)) replacementIdentity = officeFileIdentity(finalPath);
     releaseLocks = await acquireFileLocks([finalPath]);
     tempDir = fs.mkdtempSync(path.join(cwd, '.orkas-office-create-'));
     workPath = path.join(tempDir, path.basename(finalPath));
@@ -503,11 +594,12 @@ async function runCreate(
       cwd: tempDir, ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     if (created.code !== 0) {
-      return errResult('E_OFFICE_CREATE_FAILED', created.stderr || created.stdout || `exit ${created.code}`);
+      await journal.finish(operation, 'failed');
+      return withCreation(errResult('E_OFFICE_CREATE_FAILED', created.stderr || created.stdout || `exit ${created.code}`), operation);
     }
 
     if (args.ops.length) {
-      let batched = await runOfficeCli(['batch', workPath], {
+      let batched = await runOfficeCli(['batch', workPath, '--json'], {
         cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
       // A lost resident reply does not prove the batch was unapplied. Restart
@@ -523,56 +615,79 @@ async function runCreate(
           cwd: tempDir, ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
         if (recreated.code !== 0) {
-          return errResult('E_OFFICE_CREATE_FAILED', recreated.stderr || recreated.stdout || `exit ${recreated.code}`);
+          await journal.finish(operation, 'unknown');
+          return withCreation(errResult('E_OFFICE_CREATE_FAILED', recreated.stderr || recreated.stdout || `exit ${recreated.code}`), operation);
         }
-        batched = await runOfficeCli(['batch', workPath], {
+        batched = await runOfficeCli(['batch', workPath, '--json'], {
           cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
       }
       if (batched.code !== 0) {
-        return errResult('E_OFFICE_BATCH_FAILED', batched.stderr || batched.stdout || `exit ${batched.code}`);
+        const rejectedInput = isAtomicInputRejection(batched.stdout, args.ops.length);
+        await journal.finish(operation, rejectedInput ? operation.attempt === 1 ? 'retryable' : 'failed' : 'unknown');
+        return withCreation(errResult('E_OFFICE_BATCH_FAILED', batched.stderr || batched.stdout || `exit ${batched.code}`), operation);
       }
     }
 
-    const preview = args.wantPreview ? await renderToImage(workPath, tempDir, '1', ctx.signal) : null;
+    const preview = args.wantPreview ? (await renderToImage(workPath, tempDir, '1', ctx.signal)).image : undefined;
     await closeOfficeFile(workPath, tempDir);
-
-    // Promote only a fully created/batched file. Failed creation therefore
-    // leaves neither a half-built artifact nor a collision that forces the
-    // model's retry onto `-2.xlsx`. Preserve an owned prior version until the
-    // replacement has reached its final path so retries cannot destroy it.
+    ctx.signal?.throwIfAborted();
     let backupPath = '';
-    if (fs.existsSync(finalPath)) {
+    // Only the same prior owned revision may be replaced. A path registered
+    // earlier in the turn does not establish ownership of later outside bytes.
+    let replaceOwned = replacementIdentity !== undefined && officeFileIdentity(finalPath) === replacementIdentity;
+    if (replaceOwned) {
       await closeOfficeFile(finalPath, cwd);
+      replaceOwned = officeFileIdentity(finalPath) === replacementIdentity;
+    }
+    if (replaceOwned) {
+      await journal.bindFinal(operation, finalPath);
+      ctx.signal?.throwIfAborted();
+      replaceOwned = officeFileIdentity(finalPath) === replacementIdentity;
+    }
+    if (replaceOwned) {
       backupPath = path.join(tempDir, `.previous-${path.basename(finalPath)}`);
       fs.renameSync(finalPath, backupPath);
-    }
-    try {
-      fs.renameSync(workPath, finalPath);
-    } catch (err) {
-      if (backupPath && fs.existsSync(backupPath) && !fs.existsSync(finalPath)) {
-        fs.renameSync(backupPath, finalPath);
+      try { fs.renameSync(workPath, finalPath); published = true; }
+      catch (error) {
+        if (fs.existsSync(backupPath) && !fs.existsSync(finalPath)) fs.renameSync(backupPath, finalPath);
+        throw error;
       }
-      throw err;
+    } else {
+      finalPath = await publishNewOfficeFile(workPath, args.inputAbs, ctx.signal,
+        selected => journal.bindFinal(operation!, selected));
+      renamed = finalPath !== args.inputAbs;
+      cwd = path.dirname(finalPath);
+      published = true;
     }
-    if (backupPath) fs.rmSync(backupPath, { force: true });
-
+    // Publication is already durable. Register the saved artifact before
+    // fallible bookkeeping/backup cleanup so a later error cannot hide it
+    // from the turn's produced-file delivery. Keep that error and no-replay
+    // state; registration does not claim the whole task or QA completed.
     if (opts.onFileWritten) {
       try { await opts.onFileWritten(finalPath); }
       catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
     }
+    await journal.finish(operation, 'published');
+    if (backupPath) fs.rmSync(backupPath, { force: true });
 
     const n = args.unitCount;
     const base = `${args.noun} created: ${finalPath} (${n} ${args.unit}${n === 1 ? '' : 's'})`;
     const renameSignal = renamed ? renderRenameSignal(args.inputAbs, finalPath) : '';
     const content = `${base}${renameSignal}${renderOfficeArtifactReceipt(finalPath)}`;
-    return { content, ...(preview ? { images: [preview] } : {}) };
+    return withCreation({ content, ...(preview ? { images: [preview] } : {}) }, operation);
   } catch (err) {
-    const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_CREATE_FAILED';
-    return errResult(code, (err as Error).message);
+    if (operation?.status === 'started') {
+      try { await journal.finish(operation, published ? 'published' : 'unknown'); }
+      catch { operation.status = published ? 'published' : 'unknown'; }
+    }
+    if (!operation) return errResult('E_OFFICE_CREATION_STATE_UNAVAILABLE', 'Creation state could not be verified; no Office creation was dispatched.');
+    const code = err instanceof OfficeCreationStateError ? 'E_OFFICE_CREATION_STATE_UNAVAILABLE'
+      : err instanceof OfficeCliError ? err.code : 'E_OFFICE_CREATE_FAILED';
+    return withCreation(errResult(code, (err as Error).message), operation);
   } finally {
     if (workPath && tempDir) await closeOfficeFile(workPath, tempDir);
-    if (fs.existsSync(finalPath)) await closeOfficeFile(finalPath, cwd);
+    if (releaseLocks && fs.existsSync(finalPath)) await closeOfficeFile(finalPath, cwd);
     if (releaseLocks) releaseLocks();
     if (tempDir) {
       try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -607,12 +722,13 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_docx',
     description:
-      'Create one editable DOCX from ordered paragraphs, tables, and workspace or attachment images. Returns the saved path and an optional first-page PNG; use edit_office on the returned path for corrections. Name collisions are reported.',
+      'Create an editable DOCX from paragraphs, tables and local images. Returns the collision-safe path and optional preview; correct it with edit_office.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Output .docx path; absolute or workspace-relative.' },
+        retry_of: { type: 'string', description: 'Retryable failure\'s operation_id; retain its path.' },
         title: { type: 'string', description: 'Optional Heading 1 before the body.' },
         paragraphs: {
           type: 'array',
@@ -698,6 +814,7 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
         wantPreview: input.preview !== false,
         noun: 'Word document', unit: 'paragraph',
         unitCount: paragraphs.length,
+        retryOf: input.retry_of,
       });
     },
   };
@@ -722,10 +839,10 @@ function xlsxCellPropertySchema(): Record<string, unknown> {
     'font.name': { type: 'string', description: 'XLSX cell font family.' },
     'font.color': { type: 'string', description: 'XLSX cell text color; do not use the ambiguous bare color key.' },
     'font.size': { type: 'string' },
-    underline: { type: 'string', description: 'Underline style.' },
-    halign: { type: 'string', description: 'Horizontal alignment.' },
-    valign: { type: 'string', description: 'Vertical alignment.' },
-    wrap: { type: 'boolean', description: 'Wrap text.' },
+    underline: { type: 'string' },
+    halign: { type: 'string' },
+    valign: { type: 'string' },
+    wrap: { type: 'boolean' },
     border: { type: 'string', description: 'Border style on all sides.' },
     merge: { type: 'string', description: 'Merge range anchored at this cell, e.g. "A1:C1".' },
   };
@@ -767,10 +884,10 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
         type: 'string',
         description: 'Labels, e.g. "value", "percent", "outsideEnd", or "none".',
       },
-      catTitle: { type: 'string', description: 'Category-axis title.' },
+      catTitle: { type: 'string' },
       axistitle: { type: 'string', description: 'Value-axis title.' },
-      axismin: { type: 'number', description: 'Value-axis minimum.' },
-      axismax: { type: 'number', description: 'Optional value-axis maximum.' },
+      axismin: { type: 'number' },
+      axismax: { type: 'number' },
       axisnumfmt: { type: 'string', description: 'Value-axis number format, e.g. "#,##0" or "0.0%".' },
       gridlines: { type: ['boolean', 'string'], description: 'Major gridlines or line style.' },
       colors: { type: 'string', description: 'Comma-separated series colors, e.g. "4472C4,ED7D31".' },
@@ -821,12 +938,13 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
     name: 'create_xlsx',
     compatibilityInputFields: ['sheet', 'rows', 'columns', 'charts'],
     description:
-      'Create one editable XLSX from sheets with styled or formula cells, column settings, and native charts bound to cell ranges. Returns the saved path and an optional PNG preview; use edit_office on the returned path for corrections. Name collisions are reported.',
+      'Create an editable XLSX with sheets, styled cells, formulas, column settings and native charts bound to cell ranges. Returns the collision-safe path and optional preview; correct it with edit_office.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Output .xlsx path; absolute or workspace-relative.' },
+        retry_of: { type: 'string', description: 'Retryable failure\'s operation_id; retain its path.' },
         sheets: {
           type: 'array',
           minItems: 1,
@@ -873,6 +991,7 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
         ops: buildXlsxWorkbookBatch(sheets),
         wantPreview: input.preview !== false,
         noun: 'Excel workbook', unit: 'cell',
+        retryOf: input.retry_of,
         unitCount: sheets.reduce(
           (total, sheet) => total + (Array.isArray(sheet.rows)
             ? sheet.rows.reduce((sheetTotal, row) => sheetTotal + (Array.isArray(row) ? row.length : 0), 0)
@@ -884,95 +1003,197 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
   };
 }
 
+/** Validate the optional production features before reserving a creation identity.
+ * Existing supported object units retain their native meaning and validation path. */
+const PPTX_GEOMETRY_FIELDS = ['x', 'y', 'width', 'height'] as const;
+const PPTX_GEOMETRY_PROPERTIES = Object.fromEntries(PPTX_GEOMETRY_FIELDS.map(key => [key, {
+  type: 'string',
+}]));
+
+function pptxProductionInputError(input: Record<string, unknown>): string | undefined {
+  const record = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === 'object' && !Array.isArray(value);
+  const length = (value: unknown, positive: boolean): boolean => {
+    if (typeof value !== 'string' || !/^-?(?:\d+(?:\.\d+)?|\.\d+)(?:in|cm|pt)$/i.test(value)) return false;
+    const number = Number.parseFloat(value);
+    return Number.isFinite(number) && (!positive || number > 0);
+  };
+  if (input.canvas !== undefined) {
+    const canvas = input.canvas;
+    if (!record(canvas) || Object.keys(canvas).some(key => !['size', 'width', 'height'].includes(key))) {
+      return 'canvas accepts size or explicit width and height only.';
+    }
+    const preset = typeof canvas.size === 'string' && ['widescreen', 'standard', '16:10'].includes(canvas.size);
+    if (!(preset && canvas.width === undefined && canvas.height === undefined)
+      && !(canvas.size === undefined && length(canvas.width, true) && length(canvas.height, true))) {
+      return 'canvas needs either a supported size or both positive width and height in in, cm, or pt.';
+    }
+  }
+  if (input.theme !== undefined) {
+    if (!record(input.theme) || Object.entries(input.theme).some(([key, value]) =>
+      !(PPTX_THEME_KEYS as readonly string[]).includes(key) || typeof value !== 'string' || !value.trim())) {
+      return 'theme accepts the declared font and color properties with non-empty string values only.';
+    }
+  }
+  if (Array.isArray(input.slides)) {
+    for (const [index, slide] of input.slides.entries()) {
+      if (!record(slide)) continue;
+      // Match the pinned engine's syntax, not a guessed inches default. Preserve
+      // raw integer/scientific EMU and unit-qualified lengths byte-for-byte.
+      for (const group of ['shapes', 'images', 'charts', 'tables']) {
+        const objects = slide[group];
+        if (!Array.isArray(objects)) continue;
+        for (const [objectIndex, object] of objects.entries()) {
+          if (!record(object)) continue;
+          for (const field of PPTX_GEOMETRY_FIELDS) {
+            const value = object[field];
+            if ((typeof value === 'string' || typeof value === 'number')
+              && /^[+-]?(?:\d+\.\d*|\.\d+)$/.test(String(value).trim())) {
+              return `slides[${index}].${group}[${objectIndex}].${field} is a unitless decimal. Give geometry an explicit unit, e.g. "0.8in" or "24pt"; bare integers/scientific notation mean EMU. No changes were applied; correct the slide array and submit it again.`;
+            }
+          }
+        }
+      }
+      for (const key of ['titleStyle', 'bodyStyle']) {
+        const style = slide[key];
+        if (style === undefined) continue;
+        if (!record(style) || Object.values(style).some(value => value !== null && typeof value === 'object')) {
+          return `slides[${index}].${key} accepts scalar geometry and style properties, like shapes.`;
+        }
+        for (const field of PPTX_GEOMETRY_FIELDS) {
+          const value = style[field];
+          if ((typeof value === 'string' || typeof value === 'number')
+            && /^[+-]?(?:\d+\.\d*|\.\d+)$/.test(String(value).trim())) {
+            return `slides[${index}].${key}.${field} is a unitless decimal. Use an explicit unit such as "0.8in" or "24pt".`;
+          }
+        }
+      }
+      if (slide.diagrams === undefined) continue;
+      if (!Array.isArray(slide.diagrams) || slide.diagrams.length > 16) return `Slide ${index + 1}: diagrams must be an array of at most 16 native graphs.`;
+      for (const diagram of slide.diagrams) {
+        if (!record(diagram) || Object.keys(diagram).some(key => !['mermaid', 'x', 'y', 'width', 'height'].includes(key))
+          || typeof diagram.mermaid !== 'string' || !diagram.mermaid.trim() || diagram.mermaid.length > 16_000
+          || !length(diagram.x, false) || !length(diagram.y, false) || !length(diagram.width, true) || !length(diagram.height, true)) {
+          return `Slide ${index + 1}: each diagram needs non-empty mermaid (at most 16000 characters) and x/y/positive width/height in in, cm, or pt; other properties are unsupported.`;
+        }
+      }
+    }
+  }
+}
+
 function createPptxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_pptx',
     description:
-      'Create one editable PPTX from slides containing positioned text, workspace or attachment images, native editable charts, tables, backgrounds, and transitions. Use edit_office on the returned path for corrections. Returns the collision-safe saved path and optional preview.',
+      'Create editable PPTX; charts/diagrams are native. title/body auto-place; body newlines split lines.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Output .pptx path; absolute or workspace-relative.' },
+        path: { type: 'string', description: 'Output .pptx path (absolute or workspace-relative).' },
+        retry_of: { type: 'string', description: 'Retryable operation_id; same path.' },
+        canvas: {
+          type: 'object', additionalProperties: false,
+          description: 'Preset OR positive width+height in in/cm/pt; default engine size.',
+          properties: {
+            size: { type: 'string', enum: ['widescreen', 'standard', '16:10'] },
+            width: { type: 'string' },
+            height: { type: 'string' },
+          },
+        },
+        theme: {
+          type: 'object', additionalProperties: false,
+          description: 'Fonts (.ea:CJK, .cs:complex), hex colors; object styles override.',
+          properties: Object.fromEntries(PPTX_THEME_KEYS.map(key => [key, { type: 'string' }])),
+        },
         slides: {
           type: 'array',
-          description: 'Slides, in order.',
+          description: 'Lengths: units (0.8in/24pt) or integer/scientific EMU; bare decimals invalid. size/lineWidth: pt. Colors: hex/theme; gradients C1-C2[-angle]. Opacity/lineOpacity: 0-100; rotation: clockwise degrees; names: edit targets.',
           items: {
             type: 'object',
             properties: {
-              title: { type: 'string', description: 'Auto-placed title.' },
-              body: { type: 'string', description: 'Auto-placed body; newlines split lines.' },
-              layout: { type: 'string', description: 'Layout name, e.g. "Title and Content".' },
-              background: { type: 'string', description: 'Hex, scheme color, or C1-C2[-angle] gradient.' },
-              transition: { type: 'string', description: 'Transition, e.g. fade, push, wipe, or morph.' },
+              title: { type: 'string' },
+              body: { type: 'string' },
+              titleStyle: { type: 'object', description: 'Title placeholder: scalar shape properties.' },
+              bodyStyle: { type: 'object', description: 'Body placeholder: scalar shape properties.' },
+              layout: { type: 'string', description: 'Office layout, e.g. Title and Content.' },
+              background: { type: 'string' },
+              transition: { type: 'string' },
+              diagrams: {
+                type: 'array', maxItems: 16,
+                description: 'Mermaid flowchart/sequence; bounds in in/cm/pt with positive width/height.',
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    mermaid: { type: 'string', minLength: 1, maxLength: 16000 },
+                    x: { type: 'string' },
+                    y: { type: 'string' },
+                    width: { type: 'string' },
+                    height: { type: 'string' },
+                  },
+                  required: ['mermaid', 'x', 'y', 'width', 'height'],
+                },
+              },
               shapes: {
                 type: 'array',
-                description: 'Positioned text shapes above title/body placeholders.',
                 items: {
                   type: 'object',
-                  description: 'Text shape with geometry and style properties.',
                   properties: {
                     text: { type: 'string' },
-                    x: { type: 'string', description: 'Left position with unit.' },
-                    y: { type: 'string', description: 'Top position with unit.' },
-                    width: { type: 'string', description: 'Width with unit.' },
-                    height: { type: 'string', description: 'Height with unit.' },
-                    fill: { type: 'string', description: 'Fill color or gradient.' },
+                    ...PPTX_GEOMETRY_PROPERTIES,
+                    fill: { type: 'string' },
                     color: { type: 'string' },
-                    size: { type: 'string', description: 'Font size.' },
+                    size: { type: 'string' },
                     bold: { type: 'boolean' },
-                    align: { type: 'string', description: 'left, center, or right.' },
-                    valign: { type: 'string', description: 'top, middle, or bottom.' },
+                    align: { type: 'string' },
+                    valign: { type: 'string' },
                     font: { type: 'string' },
-                    'font.ea': { type: 'string', description: 'CJK font family.' },
-                    geometry: { type: 'string', description: 'Shape preset; default rect.' },
-                    opacity: { type: 'number', description: 'Fill opacity, 0-100; requires a fill.' },
-                    margin: { type: 'string', description: 'One or four internal margins.' },
-                    line: { type: 'string', description: 'Outline color.' },
-                    lineWidth: { type: 'string', description: 'Outline width.' },
-                    lineDash: { type: 'string', description: 'Outline dash style.' },
-                    lineOpacity: { type: 'number', description: 'Outline opacity, 0-100.' },
-                    gradient: { type: 'string', description: 'Gradient fill.' },
-                    rotation: { type: 'number', description: 'Clockwise rotation in degrees.' },
-                    autoFit: { type: 'boolean', description: 'Fit text to the shape.' },
+                    'font.ea': { type: 'string' },
+                    geometry: { type: 'string', description: 'Preset; default rect.' },
+                    opacity: { type: 'number' },
+                    margin: { type: 'string', description: 'One or four length insets.' },
+                    line: { type: 'string' },
+                    lineWidth: { type: 'string' },
+                    lineDash: { type: 'string' },
+                    lineOpacity: { type: 'number' },
+                    gradient: { type: 'string' },
+                    rotation: { type: 'number' },
+                    autoFit: { type: 'boolean' },
                     lineSpacing: { type: 'string' },
                     spaceBefore: { type: 'string' },
                     spaceAfter: { type: 'string' },
                     shadow: {
                       type: ['string', 'boolean'],
-                      description: 'true, "none", or a shadow color; preset names are unsupported.',
+                      description: 'true, none, or color; preset names are unsupported.',
                     },
-                    name: { type: 'string', description: 'Stable edit name.' },
+                    name: { type: 'string' },
                   },
                 },
               },
               images: {
                 type: 'array',
-                description: 'Pictures; src must be in the workspace or attachments.',
+                description: 'src: workspace/attachment path. Crop edges: percent; crop: all, vertical,horizontal, or left,top,right,bottom.',
                 items: {
                   type: 'object',
                   properties: {
-                    src: { type: 'string', description: 'Absolute or workspace-relative path.' },
-                    x: { type: 'string', description: 'Left position with unit.' },
-                    y: { type: 'string', description: 'Top position with unit.' },
-                    width: { type: 'string', description: 'Width with unit.' },
-                    height: { type: 'string', description: 'Height with unit.' },
-                    crop: { type: 'string', description: 'Crop mode or rectangle.' },
-                    cropLeft: { type: 'number', description: 'Left crop percent.' },
-                    cropRight: { type: 'number', description: 'Right crop percent.' },
-                    cropTop: { type: 'number', description: 'Top crop percent.' },
-                    cropBottom: { type: 'number', description: 'Bottom crop percent.' },
-                    opacity: { type: 'number', description: 'Opacity, 0-100.' },
-                    rotation: { type: 'number', description: 'Clockwise rotation in degrees.' },
-                    alt: { type: 'string', description: 'Alternative text.' },
-                    name: { type: 'string', description: 'Stable edit name.' },
+                    src: { type: 'string' },
+                    ...PPTX_GEOMETRY_PROPERTIES,
+                    crop: { type: 'string' },
+                    cropLeft: { type: 'number' },
+                    cropRight: { type: 'number' },
+                    cropTop: { type: 'number' },
+                    cropBottom: { type: 'number' },
+                    opacity: { type: 'number' },
+                    rotation: { type: 'number' },
+                    alt: { type: 'string' },
+                    name: { type: 'string' },
                   },
                   required: ['src'],
                 },
               },
               charts: {
                 type: 'array',
-                description: 'Native editable charts; source external data visibly on the slide.',
+                description: 'data: Name:1,2;Other:3,4. categories/colors: comma-separated. anchor: x,y,width,height lengths. gridlines: hex color. Source external data visibly.',
                 items: {
                   type: 'object',
                   properties: {
@@ -980,56 +1201,48 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                       type: 'string',
                       enum: ['bar', 'column', 'line', 'pie', 'doughnut', 'area', 'scatter', 'bubble', 'radar', 'stock', 'combo', 'waterfall', 'funnel', 'treemap', 'sunburst', 'boxWhisker', 'histogram', 'pareto'],
                     },
-                    data: { type: 'string', description: 'Series: "Name:1,2,3;Name 2:4,5,6".' },
-                    categories: { type: 'string', description: 'Comma-separated category labels.' },
+                    data: { type: 'string' },
+                    categories: { type: 'string' },
                     title: { type: 'string' },
-                    x: { type: 'string', description: 'Left position with unit.' },
-                    y: { type: 'string', description: 'Top position with unit.' },
-                    width: { type: 'string', description: 'Width with unit.' },
-                    height: { type: 'string', description: 'Height with unit.' },
-                    anchor: { type: 'string', description: 'Positioning anchor.' },
-                    legend: { type: 'string', description: 'Legend position or visibility.' },
-                    colors: { type: 'string', description: 'Comma-separated series colors.' },
-                    dataLabels: { type: 'string', description: 'Data-label style or visibility.' },
-                    preset: { type: 'string', description: 'Built-in chart style preset.' },
-                    axismin: { type: 'number', description: 'Value-axis minimum.' },
-                    axismax: { type: 'number', description: 'Value-axis maximum.' },
-                    catTitle: { type: 'string', description: 'Category-axis title.' },
-                    axistitle: { type: 'string', description: 'Value-axis title.' },
-                    gridlines: { type: 'string', description: 'Gridline style or visibility.' },
-                    plotFill: { type: 'string', description: 'Plot-area fill color.' },
-                    chartFill: { type: 'string', description: 'Chart-area fill color.' },
-                    name: { type: 'string', description: 'Stable edit name.' },
+                    ...PPTX_GEOMETRY_PROPERTIES,
+                    anchor: { type: 'string' },
+                    legend: { type: 'string' },
+                    colors: { type: 'string' },
+                    dataLabels: { type: 'string' },
+                    preset: { type: 'string' },
+                    axismin: { type: 'number' },
+                    axismax: { type: 'number' },
+                    catTitle: { type: 'string' },
+                    axistitle: { type: 'string' },
+                    gridlines: { type: 'string' },
+                    plotFill: { type: 'string' },
+                    chartFill: { type: 'string' },
+                    name: { type: 'string' },
                   },
                   required: ['type', 'data'],
                 },
               },
               tables: {
                 type: 'array',
-                description: 'Tables on the slide.',
                 items: {
                   type: 'object',
                   properties: {
                     rows: {
                       type: 'array',
-                      description: 'Cell grid.',
                       items: { type: 'array', items: { type: ['string', 'number'] } },
                     },
-                    x: { type: 'string', description: 'Left position with unit.' },
-                    y: { type: 'string', description: 'Top position with unit.' },
-                    width: { type: 'string', description: 'Table width with unit.' },
-                    height: { type: 'string', description: 'Table height with unit.' },
-                    rowHeight: { type: 'string', description: 'Default row height.' },
-                    colWidths: { type: 'string', description: 'Comma-separated column widths.' },
-                    headerFill: { type: 'string', description: 'Header-row fill color.' },
-                    bodyFill: { type: 'string', description: 'Body-row fill color.' },
-                    style: { type: 'string', description: 'Native PowerPoint table style name.' },
-                    'border.all': { type: 'string', description: 'All-border style/color.' },
-                    'border.horizontal': { type: 'string', description: 'Horizontal-border style/color.' },
-                    'border.vertical': { type: 'string', description: 'Vertical-border style/color.' },
-                    firstRow: { type: 'boolean', description: 'Emphasize header row.' },
-                    bandedRows: { type: 'boolean', description: 'Alternate body-row styling.' },
-                    name: { type: 'string', description: 'Stable edit name.' },
+                    ...PPTX_GEOMETRY_PROPERTIES,
+                    rowHeight: { type: 'string' },
+                    colWidths: { type: 'string', description: 'Comma-separated widths.' },
+                    headerFill: { type: 'string' },
+                    bodyFill: { type: 'string' },
+                    style: { type: 'string' },
+                    'border.all': { type: 'string' },
+                    'border.horizontal': { type: 'string' },
+                    'border.vertical': { type: 'string' },
+                    firstRow: { type: 'boolean' },
+                    bandedRows: { type: 'boolean' },
+                    name: { type: 'string' },
                   },
                   required: ['rows'],
                 },
@@ -1037,11 +1250,13 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
             },
           },
         },
-        preview: { type: 'boolean', description: 'Return a first-slide PNG; default true.' },
+        preview: { type: 'boolean', description: 'First-slide PNG; default true.' },
       },
       required: ['path'],
     },
     async execute(input, ctx) {
+      const productionError = pptxProductionInputError(input);
+      if (productionError) return errResult('E_BAD_INPUT', productionError);
       const prep = prepareOutput(opts, ctx, input, '.pptx');
       if ('error' in prep) return prep.error;
       const rawSlides = Array.isArray(input.slides) ? (input.slides as PptxSlideSpec[]) : [];
@@ -1061,10 +1276,11 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
       return runCreate(opts, ctx, {
         inputAbs: prep.abs,
         createFlags: ['--force'],
-        ops: buildPptxBatch(slides),
+        ops: buildPptxBatch(slides, { canvas: input.canvas, theme: input.theme } as PptxCreationOptions),
         wantPreview: input.preview !== false,
         noun: 'PowerPoint deck', unit: 'slide',
         unitCount: slides.length,
+        retryOf: input.retry_of,
       });
     },
   };
@@ -1145,9 +1361,14 @@ async function renderOfficePage(
 ): Promise<ToolResult> {
   let collisionAudit = analysisMode === 'quality_review' && path.extname(abs).toLowerCase() === '.pptx'
     ? unassessedTextCollision('collection_unavailable') : undefined;
-  const img = await renderToImage(abs, cwd, page, signal, collisionAudit
+  const rendered = await renderToImage(abs, cwd, page, signal, collisionAudit
     ? audit => { collisionAudit = audit; } : undefined);
-  if (!img) return errResult('E_OFFICE_RENDER_FAILED', `could not render ${abs} page ${page}`);
+  if (!rendered.image) {
+    const diagnostic = { page, artifact_revision: shortRevision(artifact.artifactSha256), ...rendered.error };
+    return errResult('E_OFFICE_RENDER_FAILED', `could not render ${abs} page ${page}\n`
+      + `<office-render-error>${JSON.stringify(diagnostic).replace(/</g, '\\u003c')}</office-render-error>`);
+  }
+  const img = rendered.image;
   const imageSha256 = sha256Bytes(Buffer.from(img.data, 'base64'));
   return {
     content:
@@ -1264,7 +1485,7 @@ async function checkOfficeFile(
     ? 'invalid'
     : issueSeverities.blocker > 0 || (xlsxStats?.error_cells ?? 0) > 0
       ? 'blockers_found'
-      : issues.code !== 0 || issueCount === null || xlsxStatsScanOk === false || issueSeverities.unknown > 0
+      : issues.code !== 0 || issueCount === null || contrastScanOk === false || xlsxStatsScanOk === false || issueSeverities.unknown > 0
         ? 'indeterminate'
         : 'reviewed';
   const payload = {
@@ -1505,7 +1726,7 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Existing .docx/.xlsx/.pptx; absolute or workspace-relative.' },
-        mode: { type: 'string', enum: ['text', 'outline', 'get', 'query'], description: 'text (default) returns displayed content; outline returns structure; get reads paths with formula/value metadata; query applies selectors.' },
+        mode: { type: 'string', enum: ['text', 'outline', 'get', 'query'], description: 'text (default) returns content (DOCX body/notes with coverage); outline returns structure; get reads paths with formula/value metadata; query applies selectors.' },
         targets: {
           type: 'array',
           minItems: 1,
@@ -1557,6 +1778,9 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
 
       const cwd = path.dirname(abs);
       try {
+        if (mode === 'text' && path.extname(abs).toLowerCase() === '.docx') {
+          return await readDocxText(abs, cwd, ctx.signal);
+        }
         if (mode === 'get' || mode === 'query') {
           const results: Array<Record<string, unknown>> = [];
           for (const target of targets) {
@@ -1595,7 +1819,7 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'edit_office',
     description:
-      'Edit DOCX, XLSX, or PPTX with an ordered atomic batch after discovering stable targets with office_read. Existing user files produce a separate validated copy; files created this turn may be refined in place. Use office_review for final QA.',
+      'Edit DOCX/XLSX/PPTX in one ordered atomic batch using office_read targets. Existing files get a validated copy; current-turn outputs may update in place. office_review handles QA.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1619,21 +1843,21 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
               },
               path: {
                 type: 'string',
-                description: 'Target element path (action set/remove). For XLSX cells use the exact A1 path returned by office_read, e.g. "/Sheet1/A2"; never use "/Sheet1/cell[A2]".',
+                description: 'set/remove target. XLSX: exact A1 from office_read ("/Sheet1/A2"); never use "/Sheet1/cell[A2]".',
               },
               parent: {
                 type: 'string',
-                description: 'Parent element path (action add). For an XLSX structural cell insertion, put the A1 address here, e.g. "/Sheet1/A2"; ordinary XLSX writes should use set(path, props).',
+                description: 'Add parent. XLSX structural cell insertion: A1 ("/Sheet1/A2"); ordinary writes use set(path, props).',
               },
               type: {
                 type: 'string',
-                description: 'Add type: DOCX p/table/picture; XLSX cell/table/chart/picture; PPTX shape/textbox/picture/chart/table/slide.',
+                description: 'DOCX p/table/picture/header/footer; header/footer use parent "/" and props text/align. XLSX cell/table/chart/picture; PPTX shape/textbox/picture/chart/table/slide.',
               },
               props: {
                 type: 'object',
                 additionalProperties: true,
                 properties: xlsxCellPropertySchema(),
-                description: 'Scalar props; file values use workspace/attachment paths. XLSX cell set reuses create_xlsx value/formula/format/style. Table rows are a primitive grid; XLSX tables require ref or range, e.g. "A1:G6".',
+                description: 'Scalar props; local file paths. PPTX add slide at /: create_pptx slide fields, including object arrays. XLSX cell set: create_xlsx cell fields. Table rows: primitive grid; XLSX tables require ref or range ("A1:G6").',
               },
             },
             required: ['action'],
@@ -1661,6 +1885,12 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
       const normalized = normalizeEditOperations(opts, ctx, input.operations);
       if ('error' in normalized) return errResult('E_BAD_INPUT', normalized.error);
       let normalizedOperations = normalized.operations;
+      if (sourceExt === '.pptx') {
+        const slides = normalizedOperations.flatMap(operation => operation.action === 'add'
+          && operation.type === 'slide' && operation.parent === '/' ? [operation.props] : []);
+        const productionError = pptxProductionInputError({ slides });
+        if (productionError) return errResult('E_BAD_INPUT', productionError);
+      }
       if (sourceExt === '.xlsx') {
         const contractError = xlsxEditContractError(normalizedOperations);
         if (contractError) return errResult('E_BAD_INPUT', contractError);
@@ -1670,7 +1900,7 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
       }
       let ops: OfficeBatchOp[];
       try {
-        ops = buildEditBatch(normalizedOperations);
+        ops = buildEditBatch(normalizedOperations, { pptx: sourceExt === '.pptx' });
       } catch (err) {
         if (err instanceof OfficeEditInputError) return errResult('E_BAD_INPUT', err.message);
         throw err;
@@ -1727,10 +1957,18 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
         await closeOfficeFile(workPath, workCwd);
         // A prior inspection can leave the destination's resident holding the
         // original file open. Release it before the atomic in-place replace.
-        if (fs.existsSync(finalPath)) await closeOfficeFile(finalPath, finalCwd);
-        fs.renameSync(workPath, finalPath);
+        ctx.signal?.throwIfAborted();
+        if (finalPath === sourceAbs) {
+          if (fs.existsSync(finalPath)) await closeOfficeFile(finalPath, finalCwd);
+          ctx.signal?.throwIfAborted();
+          fs.renameSync(workPath, finalPath);
+        } else {
+          finalPath = await publishNewOfficeFile(workPath, requestedOutput, ctx.signal);
+          renamed = finalPath !== requestedOutput;
+          finalCwd = path.dirname(finalPath);
+        }
 
-        const preview = input.preview === true ? await renderToImage(finalPath, finalCwd, '1', ctx.signal) : null;
+        const preview = input.preview === true ? (await renderToImage(finalPath, finalCwd, '1', ctx.signal)).image : undefined;
         if (opts.onFileWritten) {
           try { await opts.onFileWritten(finalPath); }
           catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
@@ -1768,6 +2006,7 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
  *  uid (no workspace/attachment scope to sandbox to), mirroring image/video gen. */
 export function createOfficeTools(opts: OfficeToolsOpts = {}): AgentTool[] {
   if (!opts.userId) return [];
+  creationJournals.set(opts, new OfficeCreationJournal(opts.creationStateDir));
   return [
     createDocxTool(opts),
     createXlsxTool(opts),

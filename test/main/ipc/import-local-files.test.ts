@@ -199,8 +199,8 @@ describe('add a user-selected local file to conversation attachments', () => {
     ['txt', 'text'], ['pdf', 'pdf'], ['docx', 'docx'], ['xlsx', 'spreadsheet'],
     ['pptx', 'presentation'], ['zip', 'archive'], ['mp4', 'video'],
   ])('copies an unrecorded external %s file and reuses its pending attachment on repeat', async (ext, kind) => {
-    // The two rejected reads/deletes of the original path are asserted below.
-    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{$/ });
+    // Read-only preview never authorizes edits or deletion of the original.
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.writeText failed \{$/ });
     expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.deletePath failed \{$/ });
     const fixtures: Record<string, Buffer> = {
       pdf: makeMinimalPdf(['Selected document']), docx: makeMinimalDocx({ paragraphs: ['Selected document'] }),
@@ -215,12 +215,19 @@ describe('add a user-selected local file to conversation attachments', () => {
     expect(fs.readFileSync(abs)).toEqual(content);
     await expect(invoke('conversations.attachments.import', { cid: CID, path: abs }))
       .resolves.toMatchObject({ ok: true, reused: true, info: { name: result.info.name } });
-    // Import copies bytes; it does not grant access to the original directory.
+    // The host can preview an external file while mutation stays scoped.
     await expect(invoke('produced.readText', { cid: CID, path: abs }))
+      .resolves.toMatchObject({ ok: true, text: content.toString('utf8'), size: content.length });
+    await expect(invoke('workspace.statPath', { cid: CID, path: abs }))
+      .resolves.toMatchObject({ ok: true, exists: true, readOnly: true });
+    await expect(invoke('produced.writeText', { cid: CID, path: abs, content: 'unauthorized replacement' }))
       .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
     await expect(invoke('workspace.deletePath', { cid: CID, path: abs }))
       .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
     expect(fs.readFileSync(abs)).toEqual(content);
+    expect(ipcDiagnostics.mock.calls.map(([level, message]) => [level, message])).toEqual([
+      ['error', 'invoke produced.writeText failed'], ['error', 'invoke workspace.deletePath failed'],
+    ]);
   });
 
   it('rejects unsupported files, directories, missing and oversized audio and allows retry when the file returns', async () => {
@@ -518,3 +525,64 @@ describe('orkas.importLocalFiles › conversation scope', () => {
     expect(fs.existsSync(attachmentDir())).toBe(false);
   });
 });
+
+describe('add a user-selected local file to a video production', () => {
+  const CANVAS_CID = 'conv-video-canvas';
+  let workspace: string;
+
+  beforeEach(() => {
+    workspace = path.join(tmpDir, 'canvas-workspace');
+    fs.mkdirSync(path.join(workspace, 'ad', 'videos', 'main'), { recursive: true });
+    vi.doMock('../../../src/main/features/group_chat/conv_workspace', async (importOriginal) => ({
+      ...(await importOriginal<object>()),
+      getConversationWorkspacePath: async () => workspace,
+    }));
+  });
+
+  afterEach(() => {
+    vi.doUnmock('../../../src/main/features/group_chat/conv_workspace');
+  });
+
+  it('copies it into the production and lists it, without the renderer seeing a path', async () => {
+    const abs = sourceFile('box.png', 'bytes');
+
+    const result = await importLocalFiles({
+      scope: 'video_canvas',
+      cid: CANVAS_CID,
+      targetDir: 'ad',
+      entries: [{ path: abs, name: 'box.png', size: 5 }, { path: sourceFile('notes.txt', 'x'), name: 'notes.txt', size: 1 }],
+    });
+
+    expect(result).toEqual({ ok: true, files: [
+      { name: 'box.png', ok: true, asset_id: 'box' },
+      { name: 'notes.txt', ok: false, reason: 'unsupported' },
+    ] });
+    expect(JSON.stringify(result)).not.toContain(sourceDir);
+    expect(fs.readFileSync(path.join(workspace, 'ad', 'media', 'box.png'), 'utf8')).toBe('bytes');
+  });
+
+  it('refuses a folder outside the conversation\'s workspace', async () => {
+    const result = await importLocalFiles({
+      scope: 'video_canvas',
+      cid: CANVAS_CID,
+      targetDir: '../elsewhere',
+      entries: [{ path: sourceFile('box.png', 'bytes'), name: 'box.png', size: 5 }],
+    });
+
+    expect(result).toEqual({ ok: true, files: [{ name: 'box.png', ok: false, reason: 'not_found' }] });
+    expect(fs.existsSync(path.join(tmpDir, 'elsewhere'))).toBe(false);
+  });
+
+  it('refuses an invalid conversation', async () => {
+    const result = await importLocalFiles({
+      scope: 'video_canvas',
+      cid: '../nope',
+      targetDir: 'ad',
+      entries: [{ path: sourceFile('box.png', 'bytes'), name: 'box.png', size: 5 }],
+    });
+
+    expect(result.ok).toBe(false);
+    expectTestLog({ level: 'warn', source: 'ipc', message: /^local file import request failed/ });
+  });
+});
+

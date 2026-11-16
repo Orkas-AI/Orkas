@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ class Checkpoint:
         self.events.write_text('', encoding='utf-8')
         self.inventory = []
         self.results = {}
+        self.expected_errors = []
         self.errors = 0
         self.current = 'collection'
         self.phase = 'collection'
@@ -47,8 +49,19 @@ class Checkpoint:
         with self.events.open('a', encoding='utf-8') as output:
             output.write(json.dumps({'case': self.current, 'phase': self.phase, 'stream': stream, 'text': text}) + '\n')
 
+    def drain_console(self):
+        # The production console sink queues IO. Settle it while pytest still
+        # owns this phase's capture, before another case can inherit its logs.
+        module = sys.modules.get('utils.log')
+        sink = getattr(module, '_console_sink', None)
+        wait = getattr(sink, 'wait_idle', None)
+        if callable(wait) and not wait(timeout=1):
+            self.errors += 1
+            self.event('stderr', '[00:00:00.000] [error] [(python-checkpoint)] Console log drain timed out\n')
+
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
+        self.drain_console()
         part, total = map(int, config.getoption('--orkas-checkpoint-shard').split('/'))
         files = sorted({str(item.path) for item in items})
         selected_files = set(files[part - 1::total])
@@ -59,6 +72,17 @@ class Checkpoint:
         items[:] = kept
         self.inventory = [item.nodeid for item in items]
         self.batch_units = len(files)
+        for item in items:
+            for marker in item.iter_markers('orkas_expected_errors'):
+                if marker.kwargs or not marker.args:
+                    raise pytest.UsageError('Expected error logs require explicit (prefix, count) pairs')
+                for value in marker.args:
+                    if (not isinstance(value, (tuple, list)) or len(value) != 2
+                            or not isinstance(value[0], str) or not 1 <= len(value[0]) <= 512
+                            or '\n' in value[0] or '\r' in value[0]
+                            or type(value[1]) is not int or not 1 <= value[1] <= 200):
+                        raise pytest.UsageError('Invalid expected error log declaration')
+                    self.expected_errors.append({'case': item.nodeid, 'prefix': value[0], 'count': value[1]})
 
     def pytest_collectreport(self, report):
         if report.failed:
@@ -69,18 +93,30 @@ class Checkpoint:
     def pytest_runtest_logstart(self, nodeid, location):
         self.current = nodeid
 
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_setup(self, item):
         self.phase = 'setup'
+        yield
+        self.drain_console()
 
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_call(self, item):
         self.phase = 'call'
+        yield
+        self.drain_console()
 
+    @pytest.hookimpl(hookwrapper=True, trylast=True)
     def pytest_runtest_teardown(self, item):
         self.phase = 'teardown'
+        yield
+        self.drain_console()
 
     def pytest_runtest_logreport(self, report):
         result = self.results.setdefault(report.nodeid, {'phases': {}, 'durationMs': 0})
-        result['phases'][report.when] = report.outcome
+        # pytest emits failed unittest subtests before the enclosing call's
+        # passed report. A later success must not erase that phase's failure.
+        if result['phases'].get(report.when) != 'failed':
+            result['phases'][report.when] = report.outcome
         result['durationMs'] += round(report.duration * 1000)
         for name, text in report.sections:
             # pytest includes previous phases in later reports. Read each once.
@@ -109,7 +145,8 @@ class Checkpoint:
                           'durationMs': result['durationMs']})
         self.path.write_text(json.dumps({'schema': 1, 'reason': 'passed' if exitstatus == 0 else 'failed',
                                         'unhandledErrors': self.errors, 'inventory': self.inventory,
-                                        'files': files, 'batchUnits': getattr(self, 'batch_units', 0)}), encoding='utf-8')
+                                        'files': files, 'expectedErrors': self.expected_errors,
+                                        'batchUnits': getattr(self, 'batch_units', 0)}), encoding='utf-8')
 
     def pytest_unconfigure(self, config):
         logging.getLogger().removeHandler(self.handler)
@@ -118,4 +155,5 @@ class Checkpoint:
 
 
 def pytest_configure(config):
+    config.addinivalue_line('markers', 'orkas_expected_errors: exact case-call fault log prefixes and counts; raw severity is retained')
     config.pluginmanager.register(Checkpoint(config), 'orkas-checkpoint-protocol')

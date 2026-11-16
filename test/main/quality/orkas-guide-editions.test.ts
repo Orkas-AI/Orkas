@@ -82,3 +82,40 @@ it('retains explicit-request and accepted-offer authority without requiring a se
  expect(removal.split('## Files inside a Skill')[0]).toContain('has no protocol here. The user does it:');
  expect(removal).toContain('Do not call the tool again in that turn');
 });
+
+it('documents same-turn project scope and the public reviewed cleanup path', () => {
+  const guide = read('references/projects-and-automation.md');
+  expect(guide).toContain('later to-do operations in the same reply default to that new Project');
+  expect(guide).toContain('explicitly request global to-dos for global work');
+  expect(guide).toContain('Other Projects remain unavailable');
+  const cleanup = guide.split('## Clean up to-dos')[1]?.split('## Schedule')[0] || '';
+  for (const fact of ['**To-do > Clean up**', '7/14/30/60/90/180', '30 days', 'linked conversations', 'changed work is skipped', '**Stop**', 'deleted/skipped/failed', 'open-source']) expect(cleanup, fact).toContain(fact);
+  expect(cleanup).toContain('Project, last update age, and status');
+});
+
+it('describes guarded Commander saving separately from manual save and publication', () => {
+  const apps = read('references/library-search-and-apps.md').replace(/\s+/g, ' ');
+  expect(apps).toMatch(/Commander can also save an app result or an app folder/);
+  expect(apps).toContain('saved destination and version');
+  expect(apps).toContain('changed or deleted destination stops the update');
+  expect(apps).toContain('new copy');
+  expect(apps).toContain('without clearing records');
+  expect(apps).toContain('do not publish or update a public website');
+});
+it('explains recurring conversation reuse and scope/deletion recovery', () => {
+  const projects = read('references/projects-and-automation.md').replace(/\s+/g, ' ');
+  for (const fact of ['created in chat runs in that conversation', 'first run and reuses it',
+    "latest run's conversation", 'conversation was deleted', "Project scope", 'busy conversation queues'])
+    expect(projects, fact).toContain(fact);
+  expect(read('references/getting-started.md')).toContain("Runs continue in the automation's conversation");
+});
+it('describes supplied-media Studio capabilities and keeps managed audio edition-bound', () => {
+  const agents = read('references/agents-skills-and-connectors.md');
+  for (const fact of ['basic RAW development', 'layered PSD', 'vector PDF', 'fixed-page catalogues',
+    'video audio extraction', 'format conversion', 'timed tracks', 'music ducking', 'Word timings are estimates',
+    'transcribe the final audio', 'film/drama recaps']) expect(agents, fact).toContain(fact);
+  const voice = agents.split('For audio-only tasks')[1]?.split('Choose **VideoStudio**')[0] || '';
+  expect(voice).toContain('Commercial edition only');
+  expect(voice).toContain('open-source build');
+  expect(voice).toContain('configured speech');
+});

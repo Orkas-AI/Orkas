@@ -119,3 +119,93 @@ it('does not label an untyped artifact whose editing binding is damaged', async 
   const inspection = await f.artifacts.inspectArtifactIndex(wire.uid, cid, created.artifactId);
   expect(inspection.ok).toBe(false); expect(inspection).not.toHaveProperty('appType');
 });
+
+it.each([false, true])('updates an untyped destination offline as local under the same ID (historical binding: %s)', async historical => {
+  const f = await fixture();
+  const meta = JSON.parse(fs.readFileSync(f.metadata, 'utf8'));
+  delete meta.appType;
+  fs.writeFileSync(f.metadata, JSON.stringify(meta));
+  const artifactId = meta.sourceArtifactId;
+  if (historical) {
+    const artifactMeta = path.join(root, wire.uid, 'cloud/chat_artifacts/type-conversation', artifactId, '__orkas-meta.json');
+    const source = JSON.parse(fs.readFileSync(artifactMeta, 'utf8'));
+    delete source.savedAppId;
+    fs.writeFileSync(artifactMeta, JSON.stringify(source));
+  }
+  const before = fs.readFileSync(f.metadata, 'utf8');
+  expect(await f.saved.getSaveTarget(wire.uid, 'type-conversation', { artifactId }))
+    .toMatchObject({ appId: f.kept.id, appType: 'local' });
+  expect(fs.readFileSync(f.metadata, 'utf8')).toBe(before);
+  expect(await f.saved.saveFromArtifact(wire.uid, 'type-conversation', artifactId, 'auto'))
+    .toMatchObject({ ok: true, id: f.kept.id });
+  expect(JSON.parse(fs.readFileSync(f.metadata, 'utf8')).appType).toBe('local');
+  expect(fs.readFileSync(path.join(path.dirname(f.metadata), 'index.html'), 'utf8')).toContain('Keep this source');
+  vi.resetModules();
+  const reopened = await import('../../../src/main/features/saved_apps');
+  expect(reopened.listSavedApps(wire.uid)).toMatchObject([{ id: f.kept.id, appType: 'local' }]);
+});
+
+
+it('generates and saves edits of an untyped app as local offline', async () => {
+  const f = await fixture();
+  const meta = JSON.parse(fs.readFileSync(f.metadata, 'utf8')); delete meta.appType;
+  fs.writeFileSync(f.metadata, JSON.stringify(meta));
+  const edited = await f.saved.openForEditing(wire.uid, f.kept.id);
+  if (!edited.ok) throw new Error(edited.error);
+  const cid = (edited.conversation as any).conversation_id;
+  const revised = await f.artifacts.createArtifact(wire.uid, cid, 'helper', {
+    files: [{ path: 'index.html', content: '<h1>Edited offline</h1>' }],
+  });
+  if (!revised.ok) throw new Error(revised.error);
+  expect(f.artifacts.readArtifactMeta(wire.uid, cid, revised.artifactId)?.appType).toBe('local');
+  expect(await f.saved.saveFromArtifact(wire.uid, cid, revised.artifactId, 'update'))
+    .toMatchObject({ ok: true, id: f.kept.id });
+  expect(fs.readFileSync(path.join(path.dirname(f.metadata), 'index.html'), 'utf8')).toContain('Edited offline');
+  expect(await f.saved.listResolvedSavedApps(wire.uid)).toMatchObject([{ id: f.kept.id, appType: 'local' }]);
+});
+
+
+it('does not turn an unresolved edit of a missing legacy destination into a new app', async () => {
+  const f = await fixture();
+  const edited = await f.saved.openForEditing(wire.uid, f.kept.id);
+  if (!edited.ok) throw new Error(edited.error);
+  const cid = (edited.conversation as any).conversation_id;
+  const revised = await f.artifacts.createArtifact(wire.uid, cid, 'helper', {
+    files: [{ path: 'index.html', content: '<h1>Revised source</h1>' }],
+  });
+  if (!revised.ok) throw new Error(revised.error);
+  const contextFile = path.join(root, wire.uid, 'local/app-edits', cid, 'context.json');
+  const context = JSON.parse(fs.readFileSync(contextFile, 'utf8')); delete context.appType;
+  fs.writeFileSync(contextFile, JSON.stringify(context));
+  fs.rmSync(path.dirname(f.metadata), { recursive: true });
+  expect(await f.saved.getSaveTargetForDisplay(wire.uid, cid, { artifactId: revised.artifactId })).toBeNull();
+  await expect(f.saved.getSaveTarget(wire.uid, cid, { artifactId: revised.artifactId })).rejects.toThrow('app not found');
+  expect(await f.saved.saveFromArtifact(wire.uid, cid, revised.artifactId, 'auto'))
+    .toMatchObject({ ok: false, error: 'app_edit_target_missing' });
+  expect(f.saved.listSavedApps(wire.uid)).toHaveLength(0);
+});
+
+
+it('keeps save-as-new available and returns recoverable failures when an editing context is damaged', async () => {
+  const f = await fixture(); const edited = await f.saved.openForEditing(wire.uid, f.kept.id);
+  if (!edited.ok) throw new Error(edited.error);
+  const cid = (edited.conversation as any).conversation_id, before = fs.readFileSync(f.metadata);
+  const typed = await f.artifacts.createArtifact(wire.uid, cid, 'helper', { files: [{ path: 'index.html', content: '<h1>Typed</h1>' }] });
+  const untyped = await f.artifacts.createArtifact(wire.uid, cid, 'helper', { files: [{ path: 'index.html', content: '<h1>Untyped</h1>' }] });
+  if (!typed.ok || !untyped.ok) throw new Error('artifact fixture failed');
+  fs.writeFileSync(path.join(root, wire.uid, 'cloud/chat_artifacts', cid, untyped.artifactId, '__orkas-meta.json'), '{}');
+  fs.writeFileSync(path.join(root, wire.uid, 'local/app-edits', cid, 'context.json'), '{ damaged');
+  const artifactsBefore = fs.readdirSync(path.join(root, wire.uid, 'cloud/chat_artifacts', cid)).sort();
+  expect(await f.artifacts.createArtifact(wire.uid, cid, 'helper', { files: [{ path: 'index.html', content: '<h1>New</h1>' }] }))
+    .toEqual({ ok: false, error: 'app editing source unavailable; reopen editing from the app or save as a new app' });
+  expect(fs.readdirSync(path.join(root, wire.uid, 'cloud/chat_artifacts', cid)).sort()).toEqual(artifactsBefore);
+  const appsBefore = f.saved.listSavedApps(wire.uid).map(app => app.id);
+  expect(await f.saved.saveFromArtifact(wire.uid, cid, typed.artifactId, 'update')).toEqual({ ok: false, error: 'app_edit_target_missing' });
+  expect(await f.saved.saveFromArtifact(wire.uid, cid, untyped.artifactId)).toEqual({ ok: false, error: 'app_edit_target_missing' });
+  expect(f.saved.listSavedApps(wire.uid).map(app => app.id)).toEqual(appsBefore);
+  const copy = await f.saved.saveFromArtifact(wire.uid, cid, typed.artifactId);
+  if (!copy.ok) throw new Error(copy.error);
+  expect(f.saved.listSavedApps(wire.uid).find(app => app.id === copy.id)?.appType).toBe('local');
+  expect(fs.readFileSync(f.metadata)).toEqual(before);
+});
+

@@ -1,0 +1,3 @@
+## Application direct delivery
+
+This is a one-shot application request with no interactive reply channel. Complete the requested deliverable using your existing workflow, tools and quality checks. Decide unspecified creative preferences with reasonable defaults; do not pause for questions, plan review, preview approval or a start confirmation. If an indispensable input or permission is unavailable, report the blocker and preserved progress instead of requesting a reply. Do not invent missing facts, widen permissions, replay uncertain external actions or claim that a plan is the finished deliverable. Media tools own spending authorization and balance checks; follow their structured results.

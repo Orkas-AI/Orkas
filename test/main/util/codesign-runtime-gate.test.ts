@@ -333,6 +333,7 @@ describe('codesign-adhoc runtime gate', () => {
       arch: 1,
       appOutDir: tmpDir,
       __orkasTestWhisperContract: whisper.contract,
+      __orkasTestLibRawContract: require('../../fixtures/libraw-runtime.cjs').write(path.join(tmpDir, 'resources/runtime'), key),
       __orkasTestWindowsVcContract: vc.contract,
       __orkasTestEntrypointRoot: entrypointRoot,
       __orkasTestBuiltinRoot: path.join(process.cwd(), 'resources', 'builtin'),
@@ -352,6 +353,7 @@ describe('codesign-adhoc runtime gate', () => {
     expect(marker.verified).toContain('runtime:node:win32-x64');
     expect(marker.verified).toContain('runtime:ffmpeg:win32-x64');
     expect(marker.verified).toContain('runtime:whisper:win32-x64');
+    expect(marker.verified).toContain('runtime:libraw:win32-x64');
     expect(marker.verified).toContain('runtime:vc:win32-x64');
     expect(marker.verified).toContain('runtime:vc-app-local:win32-x64');
     expect(marker.verified).toContain('runtime:vc-import-closure:win32-x64');
@@ -361,6 +363,8 @@ describe('codesign-adhoc runtime gate', () => {
     expect(marker.verified).toContain('entrypoint:bin/run-skill.cjs');
     expect(marker.verified).toContain('loader:tsx');
     expect(marker.verified).toContain('mcp-runtime:node_modules/@modelcontextprotocol/sdk');
+    expect(marker.verified).toContain('connector-smoke:direct:bin/composio-mcp-server.cjs');
+    expect(marker.verified).toContain('connector-smoke:env-proxy:bin/composio-mcp-server.cjs');
     expect(marker.verified).toContain('dependency:lock-graph:win32-x64:packages=3:edges=2:overrides=0');
   }, 60_000);
 
@@ -379,6 +383,7 @@ describe('codesign-adhoc runtime gate', () => {
       arch: 1,
       appOutDir: tmpDir,
       __orkasTestWhisperContract: whisper.contract,
+      __orkasTestLibRawContract: require('../../fixtures/libraw-runtime.cjs').write(path.join(tmpDir, 'resources/runtime'), key),
       __orkasTestWindowsVcContract: vc.contract,
       packager: {
         appInfo: { productFilename: 'Orkas' },
@@ -404,6 +409,7 @@ describe('codesign-adhoc runtime gate', () => {
       arch: 1,
       appOutDir: tmpDir,
       __orkasTestWhisperContract: whisper.contract,
+      __orkasTestLibRawContract: require('../../fixtures/libraw-runtime.cjs').write(path.join(tmpDir, 'resources/runtime'), key),
       __orkasTestWindowsVcContract: vc.contract,
       packager: {
         appInfo: { productFilename: 'Orkas' },
@@ -430,6 +436,7 @@ describe('codesign-adhoc runtime gate', () => {
       arch: 1,
       appOutDir: tmpDir,
       __orkasTestWhisperContract: whisper.contract,
+      __orkasTestLibRawContract: require('../../fixtures/libraw-runtime.cjs').write(path.join(tmpDir, 'resources/runtime'), key),
       __orkasTestWindowsVcContract: vc.contract,
       packager: {
         appInfo: { productFilename: 'Orkas' },

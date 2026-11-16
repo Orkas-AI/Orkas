@@ -1,3 +1,4 @@
+import { formatUserVisibleModelError } from '../model/core-agent/user-visible-errors';
 /**
  * Auth — LLM provider credentials + ordered (provider, model, credential)
  * priority list.
@@ -59,6 +60,7 @@ import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import { shell } from 'electron';
+import type { CompletionParams, LLMProvider, StreamEvent } from '#core-agent';
 
 import { userAuthProfilesFile } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
@@ -156,18 +158,6 @@ function piOauth(): Promise<PiOauthModule> {
  *  surface a fallback hint to the user. */
 let _minimaxRegisterError: string | null = null;
 
-/**
- * Prime the dynamic-import caches (`ca()` + `piOauth()`) on app boot so the
- * first open of the settings page doesn't eat the 1-2s cold-start latency
- * of loading core-agent + pi-ai's OAuth module. Idempotent; safe to call
- * multiple times. Errors are swallowed — a failure here is recoverable
- * (listProviders has its own fallback path).
- */
-export async function warmup(): Promise<void> {
-  try { await Promise.all([ca(), piOauth()]); }
-  catch (err) { log.debug('warmup skipped:', (err as Error).message); }
-}
-
 // ── File paths ───────────────────────────────────────────────────────────
 function profilesFile(): string { return userAuthProfilesFile(getActiveUserId()); }
 
@@ -262,11 +252,15 @@ export interface ImageProfile {
  */
 export interface VideoProfile {
   id: string;
-  provider: string;          // doubao / ...
-  model: string;
+  provider: string;          // doubao
+  model: string;             // doubao-seedance-2-0-260128
   apiKey: string;
   label: string;
   createdAt: number;
+  workspaceId?: string;
+  region?: string;
+  /** Omitted on historical profiles, which retain their original global route. */
+  apiSite?: 'cn' | 'global';
 }
 
 /** BYO text-to-speech provider. Open-source builds only store user-owned keys:
@@ -280,6 +274,7 @@ export interface TtsProfile {
   model: string;             // OpenAI-compatible TTS model id ('' for doubao)
   apiKey: string;            // bearer key, or doubao V3 X-Api-Key
   resourceId?: string;       // doubao only: optional X-Api-Resource-Id override
+  workspaceId?: string;      // Alibaba Cloud workspace, empty for default
   voice?: string;            // default voice id / voice_type
   format?: string;           // default response_format / encoding
   label: string;
@@ -552,6 +547,9 @@ function parseVideoProfilesArray(arr: unknown): VideoProfile[] {
       apiKey: String(p.apiKey),
       label: String(p.label || 'default'),
       createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
+      ...(typeof p.workspaceId === 'string' ? { workspaceId: p.workspaceId } : {}),
+      ...(typeof p.region === 'string' ? { region: p.region } : {}),
+      ...(p.apiSite === 'cn' || p.apiSite === 'global' ? { apiSite: p.apiSite } : {}),
     });
   }
   return out;
@@ -574,6 +572,7 @@ function parseTtsProfilesArray(arr: unknown): TtsProfile[] {
       model: String(p.model || ''),
       apiKey: String(p.apiKey),
       ...(p.resourceId ? { resourceId: String(p.resourceId) } : {}),
+      ...(p.workspaceId ? { workspaceId: String(p.workspaceId) } : {}),
       ...(p.voice ? { voice: String(p.voice) } : {}),
       ...(p.format ? { format: String(p.format) } : {}),
       label: String(p.label || 'default'),
@@ -1239,24 +1238,13 @@ function profileToView(id: string, p: StoredProfile): ProfileView {
  * `oauthProvider` field on their API-key-facing sibling.
  */
 export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
-  let mod: CoreAgentModule | null = null;
-  try { mod = await ca(); } catch (e) {
-    log.warn('core-agent unavailable for listProviders; falling back to static catalog', { error: (e as Error).message });
-  }
-  // OAuth capability source = pi-ai's runtime registry. Custom
-  // providers (e.g. MiniMax Portal) are registered synchronously by
-  // `piOauth()` at startup; registration failures get a warn-level log.
-  // The `OAUTH_PROVIDERS` constant is only a fallback for the case
-  // where pi-ai's entire oauth module fails to load — we deliberately
-  // do NOT union it in, otherwise the UI would show OAuth buttons that
-  // can never actually work.
-  let oauthIds: Set<string>;
-  try {
-    const oauth = await piOauth();
-    oauthIds = new Set((await oauth.getOAuthProviders()).map((p) => p.id));
-  } catch {
-    oauthIds = new Set(OAUTH_PROVIDERS.map((p) => p.id));
-  }
+  // Provider capabilities are product catalog data, not a reason to load the
+  // full model runtime and OAuth implementation. OAuth capability is
+  // versioned with the app; trusted client config may append declarative
+  // OpenAI-compatible API-key providers. `startOAuth` validates/loads the
+  // actual OAuth provider only after the user clicks OAuth. Uncurated model
+  // discovery similarly remains in `listModels`.
+  const oauthIds = new Set(OAUTH_PROVIDERS.filter((p) => p.supportsOAuth !== false).map((p) => p.id));
 
   const store = loadProfiles();
   const byProvider = new Map<string, ProfileView[]>();
@@ -1296,14 +1284,18 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
 
   const sorted = sortProviderIds([...visible].filter((id) => isModelProviderAllowed(id)));
   const featuredIds = new Set(FEATURED_API_PROVIDERS.map((p) => p.id));
-  // Provider-is-known-to-pi-ai check so we don't advertise API-key support
-  // for an id that pi-ai can't build a client for. When core-agent is
-  // unavailable, fall back to the visible set so the catalog still renders.
-  // EXTERNAL_API_PROVIDERS are Orkas-side adapters (see `external-providers.ts`)
-  // that pi-ai doesn't know about — manually mark them api-capable.
-  const apiCapable = mod
-    ? new Set<string>([...mod.listPiProviders(), ...EXTERNAL_API_PROVIDERS])
-    : new Set<string>([...visible, ...EXTERNAL_API_PROVIDERS]);
+  // CATALOG rows with API-key setup metadata plus Orkas-side adapters are
+  // API-capable. Preserve API-key capability for legacy saved providers so an
+  // existing profile never becomes unmanageable merely because its provider
+  // left the current visible catalog.
+  const apiCapable = new Set<string>([
+    ...FEATURED_API_PROVIDERS.map((p) => p.id),
+    ...EXTERNAL_API_PROVIDERS,
+    ...configuredOpenAICompatibleProviders().map((provider) => provider.id),
+  ]);
+  for (const [id, profiles] of byProvider) {
+    if (profiles.some((profile) => profile.type === 'api_key')) apiCapable.add(id);
+  }
 
   // OAuth-only providers (ChatGPT Codex, Gemini Code Assist, GitHub Copilot,
   // Google Antigravity) can't be authenticated with a raw API key — their
@@ -1670,28 +1662,16 @@ function entryToView(
   return base;
 }
 
-/** Build a pi-ai-backed (provider, modelId) → name lookup. Cached per call. */
-async function buildModelNameLookup(): Promise<(p: string, m: string) => string> {
-  let mod: CoreAgentModule | undefined;
-  try { mod = await ca(); } catch { /* no pi-ai available */ }
-  const cache = new Map<string, Map<string, string>>();
+/** Build a catalog-only (provider, modelId) → name lookup. Unavailable saved
+ * ids deliberately render as their raw id without loading the runtime catalog:
+ * runtime discovery is not an authorization source. */
+async function buildModelNameLookup(_entries?: readonly Entry[]): Promise<(p: string, m: string) => string> {
   return (provider: string, modelId: string) => {
     const curated = curatedModelsFor(provider).find((m) => m.id === modelId);
-    if (curated) return curated.name;
-    if (!mod) return modelId;
-    let byId = cache.get(provider);
-    if (!byId) {
-      byId = new Map();
-      try {
-        for (const m of (mod.listPiModels(provider) || []) as any[]) {
-          if (m && typeof m.id === 'string') byId.set(m.id, (m.name as string) || m.id);
-        }
-      } catch { /* fall through */ }
-      cache.set(provider, byId);
-    }
-    return byId.get(modelId) || modelId;
+    return curated?.name || modelId;
   };
 }
+
 
 /** Read only the first eligible transport's metadata for idle code preparation.
  * Never refresh OAuth, resolve credentials, construct a client, or send a request. */
@@ -1834,32 +1814,40 @@ export async function removeEntry(entryId: string): Promise<{ removed: boolean }
 }
 
 export async function reorderEntries(orderedIds: string[]): Promise<{ entries: EntryView[] }> {
-  const userId = getActiveUserId();
   if (!Array.isArray(orderedIds)) throw new Error('orderedIds must be an array');
+  const userId = getActiveUserId();
   const store = loadProfiles({ throwOnInvalidExisting: true, userId });
   const snapshot = JSON.stringify(store);
   const runtimeResolvable = await buildRuntimeModelResolver(store.entries);
   assertAuthStoreUnchanged(userId, snapshot);
   const byId = new Map(store.entries.map((e) => [e.entryId, e]));
-  const reordered: Entry[] = [];
+  const requested = new Set<string>();
+  const reorderedSubset: Entry[] = [];
   for (const id of orderedIds) {
-    const e = byId.get(String(id));
-    if (e) { reordered.push(e); byId.delete(String(id)); }
+    const normalized = String(id);
+    const e = byId.get(normalized);
+    if (
+      e
+      && isEntryAllowed(store, e)
+      && runtimeResolvable(e.provider, e.model)
+      && !requested.has(normalized)
+    ) {
+      requested.add(normalized);
+      reorderedSubset.push(e);
+    }
   }
-  // Anything the caller forgot — append in original order so we never drop.
-  for (const e of store.entries) {
-    if (byId.has(e.entryId)) reordered.push(e);
-  }
-  store.entries = reordered;
+  let subsetIndex = 0;
+  store.entries = store.entries.map((entry) => (
+    requested.has(entry.entryId) ? reorderedSubset[subsetIndex++] : entry
+  ));
   saveProfiles(store, userId);
   invalidateCoreAgentRunner();
   const lookup = await buildModelNameLookup();
   return {
-    entries: store.entries
-      .filter((entry) => (
-        isEntryAllowed(store, entry) && runtimeResolvable(entry.provider, entry.model)
-      ))
-      .map((entry) => entryToView(entry, store, lookup, true)),
+    entries: store.entries.map(entry => entryToView(
+      entry, store, lookup, runtimeResolvable(entry.provider, entry.model),
+      entryContextWindowTooSmall(store, entry, runtimeResolvable),
+    )),
   };
 }
 
@@ -2573,6 +2561,60 @@ function sanitizeConnectionError(
   return sanitizeLogTextForUpload(message);
 }
 
+function userVisibleConnectionError(
+  safeMessage: string,
+  providerId?: string,
+): string {
+  return formatUserVisibleModelError(safeMessage, {
+    ...(providerId ? { providerLabel: providerLabel(providerId) } : {}),
+  });
+}
+
+function connectionProbeParams(model: string): CompletionParams {
+  return {
+    model,
+    systemPrompt: 'You are a connectivity probe; reply with a single word.',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+    maxTokens: 1,
+  };
+}
+
+function isConnectionFirstResponse(event: StreamEvent): boolean {
+  if (event.type === 'text_delta') return !!event.text.trim();
+  if (event.type === 'thinking_delta') {
+    return event.chars > 0 || !!event.text?.trim();
+  }
+  return false;
+}
+
+async function measureConnectionFirstResponse(
+  provider: LLMProvider,
+  params: CompletionParams,
+  startedAt: number,
+): Promise<number> {
+  const controller = new AbortController();
+  const iterator = provider.stream({ ...params, signal: controller.signal })[Symbol.asyncIterator]();
+  try {
+    while (true) {
+      const step = await iterator.next();
+      if (step.done) break;
+      if (step.value.type === 'error') throw step.value.error;
+      if (isConnectionFirstResponse(step.value)) {
+        return Math.max(0, Date.now() - startedAt);
+      }
+    }
+    throw new Error('connection test returned no model response');
+  } finally {
+    controller.abort();
+    try {
+      await iterator.return?.();
+    } catch {
+      // The first response already settled the probe. Abort/return errors are
+      // expected cleanup noise and must not replace that result.
+    }
+  }
+}
+
 export async function testConnection(
   providerId: string,
   modelId?: string,
@@ -2653,14 +2695,9 @@ export async function testConnection(
         provider = await ext.createConfiguredOpenAICompatibleProvider({ providerId: pid, apiKey, modelId: probeModel });
       }
       if (!isActiveAuthOwner(userId)) return { ok: false, error: t('errors.model_not_available') };
-      const msg = await provider.complete({
-        model: probeModel,
-        systemPrompt: 'You are a connectivity probe; reply with a single word.',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
-        maxTokens: 1,
-      });
+      const durationMs = await measureConnectionFirstResponse(provider, connectionProbeParams(probeModel), t0);
       if (chosenProfileId && isActiveAuthOwner(userId)) clearCooldown(chosenProfileId);
-      return { ok: true, durationMs: Date.now() - t0, model: msg.model || probeModel, profileId: chosenProfileId };
+      return { ok: true, durationMs, model: probeModel, profileId: chosenProfileId };
     } catch (err) {
       const errMsg = sanitizeConnectionError(err, { apiKey, customConfig });
       log.warn('testConnection failed (external provider)', {
@@ -2671,7 +2708,7 @@ export async function testConnection(
       });
       return {
         ok: false,
-        error: errMsg,
+        error: userVisibleConnectionError(errMsg, pid),
         durationMs: Date.now() - t0,
         profileId: chosenProfileId,
       };
@@ -2700,20 +2737,13 @@ export async function testConnection(
         : { model: requestedModel }),
       apiKey,
     });
-    const msg = await provider.complete({
-      model: requestedModel,
-      // ChatGPT Codex's `responses` API rejects requests without
-      // `instructions` (= system prompt). Plain providers ignore it.
-      systemPrompt: 'You are a connectivity probe; reply with a single word.',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
-      maxTokens: 1,
-    });
+    const durationMs = await measureConnectionFirstResponse(provider, connectionProbeParams(requestedModel), t0);
     if (chosenProfileId && isActiveAuthOwner(userId)) clearCooldown(chosenProfileId);
-    return { ok: true, durationMs: Date.now() - t0, model: msg.model || '', profileId: chosenProfileId };
+    return { ok: true, durationMs, model: requestedModel, profileId: chosenProfileId };
   } catch (err) {
     return {
       ok: false,
-      error: sanitizeConnectionError(err, { apiKey }),
+      error: userVisibleConnectionError(sanitizeConnectionError(err, { apiKey }), pid),
       durationMs: Date.now() - t0,
       profileId: chosenProfileId,
     };

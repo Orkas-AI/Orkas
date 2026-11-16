@@ -35,6 +35,8 @@ export interface CommanderAvatar {
 
 export interface UserPreferences {
   language?: Lang;
+  /** Local user's To-do page grouping. */
+  todo_grouping?: 'project' | 'status';
   /** Per-user commander avatar (icon id + color id). Tokens come from
    * `renderer/modules/avatar.js`. Missing → renderer falls back to the
    * commander default (crown + gold). */
@@ -88,8 +90,8 @@ function readPreferencesForUser(userId: string): UserPreferences {
 }
 
 /** Merge `partial` into the on-disk preferences and atomically rewrite. */
-export function writePreferences(partial: Partial<UserPreferences>): UserPreferences {
-  const current = readPreferences();
+export function writePreferences(partial: Partial<UserPreferences>, userId = getActiveUserId()): UserPreferences {
+  const current = readPreferencesForUser(userId);
   const next: UserPreferences = { ...current };
   const updatedKeys: string[] = [];
   for (const [k, v] of Object.entries(partial)) {
@@ -110,8 +112,18 @@ export function writePreferences(partial: Partial<UserPreferences>): UserPrefere
     }
     next._field_updated_at = clocks;
   }
-  writeJsonSync(preferencesFile(), next);
+  writeJsonSync(userPreferencesFile(userId), next);
   return next;
+}
+
+export function getTodoGrouping(userId: string): 'project' | 'status' {
+  return readPreferencesForUser(userId).todo_grouping === 'status' ? 'status' : 'project';
+}
+
+export function setTodoGrouping(userId: string, grouping: unknown): 'project' | 'status' {
+  if (grouping !== 'project' && grouping !== 'status') throw new Error('invalid todo grouping');
+  if (getTodoGrouping(userId) !== grouping) writePreferences({ todo_grouping: grouping }, userId);
+  return grouping;
 }
 
 // ── Back-compat aliases for older callers ────────────────────────────────

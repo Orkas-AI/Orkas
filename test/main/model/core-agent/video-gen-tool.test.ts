@@ -6,8 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({
   generateVideo: vi.fn(),
   workspace: '',
+  route: vi.fn(),
+  quote: vi.fn(),
 }));
 
+vi.mock('../../../../src/main/features/app_media_route', () => ({ appTaskMediaRoute: h.route }));
+vi.mock('../../../../src/main/features/video_production_services', async original => ({ ...await original(), checkVideoProductionServices: h.quote }));
 vi.mock('../../../../src/main/features/video_gen', () => ({
   generateVideo: h.generateVideo,
 }));
@@ -29,6 +33,8 @@ let root = '';
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-open-video-tool-'));
   h.workspace = root;
+  h.route.mockReset().mockResolvedValue(undefined);
+  h.quote.mockReset().mockResolvedValue({ sufficient: true, externally_billed_segment_ids: ['request'], unavailable_segment_ids: [], external_billing_estimate_available: false, segments: [] });
   h.generateVideo.mockReset().mockImplementation(async ({ outputAbsPath }) => ({
     ok: true,
     path: outputAbsPath,
@@ -114,46 +120,71 @@ describe('generate_video tool in the open build', () => {
     expect(String(result.content)).toContain('E_CREDITS_EXHAUSTED');
     expect(String(result.content)).toContain('Do not retry');
   });
-  it.each([false, true, undefined])('preserves approval only for structured undispatched failure (dispatched=%s)',async dispatched=>{
-    const prompt='A red product rotates on a clean studio table';
-    const planPath=path.join(root,'plan.json');
-    fs.writeFileSync(planPath,JSON.stringify({aspect:'9:16',total_target_sec:5,language:'zh',
-      delivery_promise:{type:'motion_led',source_required:false,motion_min_ratio:1},
-      segments:[{id:'shot-1',order:1,role:'hook',layer:'primary',source:'generate',target_sec:5,
-        spec:{media_kind:'video',prompt,resolution:'720p',quality:'balanced',generate_audio:false}}],
-      cost_estimate:{billable_generations:1}}));
-    const control=await import('../../../../src/main/features/video_production_control');
-    const statePath=control.videoProductionControlStatePath({userId:'test-video-owner',planPath});
-    await control.approveVideoProductionPlan({statePath,planPath,turnId:'gate-b'});
-    await control.approveVideoProductionGeneration({statePath,planPath,turnId:'gate-c'});
-    const approved=await control.readVideoProductionControlState(statePath,planPath);
-    const tool=createVideoGenTool({userId:'test-video-owner',agentId:'79df9cc89f5f'});
-    const generateShot=()=>tool.execute({prompt,output_path:path.join(root,'shot-1.mp4'),ratio:'9:16',duration:5,
-      resolution:'720p',quality:'balanced',generate_audio:false,production_plan_path:planPath,production_segment_id:'shot-1'},
-      {workingDir:root} as any);
-    const error={ok:false,errorCode:'PROVIDER_API_ERROR',message:'fixture terminal failure',...(dispatched===undefined?{}:{dispatched})};
-    h.generateVideo.mockResolvedValueOnce(error);
-    const result=await generateShot();
-    expect(result).toMatchObject({isError:true,content:'[PROVIDER_API_ERROR] fixture terminal failure'});
-    const state=await control.readVideoProductionControlState(statePath,planPath);
-    expect(state.generation_approval).toEqual(approved.generation_approval);
-    if(dispatched===false){
-      expect(state.transactions['video:shot-1']).toBeUndefined();
-      expect(state.transaction_history).toEqual([expect.objectContaining({status:'released',error_code:'PROVIDER_API_ERROR',approval_id:approved.generation_approval!.approval_id})]);
-      // Same explicit approval may make one new attempt, never an automatic replay.
-      h.generateVideo.mockImplementationOnce(async()=>{
-        const active=await control.readVideoProductionControlState(statePath,planPath);
-        expect(active.transactions['video:shot-1']).toMatchObject({status:'pending',approval_id:approved.generation_approval!.approval_id});
-        return {...error,dispatched:true};
-      });
-      await generateShot();expect(h.generateVideo).toHaveBeenCalledTimes(2);
-    }else{
-      expect(state.transactions['video:shot-1']).toMatchObject({status:'failed',approval_id:approved.generation_approval!.approval_id});
-      expect(state.transaction_history).toEqual([]);
-    }
-    const blocked=await generateShot();expect(blocked.isError).toBe(true);
-    expect(blocked.content).toContain('E_VIDEO_PRODUCTION_GENERATION_REAPPROVAL_REQUIRED');
-    expect(h.generateVideo).toHaveBeenCalledTimes(dispatched===false?2:1);
-  });
+});
 
+const studioId = '79df9cc89f5f';
+function studioTool() { return createVideoGenTool({ userId: 'test-video-owner', agentId: studioId, cid: 'c-video' }); }
+function shotInput() { return { prompt: 'A red product rotates on a clean studio table', output_path: 'ad/shot-1.mp4', production_dir: 'ad', duration: 5, resolution: '720p', generate_audio: false }; }
+function context() { return { workingDir: root } as any; }
+describe('current timeline and configured service boundaries', () => {
+  it.each([false, true, undefined])('permits an explicit retry only after a structured undispatched failure (dispatched=%s)', async dispatched => {
+    const tool = studioTool(), input = shotInput();
+    const error = { ok: false, errorCode: 'PROVIDER_API_ERROR', message: 'fixture terminal failure', ...(dispatched === undefined ? {} : { dispatched }) };
+    h.generateVideo.mockResolvedValue(error);
+    expect(await tool.execute(input, context())).toMatchObject({ isError: true, content: '[PROVIDER_API_ERROR] fixture terminal failure' });
+    const repeated = await tool.execute(input, context());
+    if (dispatched === false) { expect(h.generateVideo).toHaveBeenCalledTimes(2); expect(repeated.content).toContain('[PROVIDER_API_ERROR]'); }
+    else { expect(h.generateVideo).toHaveBeenCalledTimes(1); expect(repeated.content).toContain('E_GENERATION_PENDING'); }
+  });
+  it('requires the production before sending a Studio shot', async () => {
+    const { production_dir, ...input } = shotInput(); const result = await studioTool().execute(input, context());
+    expect(result).toMatchObject({ isError: true }); expect(result.content).toContain('E_PRODUCTION_DIR'); expect(h.generateVideo).not.toHaveBeenCalled();
+  });
+  it('reuses the exact completed file without another dispatch even after settings become unavailable', async () => {
+    h.generateVideo.mockImplementation(async ({ outputAbsPath }) => { fs.mkdirSync(path.dirname(outputAbsPath), { recursive: true }); fs.writeFileSync(outputAbsPath, 'completed-fixture'); return { ok: true, path: outputAbsPath, bytes: 17, provider: 'orkas-api', model: 'orkas-video', taskId: 'one' }; });
+    const tool = studioTool(), input = shotInput(); const first = await tool.execute(input, context());
+    expect(first.isError).not.toBe(true); const assets = JSON.parse(fs.readFileSync(path.join(root, 'ad/assets.json'), 'utf8')).assets;
+    expect(assets).toEqual([expect.objectContaining({ kind: 'video', path: 'shot-1.mp4', prompt: input.prompt, origin: 'generated' })]);
+    h.quote.mockResolvedValue({ sufficient: false });
+    const second = await tool.execute(input, context()); expect(second.isError).not.toBe(true); expect(second.content).toContain('already finished'); expect(second.content).not.toContain('paid for'); expect(h.generateVideo).toHaveBeenCalledTimes(1);
+  });
+  it('preserves an uncertain thrown dispatch and refuses a second request', async () => {
+    h.generateVideo.mockRejectedValue(new Error('request status unknown')); const tool = studioTool(), input = shotInput();
+    expect((await tool.execute(input, context())).content).toContain('PROVIDER_EXCEPTION');
+    expect((await tool.execute(input, context())).content).toContain('E_GENERATION_PENDING'); expect(h.generateVideo).toHaveBeenCalledTimes(1);
+  });
+  it('honors the app-selected service without falling back and includes frames in that dispatch', async () => {
+    h.route.mockResolvedValue('selected-service'); const tool = createVideoGenTool({ userId: 'u', cid: 'app-session', videoRoute: 'different-service' });
+    const result = await tool.execute({ prompt: 'opening and ending', output_path: 'f.mp4', first_frame: 'https://image.example/first.png', last_frame: 'https://image.example/last.png' }, context());
+    expect(result.isError).not.toBe(true); expect(h.generateVideo).toHaveBeenCalledWith(expect.objectContaining({ profileId: 'selected-service', firstFrameUrl: 'https://image.example/first.png', lastFrameUrl: 'https://image.example/last.png' }));
+  });
+  it('refuses a broken app-selected identity without dispatch', async () => {
+    h.route.mockRejectedValue(new Error('selection removed')); const result = await createVideoGenTool({ userId: 'u', cid: 'app-session' }).execute({ prompt: 'clip', output_path: 'f.mp4' }, context());
+    expect(result.isError).toBe(true); expect(h.generateVideo).not.toHaveBeenCalled();
+  });
+  it('bounds the expanded envelope before reading missing files', async () => {
+    const result = await createVideoGenTool({ userId: 'u' }).execute({ prompt: 'clip', output_path: 'f.mp4', reference_image_paths: Array(31).fill('missing.png') }, context());
+    expect(result.content).toContain('30'); expect(h.generateVideo).not.toHaveBeenCalled();
+  });
+  it('passes the expanded model-specific envelope to the owning validator', async () => {
+    const images = Array.from({ length: 30 }, (_, i) => 'https://image.example/' + i + '.png'), videos = Array.from({ length: 10 }, (_, i) => 'https://video.example/' + i + '.mp4');
+    await createVideoGenTool({ userId: 'u' }).execute({ prompt: 'clip', output_path: 'f.mp4', reference_image_urls: images, reference_video_urls: videos, duration: -1, ratio: 'adaptive', resolution: '1080p' }, context());
+    expect(h.generateVideo).toHaveBeenCalledWith(expect.objectContaining({ referenceImageUrls: images, referenceVideoUrls: videos, duration: -1, ratio: 'adaptive', resolution: '1080p' }));
+  });
+  it('rejects a local frame outside the workspace before dispatch', async () => {
+    const result = await createVideoGenTool({ userId: 'u' }).execute({ prompt: 'clip', output_path: 'f.mp4', first_frame: path.join(root, '..', 'outside.png') }, context());
+    expect(result.content).toContain('E_PATH_OUT_OF_SCOPE'); expect(h.generateVideo).not.toHaveBeenCalled();
+  });
+  it('does not replace an earlier Studio shot when a changed prompt uses the same name', async () => {
+    fs.mkdirSync(path.join(root, 'ad')); fs.writeFileSync(path.join(root, 'ad/shot-1.mp4'), 'old');
+    await studioTool().execute(shotInput(), context()); expect(h.generateVideo.mock.calls[0][0].outputAbsPath).not.toBe(path.join(root, 'ad/shot-1.mp4')); expect(fs.readFileSync(path.join(root, 'ad/shot-1.mp4'), 'utf8')).toBe('old');
+  });
+});
+
+it('keeps an unresolved canvas shot visible across turns without retaining a replay payload', async () => {
+  const tool = createVideoGenTool({ userId: 'test-video-owner', agentId: '79df9cc89f5f', cid: 'c-video' });
+  h.generateVideo.mockResolvedValue({ ok: false, errorCode: 'PROVIDER_API_ERROR', message: 'uncertain' });
+  await tool.execute({ ...shotInput(), shot: 'hero' }, { workingDir: root } as any);
+  const { hasPendingProductionRequest } = await import('../../../../src/main/features/video_production_budget');
+  expect(await hasPendingProductionRequest({ userId: 'test-video-owner', scope: 'c-video', productionDirAbs: path.join(root, 'ad'), shot: 'hero', kind: 'video' })).toBe(true);
 });

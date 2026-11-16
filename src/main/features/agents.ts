@@ -1427,46 +1427,25 @@ function _writePersistedAgentCatalog(stamp: string, data: Agent[]): void {
   }
 }
 
-function _invalidateAgentListCache(opts: { markDirty?: boolean; userId?: string } = {}): void {
+function _invalidateAgentListCache(opts: { userId?: string } = {}): void {
   const userId = opts.userId || getActiveUserId();
   _agentListCacheGeneration += 1;
   _agentListCache = null;
   _agentEnrichedCache = null;
   try { fs.rmSync(_agentCatalogCacheFile(userId), { force: true }); } catch { /* cache is best-effort */ }
-  if (opts.markDirty === false) return;
-  // Notify the sync engine (lazy-require — stripped in the open-source build builds). Every cache-invalidate
-  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
-  // existing call sites without sprinkling sync calls across the file. The relPath here is
-  // informational only — the engine ignores it and walks `cloud/` itself.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('agents', 'cloud/agents');
-  } catch { /* features/sync stripped */ }
 }
 
-/** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
- *  **Why exposed**: `listAgents` caches the disk spec list keyed on the two source dirs'
- *  `mtimeMs`. Local create/update/delete go through this module and call `_invalidateAgentListCache`
- *  inline. But the sync engine writes (and `unlink`s) files directly under `<uid>/cloud/agents/<aid>/`,
- *  which updates the AGENT dir's mtime but NOT the parent (`CUSTOM_AGENTS_DIR`). The parent's
- *  mtime stays unchanged, the cache stamp stays valid, and `listAgents` returns ghosts of the
- *  agents sync just deleted. The sync bridge calls this so the next `listAgents` re-scans. */
+/** Re-read definitions after an external writer changes Agent files. */
 export function invalidateAgentListCache(): void {
-  _invalidateAgentListCache({ markDirty: false });
+  _invalidateAgentListCache();
 }
 
-/** Drop only the in-memory list cache. Marketplace reconcile updates live under
- *  `<uid>/local/marketplace/agents`, not cloud-synced custom agents, so it must not mark the
- *  `agents` sync domain dirty just to make the next list call re-read disk. */
+/** Drop memory and disk catalog caches after marketplace reconciliation. */
 export function clearAgentListCache(): void {
-  _invalidateAgentListCache({ markDirty: false });
+  _invalidateAgentListCache();
 }
 
-/** Toggle the active user's enabled override for an agent. Wrapping the
- *  raw setter so the IPC handler stays one-line and the per-uid resolution
- *  happens here. The disk-spec cache doesn't need invalidating (enabled is
- *  overlaid outside it), but we no-op'd that explicitly to avoid surprise. */
+/** Persist the active user's enabled override; list reads overlay it separately. */
 export function setAgentEnabledForActiveUser(agentId: string, enabled: boolean): void {
   setAgentEnabled(getActiveUserId(), agentId, enabled);
 }
@@ -2931,10 +2910,9 @@ async function _appendAgentChatMessage(userId: string, agentId: string, record: 
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
   const agent = await getAgent(agentId);
-  // Custom agents always allow clearing; built-in chat dirs only exist when
-  // dev mode has been editing them — allow clearing those too.
+  // Only custom Agent chat records can be cleared locally.
   if (!agent) return false;
-  if (agent.source !== 'custom' && !false) return false;
+  if (agent.source !== 'custom') return false;
   for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
@@ -3102,7 +3080,7 @@ export async function sendToAgentEditChat(
 ): Promise<AgentEditResult> {
   const agent = await getAgent(agentId);
   if (!agent) return { ok: false, error: 'agent not found' };
-  if (agent.source !== 'custom' && !false) {
+  if (agent.source !== 'custom') {
     return { ok: false, error: t('errors.builtin_agent_not_editable') };
   }
 
@@ -3176,7 +3154,7 @@ export async function* streamSendToAgentEditChat(
     yield { type: 'done' };
     return;
   }
-  if (agent.source !== 'custom' && !false) {
+  if (agent.source !== 'custom') {
     yield { type: 'error', text: t('errors.builtin_agent_not_editable') };
     yield { type: 'done' };
     return;

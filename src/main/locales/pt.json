@@ -1,4 +1,9 @@
 {
+  "local.delete_file.user_continue": "Exclusão confirmada. Continue.",
+  "apps.builtin_listing_title": "Área de comércio",
+  "apps.builtin_listing_description": "Conecte lojas e crie textos de produtos, imagens e vídeos",
+  "apps.builtin_content_title": "Estúdio de conteúdo",
+  "apps.builtin_content_description": "Comece com uma ideia ou seus próprios arquivos",
   "errors.conversation_recovery_conflict": "Esta tarefa precisa de ser recuperada antes de ser aberta. As cópias existentes foram preservadas. Contacte o suporte.",
   "connectors.account_choice.title": "Escolha a conta para conectar",
   "connectors.account_choice.message": "Selecione a conta ou loja autorizada para esta conexão.",
@@ -135,7 +140,6 @@
   "errors.model_currently_unavailable": "Este modelo está indisponível no momento",
   "errors.model_config_unavailable": "Um modelo está configurado, mas sua credencial não pode ser usada no momento. Verifique a chave de API, o estado de login ou o modelo substituto em Configurações.",
   "errors.model_oauth_expired": "A autorização de {provider} expirou. Reautorize esta conta em Configurações ou mude para um modelo alternativo.",
-  "errors.model_credits_insufficient": "Créditos insuficientes, então a tarefa parou. Depois de adicionar créditos, volte a esta tarefa e escreva “Continuar” para retomar de onde parou. Você também pode mudar para um modelo disponível em Configurações.",
   "errors.custom_endpoint_suspect": "Seu endpoint de modelo personalizado falhou em várias solicitações seguidas (HTTP {status}) — ele pode estar inativo ou ter mudado. Verifique o URL da API e a chave em Configurações → Modelos, ou troque de modelo para continuar.",
   "errors.model_output_cap_repeated": "Este modelo atingiu o limite de saída por resposta várias vezes seguidas — pode ser pequeno demais para esta tarefa. Troque para um modelo com limite maior em Configurações, ou divida a tarefa.",
   "errors.model_provider_balance_insufficient": "A conta do provedor de modelo que você configurou está sem saldo (não são créditos Orkas). Recarregue com esse provedor ou troque de modelo em Configurações.",
@@ -168,10 +172,8 @@
   "agent.run_failed": "⚠️ Falha na execução do agente: {message}",
   "model.retrying": "Tentando novamente",
   "model.retrying_n": "Tentativa de repetição {attempt}",
-  "model.dev_marker": "[DEV]",
   "model.credential_fallback": "A credencial do modelo {provider} não é mais válida. Alternando para um modelo de fallback para que a tarefa continue; depois, reautorize ou atualize a credencial em Configurações.",
   "model.timeout_fallback": "O modelo {provider} não começou a responder a tempo. Alternando para um modelo de fallback para que a tarefa continue.",
-  "model.server_model_fallback": "{from} está temporariamente indisponível. {to} processou a solicitação.",
   "model.tool_loop_limit_reached": "(Limite de rodadas do loop de ferramentas atingido)",
   "model.run_aborted": "Execução abortada",
   "model.max_retries_exceeded": "Máximo de tentativas excedido",
@@ -367,6 +369,11 @@
   "errors.model_request_rejected_repeated": "Esta solicitação foi rejeitada várias vezes seguidas, então tentar de novo sem mudanças não vai alterar o resultado. Troque para outro modelo em Configurações e tente de novo, ou remova as imagens ou anexos e envie novamente.",
   "errors.provider_reply_detail": "Resposta do provedor: {detail}",
   "cli_agent.repeated_failure_hint": "“{name}” falhou novamente. Você pode pedir ao @Commander para assumir esta tarefa.",
-  "desktop.open": "Abrir",
-  "desktop.exit": "Sair"
+  "desktop.open": "Abrir Orkas",
+  "desktop.exit": "Sair do Orkas",
+  "video_budget.own_key_notice": "Foram gerados {count} arquivo(s) com a sua própria conta de serviço, que cobra diretamente de você.",
+  "errors.model_request_rejected_no_retry": "O serviço do modelo recusou esta solicitação. As tentativas automáticas foram interrompidas.",
+  "errors.model_context_capacity_insufficient": "O contexto atual excede a capacidade segura dos modelos selecionados. Esta chamada ao modelo não foi enviada. Escolha um modelo com uma janela de contexto maior ou inicie uma nova conversa.",
+  "video.delivery_retained": "Anexo {index}: a versão entregue {version} foi mantida.",
+  "video.delivery_later_edits": "As alterações posteriores não estão incluídas nesta versão."
 }

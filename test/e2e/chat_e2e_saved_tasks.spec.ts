@@ -1,4 +1,6 @@
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 
 
 test('keeps file and related resource glyphs readable within their shared icon box', async ({ orkas: app }, testInfo) => {
@@ -258,6 +260,7 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   expect(globalTodos.tasks).toEqual([]);
   await app.invoke('projects.tasks.create', { projectId: project.project.project_id, content: 'Another release check' });
   await expect(page.locator('#chat-history [data-saved-task-key]')).toHaveCount(2);
+  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveCount(1);
   await page.evaluate(() => (window as any).setLang('zh'));
   await expect(page.locator('#chat-history [data-saved-task-key] .chat-msg-created-agent-label').first()).toContainText('打开');
   await page.evaluate(() => (window as any).setLang('en'));
@@ -313,9 +316,7 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   await expect(todoCard).not.toHaveClass(/\bis-highlighted\b/);
   await expect(todoCard).toHaveCSS('background-color', restingStyle.background);
   await expect(todoCard).toHaveCSS('box-shadow', restingStyle.shadow);
-  await expect(page.locator('[data-todo-group="project"]')).toHaveAttribute('aria-pressed', 'true');
-  await expect(page.locator(`#todos-content .todo-scope-chip[data-pid="${project.project.project_id}"]`))
-    .toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-todo-group="status"]')).toHaveAttribute('aria-pressed', 'true');
   // Reopening the shortcut should reveal the highlight again in a narrow window.
   await page.setViewportSize({ width: 1024, height: 720 });
   await page.evaluate((id) => { (window as any).setLang('zh'); (window as any).setView('conversation', id); }, cid);
@@ -338,6 +339,93 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   // conversation list. Reopen through the same public route used above.
   await page.evaluate(id => (window as any).setView('conversation', id), cid);
   await expect(page.locator('#chat-history [data-saved-task-key]')).toHaveCount(2);
+  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveCount(1);
   await page.locator('#chat-history [data-saved-task-key]', { hasText: 'Nightly review' }).click();
   await expectAutomationFocused();
 });
+
+test('shows conversation source icons and header shortcuts together without crowding navigation', async ({ orkas: app }, testInfo) => {
+  let page = app.page!;
+  const { conversation } = await app.invoke<any>('conversations.create', {
+    title: 'Review the release readiness and all remaining product details '.repeat(4),
+  });
+  const cid = conversation.conversation_id;
+  const { task: todo } = await app.invoke<any>('projects.tasks.create', { content: 'Review release readiness' });
+  // Seed the existing execution association in the isolated local user, without
+  // executing a model just to establish a navigation fixture.
+  const uid = await page.evaluate<string>('currentUserId');
+  const file = path.join(app.workspaceRoot, uid, 'cloud', 'tasks', `${todo.id}.json`);
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  writeFileSync(file, JSON.stringify({ ...saved, origin_cid: cid }));
+  await page.evaluate(async cid => {
+    const runtime = window as any;
+    await runtime.loadConversations({ fresh: true });
+    runtime.setView('conversation', cid);
+    await runtime.loadConversationHistory(cid);
+  }, cid);
+  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveCount(1);
+  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveAttribute('data-header-task-id', todo.id);
+  const { task: automation } = await app.invoke<any>('autoTasks.create', {
+    content: 'Review release readiness', title: 'Daily release review', enabled: false,
+    schedule: { type: 'daily', hour: 9, minute: 0 },
+  });
+  const autoFile = path.join(app.workspaceRoot, uid, 'cloud', 'auto_tasks', automation.id, 'config.json');
+  const savedAuto = JSON.parse(readFileSync(autoFile, 'utf8'));
+  writeFileSync(autoFile, JSON.stringify({ ...savedAuto, conversation_id: cid }));
+  // The automation created this conversation: mirror the persisted source
+  // metadata that the real scheduler writes, rather than merely targeting it.
+  const indexFile = path.join(app.workspaceRoot, uid, 'cloud', 'chats', '_index.json');
+  const index = JSON.parse(readFileSync(indexFile, 'utf8'));
+  writeFileSync(indexFile, JSON.stringify(index.map((row: any) => row.conversation_id === cid
+    ? { ...row, origin_auto_task_id: automation.id } : row)));
+  const metaFile = path.join(app.workspaceRoot, uid, 'cloud', 'chats', cid, 'meta.json');
+  writeFileSync(metaFile, JSON.stringify({ ...JSON.parse(readFileSync(metaFile, 'utf8')), origin_auto_task_id: automation.id }));
+  // Reopen the seeded local user so production index caches start from these
+  // persisted scheduler facts, rather than an earlier in-process snapshot.
+  page = await app.relaunch();
+  await page.evaluate(async cid => {
+    const runtime = window as any;
+    await runtime.loadConversations({ fresh: true });
+    runtime.setView('conversation', cid);
+  }, cid);
+  const links = page.locator('#chat-header [data-header-task-id]');
+  await expect(links).toHaveCount(2);
+  await expect(page.locator(`.conv-item[data-cid="${cid}"] .conv-item-todo-icon`).first()).toBeVisible();
+  await expect(page.locator(`.conv-item[data-cid="${cid}"] .conv-item-auto-icon`).first()).toBeVisible();
+  for (const [width, height, locale] of [[1440, 900, 'en'], [1024, 600, 'zh']] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(locale => (window as any).setLang(locale), locale);
+    // Controlled member-state fixture renders the real avatar/count chrome.
+    await page.evaluate(`_groupMembersCache.set(${JSON.stringify(cid)}, [
+      { id: 'reviewer', kind: 'agent' }, { id: 'engineer', kind: 'agent' }
+    ]); _refreshChatHeader();`);
+    await expect(links).toHaveCount(2);
+    for (const link of await links.all()) await expect(link).toBeInViewport();
+    expect(await links.evaluateAll(elements => elements.every(element => {
+      const bounds = element.getBoundingClientRect();
+      const parent = element.parentElement!.getBoundingClientRect();
+      const meta = document.getElementById('chat-header-meta')!.getBoundingClientRect();
+      return bounds.left >= parent.left && bounds.right <= parent.right && bounds.width <= 240
+        && bounds.left >= meta.right && Math.abs((bounds.top + bounds.bottom - meta.top - meta.bottom) / 2) <= 1;
+    }))).toBe(true);
+    await expect(links.locator('svg')).toHaveCount(2);
+    await expect(page.locator('#conversation-info-toggle')).toBeInViewport();
+    await page.screenshot({ path: testInfo.outputPath(`conversation-task-links-${locale}.png`) });
+  }
+  await page.locator(`#chat-header [data-header-task-id="${todo.id}"]`).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator(`#todos-content [data-tid="${todo.id}"]`)).toHaveClass(/\bis-highlighted\b/);
+  await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
+  await page.locator(`#chat-header [data-header-task-id="${automation.id}"]`).click();
+  await expect(page.locator(`#auto-list [data-task-id="${automation.id}"]`)).toHaveClass(/\bis-highlighted\b/);
+  await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
+  await app.invoke('projects.tasks.delete', { taskId: todo.id });
+  await expect(links).toHaveCount(1);
+  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveAttribute('data-header-task-id', automation.id);
+  const { conversation: ordinary } = await app.invoke<any>('conversations.create', { title: 'An ordinary conversation' });
+  await page.evaluate(cid => (window as any).setView('conversation', cid), ordinary.conversation_id);
+  await expect(links).toHaveCount(0);
+  await expect(page.locator('#chat-header-task-links')).toBeHidden();
+  await page.screenshot({ path: testInfo.outputPath('conversation-task-links-empty.png') });
+});
+

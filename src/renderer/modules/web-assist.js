@@ -24,6 +24,8 @@
   const expandedInerted = new Set();
   let permissionPromptEl = null;
   let activePermissionPrompt = null;
+  let pageDialogEl = null;
+  let activePageDialog = null;
   let resizeObserver = null;
   let layoutFrame = 0;
   let nativeVisible = false;
@@ -131,6 +133,7 @@
       item.classList.toggle('is-loading', tab.loading === true);
       item.classList.toggle('is-suspended', tab.suspended === true);
       item.classList.toggle('has-permission-request', !!tab.permission_request);
+      item.classList.toggle('has-page-dialog', !!tab.page_dialog);
       item.setAttribute('aria-selected', tab.tab_id === selected?.tab_id ? 'true' : 'false');
       item.tabIndex = tab.tab_id === selected?.tab_id ? 0 : -1;
 
@@ -195,6 +198,7 @@
     const handback = shell.querySelector('[data-act="handback"]');
     if (handback) { handback.hidden = !tab?.user_controlled; handback.textContent = label('web_assist.handback', 'Let AI continue'); }
     renderPermissionPrompt();
+    renderPageDialog();
     ensureMainActiveTab();
     syncVisibility();
   }
@@ -241,6 +245,16 @@
         <ol class="web-assist-trail-list"></ol>
       </section>
       <div class="web-assist-page">
+      <form class="web-assist-permission-prompt web-assist-page-dialog" hidden role="dialog" aria-modal="false" aria-labelledby="web-assist-page-dialog-title" aria-describedby="web-assist-page-dialog-message">
+        <strong id="web-assist-page-dialog-title"></strong>
+        <p id="web-assist-page-dialog-message" class="web-assist-permission-message"></p>
+        <div class="form-row" hidden><input type="text" maxlength="100000" autocomplete="off" aria-labelledby="web-assist-page-dialog-message"></div>
+        <p class="web-assist-permission-error" role="status" hidden></p>
+        <div class="web-assist-download-prompt-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-act="cancel-dialog"></button>
+          <button type="submit" class="btn btn-primary btn-sm" data-act="accept-dialog"></button>
+        </div>
+      </form>
       <section class="web-assist-permission-prompt" hidden role="dialog" aria-modal="false" aria-labelledby="web-assist-permission-title">
         <strong id="web-assist-permission-title"></strong>
         <p class="web-assist-permission-message"></p>
@@ -272,7 +286,12 @@
     activityListEl = shell.querySelector('.web-assist-trail-list');
     activityBtn = shell.querySelector('[data-act="activity"]');
     expandBtn = shell.querySelector('[data-act="expand"]');
-    permissionPromptEl = shell.querySelector('.web-assist-permission-prompt');
+    permissionPromptEl = shell.querySelector('.web-assist-permission-prompt:not(.web-assist-page-dialog)');
+    pageDialogEl = shell.querySelector('.web-assist-page-dialog');
+    pageDialogEl.addEventListener('submit', event => { event.preventDefault(); void answerPageDialog(true); });
+    pageDialogEl.querySelector('[data-act="cancel-dialog"]').addEventListener('click', () => answerPageDialog(false));
+    pageDialogEl.addEventListener('pointerdown', claimPageDialog);
+    pageDialogEl.querySelector('input').addEventListener('input', claimPageDialog);
     permissionPromptEl.querySelector('[data-act="deny-permission"]').addEventListener('click', () => answerPermissionPrompt(false));
     permissionPromptEl.querySelector('[data-act="allow-permission"]').addEventListener('click', () => answerPermissionPrompt(true));
     activityBtn.addEventListener('click', () => setActivityOpen(activityEl.hidden));
@@ -287,7 +306,10 @@
       // Its Escape must not also dismiss browser controls or leave full screen.
       if (event.defaultPrevented) return;
       const layer = window.OverlayManager.layerForEvent(event);
-      if (layer && layer !== permissionPromptEl && layer !== activityEl) return;
+      if (layer && layer !== permissionPromptEl && layer !== pageDialogEl && layer !== activityEl) return;
+      if (!pageDialogEl.hidden && pageDialogEl.contains(event.target)) {
+        event.preventDefault(); void answerPageDialog(false); return;
+      }
       if (!permissionPromptEl.hidden && shell.contains(event.target) && !dialogIsOpen()) {
         event.preventDefault();
         void answerPermissionPrompt(false);
@@ -370,6 +392,7 @@
     overlaySubscription?.();
     overlaySubscription = window.OverlayManager.subscribe(() => {
       syncVisibility();
+      scheduleLayout();
       revealCurrentTask();
     });
     refreshCopy();
@@ -393,6 +416,9 @@
     permissionPromptEl.querySelector('#web-assist-permission-title').textContent = label('web_assist.permission_title', 'Website permission');
     permissionPromptEl.querySelector('[data-act="deny-permission"]').textContent = label('web_assist.permission_deny', 'Deny');
     permissionPromptEl.querySelector('[data-act="allow-permission"]').textContent = label('web_assist.permission_allow', 'Allow');
+    pageDialogEl.querySelector('strong').textContent = label('web_assist.title', 'Browser');
+    pageDialogEl.querySelector('[data-act="cancel-dialog"]').textContent = label('common.cancel', 'Cancel');
+    pageDialogEl.querySelector('[data-act="accept-dialog"]').textContent = label('common.confirm', 'Confirm');
     activityBtn.querySelector('span').textContent = label('web_assist.activity', 'Activity');
     shell.querySelector('#web-assist-activity-title').textContent = label('web_assist.activity', 'Activity');
     setButtonCopy(shell.querySelector('[data-act="close-activity"]'), 'web_assist.activity_close', 'Close activity');
@@ -413,7 +439,7 @@
     if (!permissionPromptEl) return;
     const tab = selectedTab();
     const request = activeView === 'conversation' && panelOpen && panelTab === 'browser'
-      && currentState?.active_tab_id === tab?.tab_id ? tab?.permission_request : null;
+      && currentState?.active_tab_id === tab?.tab_id && !tab?.page_dialog ? tab?.permission_request : null;
     permissionPromptEl.hidden = !request;
     if (activityBtn) activityBtn.disabled = !!request;
     if (!request) { activePermissionPrompt = null; return; }
@@ -450,6 +476,63 @@
       error.hidden = false;
     } finally {
       if (isCurrent()) permissionPromptEl.querySelectorAll('button').forEach(button => { button.disabled = false; });
+    }
+  }
+
+  function renderPageDialog() {
+    if (!pageDialogEl) return;
+    const tab = selectedTab();
+    const request = activeView === 'conversation' && panelOpen && panelTab === 'browser'
+      && currentState?.active_tab_id === tab?.tab_id ? tab?.page_dialog : null;
+    pageDialogEl.hidden = !request;
+    if (activityBtn) activityBtn.disabled = !!request || !permissionPromptEl.hidden;
+    if (!request) { activePageDialog = null; return; }
+    pageDialogEl.querySelector('.web-assist-permission-message').textContent = request.message;
+    pageDialogEl.querySelector('[data-act="accept-dialog"]').textContent = request.type === 'alert'
+      ? label('common.ok', 'OK') : label('common.confirm', 'Confirm');
+    if (activePageDialog?.id === request.id && activePageDialog.epoch === contextEpoch) return;
+    activePageDialog = { id: request.id, tabId: tab.tab_id, epoch: contextEpoch };
+    pageDialogEl.querySelector('.web-assist-permission-error').hidden = true;
+    pageDialogEl.querySelectorAll('button').forEach(button => { button.disabled = false; });
+    const prompt = request.type === 'prompt';
+    pageDialogEl.querySelector('.form-row').hidden = !prompt;
+    pageDialogEl.querySelector('input').value = prompt ? request.value || '' : '';
+    const cancel = pageDialogEl.querySelector('[data-act="cancel-dialog"]');
+    cancel.hidden = request.type === 'alert';
+    setActivityOpen(false);
+    (prompt ? pageDialogEl.querySelector('input') : cancel.hidden
+      ? pageDialogEl.querySelector('[data-act="accept-dialog"]') : cancel).focus();
+  }
+
+  function claimPageDialog() {
+    if (!activePageDialog || pageDialogEl.hidden) return;
+    void window.orkas.invoke('webAssist.dialogResponse', { tabId: activePageDialog.tabId,
+      requestId: activePageDialog.id, editing: true, ...(selectedTab()?.page_dialog?.type === 'prompt'
+        ? { value: pageDialogEl.querySelector('input').value } : {}) }).catch(() => { log.warn('browser dialog input claim failed'); });
+  }
+
+  async function answerPageDialog(accepted) {
+    const request = activePageDialog;
+    if (!request || pageDialogEl.hidden || pageDialogEl.querySelector('[data-act="accept-dialog"]').disabled) return;
+    const isCurrent = () => activePageDialog?.id === request.id && contextEpoch === request.epoch
+      && selectedTab()?.tab_id === request.tabId && selectedTab()?.page_dialog?.id === request.id;
+    if (!isCurrent()) return;
+    pageDialogEl.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    try {
+      const result = await window.orkas.invoke('webAssist.dialogResponse', { tabId: request.tabId,
+        requestId: request.id, accepted, ...(selectedTab().page_dialog.type === 'prompt'
+          ? { value: pageDialogEl.querySelector('input').value } : {}) });
+      if (!isCurrent()) return;
+      if (!result?.handled) throw new Error('dialog response failed');
+      delete selectedTab().page_dialog;
+      renderState(currentState);
+    } catch (_) {
+      if (!isCurrent()) return;
+      const error = pageDialogEl.querySelector('.web-assist-permission-error');
+      error.textContent = label('web_assist.permission_failed', 'Could not save your choice. Try again.');
+      error.hidden = false;
+    } finally {
+      if (isCurrent()) pageDialogEl.querySelectorAll('button').forEach(button => { button.disabled = false; });
     }
   }
 
@@ -660,7 +743,6 @@
     if (tab?.suspended && tab.error_code && !retry) return;
     if (!tab || (currentState?.active_tab_id === tab.tab_id && !tab.suspended) || activationInFlight === tab.tab_id) return;
     if (!(panelOpen && panelTab === 'browser' && activeView === 'conversation')) return;
-    if (modalIsOpen()) return;
     activationInFlight = tab.tab_id;
     window.orkas.invoke('webAssist.activateTab', { tabId: tab.tab_id }).then((result) => {
       if (result?.ok && result.state) renderState(result.state);
@@ -696,7 +778,8 @@
     if (shell.hidden !== !shown) shell.hidden = !shown;
     const ready = shown && !tab?.suspended && !!tab?.display_url
       && currentState?.active_tab_id === tab.tab_id;
-    const next = ready && !modalIsOpen();
+    window.OverlayManager.setBrowserTarget(ready ? host : null);
+    const next = ready && !window.OverlayManager.isBrowserOccluded();
     const nextTabId = ready ? tab.tab_id : '';
     if (nativeVisible === next && nativeTabId === nextTabId) return;
     layoutRevision += 1;
@@ -713,6 +796,9 @@
     layoutFrame = window.requestAnimationFrame(async () => {
       layoutFrame = 0;
       const request = layoutRevision;
+      // Measure existing layers before every native reveal, including a panel
+      // opened after a popup and a layout changed while awaiting main.
+      window.OverlayManager.refresh();
       if (!await window.OverlayManager.settled() || request !== layoutRevision
         || !nativeVisible || !host || host.hidden) return;
       const rect = host.getBoundingClientRect();
@@ -723,7 +809,10 @@
         overlayRevision: window.OverlayManager.version(), overlayEpoch: window.OverlayManager.epoch(),
       }).then((result) => {
         if (request !== layoutRevision || !nativeVisible) return;
-        if (result?.ok && result.state) renderState(result.state);
+        if (result?.ok) {
+          window.OverlayManager.setPresentedBounds(result.bounds);
+          if (result.state) renderState(result.state);
+        }
       }).catch(() => { log.warn('native view layout failed'); });
     });
   }

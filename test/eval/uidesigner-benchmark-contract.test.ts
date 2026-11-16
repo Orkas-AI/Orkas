@@ -73,7 +73,7 @@ it('keeps only UIDesigner routing boundaries resident and delegates source mecha
     expect(source).toMatch(/code-to-HTML mapping for the preserved shell and the changed region/i);
   });
   it('keeps the shipped resource privacy and evidence boundaries explicit', () => {
-    const alwaysOnProfile = [...shippedAgent.knowhow, ...shippedAgent.standards].join('\n');
+    const alwaysOnProfile = [shippedAgent.workflow, ...shippedAgent.standards].join('\n');
     expect(shippedAgent.knowhow).toHaveLength(5);
     expect(shippedAgent.standards).toHaveLength(5);
     expect(alwaysOnProfile).toMatch(/explicit final format/i);
@@ -120,7 +120,7 @@ it('keeps only UIDesigner routing boundaries resident and delegates source mecha
     expect(ordinary).toMatch(/each baseline item is either `ok` with what was compared, or names the element, the problem, and the fix/i);
     expect(ordinary).toMatch(/Fix every design warning or state why it stays/i);
     expect(ordinary).toMatch(/written visual review against the executor's Visual Craft Baseline/i);
-    expect(shippedAgent.standards.join('\n')).toMatch(/standalone artifact has[^.]*written visual review/i);
+    expect(shippedAgent.standards.join('\n')).toMatch(/standalone artifacts?[^.]*visual[- ]review (?:evidence|record)/i);
 
     // A layout redesign of an existing screen keeps the product's visual layer.
     expect(ordinary).toMatch(/does not license a new visual language/i);
@@ -162,5 +162,70 @@ it('keeps only UIDesigner routing boundaries resident and delegates source mecha
     expect(ordinary).toMatch(/never invent a problem to fill it/i);
     expect(ordinary).toMatch(/That is the only repair round/i);
     expect(skillBody('ui-design-source')).toMatch(/A requested layout redesign puts widths, grouping, density/i);
+  });
+
+  it('retains shipped conditional completion, recovery and format contracts through actual runtime guidance', async () => {
+    const agents = await import('../../src/main/features/agents');
+    const bus = await import('../../src/main/features/group_chat/bus');
+    const normalized = agents.normalizeAgent(shippedAgent, 'marketplace');
+    const guidance = bus._buildAgentRuntimeGuidanceForTest(normalized?.profile);
+    const promptWith = (...names: string[]) => [shippedAgent.workflow, guidance,
+      ...names.map(name => `## skill: ${name}\n${skillBody(name)}`)].join('\n\n');
+    const svgPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace');
+    expect(svgPrompt).toContain('Explicit final format wins immediately');
+    expect(svgPrompt).toMatch(/missing product name or exact icon list is a low-risk/i);
+    expect(svgPrompt).toMatch(/do not open a preference form/i);
+    expect(svgPrompt).toContain('HTML intentionally absent');
+
+    const runtimePrompt = promptWith('ui-design-executor', 'ui-artifact-workspace');
+    expect(runtimePrompt).toContain('function safeInit()');
+    expect(runtimePrompt).toContain('runtime-guarded-init');
+    expect(runtimePrompt).toMatch(/html_preview` with `interactions:false` and `screenshots:true`/i);
+    expect(runtimePrompt).not.toMatch(/preview interaction audit is authoritative/i);
+
+    const figmaPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace', 'ui-design-source');
+    expect(figmaPrompt).toContain('Exact');
+    expect(figmaPrompt).toContain('Adaptive (optional)');
+    expect(figmaPrompt).toMatch(/adaptive.{0,40}provisional.{0,40}non-fidelity/i);
+    expect(figmaPrompt).toMatch(/never call it 1:1/i);
+
+    const rasterPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace');
+    expect(rasterPrompt).toContain('prewire the future relative raster path');
+    expect(rasterPrompt).toMatch(/do not call a billable generation tool/i);
+    expect(rasterPrompt).toContain('capability: "raster-image-generation"');
+    expect(rasterPrompt).toContain('status: "pending"');
+    expect(rasterPrompt).toContain('--expect raster-handoff');
+    expect(rasterPrompt).toMatch(/narrow omission safeguard/i);
+    expect(rasterPrompt).toMatch(/explicit vector intent only when it came from the user/i);
+
+    const livePrompt = promptWith('ui-design-executor', 'ui-artifact-workspace', 'ui-live-artifact');
+    expect(livePrompt).toContain('--expect live-ready');
+    expect(livePrompt).toMatch(/make one focused repair and rerun once/i);
+    expect(livePrompt).toMatch(/do not add an approval question or an open-ended QA loop/i);
+
+    const revisionPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace');
+    expect(revisionPrompt).toMatch(/desktop plus mobile evidence only when the user explicitly requests/i);
+    expect(revisionPrompt).toMatch(/otherwise omit target for desktop/i);
+    expect(revisionPrompt).toMatch(/screenshots:true.*final visual review/i);
+    expect(revisionPrompt).toMatch(/follow-up[\s\S]*baseline revision N[\s\S]*exactly once to N\+1/i);
+
+    const newArtifactPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace');
+    expect(newArtifactPrompt).toMatch(/new artifact[\s\S]*revision 1[\s\S]*initial validation (?:and|or) preview[\s\S]*revision 1/i);
+    expect(newArtifactPrompt).not.toMatch(/new artifact[\s\S]{0,160}revision 0/i);
+
+    const defaultPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace');
+    expect(defaultPrompt).toMatch(/Tools-off does not turn a new artifact into a future brief/i);
+    expect(defaultPrompt).toMatch(/Keep this default command unchanged for ordinary HTML/i);
+    expect(defaultPrompt).toMatch(/expectation failure is a focused same-turn repair signal, not a new approval gate/i);
+
+    const formPrompt = promptWith('ui-design-executor', 'ui-artifact-workspace', 'ui-controls-accessibility', 'ui-html-renderer');
+    expect(formPrompt).toContain('### Delivery standards');
+    expect(formPrompt).toMatch(/pristine, dirty\/touched invalid, submitted-pending/i);
+    expect(formPrompt).toMatch(/JavaScript parser is unavailable, avoid backslash regex shorthands/i);
+    expect(formPrompt).toMatch(/use `?\[0-9\]`?, direct string checks, or `?input\.validity`?/i);
+    expect(formPrompt).toMatch(/no-backend prototype may use one explicit Success\/Server failure selector/i);
+    expect(formPrompt).toMatch(/normal submit\/import action must read it before mutation/i);
+    expect(formPrompt).toMatch(/validation errors, post-filter sentinels, or feedback overwritten by render do not prove/i);
+    expect(shippedAgent.workflow).not.toMatch(/feedback overwritten by render never count/i);
   });
 });

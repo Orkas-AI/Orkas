@@ -113,7 +113,7 @@ describe('named Agent execution ownership', () => {
     expect(prompt).toContain('The commander decides how to continue');
     expect(prompt).toContain('that handing off cannot resolve');
     expect(prompt).toContain('Do not hand back merely for missing input, a recoverable failure');
-    expect(prompt).toContain('instead of silently substituting another choice');
+    expect(prompt).toContain('The `cross_session_memory` tool contract owns durability, destination, and write permissions.');
     expect(prompt).toContain('Preserve the intended scope');
     expect(prompt).toContain('Claim a memory change only after the tool confirms success');
     expect(prompt.match(/<handback reason="capability_boundary" \/>/g)).toHaveLength(1);

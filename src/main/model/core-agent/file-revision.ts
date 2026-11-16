@@ -14,7 +14,7 @@
  */
 
 import * as crypto from 'node:crypto';
-import * as fs from 'node:fs';
+import { fileSystemForPath } from '../../util/user-file-fs';
 import * as path from 'node:path';
 
 import type { ToolContext } from '#core-agent';
@@ -93,7 +93,7 @@ function replayKey(baseRevision: string, contentHash: string): string {
 /** Resolve aliases/casing for an existing file while retaining a safe fallback
  * for a path that vanishes between a tool result and its revision receipt. */
 export function canonicalFileRevisionPath(abs: string): string {
-  try { return fs.realpathSync.native(abs); }
+  try { return fileSystemForPath(abs).realpathSync.native(abs); }
   catch { return path.resolve(abs); }
 }
 

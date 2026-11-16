@@ -3,7 +3,7 @@
  * skills.
  *
  * Lives at `<uid>/cloud/config/component-enabled.json`, alongside
- * preferences.json and following the same cloud-sync policy. Local CLI connector
+ * preferences.json for per-user persistence. Local CLI connector
  * overrides instead live in `<uid>/local/config/device-connector-enabled.json`.
  *
  * **Schema** (v1):
@@ -50,17 +50,6 @@ import { writeTextAtomicSync } from '../storage';
 import { connectorRecordsForScope, isDeviceLocalConnector, prepareDeviceLocalConnectorStorage } from './connectors/device-local';
 
 const log = createLogger('component-enabled');
-
-// Lazy require sync: the module is stripped from the open-source build builds, and a static import would
-// break that build at module-load time. When sync is absent we silently no-op — the file
-// still sits at `cloud/config/` for whenever sync becomes available.
-function _notifyDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('component_enabled', 'cloud/config/component-enabled.json');
-  } catch { /* features/sync stripped */ }
-}
 
 const SCHEMA_VERSION = 1;
 
@@ -242,7 +231,6 @@ export function setAgentEnabled(uid: string, agentId: string, enabled: boolean):
   else next.agents[agentId] = false;
   touchClock(next, 'agents', agentId);
   writeAtomic(uid, next);
-  _notifyDirty();
   log.info(`agent ${agentId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 
@@ -260,7 +248,6 @@ export function setSkillEnabled(uid: string, skillId: string, enabled: boolean):
   else next.skills[skillId] = false;
   touchClock(next, 'skills', skillId);
   writeAtomic(uid, next);
-  _notifyDirty();
   log.info(`skill ${skillId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 
@@ -279,7 +266,6 @@ export function setConnectorEnabled(uid: string, connectorId: string, enabled: b
   touchClock(next, 'connectors', connectorId);
   const local = isDeviceLocalConnector(connectorId);
   writeAtomic(uid, next, local);
-  if (!local) _notifyDirty();
   log.info(`connector ${connectorId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 
@@ -333,7 +319,6 @@ export function migrateComponentEnabledId(
   }
 
   writeAtomic(uid, next);
-  _notifyDirty();
   log.info(`${kind} enabled-state id migrated ${fromId} → ${toId}${sourceWins ? '' : ' (newer destination kept)'}`);
   return true;
 }

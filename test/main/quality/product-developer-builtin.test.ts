@@ -17,7 +17,6 @@ const builtinMarketplaceRoot = path.join(
 );
 const builtinManifestPath = path.join(
   repoRoot,
-  'PC',
   'resources',
   'builtin',
   '_manifest.json',
@@ -37,6 +36,18 @@ const skillDirs = [
 ];
 
 describe('ProductDeveloper builtin contract', () => {
+  it('accepts demos and prototypes through the existing development capabilities', () => {
+    const spec = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'));
+    const skill = fs.readFileSync(path.join(productDevDir, 'SKILL.md'), 'utf8');
+    const meta = JSON.parse(fs.readFileSync(path.join(productDevDir, '_meta.json'), 'utf8'));
+    expect(spec.description_zh).toMatch(/原型|演示/);
+    expect(spec.description_en).toMatch(/demo|prototype/i);
+    expect(spec.workflow).toMatch(/demos.*prototypes/i);
+    expect(spec.dispatch).not.toMatch(/hand.*prototyp/i);
+    expect(skill).not.toMatch(/hand off to prototyping|not vague discovery, disposable demos|disposable prototypes.*belong/i);
+    expect(meta.routing.negative_examples.join('\n')).not.toMatch(/demo|prototyp/i);
+  });
+
   it('ships only from packaged builtin marketplace paths', () => {
     expect(fs.existsSync(path.join(repoRoot, 'Resource', 'agents', 'a316881746f9'))).toBe(false);
     for (const id of [
@@ -58,6 +69,8 @@ describe('ProductDeveloper builtin contract', () => {
     const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'));
 
     expect(agent.agent_id).toBe('a316881746f9');
+    const manifest = JSON.parse(fs.readFileSync(builtinManifestPath, 'utf8'));
+    expect(manifest.inventory.marketplace_agents.find((row: any) => row.id === agent.agent_id)?.version).toBe(agent.version);
     expect(agent.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(agent.min_app_version).toBe('1.6.2');
     expect(Date.parse(JSON.parse(
@@ -278,7 +291,6 @@ describe('ProductDeveloper builtin contract', () => {
 
     const skillMd = fs.readFileSync(path.join(productDevDir, 'SKILL.md'), 'utf8');
     expect(skillMd).toMatch(/do not invent an MVP, PRD, scope, architecture, or code/i);
-    expect(skillMd).toMatch(/disposable demo[\s\S]*do not produce implementation\s+artifacts/i);
     expect(skillMd).toMatch(/do not present stale results[\s\S]*as verified behavior/i);
     const safetyPreflight = skillMd.indexOf('Before the first dependency installation');
     const implementation = skillMd.indexOf('Make the smallest coherent change');

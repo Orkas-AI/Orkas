@@ -10,12 +10,79 @@ real-provider evaluation. Do not record credentials or private audio in evidence
 - Configure a user-owned supported API key. Missing, expired, malformed and
   denied credentials fail clearly; recovery succeeds after explicit correction.
 - Search/image/video/voice provider selection follows this build's public API-key
-  policy. Model selection remains provider-owned where the settings expose only
-  provider/key. No hosted account, quota, private credential sentinel or automatic
+  policy. Native speech presets expose their supported model choices; historical
+  saved speech configurations retain their selected model and endpoint. No hosted account, quota, private credential sentinel or automatic
   managed fallback is introduced.
 - Verify request shape, voice capabilities, input limits, format and error
   classification with controlled transport. Unknown voices, malformed references
   and rejected output do not become success. Cancellation makes no retry.
+
+### Native BYOK TTS scope (2026-11-06)
+
+Settings > Models > Speech supports six BYOK providers: Doubao Seed TTS
+2.0; MiniMax Speech 2.8 HD/Turbo; Alibaba Qwen-Audio 3.1 TTS Plus/Flash and
+CosyVoice 3.5 Flash/Plus; Google Gemini 3.8 Flash/Flash-Lite TTS; ElevenLabs
+Eleven v4/v4 Turbo; OpenAI GPT-4o mini TTS. Historical configurations retain
+their model and endpoint. ASR, music and sound effects are outside this speech configuration change.
+
+- Native protocols: [MiniMax HTTP/hex](https://platform.minimax.cn/docs/api-reference/speech-t2a-http),
+  [Qwen HTTP](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-http-api),
+  [CosyVoice task WebSocket](https://help.aliyun.com/zh/model-studio/cosyvoice-client-events),
+  [Gemini Interactions](https://aistudio.google.com/docs/speech-generation),
+  [ElevenLabs speech](https://elevenlabs.io/docs/api-reference/text-to-speech/convert)
+  and [dialogue WebSocket](https://elevenlabs.io/docs/eleven-api/guides/how-to/websockets/realtime-tdd),
+  [OpenAI Speech](https://developers.openai.com/api/docs/guides/text-to-speech).
+- Domestic providers use domestic endpoints; Alibaba requires a Beijing
+  Workspace ID and matching key. CosyVoice 3.5 is clone-only: enter an enrolled
+  voice ID, not a public voice from another model. ElevenLabs requires a voice
+  available to the user's account. Saving is local configuration, not proof of
+  funded model/voice access, and never initiates billable synthesis.
+- Gemini preserves the literal transcript and adds no style instruction. Its
+  unary WAV is validated; MP3/Opus conversion uses the existing local FFmpeg
+  runtime. A missing converter or unsupported explicit speed is rejected
+  before dispatch. Eleven v4 likewise rejects unsupported non-neutral speed.
+- WebSockets honor the shared proxy resolver, support HTTP(S) CONNECT and fail
+  closed on unsupported proxy routes. Frames, aggregate audio, task duration
+  and local conversion are bounded. A close without the provider's completion
+  event never saves partial audio or reconnects automatically.
+- Only the documented Alibaba result host is downloaded, over HTTPS with no
+  provider key and no redirects. Receipt/download/conversion errors preserve
+  possible-charge status; no implicit provider fallback or paid retry occurs.
+- [OpenAI deprecations](https://developers.openai.com/api/docs/deprecations)
+  schedules legacy Speech models for shutdown on 2027-01-06. This implementation
+  uses the still-available Speech API; Realtime replacement models need a
+  separate verbatim-TTS migration before that deadline.
+- `tts_native_providers_lifecycle.test.ts`, `tts_native_websocket_e2e.test.ts`,
+  `tts_elevenlabs_lifecycle.test.ts` and `util/tts-audio.test.ts` cover native
+  payloads/auth, completion/error states, byte delivery, no replay, proxy and
+  local encoding. `ipc/model-config-auth.test.ts` covers encrypted persistence,
+  reopen, local-user isolation, ordering and removal. `tts_providers_e2e_settings.spec.ts`
+  exercises the actual Electron configuration UI, relaunch, shared dropdown
+  dismissal, English/Chinese and narrow-window layout. These fixtures do not
+  establish real provider permission, charge, speech quality or intelligibility.
+- The public Orkas API-key route remains available, retaining its Bearer key,
+  stable model and opaque usage headers. No official account session is used.
+- Web application support remains **deferred** under the existing media-generation
+  family: BYOK secrets and paid generation stay in the desktop host; no new SDK
+  grant or bridge is added. Configurations share existing encrypted local auth
+  storage, and generated audio retains its caller's existing artifact ownership;
+  this adds no independent billed cloud-storage module.
+
+### API parameter contract follow-up (2026-11-06)
+
+`tts_api_parameters.test.ts` adds an independent request/response matrix from
+the official endpoint specifications above. These are deterministic protocol
+fixtures, not proof of a provider account's permission or speech quality.
+
+| Provider / family | Protected request and delivery contract |
+| --- | --- |
+| Doubao HTTP | POST, API key/resource/request UUID headers, MP3/WAV/PCM/Opus/Ogg mapping, 48 kHz for `ogg_opus`, 24 kHz for PCM/WAV/MP3, cloned-voice resource/model, unsupported-format preflight refusal |
+| MiniMax Speech 2.8 HD / Turbo | Domestic POST, Bearer key, unchanged transcript/model/voice, native hex output, MP3/WAV/PCM/FLAC/Opus and valid sampling settings |
+| Qwen-Audio 3.1 Plus / Flash | Beijing workspace POST, Bearer key, `input.rate`, four native formats, HTTPS result download without the API key |
+| CosyVoice 3.5 Flash / Plus | Real local WebSocket task lifecycle, model/voice/rate/sampling/format, complete text at the limit, no connection above limits |
+| Gemini 3.8 Flash / Flash-Lite TTS | Interactions POST/API key, literal transcript, speech config, unary WAV, real local conversion to MP3/Opus and exact PCM delivery |
+| Eleven v4 / v4 Turbo | Native HTTP or real local dialogue WebSocket, `xi-api-key`, codec query, voice registration, local PCM-to-WAV wrapping and rejection of unsupported speed |
+| OpenAI GPT-4o mini TTS | Speech POST/Bearer key, six output formats, omitted optional speed and accepted/rejected speed/text boundaries |
 
 ## Owning automated coverage
 
@@ -36,6 +103,9 @@ request; profile storage failures remain redacted. Synthesis keeps its 120-secon
 deadline and parent cancellation active after response headers until body receipt
 finishes. Receipt is bounded before buffering at 50 MiB for binary audio and
 100 MiB for Doubao NDJSON, including chunked responses without Content-Length.
+Only a structured rejected rate-limit response may wait and retry inside the
+original operation deadline; accepted or uncertain work is never replayed. At most
+two speech transports run concurrently, including cancellation settlement.
 Fragmented bytes stay ordered; disconnect, overflow, cancellation and deadline
 leave prior output intact without replaying a possibly charged request. The same
 checks cover custom, ElevenLabs, Doubao and public Orkas API-key speech; the latter
@@ -177,3 +247,152 @@ not identify the responsible model and cannot establish human listening quality.
 An observed timestamp beyond source duration remains a defect rather than a
 success or permission to drop content. Report native Windows and Linux results
 separately from macOS, alongside live service, listening and long-audio gaps.
+
+## Multilingual narration estimates
+
+The shared estimator covers Latin scripts including Vietnamese, Japanese,
+Korean, Thai, Cyrillic and Arabic. NFC-equivalent narration has the same estimate;
+numeric separators and sentence pauses stay distinct. Chinese and English retain
+their established rates. `tts_fit.test.ts` carries thirteen measured duration
+fixtures with an independent twenty-percent tolerance and fit acceptance, while
+`storyboard_timing.test.ts` checks bundled helper parity. These fixed samples do
+not establish pronunciation quality or current provider availability. Capabilities
+resolve through the configured public provider; no official-account voice catalog
+or hosted billing contract is introduced by the estimator update.
+
+## Source-bound recognition and invalid timing
+
+Hold recognition after its decoded WAV is prepared, then overwrite, atomically
+replace or delete the original recording. Segment/word recognition must still
+use the initially prepared audio and original hash, publishing that version's
+TXT/SRT/JSON without replay. Equal-length tones distinguish which audio was
+recognized. An unstable source during decoding fails before recognition; old
+word timing cannot edit replacement bytes. Prior sources and outputs survive.
+
+Bound cues by actual decoded audio, including a video whose picture lasts longer.
+Overflow, reversed/overlapping/zero/negative/missing intervals fail with retained
+recognized TXT only, no editable JSON/SRT and no extra ASR call. Preserve the
+existing one-millisecond timing allowance and verify an explicit healthy retry.
+VideoStudio's point-word repair is independently maintained: do not infer that
+VoiceStudio fabricates identical word intervals.
+
+## Local delivery, extraction and conversion
+
+Pure extraction/conversion ignores saved trim, speed, volume, cleanup, music,
+word edits and render normalization. Extraction defaults to compatible stream
+copy; multiple audio streams require the explicit index returned by probe. Cover
+MP3, WAV, FLAC, M4A/AAC, OGG/Vorbis and Opus; typed rate/channel/precision/bitrate
+settings and incompatible-copy refusal followed by explicit conversion. Reopen
+saved export settings and test one-off overrides without changing that profile.
+Default render remains 48 kHz stereo, WAV16/MP3 192k with its existing loudness
+setting. Independent decoded PCM detects an accidental level or channel change.
+
+Use real temporary WAV/MP4/MKV with distinct tracks and known samples. Reject
+missing audio, corruption, unsupported settings, changed source, network/playlist
+protocols and cancellation without replacing previous work. Transfers retain the
+30-minute total deadline, 8 GiB/four-hour input and 2 GiB output bounds. Inject
+encode/decode, disk-full, stalled dependency and source-change faults; publish
+only complete candidates under the project lock, remove candidates on failure,
+and prove recovery works without damaging the project or earlier exports.
+
+## Cleanup, enhancement and recorded speech
+
+| User goal | Independent result and counterexample |
+| --- | --- |
+| Trim only edges / compress only long pauses | Retain quiet first/last speech, short breaths and all unrequested gaps; verify time maps and duration. Explicit no-treatment preserves the original. |
+| Denoise | Measure noise reduction alongside retained speech; unchanged/renormalized, silent and unrelated outputs fail. |
+| Filter rumble only | Reduce known 40 Hz relative to 440 Hz while retaining high detail, level contrast, timing and pauses. |
+| Reduce sibilance only | Reduce a loud 8 kHz burst relative to voice, preserving quiet detail, low-frequency content and unrelated dynamics. |
+| Level dynamics only | Reduce loud/quiet contrast without deleting pauses, muting voice or changing unrelated spectral bands. |
+| Combine, revise, reuse and undo | Persist ordered settings; reuse only a verified unchanged prefix. Source/settings changes invalidate dependent caches. Undo starts from originals and preserves the earlier export. |
+| Reject invalid work | Unknown fields, filter-string injection, invalid types/ranges and more than 16 processing steps fail before mutation. Missing codecs/cancel preserve sources; editing does not require Whisper. |
+
+Use both synthetic signals and checked-in English JFK/Mandarin fixtures with
+license/hash attribution in `test/fixtures/voice/README.md`; never download
+recordings/models automatically. Inject controlled noise, rumble, gain changes,
+pauses and sibilance. Keep a clean reference outside the execution workspace.
+Cover float 44.1 kHz WAV, 16 kHz MP3, 48 kHz FLAC, 44.1 kHz AAC/M4A and 48 kHz
+Ogg/Opus, distinct stereo content, and 1/21/200 ms clips. Preserve source hashes,
+quiet phrases and short breaths; cancel an active candidate, remove temporary
+files/locks, restore the source and recover successfully.
+
+Use bounded waveform-derived delay for FFT denoising (at most 50 ms), a separate
+voice-band comparison and symmetric phrase contrast. Wrong audio, excessive
+shift, silence and unrequested treatment must still fail. Undo compares against
+the actual noisy input, not a clean reference. These fixed recordings and
+spectral checks do not certify human listening quality or arbitrary defects.
+All-silent preservation is valid when no silence-removal operation was requested;
+a silence-removal request that cannot produce usable speech must not invent audio.
+
+## Local timeline, word edits and mono levels
+
+Schema 3 adds supplied timed `tracks` and source-segment `word_edit`; older
+schema-1/2 defaults remain compatible. Cleanup precedes overlays and defines
+track placement's clock. Only main narration keys music ducking; sound effects
+and other music do not. Use explicit overlap/fade settings for supplied BGM,
+without another generation or beat-analysis request. Floating intermediates keep
+mix peaks until final normalization/encoding; composition caps 32 tracks and
+bounds aggregate media, decoded work and intermediate PCM.
+
+Word mode uses experimental word/subword units, not forced alignment or automatic
+filler detection. Keep zero-duration text with an adjacent timed unit rather
+than inventing an interval. Inclusive keep/remove indices bind to both transcript
+and current source hash before local cleanup/speed. Reject stale hashes, invalid,
+reordered/overlapping/untimed indices and remove-all selections without losing
+prior output. Timing changes require a fresh final-audio transcript for captions.
+
+Measure real output frequency/time windows, continuous narration, loop seam jumps
+and tail envelopes; wrong placement, hard loops, missing requested fades and
+correct-duration holes fail. Pure conversion ignores composition and ASR state.
+Schema-3 rendering and word transcription share a 30-minute overall deadline.
+
+For mono export, every assembly/word-cut/processing/track path uses the requested
+channel count. Compare original retained PCM, stereo channel frequencies, an
+independently normalized mono downmix, five cleanup types/cache/undo, one-off
+channel overrides, legacy/timeline music and speech-only ducking. Normalized
+peaks and third-harmonic distortion check clipping; they do not certify true
+intersample peak. Old derived processing caches rebuild under version 2 while
+originals/finished exports remain unchanged; matching new work reuses the cache.
+
+## Saved project replay and delivered-file identity
+
+A correct WAV does not prove the saved project can reproduce it. Copy only scoped
+referenced media/word timing into a new physical directory, omit caches/exports,
+run the shipped audio script in a fresh process and compare the complete decoded
+interleaved PCM against the selected delivery. Use one-off lossless WAV only;
+retain edits/gains/channels/rate/loudness and allow at most one 16-bit quantization
+step. Test suffixed project revisions, relocation, scoped aliases, format-only
+export, one altered sample, swapped channels with equal mono sum, missing/corrupt
+media, outside references and unavailable takes. Run against an isolated copy,
+never repairing the original workspace to make the comparison pass.
+
+The short-fixture verifier budgets eight candidate projects, 64 segments,
+32 tracks, 128 references, 32 MiB copied media, 30 seconds of media/output,
+120 seconds decode-work and a shared 15-second subprocess deadline. Unavailable
+or over-budget evidence fails closed; these are verifier limits, not product
+limits. This is not universal replay of arbitrary/long/lossy projects.
+
+When publication evidence exists, verify the actual produced attachment rather
+than any retained intermediate or prose claim. Correct unpublished audio cannot
+hide a wrong published file. TXT/SRT without JSON is valid preserved-input/content
+evidence; never invent a source digest. A supplied JSON digest must match.
+
+## Local owning selections and boundaries
+
+Use `npm test --` with the actual files under `test/main/features/`:
+`voice_studio_core.test.ts`, `voice_studio_processing.test.ts`,
+`voice_studio_enhancement.test.ts`, `voice_studio_recorded.test.ts`,
+`voice_studio_e2e_project.test.ts`, `voice_studio_e2e_narration.test.ts`,
+`voice_studio_e2e_delivery.test.ts`, `voice_studio_transfer_deadline.test.ts`,
+`voice_studio_e2e_composition.test.ts`, `voice_studio_e2e_channels.test.ts` and
+`voice_studio_guidance.test.ts`. `test/eval/voice-project-replay.test.ts` owns
+independent fresh-process replay. Real recognition is explicit via
+`ORKAS_REAL_WHISPER_TEST=1` after native prerequisites are verified.
+
+Installed `voice-project` references own local delivery, ordered processing,
+timeline mixing and word editing. Verify their links and execute their example
+requests with real codecs; resident Agent descriptions, permissions and tools
+are unchanged. Managed separation/music, official credits, private model cohort
+history and monorepo retained logs are excluded. Local effects and supplied BGM
+remain available. No document update marks model behavior, paid suppliers,
+packaging, Windows/Linux native paths or perceptual listening accepted.

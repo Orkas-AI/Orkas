@@ -3,6 +3,21 @@ import { parseHtmlStructure } from '../../../src/main/features/video_studio_html
 
 describe('HTML copy character references', () => {
   it.each([
+    ['<h1>co<em>operate</em></h1>', 'cooperate'],
+    ['<h1>Orkas <strong>Studio</strong></h1>', 'Orkas Studio'],
+    ['<h1>Orkas<strong>Studio</strong></h1>', 'OrkasStudio'],
+    ['<h1>让协作<br>更简单</h1>', '让协作更简单'],
+    ['<svg><text><tspan>让协作</tspan><tspan>更简单</tspan></text></svg>', '让协作更简单'],
+    ['<p>co</p><p>operate</p>', 'co operate'],
+    ['<svg><text>co</text><text>operate</text></svg>', 'co operate'],
+    ['<span>&#165;</span><span>99</span>', '¥99'],
+    ['<span>&amp;</span><span>yen;99</span>', '&yen;99'],
+    ['co<!-- hidden note -->operate', 'cooperate'],
+  ])('preserves authored copy boundaries in %s', (source, expected) => {
+    expect(parseHtmlStructure(source).textContent).toBe(expected);
+  });
+
+  it.each([
     ['¥99', '¥99'], ['&yen;99', '¥99'], ['&#165;99', '¥99'], ['&#xA5;99', '¥99'],
     ['&euro;9 &pound;8 &copy;', '€9 £8 ©'], ['A&nbsp;B', 'A B'],
     ['&#x1F600; &#20013;', '😀 中'], ['&#128;9', '€9'],

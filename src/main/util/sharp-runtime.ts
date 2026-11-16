@@ -13,7 +13,7 @@ interface ImageRequestOptions extends Pick<SharpOptions, 'failOn' | 'limitInputP
 }
 
 interface ImageClient {
-  request(operation: string, buffer: Buffer, options?: ImageRequestOptions): Promise<any>;
+  request(operation: string, buffer: Buffer, options?: ImageRequestOptions | { reference: Buffer; canvas: { width: number; height: number } }): Promise<any>;
   close(): void;
 }
 
@@ -42,6 +42,10 @@ export function imageMetadata(buffer: Buffer, options: ImageRequestOptions = {})
 
 export function encodeImage(buffer: Buffer, options: ImageRequestOptions): Promise<{ data: Buffer; info: OutputInfo }> {
   return imageClient().request('encode', buffer, options);
+}
+
+export async function matchesPsdPreview(buffer: Buffer, reference: Buffer, canvas: { width: number; height: number }): Promise<boolean> {
+  return (await imageClient().request('psd-check', buffer, { reference, canvas })).matches;
 }
 
 export function closeImageRuntime(): void {

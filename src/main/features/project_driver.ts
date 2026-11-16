@@ -99,9 +99,7 @@ function _localDate(nowMs: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-// ── Config (cloud, synced) ──────────────────────────────────────────────────
-
-function _notifyDirty(_pid: string): void {}
+// ── Per-user persisted configuration ────────────────────────────────────────
 
 function _configFile(uid: string, pid: string): string {
   return pid ? projectDriverFile(uid, pid) : userTodoDriverFile(uid);
@@ -161,7 +159,6 @@ export async function writeConfig(
   const f = _configFile(uid, pid);
   fs.mkdirSync(path.dirname(f), { recursive: true });
   await writeJson(f, next);
-  _notifyDirty(pid);
   return next;
 }
 

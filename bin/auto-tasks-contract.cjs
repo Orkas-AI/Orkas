@@ -4,6 +4,10 @@ exports.description = 'Manage scheduled automation tasks and their enabled state
 exports.shape = (z, bound) => {
   const ref = z.object({ id: z.string().min(1), name: z.string().min(1) }).strict();
   const clock = { hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) };
+  const weekday = z.number().int().min(0).max(6);
+  const day = z.number().int().min(1).max(31);
+  const selection = (value, max) => z.array(value).min(1).max(max)
+    .refine(values => new Set(values).size === values.length, 'Selections must be distinct');
   return {
     action: z.enum(['list', 'get', 'create', 'update', 'delete', 'enable', 'disable']).describe('list: summaries, total matching count, next_offset; get: full detail by task_id. create: new schedule; list first to find existing tasks. enable/disable resumes/pauses scheduling. delete only when requested.'),
     task_id: z.string().regex(/^at_[0-9a-f]{8}$/).optional().describe('Required for get/update/delete/enable/disable; use an id from list.'),
@@ -14,9 +18,11 @@ exports.shape = (z, bound) => {
       z.object({ type: z.literal('one_time'), at: z.string().datetime({ offset: true }) }).strict(),
       z.object({ type: z.literal('hourly'), interval_hours: z.number().int().min(1).max(876000) }).strict(),
       z.object({ type: z.literal('daily'), ...clock }).strict(),
-      z.object({ type: z.literal('weekly'), weekday: z.number().int().min(0).max(6), ...clock }).strict(),
-      z.object({ type: z.literal('monthly'), day: z.number().int().min(1).max(31), ...clock }).strict(),
-    ]).optional().describe('Required for create. Calendar times use the assigned device timezone; weekday 0 is Sunday; day 31 uses the last day in shorter months. one_time uses an ISO timestamp with offset.'),
+      z.object({ type: z.literal('weekly'), weekday: z.union([weekday, z.literal('workdays')]).optional(), weekdays: selection(weekday, 7).optional(), ...clock }).strict()
+        .refine(s => (s.weekday !== undefined) !== (s.weekdays !== undefined), 'Provide exactly one of weekday or weekdays'),
+      z.object({ type: z.literal('monthly'), day: day.optional(), days: selection(day, 31).optional(), ...clock }).strict()
+        .refine(s => (s.day !== undefined) !== (s.days !== undefined), 'Provide exactly one of day or days'),
+    ]).optional().describe("Required for create. Calendar times use the assigned device timezone; weekday 0 is Sunday; 'workdays' means Monday–Friday. Month dates beyond a month's length run once on its last day. one_time uses an ISO timestamp with offset."),
     enabled: z.boolean().optional().describe('List: filter by enabled state; omitted includes both. Defaults to true on create; omitted updates preserve the current value.'),
     end_condition: z.discriminatedUnion('type', [
       z.object({ type: z.literal('date'), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict(),
@@ -50,7 +56,10 @@ exports.inputSchema = (z, bound) => {
     required: [discriminator],
     ...(union.description ? { description: union.description } : {}),
   });
-  fields.schedule = flatten(fields.schedule, 'type', 'one_time requires at; hourly requires interval_hours; daily requires hour/minute; weekly also requires weekday; monthly also requires day. Omit fields belonging to other types.');
+  fields.schedule = flatten(fields.schedule, 'type', 'one_time requires at; hourly requires interval_hours; daily/weekly/monthly require hour/minute. weekly also requires exactly one of weekday or weekdays; monthly exactly one of day or days. Omit fields belonging to other types.');
+  // Portable discovery retains the numeric/string selector without nested unions.
+  fields.schedule.properties.weekday = { type: ['integer', 'string'], enum: [0, 1, 2, 3, 4, 5, 6, 'workdays'] };
+  for (const name of ['weekdays', 'days']) fields.schedule.properties[name].uniqueItems = true;
   fields.recipient = flatten(fields.recipient, 'kind', 'commander takes kind only; agent also requires id and name.');
   const cutoff = fields.end_condition;
   fields.end_condition = {

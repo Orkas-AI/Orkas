@@ -101,6 +101,23 @@ async function loadRegistry() {
   return import('../../../src/main/model/core-agent/skill-registry');
 }
 
+it('discovers social writing and draft preparation without claiming unrelated database migration', async () => {
+  const source = path.resolve(__dirname, '../../../resources/builtin/marketplace/skills');
+  for (const id of ['de1fe2e2c26a', 'fb79ebe322c7']) {
+    const destination = path.join(builtinDir(), id);
+    fs.mkdirSync(destination, { recursive: true });
+    for (const file of ['SKILL.md', '_meta.json']) fs.copyFileSync(path.join(source, id, file), path.join(destination, file));
+  }
+  const registry = await loadRegistry();
+  const writing = await registry.searchAvailableSkills(TEST_UID, '社媒内容创作');
+  expect(writing.rows.map(row => row.id)).toContain('fb79ebe322c7');
+  const preparation = await registry.searchAvailableSkills(TEST_UID, '保存草稿');
+  expect(preparation.rows.map(row => row.id)).toContain('de1fe2e2c26a');
+  const unrelated = await registry.searchAvailableSkills(TEST_UID, 'database migration');
+  expect(unrelated.rows.map(row => row.id)).not.toContain('de1fe2e2c26a');
+  expect(unrelated.rows.map(row => row.id)).not.toContain('fb79ebe322c7');
+});
+
 describe('Agent authoring Skill candidates', () => {
   it('advertises all packaged shared and System descriptions once without loading bodies', async () => {
     const packaged = path.resolve(__dirname, '../../../resources/builtin');

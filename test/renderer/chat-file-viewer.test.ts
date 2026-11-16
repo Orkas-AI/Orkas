@@ -92,6 +92,19 @@ describe('chat-file-viewer › _kindOf', () => {
 });
 
 describe('file preview availability feedback', () => {
+  it.each([true, false])('carries authoritative read-only=%s into the native preview without changing caller options', async readOnly => {
+    const open = vi.fn();
+    const opts = { cid: 'task', readOnly: false };
+    const context = vm.createContext({
+      window: { orkas: { invoke: vi.fn(async () => ({ ok: true, exists: true, isFile: true, readOnly })) },
+        OrkasPreviewWindows: { open, options: (value: unknown) => value } },
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    await context.openChatFileViewer('/Downloads/交接.md', 'Report', opts);
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({ path: '/Downloads/交接.md', options: expect.objectContaining({ readOnly }) }));
+    expect(opts.readOnly).toBe(false);
+  });
+
   it.each([
     ['archive.zip', 'Download report.pdf', false],
     ['ARCHIVE.ZIP', 'Archive', true],

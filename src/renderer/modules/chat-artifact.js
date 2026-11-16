@@ -64,6 +64,10 @@
   }
 
   function _artifactSaveFailure(value, fallbackType = 'operation') {
+    // Structured save codes the main process already returns; kept verbatim.
+    if (value && ['app_type_mismatch', 'app_edit_conflict', 'app_edit_target_missing', 'app_edit_data_migration'].includes(value.code)) {
+      return { error_type: 'operation', error_code: value.code };
+    }
     const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
     let errorCode = 'artifact_save_failed';
     if (/not found/.test(message)) errorCode = 'artifact_not_found';

@@ -4,13 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
 
-for (const variant of ['working', 'denied-order', 'memory-only', 'write-only', 'fake-list'] as const) {
+for (const variant of ['working', 'delayed-ready', 'never-ready', 'denied-order', 'memory-only', 'write-only', 'fake-list'] as const) {
   test(`notes completion oracle observes real save/list/reopen: ${variant}`, async ({ sdkOrkas: orkas }, info) => {
     const data = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }],
       access: { read: ['body'], insert: ['body'] } }] };
     const query = `await orkasApp.data.query({table:'notes'${variant === 'denied-order' ? ",order:{field:'createdAt',direction:'desc'}" : ''}})`;
     const entry = orkas.createWorkspaceFile('notes/index.html', `<!doctype html><html><head><script src="/__orkas/sdk.js"></script></head><body>
-      <label>Note<textarea></textarea></label><button>Save</button><h2>Notes</h2><ul></ul><p role="status"></p>
+      <label>Note<textarea></textarea></label><button ${variant === 'delayed-ready' || variant === 'never-ready' ? 'disabled' : ''}>Save</button><h2>Notes</h2><ul></ul><p role="status"></p>
       <script>const field=document.querySelector('textarea'),list=document.querySelector('ul');let rows=[];
       async function refresh(){const r=${variant === 'memory-only' ? '{records:rows}' : query};list.replaceChildren();for(const row of r.records){const li=document.createElement('li');li.textContent=row.body;list.append(li);}}
       document.querySelector('button').onclick=async()=>{try{
@@ -18,6 +18,7 @@ for (const variant of ['working', 'denied-order', 'memory-only', 'write-only', '
         ${variant === 'fake-list' ? "list.textContent=field.value;" : variant === 'write-only' ? '' : 'await refresh();'}
       }catch(e){document.querySelector('[role=status]').textContent=e.code;}};
       ${variant === 'write-only' || variant === 'fake-list' ? '' : "refresh().catch(e=>document.querySelector('[role=status]').textContent=e.code);"}
+      ${variant === 'delayed-ready' ? "setTimeout(()=>document.querySelector('button').disabled=false,250);" : ''}
       </script></body></html>`);
     orkas.createWorkspaceFile('notes/orkas-app.json', JSON.stringify({ sdkVersion: 1, capabilities: ['data'], data }));
     orkas.createWorkspaceFile('notes/__orkas-meta.json', JSON.stringify({ appType: 'web' }));
@@ -71,7 +72,8 @@ for (const variant of ['working', 'denied-order', 'memory-only', 'write-only', '
       preview = await open();
       let frame = preview.frameLocator('.chat-artifact-viewer-frame');
       await frame.getByRole('textbox', { name: 'Note', exact: true }).fill(marker);
-      await frame.getByRole('button', { name: 'Save', exact: true }).click();
+      if (variant === 'never-ready') await expect(frame.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+      else await frame.getByRole('button', { name: 'Save', exact: true }).click();
       // Negative controls are ordinary UI outcomes, not swallowed test failures.
       const deadline = Date.now() + 3_000;
       while (Date.now() < deadline
@@ -106,10 +108,10 @@ for (const variant of ['working', 'denied-order', 'memory-only', 'write-only', '
     }
     const observed = { evidence, bundleValid: source.valid, inventoryPreserved,
       accepted: source.valid && inventoryPreserved && evidence.commonData };
-    expect(observed.accepted).toBe(variant === 'working');
+    expect(observed.accepted).toBe((variant === 'working' || variant === 'delayed-ready'));
     writeFileSync(info.outputPath('journey.json'), JSON.stringify(observed, null, 2));
-    expect(evidence.commonData).toBe(variant === 'working');
-    if (variant === 'working') expect(evidence).toMatchObject({ saved: true, listed: true, reopened: true, status: 'completed' });
+    expect(evidence.commonData).toBe((variant === 'working' || variant === 'delayed-ready'));
+    if ((variant === 'working' || variant === 'delayed-ready')) expect(evidence).toMatchObject({ saved: true, listed: true, reopened: true, status: 'completed' });
     else expect(evidence.status).toBe('incomplete');
     expect(orkas.modelRequests).toHaveLength(0);
   });

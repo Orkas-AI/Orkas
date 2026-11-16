@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { bundledRuntimeEnv } from '../../../src/main/util/bundled-runtime';
 
 const require = createRequire(import.meta.url);
@@ -192,24 +193,40 @@ describe('VoiceStudio audio project journeys', () => {
     expect(() => audio.whisperSegments({ transcription: [{ text: 'missing timing' }] })).toThrow('invalid segment timing');
   });
 
-  it.runIf(process.env.ORKAS_REAL_WHISPER_TEST === '1')('runs the bundled transcription pipeline and saves a readable result without fetching dependencies', async () => {
-    await fs.writeFile(path.join(root, 'silence.wav'), Buffer.from(tone(1).map((b, i) => i < 44 ? b : 0)));
+  it.runIf(process.env.ORKAS_REAL_WHISPER_TEST === '1')('keeps native silence recognition readable without publishing invalid timing or fetching dependencies', async () => {
+    const source = Buffer.from(tone(1).map((b, i) => i < 44 ? b : 0));
+    await fs.writeFile(path.join(root, 'silence.wav'), source);
     await save({ schema_version: 1, segments: [] });
     const result = await call('transcribe', { input_path: 'silence.wav', language: 'en' });
-    expect(result.ok).toBe(true);
-    const file = result.files.find((f: string) => f.endsWith('.json'));
-    const transcript = JSON.parse(await fs.readFile(path.join(root, file), 'utf8'));
-    expect(transcript.schema_version).toBe(1);
-    expect(Array.isArray(transcript.segments)).toBe(true);
-    expect(transcript.source_sha256).toMatch(/^[0-9a-f]{64}$/);
-    const dir = path.dirname(path.join(root, file));
     const textFile = result.files.find((f: string) => f.endsWith('.txt'));
+    const dir = path.dirname(path.join(root, textFile));
     const declaration = JSON.parse(await fs.readFile(path.join(dir, '.orkas-output-types.json'), 'utf8'));
     expect(declaration).toEqual({ schema_version: 1, outputs: [{
       path: path.basename(textFile), content_type: 'audio-text',
       sha256: createHash('sha256').update(await fs.readFile(path.join(root, textFile))).digest('hex'),
     }] });
-    expect((await fs.readdir(dir)).sort()).toEqual(['.orkas-output-types.json', 'transcript.json', 'transcript.srt', 'transcript.txt']);
+    expect(await fs.readFile(path.join(root, 'silence.wav'))).toEqual(source);
+    // Recognition of silence is not promised to be empty. A recognizer may
+    // emit an out-of-range silence marker; that is recoverable TXT, not SRT.
+    if (!result.ok) {
+      expect(result.code).toBe('E_TRANSCRIPT');
+      expect((await fs.readFile(path.join(root, textFile), 'utf8')).trim()).not.toBe('');
+      expect((await fs.readdir(dir)).sort()).toEqual(['.orkas-output-types.json', 'transcript.txt']);
+    } else {
+      const file = result.files.find((f: string) => f.endsWith('.json'));
+      const transcript = JSON.parse(await fs.readFile(path.join(root, file), 'utf8'));
+      expect(transcript.schema_version).toBe(1);
+      expect(Array.isArray(transcript.segments)).toBe(true);
+      expect(transcript.source_sha256).toBe(createHash('sha256').update(source).digest('hex'));
+      let previous = 0;
+      for (const s of transcript.segments) {
+        expect(s.start_sec).toBeGreaterThanOrEqual(previous);
+        expect(s.end_sec).toBeGreaterThan(s.start_sec);
+        expect(s.end_sec).toBeLessThanOrEqual(1.001);
+        previous = s.end_sec;
+      }
+      expect((await fs.readdir(dir)).sort()).toEqual(['.orkas-output-types.json', 'transcript.json', 'transcript.srt', 'transcript.txt']);
+    }
   }, 60000);
 });
 
@@ -300,4 +317,195 @@ describe('VoiceStudio size and active cancellation boundaries', () => {
     await save({ schema_version: 1, segments: [{ id: 'retained', path: 'source.wav' }] });
     expect((await call('render', { format: 'wav' })).ok).toBe(true);
   }, 60000);
+});
+
+// Real decoding and source duration; only recognition output is controlled.
+// These cases protect delivered files and explicit recovery, not ASR accuracy.
+describe.skipIf(process.platform === 'win32')('VoiceStudio transcript timing publication', () => {
+  async function recognize(transcription: unknown[], action = '') {
+    const output = path.join(root, 'recognition.json');
+    await fs.writeFile(output, JSON.stringify({ transcription }));
+    const cli = path.join(root, 'whisper');
+    await fs.writeFile(cli, `#!/usr/bin/env node
+const fs = require('node:fs'), path = require('node:path'), args = process.argv.slice(2);
+fs.appendFileSync(path.join(__dirname, 'recognition-calls'), '1');
+fs.copyFileSync(args[args.indexOf('-f') + 1], path.join(__dirname, 'recognized-input.wav'));
+${action}
+fs.copyFileSync(path.join(__dirname, 'recognition.json'), args[args.indexOf('-of') + 1] + '.json');
+`);
+    await fs.chmod(cli, 0o755);
+    process.env.ORKAS_WHISPER_CPP = cli;
+    process.env.ORKAS_WHISPER_MODEL = output;
+  }
+  const segment = (from: number, to: number, text: string) => ({ offsets: { from, to }, text });
+  async function setup() {
+    await fs.writeFile(path.join(root, 'source.wav'), tone(2));
+    await save({ schema_version: 1, segments: [] });
+  }
+  // The user owns later source edits. This attempt still delivers the decoded
+  // initial recording, and its transcript must never authorize cuts on a new one.
+  it.each(['segment', 'word'].flatMap(granularity => ['overwrite', 'replace', 'delete'].map(change => ({ granularity, change }))))(
+    'delivers the initial $granularity recording after source $change during recognition', async ({ granularity, change }) => {
+      await setup();
+      const source = path.join(root, 'source.wav'), original = await fs.readFile(source);
+      const replacement = tone(2, 880);
+      await fs.writeFile(path.join(root, 'replacement.wav'), replacement);
+      await recognize([segment(0, 1000, 'Initial recording.')]);
+      const prior = await call('transcribe', { input_path: 'source.wav', granularity });
+      const priorBytes = await Promise.all(prior.files.map((f: string) => fs.readFile(path.join(root, f))));
+      const actions: Record<string, string> = {
+        overwrite: "fs.writeFileSync(path.join(__dirname, 'source.wav'), fs.readFileSync(path.join(__dirname, 'replacement.wav')));",
+        replace: "fs.renameSync(path.join(__dirname, 'replacement.wav'), path.join(__dirname, 'source.wav'));",
+        delete: "fs.unlinkSync(path.join(__dirname, 'source.wav'));",
+      };
+      await recognize([segment(0, 1000, 'Initial recording.')], actions[change]);
+      const result = await call('transcribe', { input_path: 'source.wav', granularity });
+      expect(result.ok).toBe(true);
+      const transcriptPath = result.files.find((f: string) => f.endsWith('.json'));
+      const transcript = JSON.parse(await fs.readFile(path.join(root, transcriptPath), 'utf8'));
+      expect(transcript.source_sha256).toBe(createHash('sha256').update(original).digest('hex'));
+      expect(transcript.source_sha256).not.toBe(createHash('sha256').update(replacement).digest('hex'));
+      expect(transcript.segments).toEqual([{ start_sec: 0, end_sec: 1, text: 'Initial recording.' }]);
+      expect(await fs.readFile(path.join(root, result.files.find((f: string) => f.endsWith('.srt'))), 'utf8'))
+        .toBe('1\n00:00:00,000 --> 00:00:01,000\nInitial recording.\n');
+      const observed = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, ['-v', 'error', '-nostdin', '-i',
+        path.join(root, 'recognized-input.wav'), '-f', 's16le', '-ac', '1', '-ar', '16000', '-'], { timeout: 30000 });
+      expect(observed.status).toBe(0); expect(observed.stderr.length).toBe(0);
+      expect(observed.stdout.length).toBe(2 * 16000 * 2);
+      // An independent frequency oracle distinguishes the two equal-sized sources.
+      const energy = (hz: number) => {
+        let re = 0, im = 0;
+        for (let i = 1600; i < 3200; i++) {
+          const sample = observed.stdout.readInt16LE(i * 2);
+          re += sample * Math.cos(2 * Math.PI * hz * i / 16000);
+          im += sample * Math.sin(2 * Math.PI * hz * i / 16000);
+        }
+        return Math.hypot(re, im) / 1600;
+      };
+      expect(energy(440)).toBeGreaterThan(1000); expect(energy(880)).toBeLessThan(5);
+      expect(await fs.readFile(path.join(root, 'recognition-calls'), 'utf8')).toBe('11');
+      expect(await Promise.all(prior.files.map((f: string) => fs.readFile(path.join(root, f))))).toEqual(priorBytes);
+      expect((await fs.readdir(path.dirname(path.join(root, transcriptPath)))).sort())
+        .toEqual(['.orkas-output-types.json', 'transcript.json', 'transcript.srt', 'transcript.txt']);
+      if (change === 'delete') await expect(fs.stat(source)).rejects.toMatchObject({ code: 'ENOENT' });
+      else expect(await fs.readFile(source)).toEqual(replacement);
+      if (granularity === 'word') {
+        await fs.writeFile(source, replacement);
+        await save({ schema_version: 3, segments: [{ id: 'cut', path: 'source.wav', word_edit: {
+          transcript_path: transcriptPath, mode: 'keep', ranges: [{ first: 0, last: 0 }] } }],
+          export: { format: 'wav', normalize_loudness: false } });
+        await expect(call('render')).rejects.toMatchObject({ code: 'E_TRANSCRIPT_STALE' });
+        expect((await fs.readdir(root)).some(f => f.startsWith('export-') || f.startsWith('.voice-render-'))).toBe(false);
+        await fs.writeFile(source, original);
+        expect((await call('render')).duration_sec).toBe(1);
+      }
+    });
+
+  it.each(['segment', 'word'])('rejects an unstable %s input during preparation before ASR and permits explicit retry', async granularity => {
+    await setup();
+    const source = path.join(root, 'source.wav');
+    await fs.writeFile(path.join(root, 'replacement.wav'), tone(2, 880));
+    await recognize([segment(0, 1000, 'Prepared recording.')]);
+    const ffmpeg = process.env.ORKAS_BUNDLED_FFMPEG!;
+    const wrapper = path.join(root, 'ffmpeg-wrapper');
+    await fs.writeFile(wrapper, `#!/usr/bin/env node
+const fs = require('node:fs'), path = require('node:path'), { spawnSync } = require('node:child_process');
+const result = spawnSync(${JSON.stringify(ffmpeg)}, process.argv.slice(2), { stdio: 'inherit' });
+if (result.status === 0) fs.copyFileSync(path.join(__dirname, 'replacement.wav'), path.join(__dirname, 'source.wav'));
+process.exit(result.status ?? 1);
+`);
+    await fs.chmod(wrapper, 0o755); process.env.ORKAS_BUNDLED_FFMPEG = wrapper;
+    await expect(call('transcribe', { input_path: 'source.wav', granularity })).rejects.toMatchObject({ code: 'E_TRANSCRIPT_STALE' });
+    await expect(fs.stat(path.join(root, 'recognition-calls'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await fs.readdir(root)).some(f => f.startsWith('transcript-'))).toBe(false);
+    expect(await fs.readFile(source)).toEqual(tone(2, 880));
+    process.env.ORKAS_BUNDLED_FFMPEG = ffmpeg;
+    const recovered = await call('transcribe', { input_path: 'source.wav', granularity });
+    expect(recovered.ok).toBe(true);
+    const transcript = JSON.parse(await fs.readFile(path.join(root, recovered.files.find((f: string) => f.endsWith('.json'))), 'utf8'));
+    expect(transcript.source_sha256).toBe(createHash('sha256').update(tone(2, 880)).digest('hex'));
+    expect(await fs.readFile(path.join(root, 'recognition-calls'), 'utf8')).toBe('1');
+  });
+
+  it.each([
+    { label: 'past the audio end', rows: [segment(0, 3000, 'Keep all recognized words.')] },
+    { label: 'reversed segments', rows: [segment(1000, 1500, 'First.'), segment(0, 500, 'Second.')] },
+    { label: 'overlapping segments', rows: [segment(0, 1200, 'First.'), segment(1000, 1800, 'Second.')] },
+    { label: 'zero-duration speech', rows: [segment(500, 500, 'Still preserve this.')] },
+    { label: 'negative timing', rows: [segment(-100, 500, 'Still preserve this.')] },
+    { label: 'missing timing', rows: [{ text: 'Still preserve this.' }] },
+    { label: 'null timing', rows: [{ offsets: { from: null, to: 500 }, text: 'Still preserve this.' }] },
+    { label: 'boolean timing', rows: [{ offsets: { from: false, to: 500 }, text: 'Still preserve this.' }] },
+    { label: 'blank timing', rows: [{ offsets: { from: ' ', to: 500 }, text: 'Still preserve this.' }] },
+    { label: 'beyond millisecond precision', rows: [segment(0, 2002, 'Still preserve this.')] },
+  ])('preserves text for $label without publishing subtitles or replacing prior results, then recovers', async ({ rows }) => {
+    await setup();
+    await recognize([segment(0, 2000, 'Prior valid transcript.')]);
+    const prior = await call('transcribe', { input_path: 'source.wav' });
+    const oldFiles = await Promise.all(prior.files.map((f: string) => fs.readFile(path.join(root, f))));
+    await recognize(rows);
+    const request = path.join(root, 'request.json');
+    await fs.writeFile(request, JSON.stringify({ project, input_path: 'source.wav' }));
+    const result = await audio.default({ args: ['transcribe', request] });
+    expect(result).toMatchObject({ ok: false, code: 'E_TRANSCRIPT' });
+    expect(result.message).not.toContain(root);
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0]).toMatch(/transcript\.txt$/);
+    const text = path.join(root, result.files[0]);
+    expect(await fs.readFile(text, 'utf8')).toBe(rows.map(s => s.text.trim()).join('\n') + '\n');
+    expect((await fs.readdir(path.dirname(text))).sort()).toEqual(['.orkas-output-types.json', 'transcript.txt']);
+    const declaration = JSON.parse(await fs.readFile(path.join(path.dirname(text), '.orkas-output-types.json'), 'utf8'));
+    expect(declaration.outputs[0]).toMatchObject({ path: 'transcript.txt', content_type: 'audio-text',
+      sha256: createHash('sha256').update(await fs.readFile(text)).digest('hex') });
+    expect(await fs.readFile(path.join(root, 'recognition-calls'), 'utf8')).toBe('11');
+    expect(await fs.readFile(path.join(root, 'source.wav'))).toEqual(tone(2));
+    expect(await Promise.all(prior.files.map((f: string) => fs.readFile(path.join(root, f))))).toEqual(oldFiles);
+    await recognize([segment(0, 1000, 'First.'), segment(1000, 2000, 'Second.')]);
+    const recovered = await call('transcribe', { input_path: 'source.wav' });
+    expect(recovered.ok).toBe(true);
+    expect(await fs.readFile(path.join(root, recovered.files.find((f: string) => f.endsWith('.srt'))), 'utf8'))
+      .toBe('1\n00:00:00,000 --> 00:00:01,000\nFirst.\n\n2\n00:00:01,000 --> 00:00:02,000\nSecond.\n');
+    expect(await fs.readFile(text, 'utf8')).toBe(rows.map(s => s.text.trim()).join('\n') + '\n');
+  });
+  it.each([1999, 2000, 2001])('accepts an end at %i ms within the existing one-millisecond precision allowance', async end => {
+    await setup(); await recognize([segment(0, end, 'Unchanged words.')]);
+    const result = await call('transcribe', { input_path: 'source.wav' });
+    expect(result.ok).toBe(true);
+    const transcript = JSON.parse(await fs.readFile(path.join(root, result.files.find((f: string) => f.endsWith('.json'))), 'utf8'));
+    expect(transcript.segments).toEqual([{ start_sec: 0, end_sec: end / 1000, text: 'Unchanged words.' }]);
+    expect(await fs.readFile(path.join(root, result.files.find((f: string) => f.endsWith('.txt'))), 'utf8')).toBe('Unchanged words.\n');
+  });
+  it('retains a valid empty transcript for silence', async () => {
+    await setup(); await recognize([]);
+    const result = await call('transcribe', { input_path: 'source.wav' });
+    expect(result).toMatchObject({ ok: true, empty: true, segments: 0 });
+    expect(await fs.readFile(path.join(root, result.files.find((f: string) => f.endsWith('.srt'))), 'utf8')).toBe('');
+  });
+  it('retains numeric offset strings without rewriting recognized words', async () => {
+    await setup(); await recognize([{ offsets: { from: '0', to: '2000' }, text: 'Original wording.' }]);
+    const result = await call('transcribe', { input_path: 'source.wav' });
+    expect(result.ok).toBe(true);
+    expect(await fs.readFile(path.join(root, result.files.find((f: string) => f.endsWith('.txt'))), 'utf8')).toBe('Original wording.\n');
+  });
+  it('checks the decoded audio end when a video container continues after its audio', async () => {
+    await setup();
+    const encoded = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, ['-v', 'error', '-nostdin',
+      '-f', 'lavfi', '-i', 'color=size=32x32:duration=4:rate=10', '-i', path.join(root, 'source.wav'),
+      '-c:v', 'mpeg4', '-c:a', 'aac', path.join(root, 'long-video.mp4')], { encoding: 'utf8', timeout: 30000 });
+    expect(encoded.status).toBe(0); expect(encoded.stderr).toBe('');
+    expect((await call('probe', { input_path: 'long-video.mp4' })).duration_sec).toBe(4);
+    await recognize([segment(0, 3000, 'Do not extend into the silent picture.')]);
+    const result = await call('transcribe', { input_path: 'long-video.mp4' });
+    expect(result).toMatchObject({ ok: false, code: 'E_TRANSCRIPT' });
+    expect(result.files).toHaveLength(1);
+    expect(await fs.readFile(path.join(root, result.files[0]), 'utf8')).toBe('Do not extend into the silent picture.\n');
+  });
+  it('preserves word-mode text after a timing failure without producing editable timing', async () => {
+    await setup(); await recognize([segment(0, 3000, 'Words remain available.')]);
+    const result = await call('transcribe', { input_path: 'source.wav', granularity: 'word' });
+    expect(result).toMatchObject({ ok: false, code: 'E_WORD_EDIT' });
+    expect(result.files).toHaveLength(1);
+    expect((await fs.readdir(path.dirname(path.join(root, result.files[0])))).sort()).toEqual(['.orkas-output-types.json', 'transcript.txt']);
+    expect(await fs.readFile(path.join(root, result.files[0]), 'utf8')).toBe('Words remain available.\n');
+  });
 });

@@ -89,7 +89,7 @@ function allowedRootsFor(opts: PdfToolsOpts): string[] {
   const roots: string[] = [];
   if (opts.userId) {
     try {
-      const workspace = getWorkspacePath(opts.userId, opts.projectId);
+      const workspace = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
       if (workspace) roots.push(workspace);
     } catch (err) {
       log.warn('resolve workspace failed', {

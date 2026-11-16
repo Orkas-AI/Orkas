@@ -53,6 +53,7 @@ import * as crypto from 'node:crypto';
 import { broadcastToRenderer } from '../../ipc';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
+import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 
 const log = createLogger('delete_file_confirm');
 
@@ -271,3 +272,10 @@ export function consumeGrantedConfirmation(token: string, absPath: string): Cons
   deleteEntry(token, 'consumed');
   return { outcome: 'granted', path: entry.path };
 }
+
+// Account activation swaps permissions and roots synchronously. Invalidate
+// pending cards and granted capabilities before that swap, even if the old
+// renderer has not dismissed its cards yet. Existing waiters settle as absent.
+registerUserSwitchHook('delete-file-confirm', () => {
+  for (const token of _entries.keys()) deleteEntry(token, 'cancelled');
+});

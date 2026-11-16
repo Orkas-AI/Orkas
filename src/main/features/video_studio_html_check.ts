@@ -31,8 +31,7 @@ function decodeHtmlAttribute(value: string): string {
 
 const legacyHtmlControls = new TextDecoder('windows-1252');
 
-function decodeHtmlText(value: string): string {
-  if (!value.includes('&')) return value;
+function decodeHtmlText(value: string, parser: XMLParser): string {
   // Escape actual markup before using the existing parser's common HTML names.
   // Numeric references follow HTML scalar/control rules and are XML-escaped so
   // a decoded ampersand cannot start a second round of entity expansion.
@@ -43,10 +42,6 @@ function decodeHtmlText(value: string): string {
     const character = !point || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff) ? '\ufffd'
       : point >= 0x80 && point <= 0x9f ? legacyHtmlControls.decode(Uint8Array.of(point)) : String.fromCodePoint(point);
     return escapeText(character);
-  });
-  const parser = new XMLParser({
-    htmlEntities: true, parseTagValue: false, trimValues: false,
-    processEntities: { maxExpandedLength: Math.max(1024, value.length * 2) },
   });
   return parser.parse(`<text>${text}</text>`).text;
 }
@@ -113,19 +108,37 @@ function parseStartTag(raw: string, start: number, end: number): HtmlStartTag | 
   return { tagName, attrs, start, end };
 }
 
+const TEXT_BLOCK_TAGS = new Set([
+  'address', 'article', 'aside', 'blockquote', 'body', 'dd', 'div', 'dl', 'dt',
+  'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4',
+  'h5', 'h6', 'header', 'hgroup', 'hr', 'html', 'li', 'main', 'nav', 'ol', 'p',
+  'pre', 'section', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'ul',
+  'svg', 'text',
+]);
+
 export function parseHtmlStructure(html: string): HtmlStructure {
   const tags: HtmlStartTag[] = [];
   const diagnostics: string[] = [];
   const textParts: string[] = [];
+  let textParser: XMLParser | undefined;
+  const appendText = (text: string) => {
+    if (!text.includes('&')) { textParts.push(text); return; }
+    // Reuse one decoder per document rather than allocate one per price/label.
+    textParser ??= new XMLParser({
+      htmlEntities: true, parseTagValue: false, trimValues: false,
+      processEntities: { maxExpandedLength: Math.max(1024, html.length * 2) },
+    });
+    textParts.push(decodeHtmlText(text, textParser));
+  };
   const lower = html.toLowerCase();
   let i = 0;
   while (i < html.length) {
     const start = html.indexOf('<', i);
     if (start < 0) {
-      textParts.push(html.slice(i));
+      appendText(html.slice(i));
       break;
     }
-    if (start > i) textParts.push(html.slice(i, start));
+    if (start > i) appendText(html.slice(i, start));
     if (html.startsWith('<!--', start)) {
       const commentEnd = html.indexOf('-->', start + 4);
       if (commentEnd < 0) {
@@ -140,7 +153,12 @@ export function parseHtmlStructure(html: string): HtmlStructure {
       diagnostics.push(`unclosed HTML tag near offset ${start}`);
       break;
     }
-    const tag = parseStartTag(html.slice(start, end + 1), start, end + 1);
+    const rawTag = html.slice(start, end + 1);
+    const tag = parseStartTag(rawTag, start, end + 1);
+    const closingName = !tag ? /^<\/\s*([A-Za-z][A-Za-z0-9:_-]*)\s*>$/.exec(rawTag)?.[1].toLowerCase() : undefined;
+    // Inline styling and explicit <br>/SVG <tspan> line breaks do not add copy
+    // characters. Keep separate blocks/labels apart and retain authored spaces.
+    if (TEXT_BLOCK_TAGS.has(tag?.tagName || closingName || '')) textParts.push(' ');
     if (!tag) {
       i = end + 1;
       continue;
@@ -162,7 +180,9 @@ export function parseHtmlStructure(html: string): HtmlStructure {
   return {
     tags,
     diagnostics,
-    textContent: decodeHtmlText(textParts.join(' ')).replace(/\s+/g, ' ').trim(),
+    // Decode per node: joining first could invent a character reference that
+    // was split across elements, or decode an escaped ampersand a second time.
+    textContent: textParts.join('').replace(/\s+/g, ' ').trim(),
   };
 }
 

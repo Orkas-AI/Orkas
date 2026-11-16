@@ -24,6 +24,56 @@ import { SessionPersistenceError, errorCodeForLog } from "../shared/errors.js";
 
 const log = createLogger("persistent-session");
 
+// Disposable serialized recovery snapshots, never another state source. Keys
+// do not reference Session instances, so eviction/GC cannot retain their graphs.
+const CONTEXT_CACHE_ITEM_BYTES = 4 * 1024 * 1024;
+const CONTEXT_CACHE_TOTAL_BYTES = 32 * 1024 * 1024;
+const CONTEXT_CACHE_ENTRIES = 64;
+const contextSnapshots = new Map<object, { token: object; bytes: Buffer }>();
+let contextSnapshotBytes = 0;
+function forgetContextSnapshot(key: object): void {
+  const prior = contextSnapshots.get(key);
+  if (prior) contextSnapshotBytes -= prior.bytes.length;
+  contextSnapshots.delete(key);
+}
+function rememberContextSnapshot(key: object, token: object, bytes: Buffer | undefined): void {
+  forgetContextSnapshot(key);
+  if (!bytes || bytes.length > CONTEXT_CACHE_ITEM_BYTES) return;
+  const size = bytes.length;
+  while (contextSnapshots.size >= CONTEXT_CACHE_ENTRIES || contextSnapshotBytes + size > CONTEXT_CACHE_TOTAL_BYTES) {
+    forgetContextSnapshot(contextSnapshots.keys().next().value!);
+  }
+  contextSnapshots.set(key, { token, bytes });
+  contextSnapshotBytes += bytes.length;
+}
+
+/** Exact bounded verification before omitting the old overwrite. Metadata alone
+ * cannot detect same-length replacements; an enlarged external file must not
+ * turn this optimization into an unbounded allocation/read. */
+function contextFileMatches(file: string, expected: Buffer): boolean {
+  let fd: number | undefined;
+  try {
+    if (!fs.lstatSync(file).isFile()) return false;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size !== expected.length) return false;
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, expected.length));
+    for (let offset = 0; offset < expected.length;) {
+      const size = Math.min(chunk.length, expected.length - offset);
+      const read = fs.readSync(fd, chunk, 0, size, offset);
+      if (read === 0 || !chunk.subarray(0, read).equals(expected.subarray(offset, offset + read))) return false;
+      offset += read;
+    }
+    const current = fs.lstatSync(file);
+    return current.isFile() && current.dev === stat.dev && current.ino === stat.ino
+      && current.size === stat.size && current.mtimeMs === stat.mtimeMs && current.ctimeMs === stat.ctimeMs;
+  } catch {
+    return false; // Verification failure falls back to the original authoritative save.
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 /** Synthetic content written when a prior run aborted after the model
  * issued a tool_use but before the tool produced a tool_result. Both
  * OpenAI and Anthropic chat-completion contracts require tool_use to be
@@ -70,6 +120,7 @@ function emptyToolProtocolRepairReport(): ToolProtocolRepairReport {
 export class PersistentSession extends Session {
   private readonly sessionFile: string;
   private readonly contextFile: string;
+  private readonly contextSnapshotKey = {};
   private lastToolProtocolRepairReport = emptyToolProtocolRepairReport();
   private contextMutationDepth = 0;
   private contextWriteDirty = false;
@@ -779,15 +830,39 @@ export class PersistentSession extends Session {
   }
 
   private persistContext(): void {
+    const cached = contextSnapshots.get(this.contextSnapshotKey);
+    if (cached?.token === this.contextPersistenceToken && contextFileMatches(this.contextFile, cached.bytes)) {
+      // Refresh recency without growing the cache or retaining a Session.
+      contextSnapshots.delete(this.contextSnapshotKey);
+      contextSnapshots.set(this.contextSnapshotKey, cached);
+      return;
+    }
     const state = this.getSerializedContextState();
     if (!state) {
       if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
+      forgetContextSnapshot(this.contextSnapshotKey);
       return;
     }
     this.ensureDir();
     const tmp = `${this.contextFile}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state) + "\n", "utf-8");
+    const body = JSON.stringify(state) + "\n";
+    let bytes: Buffer | undefined;
+    try {
+      if (Buffer.byteLength(body) <= CONTEXT_CACHE_ITEM_BYTES) bytes = Buffer.from(body, "utf-8");
+    } catch {
+      // Optional pre-encoding failure retains the original string save path.
+    }
+    fs.writeFileSync(tmp, bytes ?? body, "utf-8");
     fs.renameSync(tmp, this.contextFile);
+    // Publish cache state only after the original commit succeeds. Failures
+    // retain dirty state and the existing storage-only retry/flush barriers.
+    try {
+      rememberContextSnapshot(this.contextSnapshotKey, this.contextPersistenceToken, bytes);
+    } catch {
+      // A disposable optimization must not turn an already committed save
+      // into a persistence failure. Its next use falls back to a full save.
+      forgetContextSnapshot(this.contextSnapshotKey);
+    }
   }
 
   private ensureDir(): void {

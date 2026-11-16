@@ -128,6 +128,11 @@ beforeEach(async () => {
 afterEach(async () => {
   const kb = await import('../../../../src/main/features/kb_vector');
   const cliPermissions = await import('../../../../src/main/features/local_agents/cli_permissions');
+  // Project writes enqueue extraction and embedding after returning their
+  // receipt. Settle those writers before closing their SQLite stores so a
+  // late index job cannot reopen a handle during workspace cleanup.
+  const projectLibrary = await import('../../../../src/main/features/project_library_indexer');
+  await projectLibrary.drain(TEST_UID);
   kb.closeAllKb();
   cliPermissions._resetForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
@@ -514,9 +519,12 @@ describe('local_agents/bridge › auth + skills', () => {
       id: 1, token: bridge.token, method: 'publish_outputs', params: { paths },
     })).reply as any;
     try {
-      expect((await publish(['report.txt', 'unknown.txt'])).result).toEqual({ published: 1, requested: 2 });
+      const receipt = (await publish(['report.txt', 'unknown.txt'])).result;
+      expect(receipt).toMatchObject({ published: 1, requested: 2, outputs: [{ path: output }] });
+      expect(receipt.outputs).toHaveLength(1);
+      expect(decodeURIComponent(new URL(receipt.outputs[0].url).pathname).replace(/^\/(?=[A-Za-z]:\/)/, '')).toBe(output.replace(/\\/g, '/'));
       expect((await publish(['../secret'])).ok).toBe(false);
-      expect((await publish([])).result).toEqual({ published: 0, requested: 0 });
+      expect((await publish([])).result).toEqual({ published: 0, requested: 0, outputs: [] });
       controller.abort();
       expect((await publish(['report.txt'])).ok).toBe(false);
       expect(selected).toEqual([[output], []]);

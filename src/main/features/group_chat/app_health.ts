@@ -10,6 +10,7 @@
  */
 
 import * as auth from '../auth';
+import type { RunHealth } from '../local_agents/run_health';
 import * as connectorManager from '../connectors/manager';
 import { isConnectorRuntimeEnabled } from '../connectors/availability';
 import { isConnectorUsable } from '../connectors/types';
@@ -35,6 +36,9 @@ export interface AppHealthTasksProbe {
     processing: boolean;
     in_flight_actor_count: number;
     active_turn_count: number;
+    /** Bounded current-conversation facts; absent from older probe callers. */
+    runs?: RunHealth[];
+    runs_truncated?: boolean;
   };
 }
 

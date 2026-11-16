@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import * as fs from 'node:fs';
+import { fileSystemForPath } from '../../util/user-file-fs';
 import * as path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -405,7 +405,7 @@ export function parseIgnoreRules(content: string): IgnoreRule[] {
 /** Read `<dir>/.gitignore`, returning null when absent or unreadable. */
 export function readIgnoreScope(dir: string): IgnoreScope | null {
   let content: string;
-  try { content = fs.readFileSync(path.join(dir, '.gitignore'), 'utf8'); }
+  try { content = fileSystemForPath(dir).readFileSync(path.join(dir, '.gitignore'), 'utf8'); }
   catch { return null; }
   const rules = parseIgnoreRules(content);
   return rules.length ? { dir, rules } : null;

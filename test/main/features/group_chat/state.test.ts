@@ -8,6 +8,31 @@ let prevWs: string | undefined;
 const TEST_UID = 'u1';
 const TEST_CID = 'cid01';
 
+describe('local state boundary for retired cloud continuation', () => {
+  it('does not expose the hosted conflict continuation writer', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    expect(state).not.toHaveProperty('setSyncConflictResolution');
+  });
+
+  it('ignores legacy cloud conflict metadata without rewriting unrelated run state or stored bytes', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const paths = await import('../../../../src/main/paths');
+    await state.setStatus(TEST_UID, TEST_CID, 'running');
+    const identity = { turn_id: 'retained-turn', source_message_id: 'retained-source' };
+    await state.markInFlight(TEST_UID, TEST_CID, 'reviewer', true, identity);
+    const seed = await state.readState(TEST_UID, TEST_CID);
+    const raw = JSON.stringify({ ...seed, sync_conflict_resolution: {
+      version: 1, conflicts: [{ id: 'legacy', rel_path: 'cloud/legacy.json', current_path: path.join(tmpDir, 'legacy.json') }],
+    } }, null, 2);
+    const file = paths.groupChatStateFile(TEST_UID, TEST_CID);
+    fs.writeFileSync(file, raw);
+    const current = await state.readState(TEST_UID, TEST_CID);
+    expect(current).not.toHaveProperty('sync_conflict_resolution');
+    expect(current).toMatchObject({ in_flight: ['reviewer'], in_flight_turns: { reviewer: identity } });
+    expect(fs.readFileSync(file, 'utf8')).toBe(raw);
+  });
+});
+
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-state-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -778,4 +803,35 @@ describe('group_chat state › diagnostic privacy', () => {
     expect(emitted).not.toContain(original);
     expect(emitted).not.toContain(renamed);
   });
+});
+
+
+it('unions concurrent handoff grants while preserving earlier roots, run identity and local-user isolation', async () => {
+  const state = await import('../../../../src/main/features/group_chat/state');
+  const roots = ['existing', 'first-handoff', 'second-handoff', 'other-user'].map(name => path.join(tmpDir, name));
+  await state.setToolExtraRoots(TEST_UID, TEST_CID, [roots[0]]);
+  await state.markInFlight(TEST_UID, TEST_CID, 'reviewer', true, { turn_id: 'turn-union', source_message_id: 'source-union' });
+  await state.setToolExtraRoots('other-user', TEST_CID, [roots[3]]);
+  await Promise.all([
+    state.addToolExtraRoots(TEST_UID, TEST_CID, [roots[0], roots[1], 'relative-root']),
+    state.addToolExtraRoots(TEST_UID, TEST_CID, [roots[2], roots[1], '']),
+  ]);
+  vi.resetModules();
+  const cold = await import('../../../../src/main/features/group_chat/state');
+  expect(await cold.readState(TEST_UID, TEST_CID)).toMatchObject({
+    tool_extra_roots: roots.slice(0, 3), in_flight: ['reviewer'],
+    in_flight_turns: { reviewer: { turn_id: 'turn-union', source_message_id: 'source-union' } },
+  });
+  expect((await cold.readState('other-user', TEST_CID)).tool_extra_roots).toEqual([roots[3]]);
+});
+
+it('leaves durable state unchanged for duplicate or invalid handoff roots', async () => {
+  const state = await import('../../../../src/main/features/group_chat/state');
+  const paths = await import('../../../../src/main/paths');
+  const root = path.join(tmpDir, 'existing');
+  await state.setToolExtraRoots(TEST_UID, TEST_CID, [root]);
+  const file = paths.groupChatStateFile(TEST_UID, TEST_CID);
+  const before = fs.readFileSync(file);
+  await state.addToolExtraRoots(TEST_UID, TEST_CID, [root, '', 'relative-only']);
+  expect(fs.readFileSync(file)).toEqual(before);
 });

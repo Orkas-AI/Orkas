@@ -39,6 +39,61 @@ test.afterEach(async ({}, info) => {
   if (analysis.requiresReview) console.info(formatProcessLogSummary(analysis));
 });
 
+test('hides app-private history in real search and after restart while preserving the source archive', async ({}, info) => {
+  const app = new OrkasTestApp(info, { configuredModel: false, marketplaceStub: true, seedLanguage: 'en' });
+  try {
+    await app.launch();
+    await installEmptyLibrarySearch(app, pcRoot);
+    const identity = await app.electronApp!.evaluate(async (_, root) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      const fs = req('node:fs');
+      const chats = req(`${root}/src/main/features/chats.ts`);
+      const paths = req(`${root}/src/main/util/project-layout.ts`);
+      const store = req(`${root}/src/main/features/search/chat_store.ts`);
+      const hidden = await chats.createConversation('account-e2e', { kind: 'app_task', title: 'Internal application archive' });
+      const visible = await chats.createConversation('account-e2e', { title: 'My archive notes' });
+      const text = 'archivevisibilitymarker';
+      for (const row of [hidden, visible]) {
+        fs.writeFileSync(paths.conversationMessageFile('account-e2e', row.conversation_id), JSON.stringify({ role: 'user', content: text, time: 't' }) + '\n');
+        store.replaceConversation('account-e2e', row.conversation_id,
+          [{ cid: row.conversation_id, msgIndex: 0, role: 'user', time: 't', text }], { mtime: 1, size: 1, next: 1 });
+      }
+      return { hidden: hidden.conversation_id, visible: visible.conversation_id,
+        file: paths.conversationMessageFile('account-e2e', hidden.conversation_id) };
+    }, pcRoot);
+    const source = readFileSync(identity.file);
+    const check = async () => {
+      for (const includeChatSnippets of [false, true]) {
+        const page = await app.invoke<any>('search.global', { query: 'archivevisibilitymarker', scope: 'chat', includeChatSnippets });
+        expect(page.results.map((row: any) => row.cid)).toEqual([identity.visible]);
+      }
+      const page = app.page!;
+      await page.locator('#sidebar-search-btn').click();
+      await page.locator('#search-input').fill('archivevisibilitymarker');
+      await page.locator('#search-input').press('Enter');
+      await page.locator('.search-tab[data-tab="chat"]').click();
+      await expect(page.locator('#search-body .search-result-title')).toHaveText(['My archive notes']);
+      await expect(page.locator('#search-body .search-result-snippet')).toContainText('archivevisibilitymarker');
+      expect(readFileSync(identity.file)).toEqual(source);
+      await page.locator('#search-input').press('Escape');
+    };
+    await check();
+    expect(await app.electronApp!.evaluate(async (_, root) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      await req(`${root}/src/main/features/search/indexer.ts`).reconcileChatsIndex('account-e2e');
+      return [...req(`${root}/src/main/features/search/chat_store.ts`).indexedConversationIds('account-e2e')];
+    }, pcRoot)).toEqual([identity.visible]);
+    await app.relaunch();
+    await installEmptyLibrarySearch(app, pcRoot);
+    await check();
+    await app.page!.locator('#sidebar-search-btn').click();
+    await app.page!.locator('#search-input').fill('archivevisibilitymarker');
+    await app.page!.locator('#search-input').press('Enter');
+    await expect(app.page!.locator('#search-body .search-result-title')).toHaveText(['My archive notes']);
+    await app.page!.screenshot({ path: info.outputPath('search-app-private-restart.png') });
+  } finally { await app.dispose(); }
+});
+
 test('searches automations and to-dos in distinct categories and reveals their current entries', async ({}, info) => {
   const app = new OrkasTestApp(info, { configuredModel: false, seedLanguage: 'zh' });
   try {
@@ -894,7 +949,7 @@ test('shows preparation before full results, searches partial history, and resum
 });
 
 test('runs rebuild, live indexing and snippet workers from an ASAR with the shipped dependency layout', async ({}, testInfo) => {
-  const app = new OrkasTestApp(testInfo, { configuredModel: false });
+  const app = new OrkasTestApp(testInfo, { configuredModel: false, marketplaceStub: true });
   try {
     const source = path.join(app.root, 'package-source');
     const archive = path.join(app.root, 'fixture.asar');
@@ -949,8 +1004,16 @@ test('runs rebuild, live indexing and snippet workers from an ASAR with the ship
         const snippet = await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => reject(new Error('Packaged snippet worker did not respond')), 10_000);
           snippetWorker.once('error', (error: Error) => { clearTimeout(timeout); reject(error); });
-          snippetWorker.once('message', (message: any) => { clearTimeout(timeout); resolve(message.rows[0]?.[1]?.snippet); });
-          snippetWorker.postMessage({ id: 1, file, indexes: [0], tokens: ['packagedmarker'], source: { userId: 'packaged-fixture', cid: 'source' } });
+          snippetWorker.on('message', (message: any) => {
+            // The application-ready receipt precedes the correlated reply.
+            if (message.ready === true) {
+              snippetWorker!.postMessage({ id: 1, file, indexes: [0], tokens: ['packagedmarker'], source: { userId: 'packaged-fixture', cid: 'source' } });
+              return;
+            }
+            if (message.id !== 1) return;
+            clearTimeout(timeout);
+            resolve(message.rows[0]?.[1]?.snippet);
+          });
         });
         return { complete: batch.complete, liveComplete, liveMatches: store.postingsFor('packaged-fixture', 'packagedlivemarker').length, count: store.docCount('packaged-fixture'),
           matches: store.postingsFor('packaged-fixture', 'packagedmarker').length, snippet };

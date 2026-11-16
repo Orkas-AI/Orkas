@@ -522,7 +522,23 @@ function _previousManagedFiles(
   return Array.from(new Set([
     ..._safeManagedFiles(existing.builtin_files),
     ..._resourceSeedManagedFiles(target, kind, id),
+    ...(kind === 'agent' ? _agentSkillFiles(target) : []),
   ])).sort((a, b) => a.localeCompare(b));
+}
+
+/** A marketplace bundle or an older seed lists no files, so without this the Skills it
+ *  shipped that the package has since dropped stay visible to the Agent. Everything under
+ *  skills/ is package content: Skills the user or the Agent writes live outside the install. */
+function _agentSkillFiles(target: string): string[] {
+  const skills = path.join(target, 'skills');
+  _assertManagedPath(skills, resolveSandboxRoot(target));
+  return marketplaceContentTreeFiles(skills).map((rel) => `skills/${rel}`);
+}
+
+function _assertManagedPath(candidate: string, root: string, followFinalSymlink = true): void {
+  if (!isPathAllowed(candidate, [root], { rootsResolved: true, followFinalSymlink })) {
+    throw Object.assign(new Error('builtin content path is outside the install'), { code: 'E_PATH_OUT_OF_SCOPE' });
+  }
 }
 
 async function _copyExistingDirectoryContents(src: string, dst: string): Promise<void> {
@@ -537,12 +553,6 @@ async function _copyExistingDirectoryContents(src: string, dst: string): Promise
       recursive: true,
       force: true,
     });
-  }
-}
-
-function _assertManagedPath(candidate: string, root: string, followFinalSymlink = true): void {
-  if (!isPathAllowed(candidate, [root], { rootsResolved: true, followFinalSymlink })) {
-    throw Object.assign(new Error('builtin content path is outside the install'), { code: 'E_PATH_OUT_OF_SCOPE' });
   }
 }
 

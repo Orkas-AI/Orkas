@@ -50,6 +50,7 @@ describe('application shutdown durability and latency', () => {
     const events: string[] = [];
     const mark = (name: string) => () => { events.push(name); };
     const dependencies: Record<string, unknown> = {
+      './features/web_apps/task-host': { stopAppTaskMaintenance: mark('app-maintenance-stop'), startAppTaskMaintenance: mark('app-maintenance-start') },
       './util/boot_init': { stopBootWork: mark('boot-work') },
       './features/library_corpus': { closeAllLibraryCorpora: mark('library-owners') },
       './features/local_agents/runner.js': { stopBackgroundRuns: mark('background-cli') },
@@ -90,7 +91,7 @@ describe('application shutdown durability and latency', () => {
     const pending = shutdown.prepare(mode);
     expect(shutdown.prepare(mode)).toBe(pending);
     await vi.waitFor(() => expect(events).toContain('process-sessions'));
-    expect(events).toEqual(mode === 'quit' ? ['capture', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions'] : ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions']);
+    expect(events).toEqual(mode === 'quit' ? ['capture', 'app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions'] : ['app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions']);
     archived.release();
     await vi.waitFor(() => expect(events).toContain('browser-save'));
     expect(events).toContain('history-workers');
@@ -120,7 +121,7 @@ describe('application shutdown durability and latency', () => {
       exited.release();
     }
     await pending;
-    const owners = ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'history-workers', 'office-extract', 'office', 'browser-save', 'open-lifecycle', 'app-close', 'app-databases'];
+    const owners = ['app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'history-workers', 'office-extract', 'office', 'browser-save', 'open-lifecycle', 'app-close', 'app-databases'];
     expect([...events].sort()).toEqual([...owners, ...(mode === 'quit' ? ['capture', 'terminate', 'dispose'] : [])].sort());
     expect(shutdown.complete).toBe(true);
   });
@@ -139,6 +140,7 @@ describe('application shutdown durability and latency', () => {
     visit(parsed);
     const mark = (name: string) => () => { events.push(name); };
     const dependencies: Record<string, unknown> = {
+      './features/web_apps/task-host': { stopAppTaskMaintenance: mark('app-maintenance-stop'), startAppTaskMaintenance: mark('app-maintenance-start') },
       './util/boot_init': { stopBootWork: vi.fn(), resumeBootAdmission: mark('boot') },
       './features/library_corpus': { closeAllLibraryCorpora: vi.fn(), resumeLibraryAdmission: async () => { events.push('library'); } },
       './features/local_agents/runner.js': { stopBackgroundRuns: vi.fn() },
@@ -176,7 +178,7 @@ describe('application shutdown durability and latency', () => {
     const events: string[] = [];
     const shutdown = realComposition(events, { terminate: async () => { throw new Error('controlled timeout'); } });
     await expect(shutdown.prepare()).rejects.toMatchObject({ code: 'E_SHUTDOWN_PROCESSES_FAILED' });
-    expect(events).toEqual(['task-admission', 'library', 'boot', 'auto-scheduler', 'driver-scheduler']);
+    expect(events).toEqual(['app-maintenance-stop', 'task-admission', 'library', 'boot', 'app-maintenance-start', 'auto-scheduler', 'driver-scheduler']);
   });
 
   it('still exits when stopping retained commands fails, because no user data depends on it', async () => {
@@ -184,7 +186,7 @@ describe('application shutdown durability and latency', () => {
     const shutdown = realComposition(events, { stopAllProcessSessions: async () => { throw new Error('controlled failure'); } });
     await shutdown.prepare();
     expect(shutdown.complete).toBe(true);
-    expect(events).toEqual(['process-sessions-warned']);
+    expect(events).toEqual(['app-maintenance-stop', 'process-sessions-warned']);
   });
 
   it('pins owned processes before stopping producers and confirms their exit before installer handoff', async () => {
@@ -286,25 +288,29 @@ describe('application shutdown durability and latency', () => {
     expect(reentered).toBe(pending);
   });
 
-  it('finishes independent local saves together before normal exit', async () => {
+  it.each(['quit', 'relaunch'] as const)('finishes independent local saves together without delaying %s for a timer', async mode => {
     const search = gate();
     const browser = gate();
     const started: string[] = [];
-    const shutdown = createShutdownCoordinator({
-      localTasks: [
-        { name: 'search', run: () => { started.push('search'); return search.promise; } },
-        { name: 'browser', run: () => { started.push('browser'); return browser.promise; } },
-      ], onFailure: vi.fn(),
-    });
-    const pending = shutdown.prepare();
-    await Promise.resolve();
-    expect(started).toEqual(['search', 'browser']);
-    search.release();
-    await Promise.resolve();
-    expect(shutdown.complete).toBe(false);
-    browser.release();
-    await pending;
-    expect(shutdown.complete).toBe(true);
+    vi.useFakeTimers();
+    try {
+      const shutdown = createShutdownCoordinator({
+        localTasks: [
+          { name: 'search', run: () => { started.push('search'); return search.promise; } },
+          { name: 'browser', run: () => { started.push('browser'); return browser.promise; } },
+        ], onFailure: vi.fn(),
+      });
+      const pending = shutdown.prepare(mode);
+      await Promise.resolve();
+      expect(started).toEqual(['search', 'browser']);
+      search.release();
+      await Promise.resolve();
+      expect(shutdown.complete).toBe(false);
+      browser.release();
+      await pending;
+      expect(shutdown.complete).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 
 

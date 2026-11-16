@@ -1,19 +1,21 @@
+import { getDeviceId } from './machine_device_id';
 import * as fsSync from 'node:fs';
 import * as fs from 'node:fs/promises';
 import { isIP } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 
+import { registerUserSwitchHook } from './user-switch-hooks';
 import { prepareFeedbackUploadImage } from '../util/image-transform';
 import { composeAbortSignal, throwIfAborted } from '../util/abort';
 import { logPathRef } from '../util/log-redact';
 import { createLogger } from '../logger';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
-import { getDeviceId } from './machine_device_id';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
+
+import { MEDIA_TRANSFER_POLICY } from '../util/media-transfer-policy';
 
 const log = createLogger('generation-reference-assets');
 
@@ -21,14 +23,15 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 12 * 1024 * 1024;
 const MAX_REFERENCE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const VIDEO_COMPRESS_TRIGGER_BYTES = 8 * 1024 * 1024;
-const REFERENCE_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
-const VIDEO_COMPRESS_TIMEOUT_MS = 10 * 60 * 1000;
+const REFERENCE_TRANSFER_TIMEOUT_MS = MEDIA_TRANSFER_POLICY.transferMs;
+const VIDEO_COMPRESS_TIMEOUT_MS = MEDIA_TRANSFER_POLICY.preparationMs;
 const PROGRESS_HEARTBEAT_MS = 15 * 1000;
 
 interface GeneratedMediaUrlEntry {
   url: string;
   ownerId: string;
   fileIdentity: string;
+  expiresAt: number;
 }
 
 const generatedMediaUrls = new Map<string, GeneratedMediaUrlEntry>();
@@ -40,6 +43,8 @@ export interface PrepareReferenceUrlsInput {
   urls?: string[];
   paths?: string[];
   maxItems: number;
+  pathsFirst?: boolean;
+  preserveImageBytes?: boolean;
   signal?: AbortSignal;
   onProgress?: GenerationReferenceProgressReporter;
 }
@@ -64,10 +69,12 @@ export function registerGeneratedMediaUrl(absPath: string, url?: string): void {
   }
   const fileIdentity = localFileIdentity(cleanPath);
   if (!cleanPath || !cleanUrl || !fileIdentity) return;
+  if (generatedMediaUrls.size >= 256) generatedMediaUrls.delete(generatedMediaUrls.keys().next().value);
   generatedMediaUrls.set(cleanPath, {
     url: cleanUrl,
     ownerId: currentReferenceOwnerId(),
     fileIdentity,
+    expiresAt: referenceUrlExpiry(cleanUrl),
   });
 }
 
@@ -76,7 +83,8 @@ export function generatedMediaUrlForPath(absPath: string): string {
   const entry = generatedMediaUrls.get(cleanPath);
   if (!entry) return '';
   if (
-    entry.ownerId !== currentReferenceOwnerId()
+    entry.expiresAt <= Date.now() + MEDIA_TRANSFER_POLICY.transferMs
+    || entry.ownerId !== currentReferenceOwnerId()
     || entry.fileIdentity !== localFileIdentity(cleanPath)
   ) {
     generatedMediaUrls.delete(cleanPath);
@@ -85,15 +93,46 @@ export function generatedMediaUrlForPath(absPath: string): string {
   return entry.url;
 }
 
+registerUserSwitchHook('generation-reference-assets', () => {
+  generatedMediaUrls.clear();
+});
+
+// COS signatures have a structured expiry. Unsigned public URLs retain their
+// existing semantics; similarly named application query fields are not expiry.
+function referenceUrlExpiry(url: string): number {
+  const signedTime = new URL(url).searchParams.get('q-sign-time');
+  if (signedTime === null) return Infinity;
+  const parts = signedTime.split(';');
+  if (parts.length !== 2 || !parts.every(part => /^\d+$/.test(part))) return 0;
+  const expiry = Number(parts[1]) * 1000;
+  return Number.isSafeInteger(expiry) ? expiry : 0;
+}
+
+export async function withReferencePreparation<T>(signal: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const composed = composeAbortSignal(signal, MEDIA_TRANSFER_POLICY.preparationMs, 'Reference preparation timed out');
+  try {
+    const result = await work(composed.signal);
+    throwIfAborted(composed.signal);
+    return result;
+  } catch (error) {
+    if (composed.signal.aborted && !signal?.aborted) throw composed.signal.reason;
+    throw error;
+  } finally { composed.cleanup(); }
+}
+
 export async function prepareReferenceUrls(input: PrepareReferenceUrlsInput): Promise<string[]> {
+  return withReferencePreparation(input.signal, signal => prepareReferenceUrlsWithinBudget({ ...input, signal }));
+}
+
+async function prepareReferenceUrlsWithinBudget(input: PrepareReferenceUrlsInput): Promise<string[]> {
   const urls = (input.urls || []).map(normalizeUrl).filter(Boolean);
   const paths = (input.paths || []).map(normalizePath).filter(Boolean);
+  if (input.preserveImageBytes && urls.some(url => url.startsWith('asset://'))) {
+    throw new Error('Reference images require an HTTPS URL or a local image path');
+  }
   const out: string[] = [];
 
-  for (const url of urls) {
-    if (out.length >= input.maxItems) break;
-    out.push(url);
-  }
+  if (!input.pathsFirst) out.push(...urls.slice(0, input.maxItems));
 
   let localIndex = 0;
   for (const localPath of paths) {
@@ -115,9 +154,12 @@ export async function prepareReferenceUrls(input: PrepareReferenceUrlsInput): Pr
       onProgress: input.onProgress,
       index: localIndex,
       total: paths.length,
+      preserveImageBytes: input.preserveImageBytes,
     }));
   }
 
+  if (input.pathsFirst) out.push(...urls.slice(0, Math.max(0, input.maxItems - out.length)));
+  throwIfAborted(input.signal);
   return out;
 }
 
@@ -126,6 +168,13 @@ export async function loadImageReferenceBuffers(urls: string[] = [], paths: stri
 }
 
 export async function loadImageReferenceBuffersWithProgress(
+  urls: string[] = [], paths: string[] = [],
+  opts: { signal?: AbortSignal; onProgress?: GenerationReferenceProgressReporter } = {},
+): Promise<Buffer[]> {
+  return withReferencePreparation(opts.signal, signal => loadImageReferenceBuffersWithinBudget(urls, paths, { ...opts, signal }));
+}
+
+async function loadImageReferenceBuffersWithinBudget(
   urls: string[] = [],
   paths: string[] = [],
   opts: {
@@ -146,7 +195,7 @@ export async function loadImageReferenceBuffersWithProgress(
       index,
       total,
     });
-    const buf = await fs.readFile(localPath);
+    const buf = await fs.readFile(localPath, { signal: opts.signal });
     throwIfAborted(opts.signal);
     out.push(buf);
   }
@@ -195,6 +244,7 @@ async function compressAndUploadReference(
     onProgress?: GenerationReferenceProgressReporter;
     index: number;
     total: number;
+    preserveImageBytes?: boolean;
   },
 ): Promise<string> {
   throwIfAborted(opts.signal);
@@ -207,8 +257,9 @@ async function compressAndUploadReference(
     ? await prepareImage(localPath, opts)
     : await prepareVideo(localPath, opts);
 
-  if (prepared.buf.length > MAX_UPLOAD_BYTES) {
-    throw new Error(`${referenceLabel(kind, opts)} exceeds ${MAX_UPLOAD_BYTES / 1024 / 1024}MB after compression`);
+  const uploadLimit = kind === 'image' && opts.preserveImageBytes ? 24 * 1024 * 1024 : MAX_UPLOAD_BYTES;
+  if (prepared.buf.length > uploadLimit) {
+    throw new Error(`${referenceLabel(kind, opts)} exceeds ${uploadLimit / 1024 / 1024}MB after compression`);
   }
 
   throwIfAborted(opts.signal);
@@ -220,15 +271,17 @@ async function compressAndUploadReference(
 
 async function prepareImage(
   localPath: string,
-  opts: { signal?: AbortSignal },
+  opts: { signal?: AbortSignal; preserveImageBytes?: boolean },
 ): Promise<{ buf: Buffer; mimeType: string; fileName: string }> {
   throwIfAborted(opts.signal);
-  const raw = await fs.readFile(localPath);
+  if (opts.preserveImageBytes && (await fs.stat(localPath)).size > 24 * 1024 * 1024) throw new Error('Reference image exceeds 24MB');
+  const raw = await fs.readFile(localPath, { signal: opts.signal });
   throwIfAborted(opts.signal);
   if (!raw.length) throw new Error(`${referenceLabel('image', opts)} is empty`);
   const mimeType = detectImageMime(raw, localPath);
   if (!mimeType) throw new Error(`unsupported ${referenceLabel('image', opts)} type`);
 
+  if (opts.preserveImageBytes) return { buf: raw, mimeType, fileName: replaceExt(path.basename(localPath), '.' + mimeType.split('/')[1].replace('jpeg', 'jpg')) };
   const image = await prepareFeedbackUploadImage(raw, {
     fileName: path.basename(localPath),
     mimeType,
@@ -249,7 +302,7 @@ async function prepareVideo(
   },
 ): Promise<{ buf: Buffer; mimeType: string; fileName: string }> {
   throwIfAborted(opts.signal);
-  const raw = await fs.readFile(localPath);
+  const raw = await fs.readFile(localPath, { signal: opts.signal });
   throwIfAborted(opts.signal);
   if (!raw.length) throw new Error(`${referenceLabel('video', opts)} is empty`);
   const mimeType = detectVideoMime(raw, localPath);
@@ -446,87 +499,7 @@ function normalizeUrl(value?: string): string {
   throw new Error('reference URL must be an HTTPS public URL or asset:// provider URL');
 }
 
-function validateDirectUploadTarget(
-  uploadValue: string,
-  fileValue: string,
-  apiBase: string,
-): { uploadUrl: string; fileUrl: string } {
-  const fileUrl = normalizeUrl(fileValue);
-  let upload: URL;
-  let file: URL;
-  let api: URL;
-  try {
-    upload = new URL(uploadValue);
-    file = new URL(fileUrl);
-    api = new URL(apiBase);
-  } catch {
-    throw new Error('COS direct upload authorization returned an invalid URL');
-  }
-  if (upload.username || upload.password || upload.hash) {
-    throw new Error('COS direct upload authorization returned an unsafe URL');
-  }
-
-  const publicCosTarget = upload.protocol === 'https:'
-    && !isPrivateReferenceHost(upload.hostname)
-    && upload.origin === file.origin
-    && upload.pathname === file.pathname;
-  const localTestTarget = isLoopbackReferenceHost(api.hostname)
-    && isLoopbackReferenceHost(upload.hostname)
-    && upload.protocol === api.protocol
-    && upload.port === api.port;
-  if (!publicCosTarget && !localTestTarget) {
-    throw new Error('COS direct upload authorization returned an unsafe target');
-  }
-  return { uploadUrl: upload.toString(), fileUrl };
-}
-
-function validateDirectUploadHeaders(
-  value: unknown,
-  contentType: string,
-  contentLength: number,
-  contentMd5: string,
-): Record<string, string> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('COS direct upload authorization returned invalid headers');
-  }
-  const allowed = new Set([
-    'content-type',
-    'content-length',
-    'content-md5',
-    'content-disposition',
-    'x-cos-acl',
-    'x-cos-server-side-encryption',
-  ]);
-  const normalized = new Map<string, string>();
-  const output: Record<string, string> = {};
-  for (const [name, raw] of Object.entries(value as Record<string, unknown>)) {
-    const lowerName = name.trim().toLowerCase();
-    const headerValue = String(raw);
-    if (!allowed.has(lowerName) || normalized.has(lowerName) || /[\r\n]/.test(headerValue)) {
-      throw new Error('COS direct upload authorization returned unsafe headers');
-    }
-    normalized.set(lowerName, headerValue);
-    output[name] = headerValue;
-  }
-  const expected = new Map<string, string>([
-    ['content-type', contentType],
-    ['content-length', String(contentLength)],
-    ['content-md5', contentMd5],
-    ['x-cos-acl', 'private'],
-    ['x-cos-server-side-encryption', 'AES256'],
-  ]);
-  for (const [name, expectedValue] of expected) {
-    if (normalized.get(name) !== expectedValue) {
-      throw new Error('COS direct upload authorization returned mismatched headers');
-    }
-  }
-  if (!normalized.get('content-disposition')?.startsWith('attachment;')) {
-    throw new Error('COS direct upload authorization returned invalid content disposition');
-  }
-  return output;
-}
-
-function localFileIdentity(absPath: string): string {
+export function localFileIdentity(absPath: string): string {
   if (!absPath) return '';
   try {
     const stat = fsSync.statSync(absPath, { bigint: true });

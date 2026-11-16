@@ -80,7 +80,9 @@ function createSharpClient({ nodeExecutable, workerPath = __filename, timeoutMs 
       pending.delete(message.id);
       clearTimeout(item.timer);
       const result = message.result;
-      const valid = item.operation === 'metadata'
+      const valid = item.operation === 'psd-check'
+        ? result && typeof result.matches === 'boolean'
+        : item.operation === 'metadata'
         ? result && typeof result.format === 'string' && result.width > 0 && result.height > 0
         : result && Buffer.isBuffer(result.data) && result.data.length > 0 && result.info?.size === result.data.length;
       if (message.ok === true && valid) item.resolve(result);
@@ -123,8 +125,22 @@ function createSharpClient({ nodeExecutable, workerPath = __filename, timeoutMs 
 async function processImage(operation, buffer, options = {}) {
   if (process.versions.electron) throw failure('E_IMAGE_RUNTIME_ELECTRON', 'Stock Node is required.');
   if (!Buffer.isBuffer(buffer) || !buffer.length) throw failure('E_IMAGE_PROCESS', 'Image bytes are required.');
-  if (!['metadata', 'encode'].includes(operation)) throw failure('E_IMAGE_PROCESS', 'Unknown image operation.');
+  if (!['metadata', 'encode', 'psd-check'].includes(operation)) throw failure('E_IMAGE_PROCESS', 'Unknown image operation.');
   const sharp = require('sharp');
+  if (operation === 'psd-check') {
+    const { decodePsdPreview } = require('./psd-preview.cjs');
+    const width = options.canvas?.width, height = options.canvas?.height;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || !Buffer.isBuffer(options.reference)) {
+      throw failure('E_IMAGE_PROCESS', 'PSD comparison needs a bounded canvas and reference image.');
+    }
+    const candidate = decodePsdPreview(buffer, width, height);
+    const { data, info } = await sharp(options.reference, { limitInputPixels: 4_194_304 })
+      .toColourspace('srgb').ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const matches = info.width === width && info.height === height && candidate.length === data.length
+      && data.every((value, index) => index % 4 === 3 ? value === candidate[index]
+        : Math.abs(value - candidate[index]) * data[index - index % 4 + 3] / 255 <= 1.01);
+    return { matches };
+  }
   let pipeline = sharp(buffer, {
     ...(options.failOn ? { failOn: options.failOn } : {}),
     ...(options.limitInputPixels !== undefined ? { limitInputPixels: options.limitInputPixels } : {}),

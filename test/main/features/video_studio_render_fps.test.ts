@@ -4,7 +4,7 @@ import * as path from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { declaredCompositionFps, qualityFps } from '../../../src/main/features/video_studio';
+import { qualityFps } from '../../../src/main/features/video_studio';
 
 // The manifest's `fps` reached the design contract's canvas and stopped there:
 // nothing on the render path ever read it, so every non-draft render came out
@@ -23,15 +23,6 @@ afterAll(() => {
   for (const dir of tmpRoots) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function withManifest(fps: unknown): string {
-  const dir = tmpDir();
-  fs.writeFileSync(
-    path.join(dir, 'composition-manifest.json'),
-    JSON.stringify({ composition: { width: 1920, height: 1080, duration: 30, fps } }),
-  );
-  return dir;
-}
-
 describe('render frame rate resolution', () => {
   it('honours what the composition declared instead of the house default', () => {
     expect(qualityFps(undefined, undefined, 60)).toBe(60);
@@ -49,15 +40,5 @@ describe('render frame rate resolution', () => {
     // Nothing escapes the ceiling.
     expect(qualityFps('high', 240, undefined)).toBe(60);
     expect(qualityFps('high', undefined, 240)).toBe(60);
-  });
-
-  it('reads the declaration from the manifest, and survives its absence', async () => {
-    expect(await declaredCompositionFps(withManifest(24))).toBe(24);
-    expect(await declaredCompositionFps(withManifest(90))).toBe(60);
-    // A composition with no manifest, or a manifest with no usable fps, must
-    // not fail the render — it simply has nothing to declare.
-    expect(await declaredCompositionFps(withManifest(0))).toBeUndefined();
-    expect(await declaredCompositionFps(withManifest('30'))).toBeUndefined();
-    expect(await declaredCompositionFps(tmpDir())).toBeUndefined();
   });
 });

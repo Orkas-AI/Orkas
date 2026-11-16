@@ -2,6 +2,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import {
+  appConversationRoot,
+  appExecutionSessionRoot,
+  appExecutionFileStem,
   userRoot,
   userChatsDir,
   userProjectsDir,
@@ -140,6 +143,7 @@ function listProjectConversationIds(uid: string): string[] {
 }
 
 export function findProjectIdForConversation(uid: string, cid: string): string | null {
+  if (appConversationRoot(uid, cid)) return null;
   if (!safeId(cid)) return null;
   assertConversationRelocationReady(uid, cid);
   const cachedByCid = conversationProjectCache.get(uid);
@@ -182,6 +186,7 @@ export function findProjectIdForConversation(uid: string, cid: string): string |
 }
 
 export function projectIdForConversationHint(uid: string, cid: string, projectHint?: string | null): string | null {
+  if (appConversationRoot(uid, cid)) return null;
   assertConversationRelocationReady(uid, cid);
   if (projectHint === null) {
     if (safeId(cid)) rememberConversationProject(uid, cid, null);
@@ -209,6 +214,15 @@ export interface ConversationLayout {
 }
 
 export function conversationLayout(uid: string, cid: string, projectHint?: string | null): ConversationLayout {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) {
+    const messageFile = path.join(appRoot, 'messages.jsonl');
+    const metaFile = path.join(appRoot, 'meta.json');
+    return { projectId: null, chatsDir: appRoot, indexFile: metaFile,
+      messageFile, groupDir: appRoot, metaFile, membersFile: path.join(appRoot, 'members.json'),
+      stateFile: path.join(appRoot, 'state.json'), planFile: path.join(appRoot, 'plan.json'),
+      messageRelPath: cloudRelForAbs(uid, messageFile), indexRelPath: cloudRelForAbs(uid, metaFile) };
+  }
   const pid = projectIdForConversationHint(uid, cid, projectHint);
   if (pid) {
     return {
@@ -251,6 +265,7 @@ export function conversationMessageFile(uid: string, cid: string, projectHint?: 
  * extend the old top-level layout. */
 export function conversationMessageReadFile(uid: string, cid: string, projectHint?: string | null): string {
   const layout = conversationLayout(uid, cid, projectHint);
+  if (appConversationRoot(uid, cid)) return layout.messageFile;
   if (layout.projectId && !fs.existsSync(layout.messageFile)) {
     const legacy = path.join(userChatsDir(uid), `${cid}.jsonl`);
     if (fs.existsSync(legacy)) return legacy;
@@ -280,11 +295,15 @@ function projectIdForSession(uid: string, sessionId: string): string | null {
 }
 
 export function cloudSessionFileFor(uid: string, sessionId: string): string {
+  const appRoot = appExecutionSessionRoot(uid, sessionId);
+  if (appRoot) return path.join(appRoot, `${appExecutionFileStem(sessionId)}.jsonl`);
   const pid = projectIdForSession(uid, sessionId);
   return pid ? projectSessionFile(uid, pid, sessionId) : userSessionFile(uid, sessionId);
 }
 
 export function cloudSessionToolResultsDirFor(uid: string, sessionId: string): string {
+  const appRoot = appExecutionSessionRoot(uid, sessionId);
+  if (appRoot) return path.join(appRoot, `${appExecutionFileStem(sessionId)}.tool-results`);
   const pid = projectIdForSession(uid, sessionId);
   return pid ? projectSessionCloudToolResultsDir(uid, pid, sessionId) : sessionCloudToolResultsDir(uid, sessionId);
 }
@@ -310,23 +329,31 @@ export function listCloudSessionToolResultsDirs(uid: string): string[] {
 }
 
 export function projectSessionRoots(uid: string, cid: string): string[] {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return [path.join(appRoot, 'execution')];
   const pid = findProjectIdForConversation(uid, cid);
   return pid ? [projectSessionsDir(uid, pid), userSessionsDir(uid)] : [userSessionsDir(uid)];
 }
 
 /** Read-only diagnostic hint. Never scan indexes or mutate layout on a cache miss. */
 export function cachedChatAttachmentDirForConversation(uid: string, cid: string): string | null {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return path.join(appRoot, 'attachments');
   const cached = conversationProjectCache.get(uid)?.get(cid);
   if (!cached || (cached.projectId === null && Date.now() >= cached.expiresAt)) return null;
   return cached.projectId ? projectChatAttachmentDir(uid, cached.projectId, cid) : chatAttachmentDir(uid, cid);
 }
 
 export function chatAttachmentDirForConversation(uid: string, cid: string, projectHint?: string | null): string {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return path.join(appRoot, 'attachments');
   const pid = projectIdForConversationHint(uid, cid, projectHint);
   return pid ? projectChatAttachmentDir(uid, pid, cid) : chatAttachmentDir(uid, cid);
 }
 
 export function chatAttachmentRelPath(uid: string, cid: string, name: string, projectHint?: string | null): string {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return cloudRelForAbs(uid, path.join(appRoot, 'attachments', name));
   const pid = projectIdForConversationHint(uid, cid, projectHint);
   return pid
     ? `cloud/projects/${pid}/chat_attachments/${cid}/${name}`
@@ -334,16 +361,22 @@ export function chatAttachmentRelPath(uid: string, cid: string, name: string, pr
 }
 
 export function chatArtifactCidDirForConversation(uid: string, cid: string, projectHint?: string | null): string {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return path.join(appRoot, 'artifacts');
   const pid = projectIdForConversationHint(uid, cid, projectHint);
   return pid ? projectChatArtifactCidDir(uid, pid, cid) : chatArtifactCidDir(uid, cid);
 }
 
 export function artifactDirForConversation(uid: string, cid: string, artifactId: string, projectHint?: string | null): string {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return path.join(appRoot, 'artifacts', artifactId);
   const pid = projectIdForConversationHint(uid, cid, projectHint);
   return pid ? projectArtifactDir(uid, pid, cid, artifactId) : artifactDir(uid, cid, artifactId);
 }
 
 export function chatArtifactRelPath(uid: string, cid: string, artifactId: string, rel = '', projectHint?: string | null): string {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return cloudRelForAbs(uid, path.join(appRoot, 'artifacts', artifactId, rel));
   const pid = projectIdForConversationHint(uid, cid, projectHint);
   return pid
     ? ['cloud/projects', pid, 'chat_artifacts', cid, artifactId, rel].filter(Boolean).join('/')

@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../../src/main/features/project_tasks', () => ({ getTask: vi.fn() }));
-vi.mock('../../../src/main/features/auto_tasks', () => ({ listTasks: vi.fn() }));
+vi.mock('../../../src/main/features/project_tasks', () => ({ getTask: vi.fn(), listTaskSearchRows: vi.fn() }));
+vi.mock('../../../src/main/features/auto_tasks', () => ({ listTasks: vi.fn(), listTaskSearchRows: vi.fn(), activeRunTaskId: vi.fn() }));
 
-import { getTask } from '../../../src/main/features/project_tasks';
-import { listTasks } from '../../../src/main/features/auto_tasks';
-import { resolveChatTaskReferences } from '../../../src/main/features/chat_task_references';
+import { getTask, listTaskSearchRows } from '../../../src/main/features/project_tasks';
+import { listTasks, listTaskSearchRows as listAutoTaskSearchRows, activeRunTaskId } from '../../../src/main/features/auto_tasks';
+import { resolveChatTaskReferences, conversationTaskLinks } from '../../../src/main/features/chat_task_references';
 
 const todo = { kind: 'todo', task_id: 't_e4fe5478466d', project_id: 'p_one' };
 const auto = { kind: 'automation', task_id: 'at_1234abcd', project_id: '' };
@@ -56,5 +56,36 @@ describe('chat task reference resolution', () => {
     vi.mocked(getTask).mockResolvedValue(null);
     vi.mocked(listTasks).mockResolvedValue([]);
     expect(await resolveChatTaskReferences('account-a', [todo, auto])).toEqual([]);
+  });
+});
+
+describe('conversation task navigation projection', () => {
+  it('joins existing and completed to-dos and automations in their exact conversation scopes', async () => {
+    vi.mocked(listTaskSearchRows).mockImplementation(async (_uid, pid) => [
+      { id: todo.task_id, content: 'Completed review', status: 'done', origin_cid: pid ? 'project' : 'global' },
+    ] as any);
+    vi.mocked(listAutoTaskSearchRows).mockResolvedValue([
+      { id: auto.task_id, title: 'Daily review', conversation_id: 'global' },
+    ] as any);
+    vi.mocked(activeRunTaskId).mockImplementation((_uid, cid) => cid === 'active' ? auto.task_id : '');
+    const result = await conversationTaskLinks('account-a', [
+      { conversation_id: 'global' }, { conversation_id: 'project', project_id: 'p_one' },
+      { conversation_id: 'ordinary', project_id: 'p_one' },
+      { conversation_id: 'origin', origin_auto_task_id: auto.task_id },
+      { conversation_id: 'active' },
+    ]);
+    expect(result.get('global')).toEqual([
+      { ...todo, project_id: '', title: 'Completed review' },
+    ]);
+    expect(result.get('project')).toEqual([{ ...todo, title: 'Completed review' }]);
+    expect(result.get('ordinary')).toEqual([]);
+    expect(result.get('origin')).toEqual([{ ...auto, title: 'Daily review' }]);
+    expect(result.get('active')).toEqual([{ ...auto, title: 'Daily review' }]);
+    expect(vi.mocked(listTaskSearchRows).mock.calls.map(args => args.slice(0, 2))).toEqual([
+      ['account-a', ''], ['account-a', 'p_one'],
+    ]);
+    expect(listAutoTaskSearchRows).toHaveBeenCalledExactlyOnceWith('account-a');
+    vi.mocked(activeRunTaskId).mockReturnValue('');
+    expect((await conversationTaskLinks('account-a', [{ conversation_id: 'active' }])).get('active')).toEqual([]);
   });
 });

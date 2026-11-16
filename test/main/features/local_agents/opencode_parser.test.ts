@@ -470,6 +470,15 @@ describe('local_agents/backends/opencode › 1.x and 2.x run command boundaries'
     ]);
   });
 
+  it.each(['--server=https://opencode.example:4096', '--standalone'])
+    ('keeps the private server when %s is literal text after the option terminator', (literal) => {
+      const args = buildOpencodeArgs({
+        prompt: 'hi', cwd: selected, cliFlags: parseCliHelpFlags(OPENCODE_2_RUN_HELP),
+        customArgs: ['--', literal],
+      });
+      expect(args).toEqual(['run', '--auto', '--format', 'json', '--standalone', '--', literal]);
+    });
+
   it('carries the selected directory in PWD on every platform when --dir is not sent', () => {
     const inherited = { PWD: '/stale/launch/dir' };
     expect(buildOpencodeEnv(undefined, inherited, selected).PWD).toBe(selected);

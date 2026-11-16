@@ -1,35 +1,14 @@
 /**
- * Persistence for the connectors registry.
+ * Connector registry persistence.
  *
- * Cloud connectors use `<uid>/cloud/config/connectors.json`; local CLI instances use
- * `<uid>/local/config/device-connectors.json`. Readers combine them, writers partition them.
- * **File body is plaintext JSON**; each instance's sensitive blob (`oauth_grant` + `dcr_client` +
- * `transport`) is packed into a single per-instance `secrets_enc` field encrypted via
- * `util/local-secret-store.ts`. Metadata fields (`display_name` / `status` /
- * `tools_cache` / timestamps) stay plaintext so Server-side iOS-clients-facing readers can list
- * connectors without holding the local secret backend. Account/tenant selectors in
- * `connection_parameters` are validated non-secret metadata and stay plaintext as well. `transport` sits
- * in the secrets blob even though it isn't a "secret" by name — `applyTemplate` bakes the resolved `access_token` into
- * `transport.env[oauth_env_key]` (stdio) / `transport.headers.Authorization` (streamable-http);
- * leaving it plaintext would defeat the whole encryption. Runtime cost is zero:
- * `manager.ts::_resolveTransport` re-runs `applyTemplate` from the catalog template + fresh
- * `oauth_grant` on every connect, so the persisted transport is purely vestigial. The read path
- * accepts the immediately previous per-instance `crypto-vault` `secrets_enc` format and upgrades
- * it in place.
- *
- * **Secret owner = Orkas-account OAuth user_id (when logged in), else local uid**. Same OAuth
- * user_id on every device the user signs into → cross-device decryption after cloud sync.
- * Open-source / not-logged-in falls back to local uid (file then sits in cloud/config/ but the
- * sync engine is inactive without an account, so it stays machine-private de facto). See
- * `_secretOwner` for the resolution.
- *
- * Sync trigger: each cloud-file change fires `syncFeature.markDirty('connectors', 'cloud/config/connectors.json')`
- * so user actions (install / disconnect / refresh) push within the debounce window rather than
- * waiting for the 5-min periodic. Like sync itself, gracefully no-ops in builds that strip
- * `features/sync` (open-source build).
- *
- * Local CLI changes notify the renderer without marking cloud data dirty. All writes are
- * serialized via async-mutex so two concurrent IPC calls can't race-overwrite.
+ * User records use `<uid>/cloud/config/connectors.json`; local CLI records use
+ * `<uid>/local/config/device-connectors.json`. These are local storage paths;
+ * readers combine them and writers preserve the separate record partitions.
+ * Token-bearing grants, DCR credentials and resolved transport fields are sealed
+ * per instance through local-secret-store, using the local uid as owner. Public
+ * metadata remains plaintext. The previous per-instance encrypted format is
+ * migrated without exposing secret bytes. Writes retain the mutex and atomic
+ * publication; actual changes notify the renderer.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -105,21 +84,12 @@ function _secretContext(uid: string, instanceId: string): localSecrets.LocalSecr
   };
 }
 
-function _notifyDirty(): void {
-  // The open-source build is local-only; cloud sync notification is intentionally absent.
-}
-
 function _notifyRendererChanged(): void {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
     const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => void };
     ipc.broadcastToRenderer?.('connectors:changed', { changed: true });
   } catch { /* tests / open-source build may not have the IPC bridge loaded */ }
-}
-
-function _notifyChanged(_cloudChanged = true): void {
-  _notifyDirty();
-  _notifyRendererChanged();
 }
 
 function _cloneJson<T>(value: T): T {
@@ -194,7 +164,7 @@ function _tryDecrypt(uid: string, instanceId: string, payload: string): { json: 
 }
 
 function _persistedStatusBeforeSecretError(inst: ConnectorInstance): ConnectorInstance['status'] {
-  // Synced rows should always have status, but tolerate older/malformed metadata so one bad row
+  // Persisted rows should have status; tolerate older/malformed metadata so one bad row
   // cannot make the entire connector registry unreadable while handling a decrypt failure.
   return inst.status ? _cloneJson(inst.status) : { kind: 'connecting' };
 }
@@ -307,7 +277,7 @@ function _readFileSync(uid: string, local: boolean): ConnectorsFile {
       const data: ConnectorsFile = { version: 2, connections: conns, oauth_hints: oauthHints, _deleted_at: deletedAt };
       if (migrated) {
         _writeFileSync(uid, data, local);
-        _notifyChanged(!local);
+        _notifyRendererChanged();
       }
       try {
         st = fs.statSync(file);
@@ -334,8 +304,7 @@ function _readSync(uid: string): ConnectorsFile {
 }
 
 /** Local writes cannot rewrite the cloud file or trigger a cloud dirty event. */
-function _writeSync(uid: string, data: ConnectorsFile): boolean {
-  let cloudChanged = false;
+function _writeSync(uid: string, data: ConnectorsFile): void {
   for (const local of [true, false]) {
     const subset: ConnectorsFile = {
       version: 2,
@@ -344,10 +313,8 @@ function _writeSync(uid: string, data: ConnectorsFile): boolean {
       _deleted_at: connectorRecordsForScope(data._deleted_at, local),
     };
     if (JSON.stringify(subset) === JSON.stringify(_readFileSync(uid, local))) continue;
-    const changed = _writeFileSync(uid, subset, local);
-    if (!local) cloudChanged = changed;
+    _writeFileSync(uid, subset, local);
   }
-  return cloudChanged;
 }
 
 function _writeFileSync(uid: string, data: ConnectorsFile, local: boolean): boolean {
@@ -417,7 +384,7 @@ function _rt(grant: ConnectorInstance['oauth_grant']): string {
 }
 
 export async function upsert(uid: string, inst: ConnectorInstance): Promise<void> {
-  const cloudChanged = await _writeMutex.runExclusive(async () => {
+  await _writeMutex.runExclusive(async () => {
     const cur = _readSync(uid);
     const before = cur.connections[inst.id];
     log.info('registry.upsert', {
@@ -435,11 +402,10 @@ export async function upsert(uid: string, inst: ConnectorInstance): Promise<void
     }
     return _writeSync(uid, cur);
   });
-  _notifyChanged(cloudChanged);
+  _notifyRendererChanged();
 }
 
 export async function remove(uid: string, id: string): Promise<boolean> {
-  let cloudChanged = false;
   const removed = await _writeMutex.runExclusive(async () => {
     const cur = _readSync(uid);
     if (!cur.connections[id]) return false;
@@ -452,10 +418,10 @@ export async function remove(uid: string, id: string): Promise<boolean> {
       cur.oauth_hints = hints;
     }
     cur._deleted_at = { ...(cur._deleted_at || {}), [id]: new Date().toISOString() };
-    cloudChanged = _writeSync(uid, cur);
+    _writeSync(uid, cur);
     return true;
   });
-  if (removed) _notifyChanged(cloudChanged);
+  if (removed) _notifyRendererChanged();
   return removed;
 }
 
@@ -467,7 +433,7 @@ export function shouldReauthorize(uid: string, id: string): boolean {
 
 export async function setReauthorizeHint(uid: string, id: string, enabled: boolean): Promise<void> {
   if (!uid || !id) return;
-  const cloudChanged = await _writeMutex.runExclusive(async () => {
+  await _writeMutex.runExclusive(async () => {
     const cur = _readSync(uid);
     const hints = { ...(cur.oauth_hints || {}) };
     if (enabled) hints[id] = { ...(hints[id] || {}), reauthorize: true };
@@ -475,7 +441,7 @@ export async function setReauthorizeHint(uid: string, id: string, enabled: boole
     cur.oauth_hints = hints;
     return _writeSync(uid, cur);
   });
-  _notifyChanged(cloudChanged);
+  _notifyRendererChanged();
 }
 
 export async function update(
@@ -483,7 +449,6 @@ export async function update(
   id: string,
   patch: (inst: ConnectorInstance) => ConnectorInstance,
 ): Promise<ConnectorInstance | null> {
-  let cloudChanged = false;
   const next = await _writeMutex.runExclusive(async () => {
     const cur = _readSync(uid);
     const existing = cur.connections[id];
@@ -496,10 +461,10 @@ export async function update(
       rt_changed: existing.oauth_grant?.refresh_token !== updated.oauth_grant?.refresh_token,
     });
     cur.connections[id] = updated;
-    cloudChanged = _writeSync(uid, cur);
+    _writeSync(uid, cur);
     return updated;
   });
-  if (next) _notifyChanged(cloudChanged);
+  if (next) _notifyRendererChanged();
   return next;
 }
 
@@ -513,7 +478,6 @@ export async function updateMany(
   uid: string,
   patches: ReadonlyMap<string, readonly ConnectorInstancePatch[]>,
 ): Promise<Record<string, ConnectorInstance>> {
-  let cloudChanged = false;
   const updated = await _writeMutex.runExclusive(async () => {
     const cur = _readSync(uid);
     const out: Record<string, ConnectorInstance> = {};
@@ -531,10 +495,10 @@ export async function updateMany(
       cur.connections[id] = next;
       out[id] = next;
     }
-    if (Object.keys(out).length) cloudChanged = _writeSync(uid, cur);
+    if (Object.keys(out).length) _writeSync(uid, cur);
     return out;
   });
-  if (Object.keys(updated).length) _notifyChanged(cloudChanged);
+  if (Object.keys(updated).length) _notifyRendererChanged();
   return updated;
 }
 

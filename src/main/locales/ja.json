@@ -1,4 +1,9 @@
 {
+  "local.delete_file.user_continue": "削除を確認しました。続けてください。",
+  "apps.builtin_listing_title": "ECワークスペース",
+  "apps.builtin_listing_description": "ストアを接続し、商品コピー・画像・動画を作成",
+  "apps.builtin_content_title": "コンテンツワークスペース",
+  "apps.builtin_content_description": "アイデアや手元の素材から始める",
   "errors.conversation_recovery_conflict": "このタスクを開くには復元が必要です。既存のコピーは保持されています。サポートにお問い合わせください。",
   "connectors.account_choice.title": "接続するアカウントを選択",
   "connectors.account_choice.message": "この接続で使用する認証済みアカウントまたは店舗を選択してください。",
@@ -135,7 +140,6 @@
   "errors.model_currently_unavailable": "このモデルは現在利用できません",
   "errors.model_config_unavailable": "モデルは設定されていますが、現在その認証情報を使用できません。設定で API キー、サインイン状態、または代替モデルを確認してください。",
   "errors.model_oauth_expired": "{provider} の認証が期限切れです。設定でこのアカウントを再認証するか、代替モデルに切り替えてください。",
-  "errors.model_credits_insufficient": "クレジットが不足したため、タスクを停止しました。クレジットを追加したら、このタスクに戻って「続ける」と送ると、続きから再開できます。設定で利用可能なモデルへ切り替えることもできます。",
   "errors.custom_endpoint_suspect": "カスタムモデルサービスへのリクエストが連続して失敗しました（HTTP {status}）。エンドポイントが無効になっている可能性があります。「設定 → モデル」で API アドレスとキーを確認するか、別のモデルに切り替えてください。",
   "errors.model_output_cap_repeated": "このモデルは 1 回あたりの出力上限に連続して達しています。このタスク量には小さすぎる可能性があります。設定で出力上限の大きいモデルに切り替えるか、タスクを分割してください。",
   "errors.model_provider_balance_insufficient": "設定したモデルプロバイダーのアカウント残高が不足しています（Orkas クレジットではありません）。プロバイダー側でチャージするか、設定でモデルを切り替えてください。",
@@ -168,10 +172,8 @@
   "agent.run_failed": "⚠️ エージェントの実行に失敗しました: {message}",
   "model.retrying": "再試行中",
   "model.retrying_n": "再試行 {attempt} 回目",
-  "model.dev_marker": "[DEV]",
   "model.credential_fallback": "{provider} モデルの認証情報は無効です。タスクを続行するため代替モデルに切り替えています。後で「設定」から再認証するか、認証情報を更新してください。",
   "model.timeout_fallback": "{provider} モデルが時間内に応答を開始しなかったため、タスクを続行できるよう代替モデルに切り替えています。",
-  "model.server_model_fallback": "{from} は一時的に利用できないため、{to} が処理しました。",
   "model.tool_loop_limit_reached": "（ツールループ回数が上限に達しました）",
   "model.run_aborted": "実行を中断しました",
   "model.max_retries_exceeded": "再試行回数が上限に達しました",
@@ -367,6 +369,11 @@
   "errors.model_request_rejected_repeated": "このリクエストは続けて拒否されています。このまま再試行しても結果は変わりません。設定で別のモデルに切り替えて再試行するか、画像や添付ファイルを外して送り直してください。",
   "errors.provider_reply_detail": "プロバイダーの応答：{detail}",
   "cli_agent.repeated_failure_hint": "「{name}」は再び失敗しました。代わりに @Commander にこのタスクを任せることができます。",
-  "desktop.open": "開く",
-  "desktop.exit": "終了"
+  "desktop.open": "Orkas を開く",
+  "desktop.exit": "Orkas を終了",
+  "video_budget.own_key_notice": "ご自身のサービスアカウントで {count} 件のファイルを生成しました。料金は直接請求されます。",
+  "errors.model_request_rejected_no_retry": "モデルサービスがこのリクエストを拒否しました。自動再試行を停止しました。",
+  "errors.model_context_capacity_insufficient": "現在のコンテキストは選択したモデルの安全な容量を超えています。今回のモデル呼び出しは送信されていません。コンテキストウィンドウが大きいモデルを選ぶか、新しい会話を開始してください。",
+  "video.delivery_retained": "添付ファイル {index}：納品済みのバージョン {version} は保持されています。",
+  "video.delivery_later_edits": "その後の変更はこのバージョンに含まれていません。"
 }

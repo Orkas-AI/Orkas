@@ -327,7 +327,7 @@ export function normalizeElectronNetFetchError(error: unknown): unknown {
     || error.message !== 'net::ERR_PROXY_CONNECTION_FAILED') return error;
   const facts = error as Error & { code?: unknown; cause?: unknown };
   if (facts.code != null || facts.cause != null) return error;
-  return Object.assign(new Error(error.message, { cause: error }), { code: 'ENETUNREACH' });
+  return Object.assign(new Error(error.message, { cause: error }), { code: 'EHOSTUNREACH' });
 }
 
 /** Chromium owns Content-Length: an explicit one fails with
@@ -423,7 +423,9 @@ async function electronUpload(url: string, init: RequestInit, body: Buffer, onPr
     };
     request.on('error', error => finish(normalizeElectronNetFetchError(error)));
     request.on('abort', () => finish(new Error('upload aborted')));
-    request.on('close', () => finish(new Error('upload closed before response completed')));
+    // ClientRequest's writable side can close immediately after finish, before
+    // response headers arrive. Only the response or an error/abort settles it;
+    // the caller's signal still bounds a request that receives no response.
     request.on('response', response => {
       report(); clearInterval(timer);
       const chunks: Buffer[] = [];

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -29,6 +30,16 @@ function testNodeCommand(script: string): string {
     return `& ${quote(TEST_NODE)} -e ${quote(script)}`;
   }
   return `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+}
+
+function testNodeLiteralCommand(script: string): string {
+  // Windows PowerShell 5 serializes native arguments using its legacy rules;
+  // embedded double quotes in -e can disappear even inside a PS literal.
+  // Keep this fixture's UTF-8 source intact without changing the shell gate.
+  const source = process.platform === 'win32'
+    ? `eval(Buffer.from('${Buffer.from(script).toString('base64')}', 'base64').toString('utf8'))`
+    : script;
+  return testNodeCommand(source);
 }
 
 // ── Electron mock (for create_pdf paths) ────────────────────────────────
@@ -136,6 +147,212 @@ function writeFakeCommand(dir: string, name: string, source: string): void {
   fs.chmodSync(launcher, 0o755);
 }
 
+it('keeps app-session file writes in the host workspace instead of the selected ordinary workspace', async () => {
+  const {lt,perm}=await loadModules();
+  perm.setLocalExecMode('workspace_approval');
+  await setTmpWorkspace();
+  const cid='app_'+ 'a'.repeat(64)+'_once_'+ 'b'.repeat(32);
+  const {appConversationRoot}=await import('../../../src/main/paths');
+  const appWorkspace=path.join(appConversationRoot('u1',cid)!, 'workspace');
+  fs.mkdirSync(appWorkspace,{recursive:true});
+  const ordinary=path.join(tmpDir,'ordinary-private.txt');
+  fs.writeFileSync(ordinary,'KEEP ORDINARY');
+  const tool=lt.createLocalTools({userId:'u1',cid}).find(tool=>tool.name==='write_file')!;
+  const own=path.join(appWorkspace,'app-result.txt');
+  expect((await tool.execute({path:own,content:'APP RESULT'},makeCtx())).isError).not.toBe(true);
+  expect(fs.readFileSync(own,'utf8')).toBe('APP RESULT');
+  const refused=await tool.execute({path:ordinary,content:'MUST NOT REPLACE'},makeCtx());
+  expect(refused.isError).toBe(true);
+  expect(refused.content).toContain('E_PATH_OUT_OF_SCOPE');
+  expect(fs.readFileSync(ordinary,'utf8')).toBe('KEEP ORDINARY');
+});
+
+describe('local-tools › native write freshness', () => {
+  it.each(['edit_file', 'apply_patch'])(
+    'rejects a same-size external change after write_file when timestamps collide before %s', async name => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('all_files_auto');
+      await setTmpWorkspace();
+      const target = path.join(tmpDir, 'write-baseline.txt');
+      const before = 'HEAD\nTAIL=0000\n', external = 'HEAD\nTAIL=9999\n';
+      const onFileWritten = vi.fn();
+      const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+      const ctx = makeCtx();
+      ctx.state.readFileState = new Map();
+      const mutableFs = require('node:fs') as typeof fs;
+      const statSync = mutableFs.statSync;
+      const spy = vi.spyOn(mutableFs, 'statSync').mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+        const stat = (statSync as Function)(file, ...args);
+        // Model a coarse filesystem clock independently of the current contents.
+        if (String(file) === target) stat.mtimeMs = 1_700_000_000_000;
+        return stat;
+      }) as typeof fs.statSync);
+      syncBuiltinESMExports();
+      try {
+        const created = await tools.find(tool => tool.name === 'write_file')!.execute({ path: target, content: before }, ctx);
+        expect(created.isError).toBeFalsy();
+        onFileWritten.mockClear();
+        fs.writeFileSync(target, external);
+        const input = name === 'edit_file'
+          ? { path: target, old_string: 'HEAD', new_string: 'UPDATED' }
+          : { patch: '*** Begin Patch\n*** Update File: ' + target + '\n@@\n-HEAD\n+UPDATED\n*** End Patch' };
+        const editor = tools.find(tool => tool.name === name)!;
+        const rejected = await editor.execute(input, ctx);
+        expect(rejected.isError, rejected.content).toBe(true);
+        expect(rejected.content).toContain('E_STALE');
+        expect(fs.readFileSync(target, 'utf8')).toBe(external);
+        expect(onFileWritten).not.toHaveBeenCalled();
+        // The explicit recovery receipt establishes the new, observed baseline.
+        const recovered = await editor.execute(input, ctx);
+        expect(recovered.isError, recovered.content).toBeFalsy();
+        expect(fs.readFileSync(target, 'utf8')).toBe('UPDATED\nTAIL=9999\n');
+        expect(onFileWritten).toHaveBeenCalledOnce();
+      } finally {
+        spy.mockRestore();
+        syncBuiltinESMExports();
+      }
+    },
+  );
+});
+
+describe('local-tools › OAuth text transparency', () => {
+  const client = '32555940559.apps.googleusercontent.com';
+  const scope = 'https://www.googleapis.com/auth/drive.readonly';
+  // Content is data for generic tools, even when it describes an OAuth flow.
+  const reference = `# Configuration example\nclient_id = "${client}"\nscope = "${scope}"\n`;
+
+  it.each(['write_file', 'append_file', 'edit_file', 'apply_patch'])(
+    'preserves OAuth reference bytes through %s and publishes one file change', async name => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('all_files_auto');
+      await setTmpWorkspace();
+      const onFileWritten = vi.fn();
+      const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+      let encoded = reference;
+      for (let depth = 0; depth < 3; depth++) encoded = encodeURIComponent(encoded);
+      const payloads = [
+        reference,
+        JSON.stringify({ client_id: client, scopes: ['gmail', 'drive', 'documents', 'spreadsheets', 'calendar', 'contacts', 'tasks']
+          .map(value => `https://www.googleapis.com/auth/${value}`), note: '界🙂' }) + '\n',
+        `// Reference constants; no request is made.\nconst client = "${client}";\nconst scope = "${scope}";\n`,
+        encoded + '\n',
+      ];
+      for (const [index, content] of payloads.entries()) {
+        const target = path.join(tmpDir, `reference-${index}.txt`);
+        const ctx = makeCtx();
+        ctx.state.readFileState = new Map();
+        let base = '';
+        if (name !== 'write_file') {
+          const created = await tools.find(t => t.name === 'write_file')!.execute({ path: target, content: 'SAFE\n' }, ctx);
+          expect(created.isError, created.content).toBeFalsy();
+          base = /revision="([^"]+)"/.exec(created.content)![1];
+        }
+        onFileWritten.mockClear();
+        const input = name === 'write_file' ? { path: target, content }
+          : name === 'append_file' ? { path: target, content, base_revision: base }
+          : name === 'edit_file' ? { path: target, old_string: 'SAFE\n', new_string: content }
+          : { patch: `*** Begin Patch\n*** Update File: ${target}\n@@\n-SAFE\n${content.slice(0, -1).split('\n').map(line => '+' + line).join('\n')}\n*** End Patch` };
+        const tool = tools.find(t => t.name === name)!;
+        const result = await tool.execute(input, ctx);
+        expect(result.isError, result.content).toBeFalsy();
+        const expected = Buffer.from(name === 'append_file' ? 'SAFE\n' + content : content);
+        expect(fs.readFileSync(target)).toEqual(expected);
+        expect(onFileWritten).toHaveBeenCalledOnce();
+        expect(onFileWritten.mock.calls[0][0]).toBe(target);
+        if (name === 'append_file') {
+          const replay = await tool.execute(input, ctx);
+          expect(replay.isError, replay.content).toBeFalsy();
+          expect(replay.content).toContain('replayed="true"');
+          expect(fs.readFileSync(target)).toEqual(expected);
+          expect(onFileWritten).toHaveBeenCalledOnce();
+        }
+      }
+    },
+  );
+
+  it.each(['bash', 'interactive_cli'])(
+    'writes a quoted OAuth reference once through %s without starting authorization', async name => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('all_files_auto');
+      await setTmpWorkspace();
+      const target = path.join(tmpDir, 'quoted-reference.txt');
+      const counter = path.join(tmpDir, 'executions.txt');
+      const payload = `${client} https://www.googleapis.com/auth/drive`;
+      const command = testNodeLiteralCommand(`const fs = require('node:fs'); fs.appendFileSync(${JSON.stringify(counter)}, '1'); fs.writeFileSync(${JSON.stringify(target)}, ${JSON.stringify(payload)});`);
+      const tool = lt.createLocalTools({ userId: 'u1' }).find(t => t.name === name)!;
+      const ctx = makeCtx();
+      const result = await tool.execute({ command, ...(name === 'interactive_cli' ? { action: 'start' } : { timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }) }, ctx);
+      expect(result.isError, result.content).toBeFalsy();
+      if (name === 'interactive_cli') {
+        let view = JSON.parse(result.content);
+        await vi.waitFor(async () => {
+          if (view.status === 'running') {
+            const read = await tool.execute({ action: 'read', session_id: view.session_id }, ctx);
+            expect(read.isError, read.content).toBeFalsy();
+            view = JSON.parse(read.content);
+          }
+          expect(view.status).toBe('exited');
+        }, { timeout: SHELL_SUCCESS_TIMEOUT_MS, interval: 25 });
+        expect(view.exit_code).toBe(0);
+      }
+      expect(fs.readFileSync(target)).toEqual(Buffer.from(payload));
+      expect(fs.readFileSync(counter, 'utf8')).toBe('1');
+    },
+  );
+
+  it.each(['write_file', 'append_file', 'edit_file', 'apply_patch'])(
+    'keeps out-of-workspace OAuth reference writes denied through %s', async name => {
+      const { lt, perm } = await loadModules();
+      perm.setLocalExecMode('workspace_approval');
+      await setTmpWorkspace();
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-oauth-outside-'));
+      try {
+        const target = path.join(outside, 'untouched.txt');
+        fs.writeFileSync(target, 'SAFE\n');
+        const onFileWritten = vi.fn();
+        const tool = lt.createLocalTools({ userId: 'u1', onFileWritten }).find(t => t.name === name)!;
+        const input = name === 'write_file' ? { path: target, content: reference }
+          : name === 'append_file' ? { path: target, content: reference, base_revision: 'file_rev_abcdefghijklmnop' }
+          : name === 'edit_file' ? { path: target, old_string: 'SAFE\n', new_string: reference }
+          : { patch: `*** Begin Patch\n*** Update File: ${target}\n@@\n-SAFE\n${reference.trimEnd().split('\n').map(line => '+' + line).join('\n')}\n*** End Patch` };
+        const result = await tool.execute(input, makeCtx());
+        expect(result.isError, result.content).toBe(true);
+        expect(result.content).toContain('E_PATH_OUT_OF_SCOPE');
+        expect(fs.readFileSync(target)).toEqual(Buffer.from('SAFE\n'));
+        expect(onFileWritten).not.toHaveBeenCalled();
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('preserves Unicode, malformed escapes, scope look-alikes and encoded content verbatim', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const write = lt.createLocalTools({ userId: 'u1' }).find(t => t.name === 'write_file')!;
+    let encoded = `${client} ${scope}`;
+    for (let depth = 0; depth < 4; depth++) encoded = encodeURIComponent(encoded);
+    const payloads = [
+      'const text = "界🙂+\ud800";\r\n',
+      `${client} %ZZ ${encodeURIComponent(scope)}`,
+      `${client} https://www.googleapis.com/auth/driveish`,
+      `${client} https://www.googleapis.com/auth/drive-archive"`,
+      `${client} https://www.googleapis.com/auth/documentsBackup"`,
+      `32555940558.apps.googleusercontent.com ${scope}`,
+      encoded,
+    ];
+    for (const [index, content] of payloads.entries()) {
+      const target = path.join(tmpDir, `allowed-${index}.txt`);
+      const result = await write.execute({ path: target, content }, makeCtx());
+      expect(result.isError, result.content).toBeFalsy();
+      const bytes = Buffer.from(content);
+      expect(fs.readFileSync(target)).toEqual(bytes);
+      expect(result.content).toContain(`file_hash="sha256:${createHash('sha256').update(bytes).digest('hex')}"`);
+    }
+  });
+});
+
 // ── Tool identity ─────────────────────────────────────────────────────────
 
 describe('local-tools › identity', () => {
@@ -208,6 +425,43 @@ describe('local-tools › identity', () => {
 });
 
 describe('local-tools › publish_outputs', () => {
+  it('preserves host filtering, replacement and explicit clearing through a program after invalid input', async () => {
+    const { runProgramWithTools } = await import('../../helpers/programmatic-tools');
+    const { lt } = await loadModules();
+    const draft = path.join(tmpDir, 'draft.json');
+    const final = path.join(tmpDir, '交付 #1 (final) %.json');
+    fs.writeFileSync(draft, 'draft');
+    fs.writeFileSync(final, 'final');
+    const publications: string[][] = [];
+    const publish = lt.createLocalTools({ onOutputsPublished: paths => {
+      publications.push([...paths]);
+      return paths.filter(candidate => candidate === draft || candidate === final);
+    } }).find(tool => tool.name === 'publish_outputs')!;
+    const result = await runProgramWithTools([publish], `
+      const invalid = await tools.publish_outputs({ paths: ['  ', null] });
+      if (invalid.ok || !invalid.content.includes('E_BAD_INPUT')) throw Error('Invalid selection accepted');
+      const draft = await tools.publish_outputs({ paths: ['draft.json', './draft.json', 'scratch.log'] });
+      if (!draft.ok) throw Error(draft.content);
+      const final = await tools.publish_outputs({ paths: ['交付 #1 (final) %.json'] });
+      if (!final.ok) throw Error(final.content);
+      const cleared = await tools.publish_outputs({ paths: [] });
+      if (!cleared.ok) throw Error(cleared.content);
+      json({ draft: JSON.parse(draft.content), final: JSON.parse(final.content), cleared: JSON.parse(cleared.content) });
+    `, tmpDir);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(publications).toEqual([[draft, path.join(tmpDir, 'scratch.log')], [final], []]);
+    const receipt = JSON.parse(result.content.slice(result.content.lastIndexOf('\n') + 1));
+    expect(receipt.draft).toMatchObject({ requested: 2, published: 1, outputs: [{ path: draft }] });
+    expect(receipt.final).toMatchObject({ requested: 1, published: 1, outputs: [{ path: final }] });
+    expect(receipt.cleared).toEqual({ requested: 0, published: 0, outputs: [] });
+    const url = new URL(receipt.final.outputs[0].url);
+    expect(url.protocol + '//' + url.hostname).toBe('chat-media://local');
+    expect(url.search + url.hash).toBe('');
+    expect(decodeURIComponent(url.pathname).replace(/^\/(?=[A-Za-z]:)/, '')).toBe(final.replace(/\\/g, '/'));
+    expect(fs.readFileSync(draft, 'utf8')).toBe('draft');
+    expect(fs.readFileSync(final, 'utf8')).toBe('final');
+  });
+
   it('accepts an explicit empty final-deliverable list', async () => {
     const { lt } = await loadModules();
     const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
@@ -218,7 +472,7 @@ describe('local-tools › publish_outputs', () => {
 
     expect(res.isError).toBeFalsy();
     expect(onOutputsPublished).toHaveBeenCalledWith([]);
-    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 0 });
+    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 0, outputs: [] });
   });
 
   it('does not treat a malformed non-empty list as an empty declaration', async () => {
@@ -249,7 +503,11 @@ describe('local-tools › publish_outputs', () => {
       path.join(tmpDir, 'out', 'report.pdf'),
       path.join(tmpDir, 'deck.pptx'),
     ]);
-    expect(JSON.parse(res.content)).toEqual({ published: 2, requested: 2 });
+    const receipt = JSON.parse(res.content);
+    expect(receipt).toMatchObject({ published: 2, requested: 2 });
+    expect(receipt.outputs.map((output: any) => output.path)).toEqual([
+      path.join(tmpDir, 'out', 'report.pdf'), path.join(tmpDir, 'deck.pptx'),
+    ]);
   });
 
   it('reports the filtered selection without turning a zero match into a task error', async () => {
@@ -261,9 +519,32 @@ describe('local-tools › publish_outputs', () => {
     const res = await publish.execute({ paths: ['not-eligible.xlsx'] }, makeCtx());
 
     expect(res.isError).toBeFalsy();
-    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 1 });
+    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 1, outputs: [] });
     expect(onOutputsPublished).toHaveBeenCalledTimes(1);
     expect(onOutputsPublished).toHaveBeenCalledWith([path.join(tmpDir, 'not-eligible.xlsx')]);
+  });
+
+  it('returns usable references only for requested files accepted by the host', async () => {
+    const { lt } = await loadModules();
+    const name = '交付 #1 (final) %.json';
+    const output = path.join(tmpDir, name);
+    fs.writeFileSync(output, '{"ok":true}');
+    const foreign = path.join(tmpDir, 'not-requested.json');
+    const publish = lt.createLocalTools({ onOutputsPublished: () => [output, output, foreign] })
+      .find((t) => t.name === 'publish_outputs')!;
+    const result = await publish.execute({ paths: [name, './' + name, 'rejected.json'] }, makeCtx());
+    const receipt = JSON.parse(result.content);
+    expect(receipt).toMatchObject({ published: 1, requested: 2 });
+    expect(receipt.outputs).toHaveLength(1);
+    expect(receipt.outputs[0].path).toBe(output);
+    const url = new URL(receipt.outputs[0].url);
+    expect(url.protocol).toBe('chat-media:');
+    expect(url.hostname).toBe('local');
+    expect(url.search + url.hash).toBe('');
+    const decoded = decodeURIComponent(url.pathname);
+    expect(process.platform === 'win32' ? decoded.slice(1) : decoded).toBe(output.replace(/\\/g, '/'));
+    expect(receipt.outputs[0].url).not.toMatch(/[()\s]/);
+    expect(fs.readFileSync(output, 'utf8')).toBe('{"ok":true}');
   });
 });
 
@@ -428,36 +709,41 @@ describe('local-tools › bash access modes', () => {
     }
   });
 
-  it('blocks synthesized Google OAuth URLs that reuse the Cloud SDK client for Workspace scopes', async () => {
+  it('prints an OAuth reference URL once without opening authorization', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_auto');
-    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1' }).find(t => t.name === 'bash')!;
+    const counter = path.join(tmpDir, 'reference-print-count.txt');
+    const url = 'https://accounts.google.com/o/oauth2/auth?client_id=32555940559.apps.googleusercontent.com&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly';
     const res = await bash.execute({
-      command: 'open "https://accounts.google.com/o/oauth2/auth?client_id=32555940559.apps.googleusercontent.com&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly"',
-      timeoutMs: 5000,
+      command: testNodeLiteralCommand(`require('node:fs').appendFileSync(${JSON.stringify(counter)}, '1'); process.stdout.write(${JSON.stringify(url)});`),
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeCtx());
 
-    expect(res.isError).toBe(true);
-    expect(res.content).toContain('E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH');
-    expect(res.content).toContain('Do not synthesize Google OAuth URLs');
+    expect(res.isError, res.content).toBeFalsy();
+    expect(res.content).toContain(url);
+    expect(fs.readFileSync(counter, 'utf8')).toBe('1');
   });
 
-  it('blocks running scripts that reuse the Cloud SDK client for Workspace scopes', async () => {
+  it('runs a local script containing OAuth constants once', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_auto');
-    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
-    const scriptPath = path.join(tmpDir, 'bad-oauth.py');
-    fs.writeFileSync(
-      scriptPath,
-      'CLIENT_ID = "32555940559.apps.googleusercontent.com"\nSCOPES = "https://www.googleapis.com/auth/gmail.readonly"\n',
-    );
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1' }).find(t => t.name === 'bash')!;
+    const scriptPath = path.join(tmpDir, 'oauth-reference.cjs');
+    const counter = path.join(tmpDir, 'reference-script-count.txt');
+    fs.writeFileSync(scriptPath,
+      'const CLIENT_ID = "32555940559.apps.googleusercontent.com";\n'
+      + 'const SCOPES = "https://www.googleapis.com/auth/gmail.readonly";\n'
+      + `require('node:fs').appendFileSync(${JSON.stringify(counter)}, '1');\n`);
     const res = await bash.execute({
-      command: `python3 ${JSON.stringify(scriptPath)}`,
-      timeoutMs: 5000,
+      command: `node ${JSON.stringify(scriptPath)}`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeCtx());
 
-    expect(res.isError).toBe(true);
-    expect(res.content).toContain('E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH');
+    expect(res.isError, res.content).toBeFalsy();
+    expect(fs.readFileSync(counter, 'utf8')).toBe('1');
   });
 
   it('re-checks the local access mode on each call', async () => {
@@ -3489,20 +3775,18 @@ describe('local-tools › write_file', () => {
     expect(fs.existsSync(path.join(tmpDir, 'out', 'no-scope.txt'))).toBe(false);
   });
 
-  it('refuses scripts that reuse the Cloud SDK OAuth client for Workspace scopes', async () => {
+  it('saves an OAuth reference script verbatim and publishes it once', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
     const onFileWritten = vi.fn();
-    const wf = lt.createLocalTools({ onFileWritten }).find((t) => t.name === 'write_file')!;
-    const res = await wf.execute({
-      path: 'bad-oauth.py',
-      content: 'CLIENT_ID = "32555940559.apps.googleusercontent.com"\nSCOPES = "https://www.googleapis.com/auth/drive.readonly"\n',
-    }, makeCtx());
+    const wf = lt.createLocalTools({ userId: 'u1', onFileWritten }).find(t => t.name === 'write_file')!;
+    const content = 'CLIENT_ID = "32555940559.apps.googleusercontent.com"\nSCOPES = "https://www.googleapis.com/auth/drive.readonly"\n';
+    const res = await wf.execute({ path: 'oauth-reference.py', content }, makeCtx());
 
-    expect(res.isError).toBe(true);
-    expect(res.content).toContain('E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH');
-    expect(fs.existsSync(path.join(tmpDir, 'bad-oauth.py'))).toBe(false);
-    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(res.isError, res.content).toBeFalsy();
+    expect(fs.readFileSync(path.join(tmpDir, 'oauth-reference.py'))).toEqual(Buffer.from(content));
+    expect(onFileWritten).toHaveBeenCalledOnce();
   });
 
   it('does NOT fire onFileWritten when the underlying write fails', async () => {
@@ -3581,6 +3865,181 @@ describe('local-tools › write_file', () => {
 });
 
 describe('local-tools › append_file', () => {
+  it('preserves valid UTF-8 boundary bytes, receipts and exact replay', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find(tool => tool.name === 'write_file')!;
+    const append = tools.find(tool => tool.name === 'append_file')!;
+    // Explicit bytes are independent of the validator: empty, ASCII/NUL,
+    // two/three/four-byte boundaries, replacement character, BOM and CRLF.
+    const shapes = [[], [0x00, 0x41, 0x7f], [0xc2, 0x80, 0xdf, 0xbf],
+      [0xe0, 0xa0, 0x80, 0xed, 0x9f, 0xbf, 0xee, 0x80, 0x80, 0xef, 0xbf, 0xbf],
+      [0xf0, 0x90, 0x80, 0x80, 0xf4, 0x8f, 0xbf, 0xbf],
+      [0xef, 0xbf, 0xbd], [0xef, 0xbb, 0xbf, 0x0d, 0x0a]];
+    const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    for (const [n, shape] of shapes.entries()) {
+      const target = path.join(tmpDir, `utf8-valid-${n}.txt`);
+      const before = Buffer.from(shape);
+      const ctx = makeCtx();
+      const first = await write.execute({ path: target, content: before.toString('utf8') }, ctx);
+      expect(first.isError, first.content).toBeFalsy();
+      expect(fs.readFileSync(target)).toEqual(before);
+      onFileWritten.mockClear();
+      const input = { path: target, content: '尾🙂\r\n', base_revision: /revision="([^"]+)"/.exec(first.content)![1] };
+      const after = Buffer.concat([before, Buffer.from(input.content)]);
+      const result = await append.execute(input, ctx);
+      expect(result.isError, result.content).toBeFalsy();
+      expect(result.content).toContain(`file_hash="${hash(after)}"`);
+      expect(result.content).toContain(`total_bytes="${after.length}"`);
+      expect(result.observations?.fileChanges).toEqual([{
+        operation: 'update', sourcePath: target, beforeExists: true, afterExists: true,
+        beforeHash: hash(before), afterHash: hash(after), beforeBytes: before.length,
+        afterBytes: after.length, coverage: 'exact',
+      }]);
+      expect(fs.readFileSync(target)).toEqual(after);
+      expect((await append.execute(input, ctx)).content).toContain('replayed="true"');
+      expect(fs.readFileSync(target)).toEqual(after);
+      expect(onFileWritten).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('rejects invalid UTF-8 without writing or poisoning the original revision and replay', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find(tool => tool.name === 'write_file')!;
+    const append = tools.find(tool => tool.name === 'append_file')!;
+    // Lone continuation, overlong encodings, surrogate, out-of-range code
+    // point, truncation and forbidden lead byte, including an invalid suffix.
+    const shapes = [[0x80], [0xc0, 0x80], [0xe0, 0x80, 0x80], [0xed, 0xa0, 0x80],
+      [0xf4, 0x90, 0x80, 0x80], [0xef, 0xbf], [0xff], [0x41, 0xf0, 0x90, 0x80]];
+    for (const [n, shape] of shapes.entries()) {
+      const target = path.join(tmpDir, `utf8-invalid-${n}.txt`);
+      const ctx = makeCtx();
+      const first = await write.execute({ path: target, content: 'original\n' }, ctx);
+      expect(first.isError).toBeFalsy();
+      onFileWritten.mockClear();
+      const input = { path: target, content: 'tail\n', base_revision: /revision="([^"]+)"/.exec(first.content)![1] };
+      const invalid = Buffer.from(shape);
+      fs.writeFileSync(target, invalid);
+      const result = await append.execute(input, ctx);
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('E_NOT_EDITABLE');
+      expect(result.content).not.toContain('revision=');
+      expect(result.observations?.fileChanges).toBeUndefined();
+      expect(fs.readFileSync(target)).toEqual(invalid);
+      expect(onFileWritten).not.toHaveBeenCalled();
+      // A rejected validation must not consume the original revision or
+      // register an append that later masquerades as a successful replay.
+      fs.writeFileSync(target, 'original\n');
+      const recovered = await append.execute(input, ctx);
+      expect(recovered.isError, recovered.content).toBeFalsy();
+      expect(recovered.content).toContain('replayed="false"');
+      expect((await append.execute(input, ctx)).content).toContain('replayed="true"');
+      expect(fs.readFileSync(target)).toEqual(Buffer.from('original\ntail\n'));
+      expect(onFileWritten).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('keeps full-file receipts and observations exact across SHA-256 block boundaries', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const write = tools.find(tool => tool.name === 'write_file')!;
+    const append = tools.find(tool => tool.name === 'append_file')!;
+    const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    for (const size of [0, 55, 56, 63, 64, 65]) {
+      const target = path.join(tmpDir, `hash-boundary-${size}.txt`);
+      const ctx = makeCtx();
+      let body = Buffer.from('a'.repeat(size));
+      const first = await write.execute({ path: target, content: body.toString() }, ctx);
+      expect(first.isError).toBeFalsy();
+      let base = /revision="([^"]+)"/.exec(first.content)![1];
+      for (const text of ['界🙂\r\n', '\u0000tail\ud800']) {
+        const input = { path: target, content: text, base_revision: base };
+        const before = body;
+        body = Buffer.concat([before, Buffer.from(text)]);
+        const result = await append.execute(input, ctx);
+        expect(result.isError, result.content).toBeFalsy();
+        expect(result.content).toContain(`file_hash="${hash(body)}"`);
+        expect(result.content).toContain(`total_bytes="${body.length}"`);
+        expect(result.observations?.fileChanges).toEqual([{
+          operation: 'update', sourcePath: target, beforeExists: true, afterExists: true,
+          beforeHash: hash(before), afterHash: hash(body), beforeBytes: before.length,
+          afterBytes: body.length, coverage: 'exact',
+        }]);
+        expect(fs.readFileSync(target)).toEqual(body);
+        const replay = await append.execute(input, ctx);
+        expect(replay.isError).toBeFalsy();
+        expect(replay.content).toContain('replayed="true"');
+        expect(replay.content).toContain(`file_hash="${hash(body)}"`);
+        expect(fs.readFileSync(target)).toEqual(body);
+        base = /revision="([^"]+)"/.exec(result.content)![1];
+      }
+      // Same size and mtime cannot stand in for checking current content.
+      const stat = fs.statSync(target);
+      const external = Buffer.from(body);
+      external[0] ^= 1;
+      fs.writeFileSync(target, external);
+      fs.utimesSync(target, stat.atime, stat.mtime);
+      const stale = await append.execute({ path: target, content: 'unseen', base_revision: base }, ctx);
+      expect(stale.isError).toBe(true);
+      expect(stale.content).toContain('E_STALE');
+      expect(stale.content).toContain(`file_hash="${hash(external)}"`);
+      expect(fs.readFileSync(target)).toEqual(external);
+    }
+  });
+
+  it.each([0, 3])('does not acknowledge or replay an append after a write fails with %i bytes written', async bytesWritten => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('all_files_auto');
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find(tool => tool.name === 'write_file')!;
+    const append = tools.find(tool => tool.name === 'append_file')!;
+    const target = path.join(tmpDir, 'failed-append.txt');
+    const ctx = makeCtx();
+    const first = await write.execute({ path: target, content: 'before\n' }, ctx);
+    expect(first.isError).toBeFalsy();
+    onFileWritten.mockClear();
+    const input = { path: target, content: 'tail🙂\n', base_revision: /revision="([^"]+)"/.exec(first.content)![1] };
+    const mutableFs = await import('node:fs').then(mod => mod.default);
+    const original = mutableFs.appendFileSync;
+    const fault = vi.spyOn(mutableFs, 'appendFileSync').mockImplementationOnce((...args) => {
+      if (bytesWritten) original(args[0], Buffer.from(args[1] as Buffer).subarray(0, bytesWritten));
+      throw Object.assign(new Error('synthetic full disk'), { code: 'ENOSPC' });
+    });
+    syncBuiltinESMExports();
+    let failed;
+    try { failed = await append.execute(input, ctx); }
+    finally { fault.mockRestore(); syncBuiltinESMExports(); }
+    expect(failed.isError).toBe(true);
+    expect(failed.content).toContain('E_APPEND_FAILED');
+    expect(failed.content).not.toContain('replayed=');
+    expect(failed.observations?.fileChanges).toBeUndefined();
+    expect(onFileWritten).not.toHaveBeenCalled();
+    const retry = await append.execute(input, ctx);
+    if (bytesWritten) {
+      expect(retry.isError).toBe(true);
+      expect(retry.content).toContain('E_STALE');
+      expect(fs.readFileSync(target)).toEqual(Buffer.concat([Buffer.from('before\n'), Buffer.from(input.content).subarray(0, bytesWritten)]));
+      expect(onFileWritten).not.toHaveBeenCalled();
+    } else {
+      expect(retry.isError).toBeFalsy();
+      expect(retry.content).toContain('replayed="false"');
+      expect((await append.execute(input, ctx)).content).toContain('replayed="true"');
+      expect(fs.readFileSync(target)).toEqual(Buffer.from('before\n' + input.content));
+      expect(onFileWritten).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it.each(['edit_file', 'apply_patch'])('appends using the fresh %s receipt across rounds, while rejecting the old revision', async (toolName) => {
     // A02: read V1 -> edit V2 -> append with V1 failed because edit returned
     // only a hash. Use actual receipts, with a fresh context for each round.
@@ -4156,6 +4615,40 @@ describe('local-tools › append_file', () => {
 // ── Local access modes + PDF tools ──────────────────────────────────────
 
 describe('local-tools › create_pdf markdown', () => {
+  it.each([
+    ['markdown', '# Revenue 42'],
+    ['html', '<!doctype html><html><body><h1>Revenue 42</h1></body></html>'],
+  ])('creates from %s through a program with exact render options and collision-safe delivery after bad input', async (sourceType, content) => {
+    const { runProgramWithTools } = await import('../../helpers/programmatic-tools');
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const requested = path.join(tmpDir, '季度 report.pdf');
+    const saved = path.join(tmpDir, '季度 report-2.pdf');
+    fs.writeFileSync(requested, 'user-owned-original');
+    const onFileWritten = vi.fn();
+    const createPdf = lt.createLocalTools({ userId: 'u1', onFileWritten })
+      .find(tool => tool.name === 'create_pdf')!;
+    const result = await runProgramWithTools([createPdf], `
+      const invalid = await tools.create_pdf({ path: 'invalid.pdf', source_type: 'text', content: 'Must not render' });
+      if (invalid.ok || !invalid.content.includes('E_BAD_INPUT')) throw Error('Unknown source accepted');
+      const created = await tools.create_pdf(${JSON.stringify({ path: '季度 report.pdf', source_type: sourceType, content, pageSize: 'Letter', landscape: true })});
+      if (!created.ok) throw Error(created.content);
+      text(created.content);
+    `, tmpDir);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(printToPDF).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ pageSize: 'Letter', landscape: true }));
+    const html = Buffer.from(loadURL.mock.calls[0][0].split('base64,')[1], 'base64').toString('utf8');
+    expect(html).toContain('<h1>Revenue 42</h1>');
+    if (sourceType === 'html') expect(html).toBe(content);
+    expect(fs.readFileSync(requested, 'utf8')).toBe('user-owned-original');
+    expect(fs.readFileSync(saved, 'utf8')).toBe('%PDF-1.4 test');
+    expect(fs.existsSync(path.join(tmpDir, 'invalid.pdf'))).toBe(false);
+    expect(onFileWritten).toHaveBeenCalledExactlyOnceWith(saved);
+    expect(result.content).toContain(saved);
+    expect(result.content).toContain('<file-renamed>');
+  });
+
   it('rejects an unknown source type without rendering or creating a file', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_auto');

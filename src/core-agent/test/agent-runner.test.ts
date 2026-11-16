@@ -199,6 +199,34 @@ describe("model history continuity", () => {
     expect(JSON.stringify(requests[4].messages)).toContain("REFERENCE_PIXELS");
   });
 
+  it("shows the model every authoring set returned by one parallel tool round", async () => {
+    const requests: CompletionParams[] = [];
+    const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+    const responses: CompletionResult[] = [
+      { model: "mock-model", usage, stopReason: "tool_use", content: [
+        { type: "tool_use", id: "reference", name: "inspect", input: { source: "reference" } },
+        { type: "tool_use", id: "clip", name: "inspect", input: { source: "clip" } },
+      ] },
+      { model: "mock-model", usage, stopReason: "end_turn", content: [{ type: "text", text: "Noted" }] },
+    ];
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => createMockProvider(responses, request => requests.push(request)));
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
+      providers: registry, session: new Session(), evolution: { enabled: false },
+      tools: [defineTool({ name: "inspect", description: "Inspect", inputSchema: { type: "object" }, executionMode: "parallel",
+        async execute(input) {
+          const source = String((input as { source?: string }).source).toUpperCase();
+          return { content: `${source} frames`, imageRetention: "active_turn", images: [{ data: `${source}_PIXELS`, mediaType: "image/png" }] };
+        },
+      })],
+    });
+    expect((await runner.run({ message: "Remake the reference with my clip" })).text).toBe("Noted");
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1].messages)).toContain("REFERENCE_PIXELS");
+    expect(JSON.stringify(requests[1].messages)).toContain("CLIP_PIXELS");
+  });
+
   it("keeps one transport context across tool rounds and replaces it for the next user task", async () => {
     const seen: (object | undefined)[] = [];
     const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };

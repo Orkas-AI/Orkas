@@ -1,0 +1,10 @@
+/* Product context extends the shared composer and history without new controls. */
+.commerce-settings>.commerce-product-field{flex:1.5;min-width:140px;max-width:260px}
+#product-association-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+.commerce-product-field{justify-content:flex-end}
+#records>.section-head{flex-wrap:wrap;gap:12px}
+#records>.section-head>.field{margin-inline-start:auto;width:240px;max-width:100%;min-width:0}
+#product-history-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+.library-product-actions{flex-basis:100%;min-width:0;font-size:12px}
+#library-product-association{width:240px;max-width:100%;min-width:0}
+#product-media-feedback{overflow-wrap:anywhere}

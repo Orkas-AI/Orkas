@@ -1,4 +1,9 @@
 {
+  "local.delete_file.user_continue": "Eliminación confirmada. Continúa.",
+  "apps.builtin_listing_title": "Espacio de comercio",
+  "apps.builtin_listing_description": "Conecta tiendas y crea textos de producto, imágenes y vídeos",
+  "apps.builtin_content_title": "Taller de contenido",
+  "apps.builtin_content_description": "Empieza con una idea o tus propios medios",
   "errors.conversation_recovery_conflict": "Esta tarea necesita recuperarse antes de abrirla. Las copias existentes se han conservado. Contacta con soporte.",
   "connectors.account_choice.title": "Elige la cuenta que quieres conectar",
   "connectors.account_choice.message": "Selecciona la cuenta o tienda autorizada para esta conexión.",
@@ -135,7 +140,6 @@
   "errors.model_currently_unavailable": "Este modelo no está disponible en este momento",
   "errors.model_config_unavailable": "Hay un modelo configurado, pero su credencial no se puede usar actualmente. Revisa la clave de API, el estado de la sesión o el modelo alternativo en Configuración.",
   "errors.model_oauth_expired": "La autorización de {provider} ha caducado. Vuelve a autorizar esta cuenta en Configuración o cambia a un modelo alternativo.",
-  "errors.model_credits_insufficient": "No hay suficientes créditos, así que la tarea se ha detenido. Después de añadir créditos, vuelve a esta tarea y escribe “Continuar” para seguir donde se quedó. También puedes cambiar a un modelo disponible en Configuración.",
   "errors.custom_endpoint_suspect": "Tu endpoint de modelo personalizado falló en varias solicitudes consecutivas (HTTP {status}); puede que haya dejado de funcionar o cambiado de ubicación. Revisa la URL y la clave de API en Configuración → Modelos o cambia a otro modelo para continuar.",
   "errors.model_output_cap_repeated": "Este modelo alcanzó su límite de salida por respuesta varias veces seguidas; puede que sea demasiado bajo para esta tarea. Cambia a un modelo con un límite de salida mayor en Configuración o divide la tarea.",
   "errors.model_provider_balance_insufficient": "Tu cuenta del proveedor de modelos configurado no tiene saldo (no son los créditos de Orkas). Recarga el saldo con ese proveedor o cambia de modelo en Configuración.",
@@ -168,10 +172,8 @@
   "agent.run_failed": "⚠️ Error en la ejecución del agente: {message}",
   "model.retrying": "Reintentando",
   "model.retrying_n": "Reintento {attempt}",
-  "model.dev_marker": "[DEV]",
   "model.credential_fallback": "La credencial del modelo de {provider} ya no es válida. Se cambia a un modelo alternativo para continuar la tarea; vuelve a autorizar o actualiza la credencial más tarde en Configuración.",
   "model.timeout_fallback": "El modelo de {provider} no comenzó a responder a tiempo. Se cambia a un modelo alternativo para continuar la tarea.",
-  "model.server_model_fallback": "{from} no está disponible temporalmente. Se cambió a {to}.",
   "model.tool_loop_limit_reached": "(Se alcanzó el límite de rondas del bucle de herramientas)",
   "model.run_aborted": "Ejecución interrumpida",
   "model.max_retries_exceeded": "Se superó el máximo de reintentos",
@@ -367,6 +369,11 @@
   "errors.model_request_rejected_repeated": "Esta solicitud se rechazó varias veces seguidas, así que reintentarla sin cambios no dará otro resultado. Cambia a otro modelo en Configuración y vuelve a intentarlo, o quita las imágenes o archivos adjuntos y vuelve a enviar.",
   "errors.provider_reply_detail": "Respuesta del proveedor: {detail}",
   "cli_agent.repeated_failure_hint": "“{name}” volvió a fallar. Puedes pedirle a @Commander que se encargue de esta tarea.",
-  "desktop.open": "Abrir",
-  "desktop.exit": "Salir"
+  "desktop.open": "Abrir Orkas",
+  "desktop.exit": "Salir de Orkas",
+  "video_budget.own_key_notice": "Se han generado {count} archivo(s) con tu propia cuenta de servicio, que te factura directamente.",
+  "errors.model_request_rejected_no_retry": "El servicio del modelo rechazó esta solicitud. Se han detenido los reintentos automáticos.",
+  "errors.model_context_capacity_insufficient": "El contexto actual supera la capacidad segura de los modelos seleccionados. Esta llamada al modelo no se ha enviado. Elige un modelo con una ventana de contexto mayor o inicia una conversación nueva.",
+  "video.delivery_retained": "Adjunto {index}: se conserva la versión entregada {version}.",
+  "video.delivery_later_edits": "Los cambios posteriores no están incluidos en esta versión."
 }

@@ -231,6 +231,42 @@ describe('local_agents/backends/_acp process lifecycle', () => {
     }
   });
 
+  it.each(['success', 'failure', 'answer', 'truncated'])('preserves the final stdout record at EOF: %s', async scenario => {
+    const fixture = String.raw`
+      const scenario = ${JSON.stringify(scenario)};
+      const send = m => process.stdout.write(JSON.stringify(m) + '\n');
+      require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+        const m = JSON.parse(line);
+        if (m.method === 'initialize') send({ id: m.id, result: { protocolVersion: 1 } });
+        if (m.method === 'session/new') send({ id: m.id, result: { sessionId: 'eof-session' } });
+        if (m.method !== 'session/prompt') return;
+        const answer = { method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { text: 'Final 中文🙂 reply.' } } } };
+        if (scenario !== 'answer') send(answer);
+        const final = scenario === 'truncated' ? '{"id":100,"result":' : JSON.stringify(
+          scenario === 'answer' ? answer : { id: m.id, ...(scenario === 'failure'
+            ? { error: { code: -32000, message: 'Fixture connection failed' } }
+            : { result: { stopReason: 'end_turn' } }) });
+        const bytes = Buffer.from(final);
+        const split = bytes.indexOf(Buffer.from('中')) + 1;
+        process.stdout.write(bytes.subarray(0, split));
+        setTimeout(() => process.stdout.end(bytes.subarray(split), () => process.exit(0)), 20);
+      });
+    `;
+    const events: any[] = [];
+    await makeAcpBackend({ logName: 'local-agents:test-acp', argv: ['-e', fixture], clientName: 'orkas-test' }).run({
+      binPath: TEST_NODE, cwd: process.cwd(), prompt: 'Complete the EOF fixture',
+      signal: new AbortController().signal, timeoutMs: 2_000, onEvent: event => events.push(event),
+    });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done', sessionId: 'eof-session', output: 'Final 中文🙂 reply.' });
+    expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual(['Final 中文🙂 reply.']);
+    expect(events.at(-1).status).toBe(scenario === 'success' ? 'completed' : 'failed');
+    if (scenario === 'failure') expect(events.at(-1).error).toBe('Fixture connection failed');
+    if (scenario === 'truncated') expect(events).toContainEqual({ type: 'raw-line', line: '{"id":100,"result":' });
+    // A final text delta alone must not invent the missing prompt response.
+    if (scenario === 'answer') expect(events.at(-1).error).toBe('cli closed without prompt result');
+  });
+
   it.each(['missing-terminal', 'upstream-error'] as const)('preserves failure evidence for %s', async mode => {
     const events: any[] = [];
     let diagnosticReceived!: () => void;

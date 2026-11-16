@@ -1,4 +1,9 @@
 {
+  "local.delete_file.user_continue": "Silme onaylandı. Lütfen devam et.",
+  "apps.builtin_listing_title": "E-ticaret çalışma alanı",
+  "apps.builtin_listing_description": "Mağazaları bağlayın; ürün metinleri, görseller ve videolar oluşturun",
+  "apps.builtin_content_title": "İçerik atölyesi",
+  "apps.builtin_content_description": "Bir fikirle veya kendi medyanızla başlayın",
   "errors.conversation_recovery_conflict": "Bu görevin açılabilmesi için kurtarılması gerekiyor. Mevcut kopyalar korundu. Yardım için destek ekibiyle iletişime geçin.",
   "connectors.account_choice.title": "Bağlanacak hesabı seçin",
   "connectors.account_choice.message": "Bu bağlantıda kullanılacak yetkili hesabı veya mağazayı seçin.",
@@ -135,7 +140,6 @@
   "errors.model_currently_unavailable": "Bu model şu anda kullanılamıyor",
   "errors.model_config_unavailable": "Bir model yapılandırılmış, ancak kimlik bilgileri şu anda kullanılamıyor. Ayarlar'dan API anahtarını, oturum durumunu veya yedek modeli kontrol edin.",
   "errors.model_oauth_expired": "{provider} yetkilendirmesinin süresi doldu. Ayarlar'dan bu hesabı yeniden yetkilendirin veya yedek modele geçin.",
-  "errors.model_credits_insufficient": "Yeterli kredi olmadığı için görev durdu. Kredi ekledikten sonra bu göreve dönüp “Devam et” yazın; görev kaldığı yerden sürer. Ayarlar'dan kullanılabilir bir modele de geçebilirsiniz.",
   "errors.custom_endpoint_suspect": "Özel model uç noktanız art arda birkaç istekte başarısız oldu (HTTP {status}); çalışmıyor veya taşınmış olabilir. Ayarlar → Modeller bölümünden API URL'sini ve anahtarını kontrol edin veya devam etmek için başka bir modele geçin.",
   "errors.model_output_cap_repeated": "Bu model art arda birkaç kez yanıt başına çıktı sınırına ulaştı; bu görev için sınır yetersiz olabilir. Ayarlar'dan daha yüksek çıktı sınırı olan bir modele geçin veya görevi bölün.",
   "errors.model_provider_balance_insufficient": "Yapılandırdığınız model sağlayıcısı hesabının bakiyesi tükendi (Orkas kredisi değil). Sağlayıcıya bakiye yükleyin veya Ayarlar'dan modeli değiştirin.",
@@ -168,10 +172,8 @@
   "agent.run_failed": "⚠️ Ajan çalışması başarısız: {message}",
   "model.retrying": "Yeniden deneniyor",
   "model.retrying_n": "Yeniden deneme {attempt}",
-  "model.dev_marker": "[DEV]",
   "model.credential_fallback": "{provider} modelinin kimlik bilgileri artık geçerli değil. Görevin devam edebilmesi için yedek modele geçiliyor; daha sonra Ayarlar'dan yeniden yetkilendirin veya kimlik bilgilerini güncelleyin.",
   "model.timeout_fallback": "{provider} modeli zamanında yanıt vermeye başlamadı. Görevin devam edebilmesi için yedek modele geçiliyor.",
-  "model.server_model_fallback": "{from} geçici olarak kullanılamıyor. {to} modeline geçildi.",
   "model.tool_loop_limit_reached": "(Araç döngüsü tur sınırına ulaşıldı)",
   "model.run_aborted": "Çalışma iptal edildi",
   "model.max_retries_exceeded": "Maksimum yeniden deneme sayısı aşıldı",
@@ -367,6 +369,11 @@
   "errors.model_request_rejected_repeated": "Bu istek art arda reddedildi; aynı şekilde yeniden denemek sonucu değiştirmez. Ayarlar'dan başka bir modele geçip yeniden deneyin ya da görselleri veya ekleri kaldırıp yeniden gönderin.",
   "errors.provider_reply_detail": "Sağlayıcının yanıtı: {detail}",
   "cli_agent.repeated_failure_hint": "“{name}” yine başarısız oldu. Bunun yerine bu görevi @Commander'a devredebilirsiniz.",
-  "desktop.open": "Aç",
-  "desktop.exit": "Çıkış"
+  "desktop.open": "Orkas'ı aç",
+  "desktop.exit": "Orkas'tan çık",
+  "video_budget.own_key_notice": "{count} dosya kendi hizmet hesabınızla oluşturuldu ve doğrudan size faturalandırılır.",
+  "errors.model_request_rejected_no_retry": "Model hizmeti bu isteği reddetti. Otomatik yeniden denemeler durduruldu.",
+  "errors.model_context_capacity_insufficient": "Mevcut bağlam, seçilen modellerin güvenli kapasitesini aşıyor. Bu model çağrısı gönderilmedi. Daha büyük bağlam penceresine sahip bir model seçin veya yeni bir sohbet başlatın.",
+  "video.delivery_retained": "Ek {index}: teslim edilen {version} sürümü korunuyor.",
+  "video.delivery_later_edits": "Sonraki düzenlemeler bu sürüme dahil değil."
 }

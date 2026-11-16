@@ -53,7 +53,7 @@ function invoke(channel, payload) {
  * file bytes never cross contextBridge/base64 IPC.
  *
  * Scopes: `contexts` (Library), `project` (project files), `conversation`
- * (composer attachments for `opts.cid`). `opts.onResolved(indexes)` — when
+ * (composer attachments for `opts.cid`), `video_canvas` (production `opts.targetDir` of `opts.cid`). `opts.onResolved(indexes)` — when
  * given — is called synchronously, before main starts copying, with the
  * positions of the Files that resolved to a path; the composer paints their
  * chips immediately and byte-uploads only the path-less rest. Indexes carry
@@ -80,9 +80,8 @@ function importLocalFiles(scope, files, opts) {
     try { opts.onResolved(entries.map((entry) => entry.index)); }
     catch (_) { /* renderer callback must not block the import */ }
   }
-  const importScope = scope === 'project'
-    ? 'project'
-    : scope === 'conversation' ? 'conversation' : 'contexts';
+  const importScope = scope === 'project' || scope === 'conversation' || scope === 'video_canvas'
+    ? scope : 'contexts';
   return ipcRenderer.invoke('orkas.importLocalFiles', {
     scope: importScope,
     projectId: opts && opts.projectId ? String(opts.projectId) : '',
@@ -112,6 +111,7 @@ function logRecord(record) {
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
 const PUSH_EVENT_CHANNELS = new Set([
+  'settings:open-models-from-app',
   'preview-windows:owner-request',
   'preview-windows:files-changed',
   'preview-windows:close-request',
@@ -210,8 +210,6 @@ contextBridge.exposeInMainWorld('orkas', {
   env: () => ipcRenderer.invoke('orkas.env'),
   relaunch: () => ipcRenderer.invoke('orkas.relaunch'),
   reportUserActivity: () => ipcRenderer.send('orkas.userActivity'),
-  getNativeSearchEnabled: () => invoke('devtools.getNativeSearchEnabled'),
-  setNativeSearchEnabled: (enabled) => invoke('devtools.setNativeSearchEnabled', { enabled }),
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),

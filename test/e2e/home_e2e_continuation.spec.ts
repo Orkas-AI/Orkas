@@ -12,6 +12,18 @@ test.describe('Commander home continuation', () => {
 
   test('expands all remaining work with accurate counts and preserves expansion on refresh', async ({ orkas, appPage }, testInfo) => {
     await appPage.setViewportSize({ width: 1280, height: 720 });
+    // Refresh replaces the groups. Resolve and scroll the current target in one
+    // renderer task instead of holding a node through an actionability wait.
+    const scrollHome = (section: string, lastRow = false) => appPage.evaluate(({ section, lastRow }) => {
+      const group = document.querySelector(`.home-group[data-section="${section}"]`);
+      let target = group;
+      if (lastRow && group) {
+        const rows = group.querySelectorAll('.home-row');
+        target = rows.item(rows.length - 1);
+      }
+      if (!target) throw new Error('Home scroll target missing');
+      target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }, { section, lastRow });
     for (let i = 0; i < 11; i += 1) {
       await orkas.invoke('projects.tasks.create', { content: `Follow-up ${i + 1}: ${'Review the customer feedback and confirm the next step. '.repeat(3)}` });
     }
@@ -43,7 +55,7 @@ test.describe('Commander home continuation', () => {
         await expect(group.locator('.home-row-status.is-completed')).toHaveCount(total);
         await expect(group.locator('.home-row-status.is-unknown')).toHaveCount(0);
       }
-      await group.locator('.home-row').last().scrollIntoViewIfNeeded();
+      await scrollHome(section, true);
       await expect(group.locator('.home-row').last()).toBeInViewport();
       if (section === 'automations') await appPage.screenshot({ path: testInfo.outputPath('home-legacy-results-completed-en.png') });
       await toggle.click();
@@ -58,16 +70,17 @@ test.describe('Commander home continuation', () => {
     await expect(todos.locator('[data-home-toggle]')).toHaveAttribute('aria-expanded', 'true');
     await expect(todos.locator('.home-row:visible')).toHaveCount(12);
     await todos.locator('[data-home-toggle]').click();
-    await todos.scrollIntoViewIfNeeded();
+    await scrollHome('todos');
     await appPage.screenshot({ path: testInfo.outputPath('home-folded-en-1280.png') });
 
     await appPage.evaluate(async () => (window as any).setLang('zh'));
     await appPage.setViewportSize({ width: 960, height: 640 });
     await expect(todos.locator('[data-home-toggle]')).toHaveText('展开其余 9 条');
     await todos.locator('[data-home-toggle]').click();
-    await todos.scrollIntoViewIfNeeded();
+    await scrollHome('todos');
     await appPage.screenshot({ path: testInfo.outputPath('home-expanded-zh-960.png') });
-    await todos.locator('.home-row').last().scrollIntoViewIfNeeded();
+    await scrollHome('todos', true);
+    await expect(todos.locator('.home-row').last()).toBeInViewport();
     await appPage.screenshot({ path: testInfo.outputPath('home-expanded-zh-footer.png') });
     await todos.locator('[data-home-toggle]').click();
     await expect(todos.locator('.home-row:visible')).toHaveCount(3);

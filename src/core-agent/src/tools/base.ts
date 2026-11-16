@@ -157,6 +157,9 @@ export type ToolResult = {
   /** Exact host receipt already included by a budgeted reader. Never serialized. */
   appliedInputReceipt?: InputReceipt;
   content: string;
+  /** Host-only source identity from a successful web fetch, including redirects.
+   * Never part of provider content; survives cached views and result capping. */
+  webSourceUrl?: string;
   /** Host-only label for the concrete service selected by a generic tool.
    * AgentRunner forwards it to UI events, but only `content` enters model
    * context. Example: `web_search` can identify the provider that answered. */
@@ -182,8 +185,8 @@ export type ToolResult = {
    *  immediately following the tool_result message (works across providers
    *  even when the provider's tool_result channel doesn't accept images). */
   images?: ToolResultImage[];
-  /** Host-selected authoring input; latest set (at most six images) survives
-   * active-turn elision/checkpoints. Empty replaces/clears the prior set. */
+  /** Host-selected authoring input; the newest sets (six images in all) survive
+   * active-turn elision/checkpoints. An empty set clears the sets before it. */
   imageRetention?: "active_turn";
   /** This result is a document the model was instructed to read whole — a
    *  skill body or its reference. File-tool hosts and core-agent's learned
@@ -250,7 +253,9 @@ export interface AgentTool {
    *  side-effect-free, `ctx.state`-non-mutating tools (read / list / grep /
    *  search / web / library reads …) should opt into "parallel"; write / edit /
    *  delete / pdf / generate / connector-call / skill tools stay sequential,
-   *  and `bash` is admitted per call through `parallelWhen`.
+   *  `bash` is admitted per call through `parallelWhen`. The requester-approved
+   *  narration exception also uses that refinement, with host-owned capacity
+   *  and file exclusion; it grants no other generation tool parallelism.
    *  Engine-internal — never sent to the model. */
   readonly executionMode?: "sequential" | "parallel";
 

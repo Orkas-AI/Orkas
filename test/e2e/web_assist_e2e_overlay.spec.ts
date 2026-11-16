@@ -3,7 +3,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import { expect, test } from './fixtures/orkas';
 
-test('every declared floating family hides native pixels while model input and screenshots remain live', async ({ modelOrkas: orkas }, testInfo) => {
+test('floating geometry controls native presentation while model input and screenshots remain live', async ({ modelOrkas: orkas }, testInfo) => {
   const server = createServer((req, res) => {
     res.setHeader('Content-Type', 'text/html');
     res.end(`<!doctype html><style>html{background:rgb(37,190,119)} input,button{font-size:20px}</style>
@@ -52,8 +52,30 @@ test('every declared floating family hides native pixels while model input and s
       document.head.appendChild(style);
       const first = document.createElement('section'); first.id = 'first-floating'; first.className = 'never-seen-floating-family';
       first.innerHTML = '<input id="floating-input" aria-label="Floating draft" value="Panel draft"><button id="close-floating">Close</button>';
-      first.querySelector('button')!.onclick = () => first.remove(); document.body.appendChild(first);
+      first.querySelector('button')!.onclick = () => first.remove();
+      const wrapper = document.createElement('div'); wrapper.className = 'ui-overlay';
+      wrapper.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:16000';
+      first.style.pointerEvents = 'auto'; wrapper.appendChild(first); document.body.appendChild(wrapper);
     });
+    await expect(page.locator('#first-floating')).toHaveCSS('opacity', '1');
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    expect((await native())[0].visible).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath('floating-ui-browser-beside.png') });
+    // Only transform changes during this transition: ResizeObserver cannot
+    // establish that a moving card crossed into the native page.
+    await page.evaluate(bounds => {
+      const first = document.getElementById('first-floating')!;
+      first.style.transition = 'transform 180ms linear';
+      first.style.transform = `translateX(${bounds.x}px)`;
+    }, original.bounds);
+    await expect.poll(async () => (await native())[0].visible).toBe(false);
+    await page.evaluate(() => { document.getElementById('first-floating')!.style.transform = 'translateX(0)'; });
+    await expect.poll(async () => (await native())[0].visible).toBe(true);
+    await page.evaluate(bounds => {
+      const first = document.getElementById('first-floating')!;
+      first.style.transition = 'none';
+      first.style.left = `${bounds.x + 20}px`; first.style.top = `${bounds.y + 20}px`;
+    }, original.bounds);
     await expect.poll(async () => (await native()).every(view => !view.visible)).toBe(true);
     await expect(page.locator('#first-floating')).toHaveCSS('opacity', '1');
     await page.locator('#floating-input').focus();
@@ -114,7 +136,7 @@ test('every declared floating family hides native pixels while model input and s
     // the first is removed, including an abnormal DOM removal rather than close.
     await page.evaluate(() => {
       const next = document.createElement('div'); next.id = 'second-floating'; next.setAttribute('role', 'menu');
-      next.style.cssText = 'position:fixed;left:40px;top:280px;width:100px;height:100px;background:white'; document.body.appendChild(next);
+      next.style.cssText = 'position:fixed;right:20px;top:280px;width:100px;height:100px;background:white'; document.body.appendChild(next);
     });
     await page.locator('#close-floating').click();
     await expect(page.locator('#first-floating')).toHaveCount(0);
@@ -136,11 +158,11 @@ test('every declared floating family hides native pixels while model input and s
     await page.evaluate(async () => {
       for (let i = 0; i < 8; i++) {
         const element = document.createElement('div'); element.className = 'ui-overlay';
-        element.style.cssText = 'position:fixed;width:80px;height:80px'; document.body.appendChild(element);
+        element.style.cssText = 'position:fixed;right:20px;top:200px;width:80px;height:80px;background:white'; document.body.appendChild(element);
         await Promise.resolve(); element.remove();
       }
       const final = document.createElement('div'); final.id = 'final-floating'; final.className = 'ui-overlay';
-      final.style.cssText = 'position:fixed;width:80px;height:80px'; document.body.appendChild(final);
+      final.style.cssText = 'position:fixed;right:20px;top:200px;width:80px;height:80px;background:white'; document.body.appendChild(final);
     });
     await expect.poll(async () => (await native())[0].visible).toBe(false);
     expect(await orkas.electronApp!.evaluate(async (_electron, args) => (
@@ -151,6 +173,31 @@ test('every declared floating family hides native pixels while model input and s
     await orkas.invoke('webAssist.layout', { ...original.bounds, overlayRevision: 0 });
     expect((await native())[0].visible).toBe(false);
     // Closing the drawer is a separate user choice and survives release.
+    await page.evaluate(() => (window as any).ConversationInfo.close());
+    await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
+      const owner = BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('/renderer/index.html'))!;
+      for (const view of owner.contentView.children.filter(view => view instanceof WebContentsView)) {
+        const tracked = view as any;
+        tracked.revealAttempts = 0;
+        tracked.originalSetVisible = view.setVisible.bind(view);
+        view.setVisible = visible => { if (visible) tracked.revealAttempts++; tracked.originalSetVisible(visible); };
+      }
+    });
+    await page.evaluate(async id => {
+      (window as any).ConversationInfo.openAndSetTab('browser', id);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      await (window as any).OverlayManager.settled();
+    }, cid);
+    // A popup created before the browser is shown participates in preflight.
+    expect((await native())[0].visible).toBe(false);
+    expect(await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
+      const owner = BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('/renderer/index.html'))!;
+      return owner.contentView.children.filter(view => view instanceof WebContentsView).map(view => {
+        const tracked = view as any;
+        view.setVisible = tracked.originalSetVisible;
+        return tracked.revealAttempts;
+      });
+    })).toEqual([0]);
     await page.evaluate(() => (window as any).ConversationInfo.close());
     await page.evaluate(() => document.getElementById('final-floating')!.remove());
     await expect(page.locator('.web-assist-shell')).toBeHidden();

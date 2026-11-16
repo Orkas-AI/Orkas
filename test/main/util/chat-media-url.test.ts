@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   chatMediaLocalPathFromUrl,
-  unresolvedChatMediaLocalUrls,
+  chatMediaCidUrl,
   chatMediaLocalUrl,
   versionChatMediaLocalUrlsInText,
   versionedChatMediaLocalUrl,
@@ -64,6 +64,63 @@ describe('util/chat-media-url', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('bounds metadata work for repeated references without caching stale file state between renders', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-reference-cost-'));
+    const file = path.join(root, 'notes.md');
+    fs.writeFileSync(file, 'old');
+    const stat = vi.spyOn(fs, 'statSync');
+    const realpath = vi.spyOn(fs, 'realpathSync');
+    const read = vi.spyOn(fs, 'readFileSync');
+    syncBuiltinESMExports();
+    const resetCounts = () => { stat.mockClear(); realpath.mockClear(); read.mockClear(); };
+    const metadataCalls = () => stat.mock.calls.length + realpath.mock.calls.length;
+    try {
+      const source = Array.from({ length: 100 }, (_, i) => `[note](notes.md:${i + 1})`).join('\n');
+      const result = versionChatMediaLocalUrlsInText(source, root);
+      expect(result.match(/chat-media:\/\/local\//g)).toHaveLength(100);
+      expect(result).toContain('#L100');
+      // An I/O budget protects history loading on slow disks. It scales with
+      // distinct files, not the number of references; file contents are unused.
+      expect(metadataCalls()).toBeLessThanOrEqual(6);
+      expect(read).not.toHaveBeenCalled();
+
+      resetCounts();
+      const missing = '[missing](deep/missing/notes.md:21)\n'.repeat(100);
+      expect(versionChatMediaLocalUrlsInText(missing, root)).toBe(missing);
+      expect(metadataCalls()).toBeLessThanOrEqual(2);
+      expect(read).not.toHaveBeenCalled();
+
+      resetCounts();
+      const outside = '[outside](../../outside/notes.md:21)\n'.repeat(100);
+      expect(versionChatMediaLocalUrlsInText(outside, root)).toBe(outside);
+      expect(versionChatMediaLocalUrlsInText('Plain prose without links.\n'.repeat(1000), root))
+        .toBe('Plain prose without links.\n'.repeat(1000));
+      expect(metadataCalls()).toBe(0);
+      expect(read).not.toHaveBeenCalled();
+      const unfinished = `${'['.repeat(10000)}](notes.md\n${'['.repeat(10000)}\n[unfinished](`;
+      expect(versionChatMediaLocalUrlsInText(unfinished, root)).toBe(unfinished);
+      expect(metadataCalls()).toBe(0);
+
+      fs.writeFileSync(file, 'replacement contents');
+      expect(versionChatMediaLocalUrlsInText(source, root)).not.toBe(result);
+      fs.unlinkSync(file);
+      expect(versionChatMediaLocalUrlsInText(source, root)).toBe(source);
+      fs.mkdirSync(path.join(root, 'deep', 'missing'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'deep', 'missing', 'notes.md'), 'Restored');
+      expect(versionChatMediaLocalUrlsInText(missing, root).match(/chat-media:\/\/local\//g)).toHaveLength(100);
+    } finally {
+      stat.mockRestore(); realpath.mockRestore(); read.mockRestore();
+      syncBuiltinESMExports();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('builds Markdown-safe conversation attachment URLs', () => {
+    expect(chatMediaCidUrl('conversation #1', 'generated (final)!.png')).toBe(
+      'chat-media://cid/conversation%20%231/generated%20%28final%29%21.png',
+    );
   });
 
   it('encodes every filename segment without encoding path separators', () => {

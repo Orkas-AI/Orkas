@@ -31,6 +31,7 @@ import type {
   AgentRunConvergenceSignal,
   AgentRunTimings,
   AgentTool,
+  ProviderRequestFailure,
   ServerModelFallbackReason,
 } from '#core-agent';
 import { createLogger } from '../../logger';
@@ -537,6 +538,11 @@ const PROVIDER_FAILURE_CODES = new Set([
   'und_err_headers_timeout', 'und_err_body_timeout', 'und_err_socket',
   'cert_has_expired', 'depth_zero_self_signed_cert',
   'unable_to_verify_leaf_signature', 'err_tls_cert_altname_invalid', 'unknown',
+  'err_empty_response', 'err_ssl_protocol_error', 'err_connection_closed',
+  'err_connection_reset', 'err_connection_refused', 'err_connection_timed_out',
+  'err_timed_out', 'err_name_not_resolved', 'err_internet_disconnected',
+  'err_network_changed', 'err_proxy_connection_failed', 'err_tunnel_connection_failed',
+  'err_cert_authority_invalid', 'err_cert_date_invalid', 'err_cert_common_name_invalid',
   'invalid_request_error', 'invalid_function_parameters', 'invalid_json_schema',
   'unsupported_parameter', 'unsupported_value', 'missing_required_parameter',
   'context_length_exceeded', 'context_capacity_insufficient', 'model_not_found', 'authentication_error',
@@ -617,6 +623,100 @@ function recordProviderRequestFailure(stats: ProviderFailureDiagnostics, failure
   Object.assign(stats, next);
   // A later failure without a valid HTTP status must not inherit one.
   if (next.provider_last_failure_http_status === undefined) delete stats.provider_last_failure_http_status;
+}
+
+/** Local structured tool-input facts; never retain arguments or tool names. */
+function sanitizeToolArgumentsFailure(value: unknown): Record<string, unknown> | undefined {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const raw = value as Record<string, unknown>;
+    if (raw.version !== 1 || raw.code !== 'tool_arguments_invalid') return;
+    const safe: Record<string, unknown> = { version: 1, code: 'tool_arguments_invalid' };
+    for (const [key, values, fallback] of [
+      ['api', ['openai-completions', 'openai-responses', 'openai-codex-responses', 'anthropic-messages',
+        'google-generative-ai', 'google-vertex', 'google-gemini-cli', 'bedrock-converse-stream'], 'unknown'],
+      ['stop_reason', ['end_turn', 'tool_use', 'max_tokens', 'stop_sequence'], 'unknown'],
+      ['stream_json', ['strict', 'non_strict', 'unobserved', 'limit'], 'unobserved'],
+      ['json_root', ['object', 'array', 'string', 'number', 'boolean', 'null', 'invalid_json', 'unobserved', 'limit'], 'unobserved'],
+    ] as const) {
+      safe[key] = typeof raw[key] === 'string' && (values as readonly string[]).includes(raw[key] as string) ? raw[key] : fallback;
+    }
+    for (const key of ['stream_chars', 'stream_chunks']) {
+      const n = raw[key];
+      if (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0) safe[key] = Math.min(n, 1_000_000_000);
+    }
+    return safe;
+  } catch { /* Diagnostic accessors cannot break model completion. */ }
+}
+
+/** Closed, bounded local Responses facts; omit transport correlation. */
+function sanitizeResponsesStatus(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const raw = value as Record<string, unknown>;
+  if (raw.version !== 1 || !Array.isArray(raw.rows)) return;
+  const safe: Record<string, unknown> = { version: 1 };
+  for (const key of ['input_count', 'prefix_limit', 'rejected_index']) {
+    const n = raw[key];
+    if (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0) safe[key] = Math.min(n, 1_000_000_000);
+  }
+  if (safe.rejected_index !== undefined && (raw.rejected_field === 'id' || raw.rejected_field === 'status')) safe.rejected_field = raw.rejected_field;
+  const states = new Set(['completed', 'in_progress', 'incomplete', 'failed', 'cancelled', 'queued',
+    'missing', 'null', 'invalid_type', 'other_string', 'unobserved', 'ambiguous']);
+  const kinds = new Set(['reasoning', 'message', 'function_call', 'function_call_output', 'custom_tool_call',
+    'custom_tool_call_output', 'tool_search_call', 'tool_search_output', 'additional_tools', 'other']);
+  safe.rows = raw.rows.slice(0, 4).flatMap(value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    const row = value as Record<string, unknown>, out: Record<string, unknown> = {};
+    for (const key of ['i', 'source_sequence']) {
+      const n = row[key];
+      if (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0) out[key] = Math.min(n, 1_000_000_000);
+    }
+    for (const key of ['wire_status', 'history_status', 'source_status', 'source_response_status']) {
+      if (key in row) out[key] = typeof row[key] === 'string' && states.has(row[key] as string) ? row[key] : 'other_string';
+    }
+    out.kind = typeof row.kind === 'string' && kinds.has(row.kind) ? row.kind : 'other';
+    out.origin = typeof row.origin === 'string' && ['observed', 'unobserved', 'ambiguous'].includes(row.origin) ? row.origin : 'unobserved';
+    if (typeof row.same_model === 'boolean') out.same_model = row.same_model;
+    return [out];
+  });
+  return safe;
+}
+
+/** Only failure logs consume these facts; no per-attempt history is retained. */
+function providerFailureContextForLog(failure: ProviderRequestFailure): Record<string, unknown> {
+  if (failure.aborted) return {};
+  try {
+    const tool_arguments = sanitizeToolArgumentsFailure(failure.toolArguments);
+    const responses_status = sanitizeResponsesStatus(failure.responsesStatus);
+    const budget = failure.contextBudget;
+    const context_budget: Record<string, number | string> = {};
+    if (budget?.version === 1) {
+      context_budget.version = 1;
+      for (const key of ['candidate_index', 'preparation_context_window', 'budget_context_window', 'output_reservation', 'usable_input_tokens',
+        'input_ceiling_tokens', 'estimated_input_tokens', 'emergency_before_tokens', 'emergency_after_tokens',
+        'compaction_before_tokens', 'compaction_after_tokens', 'compaction_attempts', 'compaction_failures']) {
+        const v = budget[key];
+        if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) context_budget[key] = Math.min(1_000_000_000, v);
+      }
+      for (const [key, allowed] of Object.entries({ estimate_source: ['estimated', 'anchored'],
+        window_source: ['catalog', 'fallback'], emergency_result: ['not_needed', 'applied', 'nothing_to_drop'] })) {
+        const v = budget[key];
+        if (typeof v === 'string' && allowed.includes(v)) context_budget[key] = v;
+      }
+    }
+    return {
+      ...(tool_arguments ? { tool_arguments } : {}),
+      ...(responses_status ? { responses_status } : {}),
+      ...(context_budget.version === 1 ? { context_budget } : {}),
+      ...(Number.isInteger(failure.contextWindow) && Number(failure.contextWindow) > 0
+        ? { context_window: boundedCount(failure.contextWindow) } : {}),
+      ...(Number.isInteger(failure.outputLimit) && Number(failure.outputLimit) > 0
+        ? { output_limit: boundedCount(failure.outputLimit) } : {}),
+    };
+  } catch {
+    // Optional diagnostic accessors cannot change model completion.
+    return {};
+  }
 }
 
 function compactString(value: unknown, max = 128): string {
@@ -1741,6 +1841,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     cacheRetention,
     thinkingLevel,
     nested = false,
+    currentUserMessage,
     drainSteer,
   } = opts;
 
@@ -2026,6 +2127,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(historyBoundaryMessageId ? { historyBoundaryMessageId } : {}),
       ...(outputDelivery ? { outputDelivery } : {}),
       ...(message ? { userMessage: message } : {}),
+      ...(currentUserMessage ? { currentUserMessage } : {}),
       ...(attachmentMetadata ? { attachmentMetadata } : {}),
       ...(opts.requireImageInput ? { requireImageInput: true } : {}),
       ...(projectId ? { projectId } : {}),
@@ -2077,6 +2179,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
           session_id: turnLogContext.session_id, turn_id: turnLogContext.turn_id,
           cid: turnLogContext.cid, session_kind: turnLogContext.session_kind,
           ...sanitizeProviderFailureDiagnostics(safeFailure), aborted: failure.aborted,
+          ...providerFailureContextForLog(failure),
         });
       },
       onCandidatesObserved: (info) => {

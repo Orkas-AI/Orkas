@@ -177,6 +177,7 @@ export function buildOrkasApiModel(modelId: string): Model<'openai-completions'>
 export async function createOrkasApiProvider(config: {
   apiKey: string;
   modelId: string;
+  userCacheKey?: string;
   usageContext?: OrkasApiUsageContext;
 }): Promise<LLMProvider> {
   if (!config.apiKey) throw new Error('orkas-api: apiKey required');
@@ -186,6 +187,7 @@ export async function createOrkasApiProvider(config: {
   return mod.createPiProvider({
     provider: ORKAS_API_PROVIDER,
     apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
     customModel: buildOrkasApiModel(config.modelId),
     defaultReasoning: 'low',
     headers: orkasApiUsageHeaders(config.usageContext),
@@ -201,7 +203,8 @@ const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1';
  * Context windows by Moonshot model id. Numbers come from
  * platform.kimi.com/docs/models (checked 2026-06). Fallback 131072 for
  * ids we haven't catalogued — safe lower bound given every current kimi
- * model is at least 128k. Legacy K2 preview ids still resolve via fallback
+ * model is at least 128k. K3 uses the host-selected decimal 1M window.
+ * Legacy K2 preview ids still resolve via fallback
  * if a stale credential references them.
  */
 const MOONSHOT_CONTEXT_WINDOW: Record<string, number> = {
@@ -332,6 +335,7 @@ export async function buildRuntimeMoonshotModel(modelId: string): Promise<Model<
 export interface CreateMoonshotProviderConfig {
   apiKey: string;
   modelId: string;
+  userCacheKey?: string;
 }
 
 /**
@@ -353,6 +357,7 @@ export async function createMoonshotProvider(config: CreateMoonshotProviderConfi
   return mod.createPiProvider({
     provider: 'moonshot',
     apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
     customModel: model,
     onPayload: repairOpenAICompatiblePayload,
   });
@@ -362,10 +367,9 @@ export async function createMoonshotProvider(config: CreateMoonshotProviderConfi
 
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
 
-// Context windows from https://api-docs.deepseek.com/quick_start/pricing
-// (checked 2026-09-10). DeepSeek V4 series introduced 1M-token context via
-// Compressed Sparse Attention. Fallback 131072 for unknown ids (safe lower
-// bound; older deprecated v3 snapshots top out there).
+// Match pi-ai's current direct DeepSeek window: 1M means 1,000,000 tokens.
+// Legacy V4 Flash ids retain that capacity through the host fallback;
+// unknown ids retain the conservative 131072 window.
 const DEEPSEEK_CONTEXT_WINDOW: Record<string, number> = {
   'deepseek-flash':              1_000_000,
   'deepseek-v4-pro':              1_000_000,
@@ -377,10 +381,13 @@ function deepseekContextWindow(modelId: string): number {
   return DEEPSEEK_CONTEXT_WINDOW[modelId] ?? 131072;
 }
 
-// The official V4 pricing/spec table lists a 384K maximum output for Pro,
-// Flash (including V4.1), and Flash Vision Exp. pi-ai clamps only against remaining context,
-// so preserving the provider's real cap avoids silently truncating long
-// reasoning + answers. Unknown/legacy ids retain a conservative 8192 fallback.
+// The host's output reservation for V4 Pro, Flash (including V4.1) and Flash
+// Vision Exp — not DeepSeek's 384K ceiling. It is subtracted from the window
+// when deriving input budgets, and on main turns it is dropped from the wire
+// (`repairDeepSeekRequest`) so DeepSeek applies its own mode default: 8K
+// non-thinking, 64K thinking, 128K at reasoning_effort=max. 128K covers the
+// largest of those. Reserving the 384K ceiling left a third of the 1M window
+// idle for output no turn ever produced. Unknown/legacy ids keep 8192.
 const DEEPSEEK_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'deepseek-flash':              128_000,
   'deepseek-v4-pro':              128_000,
@@ -422,6 +429,7 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
 export interface CreateDeepSeekProviderConfig {
   apiKey: string;
   modelId: string;
+  userCacheKey?: string;
 }
 
 export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfig): Promise<LLMProvider> {
@@ -432,6 +440,7 @@ export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfi
   return mod.createPiProvider({
     provider: 'deepseek',
     apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
     customModel: model,
     // The core adapter fills missing tool-turn reasoning after SDK conversion.
     // Preserve the caller's thinking/effort; this hook owns output limits and
@@ -444,10 +453,9 @@ export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfi
 
 const DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
 
-// Doubao Seed 2.0 series on Volcengine Ark — 256k context window (verified
-// against the official model card 2026-02). The user may enter either an
-// endpoint id (ep-xxxx) or a model id; the context window is keyed by model
-// id, with a 131072 safe lower-bound fallback for unknown ids.
+// Seed 2.0 keeps its 256K window; September Seed 2.1 Pro uses the host-selected
+// decimal 1M. Endpoint ids (ep-xxxx) and unknown models use the conservative
+// 131072 fallback when the catalog does not provide a window.
 const DOUBAO_CONTEXT_WINDOW: Record<string, number> = {
   'doubao-seed-2-1-pro-260915': 1_000_000,
   'doubao-seed-2-0-pro-260215':  262144,
@@ -459,9 +467,8 @@ function doubaoContextWindow(modelId: string): number {
   return DOUBAO_CONTEXT_WINDOW[modelId] ?? 131072;
 }
 
-// 火山方舟 Seed 2.0 系列官方 max_tokens 上限 16K（控制台接入点配置可见）。
-// 用户填的可能是 endpoint id（ep-xxxx）也可能是模型 id；endpoint id 形式
-// 走 fallback 8192 兜底，不会撞到上游 400。
+// Host output reservations vary by dated model id. Endpoint ids (ep-xxxx)
+// use the conservative 8192 fallback to avoid upstream 400s.
 const DOUBAO_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'doubao-seed-2-1-pro-260915': 32768,
   'doubao-seed-2-0-pro-260215':  16384,
@@ -501,6 +508,7 @@ export function buildDoubaoModel(modelId: string): Model<'openai-completions'> {
 export interface CreateDoubaoProviderConfig {
   apiKey: string;
   modelId: string;
+  userCacheKey?: string;
 }
 
 export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): Promise<LLMProvider> {
@@ -511,6 +519,7 @@ export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): 
   return mod.createPiProvider({
     provider: 'doubao',
     apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
     customModel: model,
     onPayload: repairOpenAICompatiblePayload,
   });
@@ -522,6 +531,7 @@ export interface CreateCustomOpenAICompatibleProviderConfig
   extends CustomOpenAICompatibleRuntimeConfig {
   apiKey: string;
   modelId: string;
+  userCacheKey?: string;
 }
 
 export function buildCustomOpenAICompatibleModel(
@@ -595,6 +605,7 @@ export async function createCustomOpenAICompatibleProvider(
   return mod.createPiProvider({
     provider: 'custom',
     apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
     customModel: isAnthropic
       ? buildCustomAnthropicModel(config.modelId, config)
       : isResponses ? buildCustomResponsesModel(config.modelId, config)
@@ -667,6 +678,7 @@ export interface CreateConfiguredOpenAICompatibleProviderConfig {
   providerId: string;
   apiKey: string;
   modelId: string;
+  userCacheKey?: string;
 }
 
 export async function createConfiguredOpenAICompatibleProvider(
@@ -687,6 +699,7 @@ export async function createConfiguredOpenAICompatibleProvider(
   return mod.createPiProvider({
     provider: config.providerId,
     apiKey: config.apiKey,
+    userCacheKey: config.userCacheKey,
     customModel: model,
     onPayload: repairOpenAICompatiblePayload,
   });

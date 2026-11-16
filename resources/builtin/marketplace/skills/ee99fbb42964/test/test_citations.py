@@ -806,6 +806,88 @@ class CompactLandscapeInput(unittest.TestCase):
                 citations.main(["--op", "verify", "--input", input_path])
 
 
+class CompactLedgerDiagnostics(unittest.TestCase):
+    def run_ledger(self, rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            claim = "The desktop app supports Windows and macOS."
+            url = "https://example.test/desktop"
+            input_path = _write_single_compact_case(tmp, source_url=url, claim=claim)
+            ledger_path = os.path.join(tmp, "evidence_ledger.jsonl")
+            with open(ledger_path, encoding="utf-8") as fh:
+                valid = json.loads(fh.readline())
+            with open(ledger_path, "w", encoding="utf-8") as fh:
+                for row in rows(valid):
+                    fh.write((row if isinstance(row, str) else json.dumps(row)) + "\n")
+            snapshot_path = os.path.join(tmp, "snapshots.jsonl")
+            _write_trusted_snapshot(snapshot_path, url, claim)
+            with mock.patch.dict(os.environ, {"ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": snapshot_path}):
+                return citations.main(["--input", input_path])
+
+    def test_mixed_ledger_explains_omissions_without_losing_valid_evidence(self):
+        result = self.run_ledger(lambda row: [
+            "", row, "{broken", [],
+            {**row, "candidate": ""},
+            {**row, "field": "unexpected-sensitive-field"},
+            {**row, "quote": ""},
+            {**row, "candidate": "Other app"},
+            {**row, "field": None},
+        ])
+        data = result["data"]
+        self.assertEqual(data["summary"]["verified"], 1)
+        self.assertEqual(data["claims"][0]["id"], "claim_os")
+        diagnostic = data["compact_landscape_expansion"]["ledger_diagnostics"]
+        self.assertEqual(diagnostic["nonempty_lines"], 8)
+        self.assertEqual(diagnostic["reason_counts"], {
+            "invalid_json": 1, "non_object": 1, "missing_candidate": 1,
+            "unrecognized_fields": 1, "incomplete_evidence": 1,
+            "candidate_outside_selection": 1, "missing_fields": 1,
+        })
+        self.assertEqual(diagnostic["samples"], [
+            {"line": 3, "reason": "invalid_json"},
+            {"line": 4, "reason": "non_object"},
+            {"line": 5, "reason": "missing_candidate"},
+            {"line": 6, "reason": "unrecognized_fields"},
+            {"line": 7, "reason": "incomplete_evidence", "missing_fields": ["quote"]},
+            {"line": 8, "reason": "candidate_outside_selection"},
+            {"line": 9, "reason": "missing_fields"},
+        ])
+        self.assertEqual(diagnostic["omitted_samples"], 0)
+        self.assertNotIn("unexpected-sensitive-field", json.dumps(diagnostic))
+        stdout = _cli_stdout(result, ["--out", "audit.json", "--report-out", "report.md"])
+        self.assertEqual(stdout["compact_landscape_expansion"]["ledger_diagnostics"], diagnostic)
+
+    def test_known_fields_and_casefold_candidate_are_kept_amid_unknown_tags(self):
+        result = self.run_ledger(lambda row: [{
+            **row, "candidate": "EXAMPLE APP", "field": "ignored-fallback",
+            "fields": ["os", "unknown-tag", "os"],
+        }])
+        data = result["data"]
+        self.assertEqual(data["summary"]["verified"], 1)
+        self.assertEqual(data["compact_landscape_expansion"]["selected_evidence_rows"], 1)
+        self.assertEqual(data["compact_landscape_expansion"]["ledger_diagnostics"]["reason_counts"], {
+            "unrecognized_fields": 1,
+        })
+
+    def test_all_unusable_input_remains_an_honest_partial_result(self):
+        result = self.run_ledger(lambda row: ["{broken", None, {**row, "claim": ""}])
+        data = result["data"]
+        self.assertTrue(data["abstain"])
+        self.assertEqual(data["compact_landscape_expansion"]["selected_evidence_rows"], 0)
+        self.assertEqual(data["compact_landscape_expansion"]["ledger_diagnostics"]["reason_counts"], {
+            "invalid_json": 1, "non_object": 1, "incomplete_evidence": 1,
+        })
+
+    def test_diagnostic_samples_are_bounded_while_counts_cover_large_ledgers(self):
+        result = self.run_ledger(lambda row: ["{broken"] * 5000 + [row])
+        diagnostic = result["data"]["compact_landscape_expansion"]["ledger_diagnostics"]
+        self.assertEqual(diagnostic["reason_counts"], {"invalid_json": 5000})
+        self.assertEqual(diagnostic["nonempty_lines"], 5001)
+        self.assertEqual(len(diagnostic["samples"]), 12)
+        self.assertEqual(diagnostic["omitted_samples"], 4988)
+        self.assertEqual(result["data"]["summary"]["verified"], 1)
+        self.assertLess(len(json.dumps(diagnostic)), 1000)
+
+
 class ReferencesContinued(unittest.TestCase):
     def test_numbering_is_first_cited_order(self):
         out = _verify([_claim("a",

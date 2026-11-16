@@ -65,7 +65,7 @@ export async function createPreviewSdk(ses: Session, contents: WebContents, bund
   }, { storageRoot });
   const pending = new Set<Promise<unknown>>();
   const evidence: PreviewSdkEvidence = { mode: 'preview', storage: 'temporary',
-    unavailableCapabilities: ['files', 'ai', 'library', 'connectors'], calls: [] };
+    unavailableCapabilities: ['files', 'ai', 'library', 'connectors', 'tasks'], calls: [] };
   let open: ReturnType<WebAppRuntime['open']>;
   let installed = false;
   const channel = 'orkas.web-app-preview';

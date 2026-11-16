@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const oauthProgress = vi.fn();
 const logInfo = vi.fn();
 const logWarn = vi.fn();
+const connectorApiKeyHeaders = vi.fn<() => Record<string, string>>();
 
 function mockElectron() {
   vi.doMock('electron', () => ({
@@ -18,6 +19,8 @@ function mockElectron() {
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  connectorApiKeyHeaders.mockReset();
+  connectorApiKeyHeaders.mockReturnValue({ Authorization: 'Bearer orkas-connector-key' });
   mockElectron();
   vi.doMock('../../../../src/main/features/connectors/_server_bridge', () => ({
     accountApiBase: () => 'https://api.test',
@@ -33,7 +36,7 @@ beforeEach(() => {
     broadcastOAuthConnectProgress: oauthProgress,
   }));
   vi.doMock('../../../../src/main/features/connectors/api-key', () => ({
-    connectorApiKeyHeaders: () => ({ Authorization: 'Bearer orkas-connector-key' }),
+    connectorApiKeyHeaders,
   }));
   vi.doMock('../../../../src/main/logger', () => ({
     createLogger: () => ({
@@ -55,6 +58,33 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth', () => {
+  it('does not infer broader, unrelated or lookalike permissions from a Search Console read grant', async () => {
+    const { missingRequiredOAuthScopes } = await import('../../../../src/main/features/connectors/oauth-scopes');
+    const read = 'https://www.googleapis.com/auth/webmasters.readonly';
+    const full = 'https://www.googleapis.com/auth/webmasters';
+    expect(missingRequiredOAuthScopes([full], [read])).toEqual([full]);
+    expect(missingRequiredOAuthScopes([read], [full + '.invalid'])).toEqual([read]);
+    expect(missingRequiredOAuthScopes([read], [full.toUpperCase()])).toEqual([read]);
+    expect(missingRequiredOAuthScopes(['https://www.googleapis.com/auth/calendar'], [full]))
+      .toEqual(['https://www.googleapis.com/auth/calendar']);
+    expect(missingRequiredOAuthScopes([read], [])).toEqual([read]);
+  });
+
+  it.each(['webmasters.readonly', 'webmasters'])(
+    'accepts Search Console read capability from an existing %s grant', async permission => {
+      const scope = 'https://www.googleapis.com/auth/' + permission;
+      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({
+        code: 0, access_token: 'fixture-access', scope, expires_in: 3600,
+      }) })));
+      const oauth = await import('../../../../src/main/features/connectors/oauth');
+      const catalog = await import('../../../../src/main/features/connectors/catalog');
+      const result = oauth.startOAuth('u1', catalog.findCatalogEntry('gsearch-console')!);
+      const observed = result.then(value => ({ value }), error => ({ error }));
+      await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=fixture');
+      expect(await observed).toMatchObject({ value: { access_token: 'fixture-access', scopes: [scope] } });
+    },
+  );
+
   it.each([
     ['connector_oauth', 1, false, 'rejected'],
     ['connector_oauth', 0, false, 'success'],
@@ -91,9 +121,10 @@ describe('features/connectors/oauth', () => {
 
   it.each(['missing_key', 'interrupted_body'] as const)('releases the pending start after %s and allows a fresh flow', async (failure) => {
     if (failure === 'missing_key') {
-      vi.doMock('../../../../src/main/features/connectors/api-key', () => ({
-        connectorApiKeyHeaders: () => { throw Object.assign(new Error('Configure an Orkas API Key.'), { code: 'orkas_api_key_required' }); },
-      }));
+      // Keep the module binding stable across dynamic imports; vary only this call.
+      connectorApiKeyHeaders.mockImplementationOnce(() => {
+        throw Object.assign(new Error('Configure an Orkas API Key.'), { code: 'orkas_api_key_required' });
+      });
     }
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200,
       text: async () => { throw new Error('Controlled interrupted start body'); } }));
@@ -102,6 +133,7 @@ describe('features/connectors/oauth', () => {
     const catalog = await import('../../../../src/main/features/connectors/catalog');
     const { shell } = await import('electron');
     const error = await oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any).catch(error => error);
+    expect(connectorApiKeyHeaders).toHaveBeenCalledOnce();
     if (failure === 'missing_key') expect(error).toMatchObject({ code: 'orkas_api_key_required' });
     else expect(error).toMatchObject({ message: 'Controlled interrupted start body' });
     expect(fetchMock).toHaveBeenCalledTimes(failure === 'missing_key' ? 0 : 1);

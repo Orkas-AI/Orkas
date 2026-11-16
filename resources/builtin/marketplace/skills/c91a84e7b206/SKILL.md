@@ -8,7 +8,7 @@ description_en: "Analyze cross-platform sales, fees, refunds, ads and inventory 
 
 1. Identify the business decision, sources, period, currency, timezone and data freshness. Start from supplied exports; there is no mandatory data service.
 2. Read [reconciliation and metrics](references/metrics.md). Establish row grain and source definitions before joining or calculating. Preserve missing values and unmatched records.
-3. Use available local computation for multi-row arithmetic; keep a reproducible calculation or query with the source/field map. Inspect totals and counterexamples, not only a chart.
+3. Use available local computation for multi-row arithmetic; keep a reproducible calculation or query with the source/field map. Inspect totals and counterexamples; for runnable calculation deliverables, test the finished artifact with normal inputs and key boundaries, compare its computed results against the business definitions, and correct discrepancies; disclose if execution is unavailable.
 4. Compare like periods, products and channels. Separate volume, price, mix, acquisition, refund and cost effects where the data supports them. Describe causal explanations as hypotheses unless independently established.
 5. Deliver the requested metrics and main drivers with formulas, reconciliation, sources, prioritized actions and the smallest missing inputs. A missing cost category limits profit interpretation rather than blocking all supported sales analysis.
 

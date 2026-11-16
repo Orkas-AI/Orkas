@@ -409,6 +409,27 @@ export type PptxChartSpec = {
   [key: string]: unknown;
 };
 
+export const PPTX_THEME_KEYS = [
+  'headingFont', 'bodyFont', 'headingFont.ea', 'bodyFont.ea',
+  'headingFont.cs', 'bodyFont.cs', 'dk1', 'lt1', 'dk2', 'lt2',
+  'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6',
+] as const;
+
+export type PptxCreationOptions = {
+  canvas?: { size?: 'widescreen' | 'standard' | '16:10'; width?: string; height?: string };
+  theme?: Partial<Record<typeof PPTX_THEME_KEYS[number], string>>;
+};
+
+/** A native editable relationship graph inside an explicit slide rectangle.
+ * Never pass browser/image-rendering, source-file or slide-growth options. */
+export type PptxDiagramSpec = {
+  mermaid: string;
+  x: string;
+  y: string;
+  width: string;
+  height: string;
+};
+
 /** One slide. `title`/`body` auto-emit the title/body placeholder shapes;
  *  `shapes` add free-positioned text boxes; `images`/`charts`/`tables` add
  *  pictures, native charts, and grids; `background`/`transition` style the
@@ -416,6 +437,8 @@ export type PptxChartSpec = {
 export type PptxSlideSpec = {
   title?: string;
   body?: string;
+  titleStyle?: Record<string, unknown>;
+  bodyStyle?: Record<string, unknown>;
   layout?: string;
   background?: string;
   transition?: string;
@@ -423,6 +446,7 @@ export type PptxSlideSpec = {
   images?: PptxImageSpec[];
   charts?: PptxChartSpec[];
   tables?: PptxTableSpec[];
+  diagrams?: PptxDiagramSpec[];
 };
 
 /** `rows` is the grid (not the engine's int `rows` prop) — excluded from a
@@ -442,6 +466,34 @@ function normalizePptxShapeShadow(props: Record<string, string>): void {
   if (props.shadow?.trim().toLowerCase() === 'outer') props.shadow = 'true';
 }
 
+function normalizePptxShapeProps(shapeProps: Record<string, string>, shape: PptxShapeSpec): void {
+  normalizePptxShapeShadow(shapeProps);
+  // OfficeCLI treats opacity as a modifier of an explicit fill carrier.
+  // Models occasionally add `opacity: 0` to an otherwise unfilled text
+  // box; passing that orphan modifier makes the whole batch fail even
+  // though it has no visual meaning. Drop only the meaningless modifier
+  // and preserve opacity whenever a real fill/gradient/pattern exists.
+  if (
+    'opacity' in shapeProps
+    && !PPTX_SHAPE_FILL_CARRIERS.some((key) => key in shapeProps)
+  ) {
+    delete shapeProps.opacity;
+  }
+  // The outline equivalent has the same carrier relationship.
+  if ('lineOpacity' in shapeProps && !('line' in shapeProps)) {
+    delete shapeProps.lineOpacity;
+  } else if (
+    typeof shape.lineOpacity === 'number'
+    && Number.isFinite(shape.lineOpacity)
+    && shape.lineOpacity >= 0 && shape.lineOpacity <= 100
+  ) {
+    // create_pptx declares percentages; OfficeCLI expects a 0..1
+    // fraction for outlines. Even 1 means 1%, not full opacity.
+    // Leave invalid inputs to engine validation, without clamping.
+    shapeProps.lineOpacity = String(shape.lineOpacity / 100);
+  }
+}
+
 /**
  * Build `add slide` ops, in order, each optionally followed by `add shape`
  * (text boxes), `add picture`, `add chart`, and `add table` ops. A slide with no
@@ -455,96 +507,119 @@ function normalizePptxShapeShadow(props: Record<string, string>): void {
  * pptx table cells hold text directly, with no `/p[1]`). Shapes/pictures that
  * coerce to no props are skipped.
  */
-export function buildPptxBatch(slides: readonly PptxSlideSpec[]): OfficeBatchOp[] {
+export function buildPptxBatch(slides: readonly PptxSlideSpec[], options: PptxCreationOptions = {}): OfficeBatchOp[] {
   const ops: OfficeBatchOp[] = [];
-  let slideNo = 0;
-  for (const s of slides) {
-    if (!s || typeof s !== 'object') continue;
-    slideNo += 1;
+  if (options.canvas) {
+    const { size, width, height } = options.canvas;
+    const props: Record<string, string> = size ? { slideSize: size } : { slideWidth: width!, slideHeight: height! };
+    ops.push({ command: 'set', path: '/', props });
+  }
+  if (options.theme) {
     const props: Record<string, string> = {};
-    if (typeof s.title === 'string' && s.title) props.title = s.title;
-    if (typeof s.body === 'string' && s.body) props.text = s.body;
-    if (typeof s.layout === 'string' && s.layout) props.layout = s.layout;
-    if (typeof s.background === 'string' && s.background) props.background = s.background;
-    if (typeof s.transition === 'string' && s.transition) props.transition = s.transition;
-    ops.push({ command: 'add', parent: '/', type: 'slide', props });
-
-    if (Array.isArray(s.shapes)) {
-      for (const shape of s.shapes) {
-        if (!shape || typeof shape !== 'object') continue;
-        const shapeProps: Record<string, string> = {};
-        addPassthrough(shapeProps, shape, PASS_ALL);
-        normalizePptxShapeShadow(shapeProps);
-        // OfficeCLI treats opacity as a modifier of an explicit fill carrier.
-        // Models occasionally add `opacity: 0` to an otherwise unfilled text
-        // box; passing that orphan modifier makes the whole batch fail even
-        // though it has no visual meaning. Drop only the meaningless modifier
-        // and preserve opacity whenever a real fill/gradient/pattern exists.
-        if (
-          'opacity' in shapeProps
-          && !PPTX_SHAPE_FILL_CARRIERS.some((key) => key in shapeProps)
-        ) {
-          delete shapeProps.opacity;
-        }
-        // The outline equivalent has the same carrier relationship.
-        if ('lineOpacity' in shapeProps && !('line' in shapeProps)) {
-          delete shapeProps.lineOpacity;
-        } else if (
-          typeof shape.lineOpacity === 'number'
-          && Number.isFinite(shape.lineOpacity)
-          && shape.lineOpacity >= 0 && shape.lineOpacity <= 100
-        ) {
-          // create_pptx declares percentages; OfficeCLI expects a 0..1
-          // fraction for outlines. Even 1 means 1%, not full opacity.
-          // Leave invalid inputs to engine validation, without clamping.
-          shapeProps.lineOpacity = String(shape.lineOpacity / 100);
-        }
-        if (!Object.keys(shapeProps).length) continue;
-        ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'shape', props: shapeProps });
-      }
+    for (const key of PPTX_THEME_KEYS) {
+      if (options.theme[key] !== undefined) props[key] = options.theme[key]!;
     }
+    if (Object.keys(props).length) ops.push({ command: 'set', path: '/theme', props });
+  }
+  let slideNo = 0;
+  for (const slide of slides) {
+    if (!slide || typeof slide !== 'object') continue;
+    for (const operation of buildPptxSlideBatch(slide, `/slide[${++slideNo}]`)) ops.push(operation);
+  }
+  return ops;
+}
 
-    if (Array.isArray(s.images)) {
-      for (const img of s.images) {
-        if (!img || typeof img !== 'object') continue;
-        const picProps: Record<string, string> = {};
-        addPassthrough(picProps, img, PASS_ALL);
-        if (!picProps.src) continue; // a picture needs a source path
-        ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'picture', props: picProps });
-      }
+const PPTX_SLIDE_STRUCTURAL = new Set([
+  'body', 'titleStyle', 'bodyStyle', 'shapes', 'images', 'charts', 'tables', 'diagrams',
+]);
+
+/** Compile one new slide at its creation-time path. Edits use the engine's
+ * last() selector immediately after the corresponding add, so earlier removes
+ * and multiple appends need neither guessed source indices nor another read. */
+function buildPptxSlideBatch(
+  s: PptxSlideSpec,
+  slidePath: string,
+  props: Record<string, string> = {},
+): OfficeBatchOp[] {
+  if (typeof s.title === 'string' && s.title) props.title = s.title;
+  if (typeof s.body === 'string' && s.body) props.text = s.body;
+  if (typeof s.layout === 'string' && s.layout) props.layout = s.layout;
+  if (typeof s.background === 'string' && s.background) props.background = s.background;
+  if (typeof s.transition === 'string' && s.transition) props.transition = s.transition;
+  const ops: OfficeBatchOp[] = [{ command: 'add', parent: '/', type: 'slide', props }];
+  // These are the objects just emitted by add-slide, not guessed source paths.
+  // Native title precedes body; styling does not duplicate either placeholder.
+  let placeholderNo = 0;
+  for (const [text, style] of [[props.title, s.titleStyle], [props.text, s.bodyStyle]] as const) {
+    if (!text) continue;
+    placeholderNo += 1;
+    const styleProps = normProps(style);
+    normalizePptxShapeProps(styleProps, style ?? {});
+    if (Object.keys(styleProps).length) {
+      ops.push({ command: 'set', path: `${slidePath}/shape[${placeholderNo}]`, props: styleProps });
     }
+  }
 
-    if (Array.isArray(s.charts)) {
-      for (const chart of s.charts) {
-        if (!chart || typeof chart !== 'object') continue;
-        const chartType = typeof chart.type === 'string' && chart.type
-          ? chart.type
-          : (typeof chart.chartType === 'string' ? chart.chartType : '');
-        if (!chartType) continue;
-        const chartProps: Record<string, string> = { chartType };
-        addPassthrough(chartProps, chart, PPTX_CHART_STRUCTURAL);
-        ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'chart', props: chartProps });
-      }
+  if (Array.isArray(s.diagrams)) {
+    for (const diagram of s.diagrams) {
+      ops.push({ command: 'add', parent: slidePath, type: 'diagram', props: {
+        mermaid: diagram.mermaid, render: 'native', poster: 'false',
+        x: diagram.x, y: diagram.y, width: diagram.width, height: diagram.height,
+      } });
     }
+  }
 
-    if (Array.isArray(s.tables)) {
-      let tableNo = 0;
-      for (const t of s.tables) {
-        if (!t || !Array.isArray(t.rows)) continue;
-        const { rowCount, colCount } = gridDims(t.rows);
-        if (!rowCount || !colCount) continue;
-        const tProps: Record<string, string> = { rows: String(rowCount), cols: String(colCount) };
-        addPassthrough(tProps, t, PPTX_TABLE_STRUCTURAL);
-        ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'table', props: tProps });
-        tableNo += 1;
-        t.rows.forEach((row, i) => {
-          if (!Array.isArray(row)) return;
-          row.forEach((cell, j) => {
-            if (cell === null || cell === undefined || cell === '') return;
-            ops.push({ command: 'set', path: `/slide[${slideNo}]/table[${tableNo}]/tr[${i + 1}]/tc[${j + 1}]`, props: { text: String(cell) } });
-          });
+  if (Array.isArray(s.shapes)) {
+    for (const shape of s.shapes) {
+      if (!shape || typeof shape !== 'object') continue;
+      const shapeProps: Record<string, string> = {};
+      addPassthrough(shapeProps, shape, PASS_ALL);
+      normalizePptxShapeProps(shapeProps, shape);
+      if (!Object.keys(shapeProps).length) continue;
+      ops.push({ command: 'add', parent: slidePath, type: 'shape', props: shapeProps });
+    }
+  }
+
+  if (Array.isArray(s.images)) {
+    for (const img of s.images) {
+      if (!img || typeof img !== 'object') continue;
+      const picProps: Record<string, string> = {};
+      addPassthrough(picProps, img, PASS_ALL);
+      if (!picProps.src) continue; // a picture needs a source path
+      ops.push({ command: 'add', parent: slidePath, type: 'picture', props: picProps });
+    }
+  }
+
+  if (Array.isArray(s.charts)) {
+    for (const chart of s.charts) {
+      if (!chart || typeof chart !== 'object') continue;
+      const chartType = typeof chart.type === 'string' && chart.type
+        ? chart.type
+        : (typeof chart.chartType === 'string' ? chart.chartType : '');
+      if (!chartType) continue;
+      const chartProps: Record<string, string> = { chartType };
+      addPassthrough(chartProps, chart, PPTX_CHART_STRUCTURAL);
+      ops.push({ command: 'add', parent: slidePath, type: 'chart', props: chartProps });
+    }
+  }
+
+  if (Array.isArray(s.tables)) {
+    let tableNo = 0;
+    for (const t of s.tables) {
+      if (!t || !Array.isArray(t.rows)) continue;
+      const { rowCount, colCount } = gridDims(t.rows);
+      if (!rowCount || !colCount) continue;
+      const tProps: Record<string, string> = { rows: String(rowCount), cols: String(colCount) };
+      addPassthrough(tProps, t, PPTX_TABLE_STRUCTURAL);
+      ops.push({ command: 'add', parent: slidePath, type: 'table', props: tProps });
+      tableNo += 1;
+      t.rows.forEach((row, i) => {
+        if (!Array.isArray(row)) return;
+        row.forEach((cell, j) => {
+          if (cell === null || cell === undefined || cell === '') return;
+          ops.push({ command: 'set', path: `${slidePath}/table[${tableNo}]/tr[${i + 1}]/tc[${j + 1}]`, props: { text: String(cell) } });
         });
-      }
+      });
     }
   }
   return ops;
@@ -657,14 +732,21 @@ function normAddProps(op: Extract<EditOp, { action: 'add' }>): Record<string, st
  * property shapes fail explicitly before a working copy is created; the caller
  * runs accepted batches with `--stop-on-error` for per-op engine failures.
  */
-export function buildEditBatch(ops: readonly EditOp[]): OfficeBatchOp[] {
+export function buildEditBatch(ops: readonly EditOp[], options: { pptx?: boolean } = {}): OfficeBatchOp[] {
   const out: OfficeBatchOp[] = [];
   for (const op of ops) {
     if (!op || typeof op !== 'object') continue;
     if (op.action === 'set' && typeof op.path === 'string' && op.path) {
       out.push({ command: 'set', path: op.path, props: normProps(op.props) });
     } else if (op.action === 'add' && typeof op.parent === 'string' && op.parent && typeof op.type === 'string' && op.type) {
-      out.push({ command: 'add', parent: op.parent, type: op.type, props: normAddProps(op) });
+      if (options.pptx && op.parent === '/' && op.type === 'slide'
+        && op.props && [...PPTX_SLIDE_STRUCTURAL].some(key => key in op.props!)) {
+        for (const operation of buildPptxSlideBatch(op.props as PptxSlideSpec, '/slide[last()]', normProps(op.props, PPTX_SLIDE_STRUCTURAL))) {
+          out.push(operation);
+        }
+      } else {
+        out.push({ command: 'add', parent: op.parent, type: op.type, props: normAddProps(op) });
+      }
     } else if (op.action === 'remove' && typeof op.path === 'string' && op.path) {
       out.push({ command: 'remove', path: op.path });
     }

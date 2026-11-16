@@ -56,6 +56,9 @@ jobs:
             sudo apt-get install --yes xvfb openbox x11-utils dbus
           fi
 
+      - name: Prepare the native repository search backend
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+
       - name: Restore standard read-only system font permissions
         run: |
           stat -c '%u:%g %a %n' /usr/share/fonts /usr/share/fonts/truetype
@@ -67,7 +70,7 @@ jobs:
 
       - name: Run Linux platform-native test lane
         run: |
-          xvfb-run --auto-servernum bash -eu -c '
+          dbus-run-session -- xvfb-run --auto-servernum bash -eu -c '
             openbox --sm-disable &
             window_manager_pid=$!
             trap "kill $window_manager_pid 2>/dev/null || true" EXIT

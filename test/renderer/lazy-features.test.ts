@@ -50,17 +50,20 @@ describe('renderer lazy feature loader', () => {
     expect(appended.every((script) => script.async === false)).toBe(true);
   });
 
-  it('does not fail marketplace loading when the optional dev enhancer is absent', async () => {
-    const { context, appended } = loadFeatureLoader((script) => {
-      if (script.src.endsWith('marketplace_dev.js')) script.onerror();
+  it('continues loading after an optional script is absent and reuses its settled attempt', async () => {
+    const { context, appended, warnings } = loadFeatureLoader((script) => {
+      if (script.src === './modules/optional-fixture.js') script.onerror();
       else script.onload();
     });
-
+    const entry = { src: './modules/optional-fixture.js', optional: true };
+    const first = context._appendRendererFeatureScript(entry);
+    expect(context._appendRendererFeatureScript(entry)).toBe(first);
+    await expect(first).resolves.toBeUndefined();
     await expect(context.loadRendererFeature('marketplace')).resolves.toBeUndefined();
     expect(appended.map((script) => script.src)).toEqual([
-      './modules/semver.js',
-      './modules/marketplace.js',
+      './modules/optional-fixture.js', './modules/semver.js', './modules/marketplace.js',
     ]);
+    expect(warnings).toEqual([]);
   });
 
   it('loads public Agent and Skill surfaces without private publishing modules', async () => {
@@ -91,7 +94,7 @@ describe('renderer lazy feature loader', () => {
 
   it('retries a required script while reusing scripts that already loaded', async () => {
     let contextAttempts = 0;
-    const { context, appended } = loadFeatureLoader((script) => {
+    const { context, appended, warnings } = loadFeatureLoader((script) => {
       if (script.src.endsWith('contexts.js') && contextAttempts++ === 0) script.onerror();
       else script.onload();
     });
@@ -104,6 +107,9 @@ describe('renderer lazy feature loader', () => {
       './modules/contexts.js',
       './modules/kb-picker.js',
     ]);
+    expect(warnings).toEqual([['[renderer-feature]', { result: 'failure', feature: 'contexts',
+      duration_ms: expect.any(Number), retry_count: 0, error_code: 'script_load_failed' }]]);
+    expect(JSON.stringify(warnings)).not.toContain('contexts.js');
   });
 
   it('collapses unknown feature names before reporting a bounded failure', async () => {
@@ -148,6 +154,7 @@ describe('renderer lazy feature loader', () => {
       './modules/date-picker.js',
       './modules/project-detail.js',
       './modules/todos.js',
+      './modules/todo-cleanup.js',
     ]);
 
     await context.loadRendererFeature('auto');
@@ -157,6 +164,7 @@ describe('renderer lazy feature loader', () => {
       './modules/date-picker.js',
       './modules/project-detail.js',
       './modules/todos.js',
+      './modules/todo-cleanup.js',
       './modules/auto.js',
     ]);
   });

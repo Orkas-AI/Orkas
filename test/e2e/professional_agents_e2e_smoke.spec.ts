@@ -29,8 +29,8 @@ type ShippedInput = {
   [key: string]: unknown;
 };
 
-const videoAgent = JSON.parse(readFileSync(
-  path.resolve(__dirname, '../../resources/builtin/marketplace/agents/79df9cc89f5f/agent.json'),
+const imageAgent = JSON.parse(readFileSync(
+  path.resolve(__dirname, '../../resources/builtin/marketplace/agents/814b61b027f0/agent.json'),
   'utf8',
 )) as { inputs: ShippedInput[] };
 
@@ -400,6 +400,22 @@ test.describe('shipped professional agents', () => {
     // demand rather than inlined, so protect them at the shipped source.
     expect(governingSkill).toContain('caps_plan.json');
     expect(governingSkill).toContain('evidence_ledger.jsonl');
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const cid = await page.evaluate<string>('currentCid');
+    expect(cid).toBeTruthy();
+    await page.locator('#new-chat-btn').click();
+    // Complete the real persisted navigation before teardown closes history.
+    const navigationReady = page.waitForEvent('console', {
+      predicate: message => message.text().includes('conversation detail turn navigation ready'),
+    });
+    await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+    await navigationReady;
+    const restored = page.locator('#chat-history .chat-message.assistant[data-from-actor="78900d8758bc"]');
+    await expect(restored).toHaveCount(1);
+    await expect(restored).toContainText(
+      'E2E DeepResearcher prompt wiring completed with an auditable partial-result boundary.',
+    );
+    expect(modelOrkas.modelRequests).toHaveLength(1);
   });
 
   test('injects the shipped ImageStudio route and evidence gates into a real task', async ({
@@ -475,18 +491,18 @@ test.describe('shipped professional agents', () => {
     const page = modelOrkas.page;
     modelOrkas.setModelTextReplies([
       [
-        'I need the production direction before starting.',
+        'I need the image direction before starting.',
         '<agent-input-form>',
-        JSON.stringify({ agent_id: '79df9cc89f5f', fields: videoAgent.inputs }),
+        JSON.stringify({ agent_id: '814b61b027f0', fields: imageAgent.inputs }),
         '</agent-input-form>',
         '<plan-interaction status="open" />',
       ].join('\n'),
-      'E2E VideoStudio resumed from the submitted direction.',
+      'E2E ImageStudio resumed from the submitted direction.',
     ]);
 
-    await selectBuiltinAgent(page, '79df9cc89f5f');
-    await expect(page.locator('#new-chat-recipient-name')).toHaveText('VideoStudio');
-    await fillSelectedAgentPrompt(page, 'Create a product video; collect the direction first.');
+    await selectBuiltinAgent(page, '814b61b027f0');
+    await expect(page.locator('#new-chat-recipient-name')).toHaveText('ImageStudio');
+    await fillSelectedAgentPrompt(page, 'Create a poster; collect the direction first.');
     await page.locator('#new-chat-send-btn').click();
 
     const form = page.locator('#chat-history .chat-input-form');
@@ -494,21 +510,17 @@ test.describe('shipped professional agents', () => {
     await expect(page.locator('#chat-history')).not.toContainText('<agent-input-form>');
     await expect(page.locator('#chat-history')).not.toContainText('<plan-interaction');
 
-    const topicField = form.locator('.form-field', { hasText: 'Topic / Content' });
+    const requestField = form.locator('.form-field', { hasText: 'Image request' });
     const aspectField = form.locator('.form-field', { hasText: 'Aspect ratio' });
-    const languageField = form.locator('.form-field', { hasText: 'Video language' });
-    const durationField = form.locator('.form-field', { hasText: 'Duration (seconds)' });
-    await expect(topicField.locator('.form-field-textarea')).toHaveValue('');
-    await expect(aspectField.locator('.ai-select-trigger')).toContainText('Landscape 16:9');
-    await expect(languageField.locator('.ai-select-trigger')).toContainText('English');
-    await expect(durationField.locator('input[type="number"]')).toHaveValue('60');
+    await expect(requestField.locator('.form-field-textarea')).toHaveValue('');
+    await expect(aspectField.locator('.ai-select-trigger')).toContainText('Square 1:1');
 
-    await topicField.locator('.form-field-textarea').fill('Launch the hardened professional agents');
+    await requestField.locator('.form-field-textarea').fill('Launch the hardened professional agents');
     await form.locator('.form-actions .btn-primary').click();
 
     await expect(form).toHaveClass(/\bis-submitted\b/);
     await expect(page.locator('#chat-history')).toContainText(
-      'E2E VideoStudio resumed from the submitted direction.',
+      'E2E ImageStudio resumed from the submitted direction.',
       { timeout: 20_000 },
     );
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(2);
@@ -520,8 +532,6 @@ test.describe('shipped professional agents', () => {
     ).join('\n');
     expect(resumedText).toContain('<agent-input-submission');
     expect(resumedText).toContain('Launch the hardened professional agents');
-    expect(resumedText).toContain('"aspect_ratio":"16:9"');
-    expect(resumedText).toContain('"language":"en"');
-    expect(resumedText).toContain('"duration_seconds":60');
+    expect(resumedText).toContain('"aspect_ratio":"1:1"');
   });
 });

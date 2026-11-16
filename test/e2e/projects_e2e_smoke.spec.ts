@@ -560,6 +560,7 @@ test.describe('projects', () => {
     // relying on permission bits that elevated users or Windows may ignore.
     renameSync(file, preserved);
     mkdirSync(file);
+    const failureAfter = orkas.rendererDiagnosticCheckpoint();
     try {
       await page.evaluate(pid => (window as any).loadProjectDetail(pid), projectId);
       await expect(page.locator('#project-instructions-input')).toBeDisabled();
@@ -580,6 +581,7 @@ test.describe('projects', () => {
     await page.locator('#project-instructions-cancel-btn').click();
     expect(await orkas.invoke('projects.instructions.get', { projectId })).toMatchObject({ content: original });
     await expect(page.locator('#project-instructions-read')).toHaveText(original);
+    await orkas.acknowledgeInvokeFailures('projects.instructions.get', 1, failureAfter);
   });
 
   test('uploads, previews, persists, and deletes a project Library file', async ({ orkas }) => {
@@ -1539,3 +1541,34 @@ test.describe('projects', () => {
   });
 
 });
+
+  test('renames a project and keeps the new name after relaunch', async ({ orkas }) => {
+    const originalName = 'E2E Project Before Rename';
+    const renamedName = 'E2E Project After Rename';
+    await createProject(orkas, originalName);
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+
+    const originalRow = orkas.page.locator('.project-row', {
+      has: orkas.page.locator('.project-name', { hasText: originalName }),
+    });
+    await originalRow.hover();
+    const renameMenuButton = originalRow.locator('[data-project-menu]');
+    await expect(renameMenuButton).toBeVisible();
+    await renameMenuButton.click();
+    await orkas.page.locator('#project-row-menu [data-action="rename"]').click();
+    const renameInput = orkas.page.locator('input.project-rename-input[data-rename-pid]');
+    await expect(renameInput).toBeFocused();
+    await renameInput.fill(renamedName);
+    await renameInput.press('Enter');
+
+    await expect(orkas.page.locator('.project-name', { hasText: originalName })).toHaveCount(0);
+    await expect(orkas.page.locator('.project-name', { hasText: renamedName })).toHaveCount(1);
+
+    const relaunchedPage = await orkas.relaunch();
+    const renamedRow = relaunchedPage.locator('.project-row', {
+      has: relaunchedPage.locator('.project-name', { hasText: renamedName }),
+    });
+    await expect(renamedRow).toHaveCount(1);
+    await renamedRow.click();
+    await expect(relaunchedPage.locator('#project-detail-title')).toHaveText(renamedName);
+  });

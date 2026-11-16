@@ -1,3 +1,8 @@
+import { MEDIA_TRANSFER_POLICY } from '../util/media-transfer-policy';
+import { fetchMediaAndRead } from '../util/media-rate-limit';
+import { VIDEO_MODEL_SPECS, LEGACY_VIDEO_MODELS, isSeedance25Model, videoModelSpec, videoFrameSupport, isRetiredVideoModel, WAN_REGIONS } from './video_models';
+import { fitVideoParameters, videoParameterModel } from './video_parameter_compatibility';
+import { createVideoCloudCredentials } from './video_cloud_auth';
 /** Video generation through configured user-owned provider keys. */
 
 import * as fs from 'node:fs/promises';
@@ -13,7 +18,7 @@ import {
   orkasApiUsageHeaders,
   type OrkasApiUsageContext,
 } from './orkas_api';
-import { prepareReferenceUrls, registerGeneratedMediaUrl } from './generation_reference_assets';
+import { prepareReferenceUrls, registerGeneratedMediaUrl, withReferencePreparation } from './generation_reference_assets';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { composeAbortSignal, fetchAndReadWithTimeout, throwIfAborted } from '../util/abort';
@@ -22,6 +27,7 @@ import { logErrorSummary, logPathRef } from '../util/log-redact';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
 
 const log = createLogger('video-gen');
+const fetchNativeVideoAndRead: typeof fetchMediaAndRead = (input,init,timeout,signal,message,read,codes) => fetchMediaAndRead(input,init,timeout,signal,message,read,codes,'video');
 const DEFAULT_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const CREATE_TIMEOUT_MS = 60_000;
@@ -39,8 +45,8 @@ const VIDU_BASE = 'https://api.vidu.com';
 const KLING_BASE = 'https://api-singapore.klingai.com';
 const GOOGLE_VIDEO_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const RUNWAY_BASE = 'https://api.dev.runwayml.com';
-const VIDEO_CREATE_HTTP_TIMEOUT_MS = 130 * 1000;
-const VIDEO_POLL_HTTP_TIMEOUT_MS = 20 * 1000;
+const VIDEO_CREATE_HTTP_TIMEOUT_MS = MEDIA_TRANSFER_POLICY.legacyCreateMs;
+const VIDEO_POLL_HTTP_TIMEOUT_MS = MEDIA_TRANSFER_POLICY.pollMs;
 
 
 export interface GenerateVideoInput {
@@ -63,6 +69,11 @@ export interface GenerateVideoInput {
   signal?: AbortSignal;
   onProgress?: VideoProgressReporter;
   usageContext?: OrkasApiUsageContext;
+  firstFrameUrl?: string;
+  firstFramePath?: string;
+  lastFrameUrl?: string;
+  lastFramePath?: string;
+  profileId?: string;
 }
 
 export type VideoProgressReporter = (event: {
@@ -117,21 +128,23 @@ export interface PickedVideoGenProfile {
 }
 export function listVideoGenCandidates(): PickedVideoGenProfile[] {
   return loadVideoProfiles()
-    .filter((profile) => isVideoProviderModelAllowed(profile.provider, profile.model))
+    .filter((profile) => isVideoProviderModelAllowed(profile.provider, profile.model) && !isRetiredVideoModel(profile.provider, profile.model))
     .map((entry) => ({ entry }));
 }
 export function pickVideoGenProfile(): PickedVideoGenProfile | null {
   return listVideoGenCandidates()[0] || null;
 }
-function videoGenCandidatesForCall(): PickedVideoGenProfile[] {
-  return listVideoGenCandidates();
-}
+export function videoGenCandidatesForCall(profileId?:string):PickedVideoGenProfile[]{const candidates=listVideoGenCandidates();return profileId?candidates.filter(c=>c.entry.id===profileId):candidates;}
 
 
 interface NormalizedVideoInput {
   prompt: string;
   referenceImageUrls: string[];
   referenceVideoUrls: string[];
+  /** The frames to open and end on, uploaded; validation has kept them apart from references
+   *  wherever the service cannot take both. */
+  firstFrameUrl?: string;
+  lastFrameUrl?: string;
   operation: 'generate' | 'edit';
   ratio: string;
   duration: number;
@@ -147,6 +160,10 @@ interface NormalizedVideoInput {
 interface AdapterVideoRequest extends NormalizedVideoInput {
   apiKey: string;
   model: string;
+  workspaceId?: string;
+  region?: string;
+  apiSite?: VideoProfile['apiSite'];
+  deadlineAt?: number;
   signal?: AbortSignal;
   onProgress?: VideoProgressReporter;
   usageContext?: OrkasApiUsageContext;
@@ -231,7 +248,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
     return { ok: false, errorCode: 'BAD_INPUT', message: 'outputAbsPath is required', dispatched: false };
   }
 
-  const candidates = videoGenCandidatesForCall();
+  const candidates = videoGenCandidatesForCall(input.profileId);
   if (!candidates.length) {
     log.warn('video gen aborted: no video profile configured');
     return { ok: false, errorCode: 'NO_CAPABLE_MODEL', message: t('video_gen.no_capable_model'), dispatched: false };
@@ -239,7 +256,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
 
   // Preserve unsupported raw arguments before generic normalization/upload.
   // Do not bill another configured service for an invalid selected request.
-  const firstInputError = candidates[0].entry.provider === 'kling' ? klingVideoInputError(input) : null;
+  const firstInputError = videoGenerationInputError(fitVideoParameters(input,candidates[0].entry.provider,candidates[0].entry.model),candidates[0].entry);
   if (firstInputError) return { ok: false, errorCode: 'BAD_INPUT', message: firstInputError, dispatched: false };
 
   let normalized: NormalizedVideoInput;
@@ -247,16 +264,19 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
     const refCount = (input.referenceImagePaths?.length || 0)
       + (input.referenceVideoPaths?.length || 0)
       + (input.referenceImageUrls?.length || 0)
-      + (input.referenceVideoUrls?.length || 0);
+      + (input.referenceVideoUrls?.length || 0)
+      + (hasFirstFrame(input) ? 1 : 0)
+      + (input.lastFrameUrl || input.lastFramePath ? 1 : 0);
     if (refCount) {
       emitProgress(input.onProgress, 'prepare_references', 'Preparing video references', { count: refCount });
     }
-    const refs = await resolveReferenceUrls(input);
+    const refs = await resolveReferenceUrls(input,candidates[0].entry);
     normalized = normalizeVideoInput({
       ...input,
       referenceImageUrls: refs.referenceImageUrls,
       referenceVideoUrls: refs.referenceVideoUrls,
-    });
+      firstFrameUrl:refs.firstFrameUrl, lastFrameUrl:refs.lastFrameUrl,
+    },candidates[0].entry);
   } catch (err) {
     // Reference preparation failed before any generation request was sent.
     const message = (err as Error).message || String(err);
@@ -269,17 +289,19 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
   let lastInputRejected = false;
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i];
-    const inputError = candidate.entry.provider === 'kling' ? klingVideoInputError(input) : null;
+    const compatibleInput=fitVideoParameters(input,candidate.entry.provider,candidate.entry.model);
+    const inputError=videoGenerationInputError(compatibleInput,candidate.entry);
     if (inputError) return { ok: false, errorCode: 'BAD_INPUT', message: inputError, ...(i === 0 ? { dispatched: false as const } : {}) };
     let adapterRes: AdapterVideoResult;
     let requestDisposition: 'sent' | 'accepted' | 'rejected' | undefined;
     let acceptedTaskId: string | undefined;
     try {
       adapterRes = await dispatchVideo({
-        ...normalized,
+        ...normalizeVideoInput({...input,referenceImageUrls:normalized.referenceImageUrls,referenceVideoUrls:normalized.referenceVideoUrls,firstFrameUrl:normalized.firstFrameUrl,lastFrameUrl:normalized.lastFrameUrl},candidate.entry),
+        workspaceId:candidate.entry.workspaceId,region:candidate.entry.region,apiSite:candidate.entry.apiSite,
         apiKey: candidate.entry.apiKey,
         model: candidate.entry.model,
-        ...(candidate.entry.provider === 'kling' ? { ratioExplicit: input.ratio !== undefined, duration: input.duration ?? normalized.duration } : {}),
+        ...(candidate.entry.provider === 'kling' && candidate.entry.model === 'kling-v3-0-turbo' ? { ratioExplicit: input.ratio !== undefined, duration: input.duration ?? normalized.duration } : {}),
         signal: input.signal,
         onProgress: event => {
           if (event.phase === 'task_created' && typeof event.data?.taskId === 'string') acceptedTaskId = event.data.taskId;
@@ -359,12 +381,16 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
     }
 
     const selectedModel = adapterRes.model || candidate.entry.model;
-    const finalPath = ensureMp4Extension(input.outputAbsPath);
+    const finalPath = candidate.entry.provider === ORKAS_API_PROVIDER
+      ? ensurePublicApiMp4Extension(input.outputAbsPath)
+      : ensureMp4Extension(input.outputAbsPath);
+    let finished: {bytes:number;changed:boolean;duration?:number;resolution?:string;ratio?:string};
     try {
       emitProgress(input.onProgress, 'save', 'Saving generated video', { provider: candidate.entry.provider });
       throwIfAborted(input.signal);
       await fs.mkdir(path.dirname(finalPath), { recursive: true });
-      await fs.writeFile(finalPath, adapterRes.buffer);
+      if(candidate.entry.provider===ORKAS_API_PROVIDER){await fs.writeFile(finalPath,adapterRes.buffer);finished={bytes:adapterRes.buffer.length,changed:false};}
+      else { const {saveCompatibleVideo}=await import('./video_output_compatibility'); finished=await saveCompatibleVideo(adapterRes.buffer,finalPath,input,{...normalizeVideoInput(compatibleInput,candidate.entry),...(candidate.entry.provider==='google'?{duration:-1}:{}),...(typeof adapterRes.duration==='number'?{duration:adapterRes.duration}:{}),...(adapterRes.ratio?{ratio:adapterRes.ratio}:{}),...(adapterRes.resolution?{resolution:adapterRes.resolution}:{})},input.signal); }
     } catch (err) {
       const message = (err as Error).message || String(err);
       log.error('video write failed after provider completed', {
@@ -386,18 +412,18 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
       };
     }
 
-    registerGeneratedMediaUrl(finalPath, adapterRes.videoUrl);
+    if(!finished.changed) registerGeneratedMediaUrl(finalPath, adapterRes.videoUrl);
     log.info('video generated', {
       provider: candidate.entry.provider,
       model: selectedModel,
       taskId: adapterRes.taskId,
       path: logPathRef(finalPath),
-      bytes: adapterRes.buffer.length,
+      bytes: finished.bytes,
     });
     return {
       ok: true,
       path: finalPath,
-      bytes: adapterRes.buffer.length,
+      bytes: finished.bytes,
       provider: candidate.entry.provider,
       model: selectedModel,
       taskId: adapterRes.taskId,
@@ -406,6 +432,7 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
       ...(adapterRes.ratio ? { ratio: adapterRes.ratio } : {}),
       ...(typeof adapterRes.duration === 'number' ? { duration: adapterRes.duration } : {}),
       ...(adapterRes.resolution ? { resolution: adapterRes.resolution } : {}),
+      ...(finished.duration!==undefined?{duration:finished.duration}:{}),...(finished.ratio?{ratio:finished.ratio}:{}),...(finished.resolution?{resolution:finished.resolution}:{}),
     };
   }
 
@@ -418,47 +445,56 @@ export async function generateVideo(input: GenerateVideoInput): Promise<Generate
 
 export const video_gen = generateVideo;
 
-async function resolveReferenceUrls(input: GenerateVideoInput): Promise<{
-  referenceImageUrls: string[];
-  referenceVideoUrls: string[];
-}> {
-  const referenceImageUrls = await prepareReferenceUrls({
-    kind: 'image',
-    urls: input.referenceImageUrls,
-    paths: input.referenceImagePaths,
-    maxItems: 9,
-    signal: input.signal,
-    onProgress: input.onProgress,
+async function resolveReferenceUrls(
+  input: GenerateVideoInput,
+  profile?: VideoProfile,
+): Promise<ResolvedReferences> {
+  return withReferencePreparation(input.signal, async (signal) => {
+    const spec = profile && videoParameterModel(profile.provider, profile.model)?.spec;
+    const referenceImageUrls = await prepareReferenceUrls({
+      kind: 'image',
+      urls: input.referenceImageUrls,
+      paths: input.referenceImagePaths,
+      maxItems: spec?.images ?? 9,
+      signal,
+      onProgress: input.onProgress,
+    });
+    const referenceVideoUrls = await prepareReferenceUrls({
+      kind: 'video',
+      urls: input.referenceVideoUrls,
+      paths: input.referenceVideoPaths,
+      maxItems: spec?.videos ?? 3,
+      signal,
+      onProgress: input.onProgress,
+    });
+    const frame = async (url?: string, filePath?: string) => (url || filePath ? (await prepareReferenceUrls({
+      kind: 'image',
+      urls: url ? [url] : [],
+      paths: filePath ? [filePath] : [],
+      maxItems: 1,
+      signal,
+      onProgress: input.onProgress,
+    }))[0] : undefined);
+    const firstFrameUrl = await frame(input.firstFrameUrl, input.firstFramePath);
+    const lastFrameUrl = await frame(input.lastFrameUrl, input.lastFramePath);
+    if(profile?.provider === ORKAS_API_PROVIDER && [...referenceImageUrls,...referenceVideoUrls].some(url=>!/^https:\/\//i.test(url))) throw new Error('Orkas API video references must use public HTTPS URLs');
+    return { referenceImageUrls, referenceVideoUrls, ...(firstFrameUrl ? { firstFrameUrl } : {}), ...(lastFrameUrl ? { lastFrameUrl } : {}) };
   });
-  const referenceVideoUrls = await prepareReferenceUrls({
-    kind: 'video',
-    urls: input.referenceVideoUrls,
-    paths: input.referenceVideoPaths,
-    maxItems: 3,
-    signal: input.signal,
-    onProgress: input.onProgress,
-  });
-  if ([...referenceImageUrls, ...referenceVideoUrls].some((url) => !/^https:\/\//i.test(url))) {
-    throw new Error('Orkas API video references must use public HTTPS URLs');
-  }
-  return { referenceImageUrls, referenceVideoUrls };
 }
 
 async function dispatchVideo(req: AdapterVideoRequest, provider: string): Promise<AdapterVideoResult> {
-  if (provider === ORKAS_API_PROVIDER) {
-    return callOrkasApiVideo({ ...req, quality: req.quality === 'quality' ? 'quality' : 'balanced' });
-  }
-
+  req = { ...req, deadlineAt: req.deadlineAt ?? Date.now() + req.timeoutMs };
+  if(provider === ORKAS_API_PROVIDER) return callOrkasApiVideo({...req,quality:req.quality==='quality'?'quality':'balanced'});
   if (provider === 'doubao') req = normalizeDoubaoVideoRequest(req);
   emitProgress(
     req.onProgress,
     'configuration',
-    `Video configuration: ${provider}/${videoModelDisplayName(req.model)}, ${req.resolution}, ${req.duration}s, `
+    `Video configuration: ${provider}/${videoModelDisplayName(req.model)}, ${req.resolution}, ${req.model === 'gemini-omni-1.1-flash' ? 'prompt-controlled duration' : `${req.duration}s`}, `
       + `${req.generateAudio ? 'audio requested' : 'silent'}; user API key, 0 Orkas credits/second`,
     {
       provider,
       model: req.model,
-      duration: req.duration,
+      ...(req.model === 'gemini-omni-1.1-flash' ? {} : { duration: req.duration }),
       resolution: req.resolution,
       generateAudio: req.generateAudio,
       creditsMilliPerSecond: 0,
@@ -470,6 +506,8 @@ async function dispatchVideo(req: AdapterVideoRequest, provider: string): Promis
   if (provider === 'kling') return callKlingVideo(req);
   if (provider === 'google') return callGoogleVideo(req);
   if (provider === 'runway') return callRunwayVideo(req);
+  if (provider === 'aliyun') return callWanVideo(req);
+  if (provider === 'google-cloud') return callCloudVeoVideo(req);
   throw new Error(`Unknown video-gen provider: ${provider}`);
 }
 
@@ -589,6 +627,7 @@ async function downloadVideo(
   onProgress?: VideoProgressReporter,
   headers?: Record<string, string>,
 ): Promise<Buffer> {
+  throwIfAborted(signal);
   emitProgress(onProgress, 'download', 'Downloading generated video');
   const timeout = composeAbortSignal(signal, DOWNLOAD_TIMEOUT_MS, 'video download timed out');
   try {
@@ -640,10 +679,15 @@ export function validateDownloadedVideo(buffer: Buffer): void {
   throw new Error('video download returned invalid or unsupported MP4 bytes');
 }
 
-function ensureMp4Extension(value: string): string {
+function ensurePublicApiMp4Extension(value: string): string {
   const extension = path.extname(value);
   if (extension.toLowerCase() === '.mp4') return value;
   return extension ? `${value.slice(0, -extension.length)}.mp4` : `${value}.mp4`;
+}
+
+function ensureMp4Extension(p: string): string {
+  const ext = path.extname(p).toLowerCase();
+  return ext ? p : `${p}.mp4`;
 }
 
 function truncate(value: string, max: number): string {
@@ -666,7 +710,7 @@ class VideoGenerationAcceptedTaskError extends Error {
 }
 
 function klingVideoInputError(input: GenerateVideoInput & { ratioExplicit?: boolean }): string | null {
-  const imageCount = (input.referenceImageUrls?.length || 0) + (input.referenceImagePaths?.length || 0);
+  const imageCount = (input.referenceImageUrls?.length || 0) + (input.referenceImagePaths?.length || 0) + (hasFirstFrame(input) ? 1 : 0);
   const videoCount = (input.referenceVideoUrls?.length || 0) + (input.referenceVideoPaths?.length || 0);
   if (input.operation === 'edit' || videoCount) return 'Kling 3.0 Turbo supports text or one first-frame image; video editing is unsupported.';
   if (imageCount > 1) return 'Kling 3.0 Turbo accepts only one first-frame image.';
@@ -686,8 +730,13 @@ async function fetchVideoControl<T>(
   timeoutMessage: string, readBody: (response: Response) => Promise<T>, creation = false,
 ): Promise<T> {
   throwIfAborted(req.signal);
+  if (!creation && req.deadlineAt !== undefined) {
+    const remaining = req.deadlineAt - Date.now();
+    if (remaining <= 0) throw new Error('Video task query timed out.');
+    timeoutMs = Math.min(timeoutMs, remaining);
+  }
   if (creation) req.onRequestDisposition?.('sent');
-  const { body } = await fetchAndReadWithTimeout(url, init, timeoutMs, req.signal, timeoutMessage, response => {
+  const { body } = await fetchNativeVideoAndRead(url, init, timeoutMs, req.signal, timeoutMessage, response => {
     if (creation) {
       // A successful header is acceptance, not a usable task receipt. A 5xx
       // or lost connection does not prove that creation had no side effect.
@@ -726,21 +775,33 @@ interface AdapterVideoResult {
   model?: string;
 }
 
-function normalizeVideoInput(input: GenerateVideoInput): NormalizedVideoInput {
-  if (input.operation === 'edit' && !(input.referenceVideoUrls?.length)) {
-    throw new Error('operation=edit requires at least one reference video');
-  }
-  const duration = clampNumber(input.duration, 5, 4, 15);
+function normalizeVideoInput(input: GenerateVideoInput, profile?: VideoProfile): NormalizedVideoInput {
+  if(!profile || profile.provider === ORKAS_API_PROVIDER) return normalizeLegacyVideoInput(input);
+  input = fitVideoParameters(input, profile.provider, profile.model);
+  const known = profile && videoParameterModel(profile.provider, profile.model);
+  const spec = known?.spec;
+  const nativeProvider = known?.provider ?? profile?.provider;
+  const current = spec && !profile!.model.startsWith('doubao-seedance-2-0');
+  const edit25 = isSeedance25Model(profile?.model) && input.operation === 'edit';
+  const duration = current ? input.duration ?? (edit25 ? -1 : nativeProvider === 'google-cloud' ? 8 : 5) : clampNumber(input.duration, 5, 4, 15);
   const pollIntervalMs = clampNumber(input.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, 1000, 30000);
   const timeoutMs = clampNumber(input.timeoutMs, DEFAULT_TIMEOUT_MS, 30_000, 60 * 60 * 1000);
+  const framed = hasFirstFrame(input);
+  // Given a first frame and no ratio, keep the frame's own shape wherever the service can.
+  const frameRatio = framed && (profile?.provider === 'doubao' || !!spec?.ratios.includes('adaptive'));
+  const firstFrameUrl = String(input.firstFrameUrl || '').trim();
+  const lastFrameUrl = String(input.lastFrameUrl || '').trim();
   return {
     prompt: input.prompt.trim(),
-    referenceImageUrls: (input.referenceImageUrls || []).map((u) => String(u || '').trim()).filter(Boolean).slice(0, 9),
-    referenceVideoUrls: (input.referenceVideoUrls || []).map((u) => String(u || '').trim()).filter(Boolean).slice(0, 3),
+    referenceImageUrls: (input.referenceImageUrls || []).map((u) => String(u || '').trim()).filter(Boolean).slice(0, spec?.images ?? 9),
+    referenceVideoUrls: (input.referenceVideoUrls || []).map((u) => String(u || '').trim()).filter(Boolean).slice(0, spec?.videos ?? 3),
+    ...(firstFrameUrl ? { firstFrameUrl } : {}),
+    ...(lastFrameUrl ? { lastFrameUrl } : {}),
     operation: input.operation === 'edit' ? 'edit' : 'generate',
-    ratio: normalizeChoice(input.ratio, ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'], '16:9'),
+    ratio: current || profile?.provider === 'doubao' ? input.ratio ?? (edit25 || frameRatio ? 'adaptive' : '16:9')
+      : normalizeChoice(input.ratio, ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'], '16:9'),
     duration,
-    resolution: normalizeChoice(input.resolution, ['480p', '720p', '1080p'], '720p'),
+    resolution: current ? input.resolution ?? (spec?.resolutions.includes('720p') ? '720p' : '768p') : normalizeChoice(input.resolution, ['480p', '720p', '1080p'], '720p'),
     quality: normalizeChoice(input.quality, ['economy', 'balanced', 'quality'], 'balanced') as NormalizedVideoInput['quality'],
     generateAudio: input.generateAudio !== false,
     watermark: input.watermark === true,
@@ -764,14 +825,14 @@ function normalizeDoubaoVideoRequest(req: AdapterVideoRequest): AdapterVideoRequ
   // Official Fast/Mini contract permits480p/720p. Requester confirmed the
   // 1080p ->720p fallback; keep Standard and the selected model identity.
   // https://docs.volcengine.com/docs/ark/video-generation-tutorial?lang=zh
-  const supports1080p = !['doubao-seedance-2-0-fast-260128', 'doubao-seedance-2-0-mini', 'doubao-seedance-2-0-mini-260615'].includes(req.model);
+  const supports1080p = !['doubao-seedance-2-5-flash', 'doubao-seedance-2-0-fast-260128', 'doubao-seedance-2-0-mini', 'doubao-seedance-2-0-mini-260615'].includes(req.model);
   return req.resolution === '1080p' && !supports1080p ? { ...req, resolution: '720p' } : req;
 }
 
 export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
   throwIfAborted(req.signal);
   req = normalizeDoubaoVideoRequest(req);
-  const content: Array<Record<string, unknown>> = [{ type: 'text', text: req.prompt }];
+  const content: Array<Record<string, unknown>> = [{ type: 'text', text: req.prompt }, ...frameContent(req)];
   for (const url of req.referenceImageUrls) {
     content.push({
       type: 'image_url',
@@ -797,6 +858,7 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
     resolution: req.resolution,
     generate_audio: req.generateAudio,
     watermark: req.watermark,
+    ...(isSeedance25Model(req.model) && req.operation === 'edit' ? { omni_reference_task_type: 'edit' } : {}),
     ...(typeof req.seed === 'number' ? { seed: req.seed } : {}),
   };
 
@@ -926,6 +988,7 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
 }
 
 export async function callMiniMaxVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  if (videoModelSpec('minimax', req.model)) return callMiniMaxH3Video(req);
   if (req.referenceVideoUrls.length || req.operation === 'edit') {
     throw new Error('MiniMax Hailuo 2.3 does not support reference-video editing in this adapter');
   }
@@ -938,9 +1001,10 @@ export async function callMiniMaxVideo(req: AdapterVideoRequest): Promise<Adapte
     duration,
     resolution,
   };
-  if (req.referenceImageUrls[0]) createBody.first_frame_image = req.referenceImageUrls[0];
+  const firstImage = req.firstFrameUrl || req.referenceImageUrls[0];
+  if (firstImage) createBody.first_frame_image = firstImage;
   const created = await requestJson(
-    `${MINIMAX_BASE}/v1/video_generation`,
+    `${videoApiBase('minimax', req)}/v1/video_generation`,
     { method: 'POST', headers, body: JSON.stringify(createBody) },
     req,
     'MiniMax video create',
@@ -953,7 +1017,7 @@ export async function callMiniMaxVideo(req: AdapterVideoRequest): Promise<Adapte
   while (Date.now() - started < req.timeoutMs) {
     await sleep(req.pollIntervalMs, req.signal);
     const queried = await requestJson(
-      `${MINIMAX_BASE}/v1/query/video_generation?task_id=${encodeURIComponent(taskId)}`,
+      `${videoApiBase('minimax', req)}/v1/query/video_generation?task_id=${encodeURIComponent(taskId)}`,
       { method: 'GET', headers },
       req,
       'MiniMax video query',
@@ -967,7 +1031,7 @@ export async function callMiniMaxVideo(req: AdapterVideoRequest): Promise<Adapte
       const fileId = String((queried as any)?.file_id || '').trim();
       if (!fileId) throw new Error(`MiniMax video task ${taskId} succeeded without file_id`);
       const file = await requestJson(
-        `${MINIMAX_BASE}/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
+        `${videoApiBase('minimax', req)}/v1/files/retrieve?file_id=${encodeURIComponent(fileId)}`,
         { method: 'GET', headers },
         req,
         'MiniMax video file retrieve',
@@ -986,8 +1050,9 @@ export async function callViduVideo(req: AdapterVideoRequest): Promise<AdapterVi
     throw new Error('Vidu Q3 Pro supports text/image generation here; reference-video editing requires a different Vidu model');
   }
   const headers = { Authorization: `Token ${req.apiKey}`, 'Content-Type': 'application/json' };
-  const firstImage = req.referenceImageUrls[0];
-  const endpoint = firstImage ? 'img2video' : 'text2video';
+  const firstImage = req.firstFrameUrl || req.referenceImageUrls[0];
+  // https://platform.vidu.com/docs/api-reference/video-models/vidu-q3/start-end-to-video
+  const endpoint = req.lastFrameUrl ? 'start-end2video' : firstImage ? 'img2video' : 'text2video';
   const resolution = req.resolution === '480p' ? '540p' : req.resolution;
   const createBody: Record<string, unknown> = {
     model: req.model,
@@ -998,10 +1063,10 @@ export async function callViduVideo(req: AdapterVideoRequest): Promise<AdapterVi
     off_peak: false,
     ...(typeof req.seed === 'number' ? { seed: req.seed } : {}),
   };
-  if (firstImage) createBody.images = [firstImage];
+  if (firstImage) createBody.images = req.lastFrameUrl ? [firstImage, req.lastFrameUrl] : [firstImage];
   else createBody.aspect_ratio = normalizeChoice(req.ratio, ['16:9', '9:16', '1:1', '4:3', '3:4'], '16:9');
   const created = await requestJson(
-    `${VIDU_BASE}/ent/v2/${endpoint}`,
+    `${videoApiBase('vidu', req)}/ent/v2/${endpoint}`,
     { method: 'POST', headers, body: JSON.stringify(createBody) },
     req,
     'Vidu video create',
@@ -1013,7 +1078,7 @@ export async function callViduVideo(req: AdapterVideoRequest): Promise<AdapterVi
   while (Date.now() - started < req.timeoutMs) {
     await sleep(req.pollIntervalMs, req.signal);
     const queried = await requestJson(
-      `${VIDU_BASE}/ent/v2/tasks/${encodeURIComponent(taskId)}/creations`,
+      `${videoApiBase('vidu', req)}/ent/v2/tasks/${encodeURIComponent(taskId)}/creations`,
       { method: 'GET', headers },
       req,
       'Vidu video query',
@@ -1032,10 +1097,11 @@ export async function callViduVideo(req: AdapterVideoRequest): Promise<AdapterVi
 }
 
 export async function callKlingVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  if (videoModelSpec('kling', req.model)) return callKling4Video(req);
   throwIfAborted(req.signal);
   const inputError = klingVideoInputError({ ...req, outputAbsPath: '' });
   if (inputError) throw new Error(inputError);
-  const firstImage = req.referenceImageUrls[0];
+  const firstImage = req.firstFrameUrl || req.referenceImageUrls[0];
   const endpoint = firstImage ? 'image-to-video' : 'text-to-video';
   const headers = { Authorization: `Bearer ${req.apiKey}`, 'Content-Type': 'application/json' };
   // https://kling.ai/document-api/api/video/3-0-turbo/text-to-video
@@ -1046,7 +1112,7 @@ export async function callKlingVideo(req: AdapterVideoRequest): Promise<AdapterV
     options: { watermark_info: { enabled: req.watermark } },
   };
   const created = await requestKlingJson(
-    `${KLING_BASE}/${endpoint}/kling-3.0-turbo`,
+    `${videoApiBase('kling', req)}/${endpoint}/kling-3.0-turbo`,
     { method: 'POST', headers, body: JSON.stringify(createBody) },
     req,
     'Kling video create',
@@ -1061,7 +1127,7 @@ export async function callKlingVideo(req: AdapterVideoRequest): Promise<AdapterV
       await sleep(req.pollIntervalMs, req.signal);
       let queried: any;
       try {
-        queried = await requestKlingJson(`${KLING_BASE}/tasks?${new URLSearchParams({ task_ids: taskId })}`, { method: 'GET', headers }, req, 'Kling video query');
+        queried = await requestKlingJson(`${videoApiBase('kling', req)}/tasks?${new URLSearchParams({ task_ids: taskId })}`, { method: 'GET', headers }, req, 'Kling video query');
         pollFailures = NO_POLL_FAILURES;
       } catch (err) {
         pollFailures = countVideoPollFailure(pollFailures, err, req.signal);
@@ -1109,6 +1175,7 @@ async function requestKlingJson(url: string, init: RequestInit, req: AdapterVide
 }
 
 export async function callGoogleVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  if (req.model === 'gemini-omni-1.1-flash') return callOmniVideo(req);
   if (req.referenceVideoUrls.length || req.operation === 'edit') {
     throw new Error('Google Veo 3.1 direct adapter currently supports text/image generation, not reference-video editing');
   }
@@ -1164,9 +1231,9 @@ export async function callRunwayVideo(req: AdapterVideoRequest): Promise<Adapter
     'Content-Type': 'application/json',
     'X-Runway-Version': '2024-11-06',
   };
-  const firstImage = req.referenceImageUrls[0];
+  const firstImage = req.firstFrameUrl || req.referenceImageUrls[0];
   const endpoint = firstImage ? 'image_to_video' : 'text_to_video';
-  const duration = nearestChoice(req.duration, [5, 10]);
+  const duration = req.duration;
   const createBody: Record<string, unknown> = {
     model: req.model,
     promptText: req.prompt,
@@ -1312,11 +1379,12 @@ function runwayRatio(ratio: string, imageToVideo: boolean): string {
 }
 
 function videoModelDisplayName(model: string): string {
+  const current = Object.values(VIDEO_MODEL_SPECS).flat().find(spec => spec.id === model);
+  if (current) return current.name;
   return ({
     'doubao-seedance-2-0-260128': 'Seedance 2.0',
     'doubao-seedance-2-0-fast-260128': 'Seedance 2.0 Fast',
     'doubao-seedance-2-0-mini': 'Seedance 2.0 Mini',
-    'server-managed': 'Server managed',
   } as Record<string, string>)[model] || model;
 }
 
@@ -1399,3 +1467,352 @@ function emitVideoPollRetry(
     });
 }
 
+
+function normalizeLegacyVideoInput(input: GenerateVideoInput): NormalizedVideoInput {
+  if (input.operation === 'edit' && !(input.referenceVideoUrls?.length)) {
+    throw new Error('operation=edit requires at least one reference video');
+  }
+  const duration = clampNumber(input.duration, 5, 4, 15);
+  const pollIntervalMs = clampNumber(input.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, 1000, 30000);
+  const timeoutMs = clampNumber(input.timeoutMs, DEFAULT_TIMEOUT_MS, 30_000, 60 * 60 * 1000);
+  return {
+    prompt: input.prompt.trim(),
+    referenceImageUrls: (input.referenceImageUrls || []).map((u) => String(u || '').trim()).filter(Boolean).slice(0, 9),
+    referenceVideoUrls: (input.referenceVideoUrls || []).map((u) => String(u || '').trim()).filter(Boolean).slice(0, 3),
+    operation: input.operation === 'edit' ? 'edit' : 'generate',
+    ratio: normalizeChoice(input.ratio, ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'], '16:9'),
+    duration,
+    resolution: normalizeChoice(input.resolution, ['480p', '720p', '1080p'], '720p'),
+    quality: normalizeChoice(input.quality, ['economy', 'balanced', 'quality'], 'balanced') as NormalizedVideoInput['quality'],
+    generateAudio: input.generateAudio !== false,
+    watermark: input.watermark === true,
+    ...(typeof input.seed === 'number' && Number.isFinite(input.seed) ? { seed: Math.trunc(input.seed) } : {}),
+    pollIntervalMs,
+    timeoutMs,
+  };
+}
+
+const VIDEO_API_BASES = {
+  minimax: { cn: 'https://api.minimax.cn', global: 'https://api.minimax.io' },
+  vidu: { cn: 'https://api.vidu.cn', global: 'https://api.vidu.com' },
+  kling: { cn: 'https://api-beijing.klingai.com', global: 'https://api-singapore.klingai.com' },
+} as const;
+
+function hasFirstFrame(input: GenerateVideoInput): boolean {
+  return !!(input.firstFrameUrl || input.firstFramePath);
+}
+
+function videoFrameInputError(input: GenerateVideoInput, profile: VideoProfile, imageCap?: number): string | null {
+  const first = hasFirstFrame(input);
+  const last = !!(input.lastFrameUrl || input.lastFramePath);
+  if (!first && !last) return null;
+  if (!first) return 'last_frame needs first_frame. Pass the opening image as first_frame too, or move this image to first_frame.';
+  if (input.operation === 'edit') return 'operation=edit cannot use first_frame or last_frame.';
+  if (profile.provider === 'google') {
+    return 'Gemini Omni has no frame setting. Pass the images as reference images and say in the prompt which one opens the video and which one ends it.';
+  }
+  const support = videoFrameSupport(profile.provider, profile.model);
+  if (support.frames === 'none') return `${support.name} does not accept images; remove first_frame.`;
+  if (last && support.frames === 'first') return `${support.name} takes a first frame only; remove last_frame.`;
+  const images = (input.referenceImageUrls?.length || 0) + (input.referenceImagePaths?.length || 0);
+  const videos = (input.referenceVideoUrls?.length || 0) + (input.referenceVideoPaths?.length || 0);
+  if ((images || videos) && !support.withReferences) {
+    return `${support.name} cannot combine first_frame or last_frame with reference images or videos. Send the images either as frames or as references.`;
+  }
+  if (imageCap !== undefined && images + 1 + (last ? 1 : 0) > imageCap) return `${support.name} accepts at most ${imageCap} images, frames included.`;
+  if (support.fixRatio && input.ratio !== undefined && input.ratio !== 'adaptive') return `${support.name} takes its aspect ratio from first_frame; omit ratio.`;
+  return null;
+}
+
+export function videoGenerationInputError(input: GenerateVideoInput, profile: VideoProfile): string | null {
+  if (profile.provider === ORKAS_API_PROVIDER) {
+    if (hasFirstFrame(input) || input.lastFrameUrl || input.lastFramePath) return 'The public Orkas API does not support explicit first_frame or last_frame. Use reference images instead.';
+    if ((input.referenceImageUrls?.length || 0) + (input.referenceImagePaths?.length || 0) > 9) return 'The public Orkas API accepts at most 9 reference images.';
+    if ((input.referenceVideoUrls?.length || 0) + (input.referenceVideoPaths?.length || 0) > 3) return 'The public Orkas API accepts at most 3 reference videos.';
+    return null;
+  }
+  const spec = videoModelSpec(profile.provider,profile.model);
+  if (profile.provider === 'kling' && profile.model === 'kling-v3-0-turbo') return videoFrameInputError(input, profile) ?? klingVideoInputError(input);
+  const framed = hasFirstFrame(input);
+  if (!spec) {
+    const frameError = videoFrameInputError(input, profile);
+    if (frameError) return frameError;
+    // Managed and saved legacy routes retain their established conversions,
+    // but cannot fulfill settings outside their original request envelope.
+    if (input.duration !== undefined && (!Number.isInteger(input.duration) || input.duration < 4 || input.duration > 15)) return 'This video service supports durations from 4 to 15 seconds. Select a configured model that supports the requested duration.';
+    if (input.resolution !== undefined && !['480p', '720p', '1080p'].includes(input.resolution)) return 'This video service supports 480p, 720p or 1080p. Select a configured model that supports the requested resolution.';
+    if (input.ratio !== undefined && !['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'].includes(input.ratio)
+      && !(profile.provider === 'doubao' && input.ratio === 'adaptive')) return 'This video service does not support the requested aspect ratio.';
+    return null;
+  }
+  const images = (input.referenceImageUrls?.length || 0) + (input.referenceImagePaths?.length || 0);
+  const videos = (input.referenceVideoUrls?.length || 0) + (input.referenceVideoPaths?.length || 0);
+  if (images > spec.images) return `${spec.name} accepts at most ${spec.images} reference images.`;
+  if (videos > spec.videos) return `${spec.name} accepts at most ${spec.videos} reference videos.`;
+  const frameError = videoFrameInputError(input, profile,
+    spec.framesWithReferences ? spec.images : undefined);
+  if (frameError) return frameError;
+  if (input.operation === 'edit' && !videos) return 'Video editing requires a reference video.';
+  if (input.operation === 'edit' && !spec.videos) return `${spec.name} does not support video editing.`;
+  if (input.duration !== undefined && ((!Number.isInteger(input.duration) || input.duration < spec.minDuration || input.duration > spec.maxDuration)
+    && !(spec.autoDuration && input.duration === -1))) return `${spec.name} duration must be ${spec.minDuration}-${spec.maxDuration} seconds${spec.autoDuration ? ' or -1 for automatic duration' : ''}.`;
+  if (input.ratio !== undefined && !spec.ratios.includes(input.ratio)
+    && !(framed && spec.framesFixRatio && input.ratio === 'adaptive')) return `${spec.name} does not support this aspect ratio.`;
+  if (input.resolution !== undefined && !spec.resolutions.includes(input.resolution)) return `${spec.name} resolution must be ${spec.resolutions.join(', ')}.`;
+  if (profile.provider === 'runway' && !images && !framed && input.ratio !== undefined && !['16:9', '9:16'].includes(input.ratio)) return 'Runway Gen-4.5 text-to-video supports 16:9 or 9:16.';
+  if (input.generateAudio === false && !spec.silent) return `${spec.name} does not expose a silent-video control. Use a service that supports silent generation.`;
+  if ((profile.provider === 'kling' || profile.provider === 'minimax' || profile.provider === 'google') && input.seed !== undefined) return `${spec.name} does not expose a seed parameter.`;
+  if (profile.provider === 'google') {
+    if (input.duration !== undefined) return 'Omni controls video duration through the prompt. Omit duration and describe the timing in the prompt.';
+  }
+  if (profile.provider === 'google-cloud' && input.duration !== undefined && ![4, 6, 8].includes(input.duration)) return 'Veo 3.1 supports durations of 4, 6 or 8 seconds.';
+  if (profile.provider === 'google-cloud' && ['1080p', '4k'].includes(input.resolution || '') && input.duration !== undefined && input.duration !== 8) return 'Veo 3.1 at 1080p or 4K requires 8 seconds.';
+  if (profile.provider === 'google-cloud') {
+    try { createVideoCloudCredentials(profile.apiKey); }
+    catch (err) { return (err as Error).message; }
+  }
+  if (isSeedance25Model(profile.model) && input.operation === 'edit') {
+    if (input.duration !== undefined && input.duration !== -1) return 'Seedance 2.5 editing requires duration=-1.';
+    if (input.ratio !== undefined && input.ratio !== 'adaptive') return 'Seedance 2.5 editing requires ratio=adaptive.';
+  }
+  if (profile.provider === 'minimax' && !images && !videos && !framed && input.ratio === 'adaptive') return 'MiniMax H3 text-to-video requires a concrete aspect ratio.';
+  if (profile.provider === 'kling' && !images && !videos && !framed && input.ratio === 'adaptive') return 'Kling text-to-video requires a concrete aspect ratio.';
+  if (profile.provider === 'kling') {
+    // Native mixed-character budget: English/26000 + non-English/11000 <= 1.
+    let english = 0;
+    let other = 0;
+    for (const character of input.prompt) {
+      if (character.codePointAt(0)! <= 0x7f) english += 1;
+      else other += 1;
+      if (english * 11000 + other * 26000 > 26000 * 11000) return 'Shorten the Kling prompt to fit its English/non-English character budget.';
+    }
+  }
+  if (profile.provider === 'aliyun') {
+    if (!/^[a-zA-Z0-9-]{1,100}$/.test(profile.workspaceId || '')) return 'Configure the Alibaba Cloud workspace ID before generating a video.';
+    if (!WAN_REGIONS.includes(profile.region as typeof WAN_REGIONS[number])) return 'Select a supported Alibaba Cloud region.';
+    if (input.prompt.length > 20000) return 'Shorten the Wan prompt to at most 20000 characters.';
+  }
+  return null;
+}
+
+type ResolvedReferences = { referenceImageUrls: string[]; referenceVideoUrls: string[]; firstFrameUrl?: string; lastFrameUrl?: string };
+
+export function effectiveVideoSettings(input: GenerateVideoInput, profile: VideoProfile): { ratio: string; resolution: string; duration: number; generateAudio: boolean } {
+  const { ratio, resolution, duration, generateAudio } = normalizeVideoInput(input, profile);
+  return { ratio, resolution, duration, generateAudio };
+}
+
+function videoApiBase(provider: keyof typeof VIDEO_API_BASES, req: AdapterVideoRequest): string {
+  // New profiles pin China explicitly; untagged credentials keep the historical route.
+  return VIDEO_API_BASES[provider][req.apiSite === 'cn' ? 'cn' : 'global'];
+}
+
+async function pollCurrentVideo(
+  req: AdapterVideoRequest, provider: string, taskId: string,
+  query: () => Promise<any>, state: (data: any) => string,
+  completed: (data: any) => Promise<AdapterVideoResult>, initial?: any,
+): Promise<AdapterVideoResult> {
+  const deadline = req.deadlineAt ?? Date.now() + req.timeoutMs;
+  emitProgress(req.onProgress, 'task_created', 'Video task accepted', { provider, taskId });
+  let failures = NO_POLL_FAILURES;
+  let data = initial;
+  try {
+    while (Date.now() < deadline) {
+      throwIfAborted(req.signal);
+      if (!data) {
+        await sleep(Math.min(req.pollIntervalMs, Math.max(0, deadline - Date.now())), req.signal);
+        if (Date.now() >= deadline) break;
+        try { data = await query(); failures = NO_POLL_FAILURES; }
+        catch (err) {
+          failures = countVideoPollFailure(failures, err, req.signal);
+          if (failures.count >= MAX_CONSECUTIVE_POLL_FAILURES) throw err;
+          emitVideoPollRetry(req.onProgress, err, failures.count, { provider, taskId });
+          continue;
+        }
+      }
+      const status = state(data).toLowerCase();
+      emitProgress(req.onProgress, 'poll_result', 'Video task status received', { provider, taskId, status });
+      if (['succeeded', 'success', 'completed', 'active'].includes(status)) return await completed(data);
+      if (['failed', 'fail', 'cancelled', 'canceled', 'expired', 'unknown'].includes(status)) {
+        throw new VideoTaskFailedError('The video provider could not complete this task.', 'The video provider could not complete this task.');
+      }
+      if (!['queued', 'pending', 'submitted', 'running', 'processing', 'in_progress'].includes(status)) throw new Error('The provider returned an unknown video task state.');
+      data = undefined;
+    }
+    throw new VideoGenerationAcceptedTaskError('Video task polling reached its deadline. Preserve the task receipt; do not submit another generation automatically.', taskId, 'TIMEOUT');
+  } catch (err) {
+    if (err instanceof VideoDeliveryError || err instanceof VideoGenerationAcceptedTaskError || err instanceof VideoTaskFailedError) throw err;
+    throw new VideoGenerationAcceptedTaskError('Video task tracking stopped after creation. Preserve the task receipt; do not submit another generation automatically.', taskId,
+      req.signal?.aborted ? 'BAD_INPUT' : failures.count > 0 && failures.allTimedOut ? 'TIMEOUT' : 'PROVIDER_API_ERROR', { cause: err });
+  }
+}
+
+async function queryCurrentVideo(url: string, init: RequestInit, req: AdapterVideoRequest): Promise<any> {
+  return fetchVideoControl(url, init, req, VIDEO_POLL_HTTP_TIMEOUT_MS, 'Video task query timed out.', response => readNativeVideoResponse(response, 'Video task query'));
+}
+
+function frameContent(req: AdapterVideoRequest): Array<Record<string, unknown>> {
+  return [
+    ...(req.firstFrameUrl ? [{ type: 'image_url', role: 'first_frame', image_url: { url: req.firstFrameUrl } }] : []),
+    ...(req.lastFrameUrl ? [{ type: 'image_url', role: 'last_frame', image_url: { url: req.lastFrameUrl } }] : []),
+  ];
+}
+
+function nativeContent(req: AdapterVideoRequest): Array<Record<string, unknown>> {
+  return [
+    { type: 'text', text: req.prompt },
+    ...frameContent(req),
+    ...req.referenceImageUrls.map(url => ({ type: 'image_url', role: 'reference_image', image_url: { url } })),
+    ...req.referenceVideoUrls.map(url => ({ type: 'video_url', role: 'reference_video', video_url: { url } })),
+  ];
+}
+
+async function callMiniMaxH3Video(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  const headers = { Authorization: `Bearer ${req.apiKey}`, 'Content-Type': 'application/json' };
+  const created = await requestJson(`${videoApiBase('minimax', req)}/v2/video_generation`, { method: 'POST', headers, body: JSON.stringify({
+    model: req.model, content: nativeContent(req), resolution: req.resolution.toUpperCase(), duration: req.duration, ratio: req.ratio,
+  }) }, req, 'MiniMax H3 create');
+  const taskId = extractTaskId(created);
+  if (!taskId) throw new Error('MiniMax H3 returned no task receipt.');
+  return pollCurrentVideo(req, 'minimax', taskId,
+    () => queryCurrentVideo(`${videoApiBase('minimax', req)}/v2/query/video_generation/${encodeURIComponent(taskId)}`, { method: 'GET', headers }, req),
+    data => String(data?.task?.status || ''), async data => {
+      const task = data.task;
+      const videoUrl = String(task?.content?.url || '');
+      if (!videoUrl) throw new Error('MiniMax H3 completed without a video output.');
+      return { buffer: await downloadVideo(videoUrl, taskId, req.signal, req.onProgress), taskId, videoUrl, status: 'succeeded', model: req.model,
+        duration: task.duration, resolution: String(task.resolution || req.resolution).toLowerCase(), ratio: task.ratio };
+    });
+}
+
+async function callKling4Video(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  const headers = { Authorization: `Bearer ${req.apiKey}`, 'Content-Type': 'application/json' };
+  const nativeModel = req.model === 'kling-v4-0-flash' ? 'kling-4.0-flash' : 'kling-4.0';
+  // Generic references are reference assets, not keyframes. Preserve every asset. Frames are
+  // keyframes: Kling wants the first frame before and the last frame after the other images.
+  const hasReferences = !!(req.referenceImageUrls.length || req.referenceVideoUrls.length || req.firstFrameUrl);
+  const contents: Array<Record<string, unknown>> = [{ type: 'prompt', text: req.prompt }];
+  req.referenceVideoUrls.forEach((url, index) => contents.push({ type: req.operation === 'edit' && index === 0 ? 'base_video' : 'feature_video', url, id: `Video${index + 1}` }));
+  if (req.firstFrameUrl) contents.push({ type: 'first_frame', url: req.firstFrameUrl });
+  req.referenceImageUrls.forEach((url, index) => contents.push({ type: 'refer_image', url, id: `Image${index + 1}` }));
+  if (req.lastFrameUrl) contents.push({ type: 'last_frame', url: req.lastFrameUrl });
+  const created = await requestKlingJson(`${videoApiBase('kling', req)}/${hasReferences ? 'omni-video' : 'text-to-video'}/${nativeModel}`, {
+    method: 'POST', headers, body: JSON.stringify({
+      ...(hasReferences ? { contents } : { prompt: req.prompt }),
+      settings: { duration: req.duration, resolution: req.resolution, aspect_ratio: req.ratio },
+      options: { watermark_info: { enabled: req.watermark } },
+    }),
+  }, req, 'Kling video create');
+  const taskId = String(created?.data?.id || '');
+  if (!taskId) throw new Error('Kling returned no task receipt.');
+  const task = (data: any) => Array.isArray(data?.data) ? data.data.find((item: any) => item?.id === taskId) : undefined;
+  return pollCurrentVideo(req, 'kling', taskId,
+    () => requestKlingJson(`${videoApiBase('kling', req)}/tasks?${new URLSearchParams({ task_ids: taskId })}`, { method: 'GET', headers }, req, 'Kling video query'),
+    data => String(task(data)?.status || ''), async data => {
+      const result = task(data);
+      const video = result?.outputs?.find((item: any) => item?.type === 'video');
+      const videoUrl = String((req.watermark ? video?.watermark_url : video?.url) || '');
+      if (!videoUrl) throw new Error('Kling completed without the requested video output.');
+      const duration = Number(video.duration);
+      return { buffer: await downloadVideo(videoUrl, taskId, req.signal, req.onProgress), taskId, videoUrl, status: 'succeeded', model: req.model,
+        ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}), resolution: req.resolution, ratio: req.ratio };
+    });
+}
+
+async function callWanVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  const base = `https://${req.workspaceId}.${req.region}.maas.aliyuncs.com/api/v1`;
+  const headers = { Authorization: `Bearer ${req.apiKey}`, 'Content-Type': 'application/json', 'X-DashScope-Async': 'enable' };
+  const media = [
+    ...(req.firstFrameUrl ? [{ type: 'first_frame', url: req.firstFrameUrl }] : []),
+    ...(req.lastFrameUrl ? [{ type: 'last_frame', url: req.lastFrameUrl }] : []),
+    ...req.referenceImageUrls.map(url => ({ type: 'reference_image', url })),
+    ...req.referenceVideoUrls.map(url => ({ type: 'reference_video', url })),
+  ];
+  const created = await requestJson(`${base}/services/aigc/video-generation/video-synthesis`, { method: 'POST', headers, body: JSON.stringify({
+    model: req.model, input: { prompt: req.prompt, ...(media.length ? { media } : {}) },
+    parameters: { resolution: req.resolution.toUpperCase(), ratio: req.ratio, duration: req.duration, audio: req.generateAudio,
+      ...(req.seed !== undefined ? { seed: req.seed } : {}) },
+  }) }, req, 'Wan video create');
+  const taskId = String(created?.output?.task_id || '');
+  if (!taskId) throw new Error('Wan returned no task receipt.');
+  return pollCurrentVideo(req, 'aliyun', taskId,
+    () => queryCurrentVideo(`${base}/tasks/${encodeURIComponent(taskId)}`, { method: 'GET', headers }, req),
+    data => String(data?.output?.task_status || ''), async data => {
+      const videoUrl = String(data?.output?.video_url || '');
+      if (!videoUrl) throw new Error('Wan completed without a video output.');
+      return { buffer: await downloadVideo(videoUrl, taskId, req.signal, req.onProgress), taskId, videoUrl, status: 'succeeded', model: req.model,
+        ...(typeof data.output.duration === 'number' ? { duration: data.output.duration } : {}), resolution: req.resolution };
+    });
+}
+
+async function callCloudVeoVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  const credentials = createVideoCloudCredentials(req.apiKey, req.signal);
+  const base = `https://us-central1-aiplatform.googleapis.com/v1/projects/${credentials.projectId}/locations/us-central1/publishers/google/models/${req.model}`;
+  const headers = async () => ({ Authorization: `Bearer ${await credentials.token()}`, 'Content-Type': 'application/json' });
+  const instance: Record<string, unknown> = { prompt: req.prompt };
+  const firstImage = req.firstFrameUrl || req.referenceImageUrls[0];
+  if (firstImage) instance.image = await imageUrlToGoogleVideoImage(firstImage, req);
+  // https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/veo-video-generation
+  if (req.lastFrameUrl) instance.lastFrame = await imageUrlToGoogleVideoImage(req.lastFrameUrl, req);
+  const created = await requestJson(`${base}:predictLongRunning`, { method: 'POST', headers: await headers(), body: JSON.stringify({
+    instances: [instance], parameters: { aspectRatio: req.ratio, durationSeconds: req.duration, resolution: req.resolution, sampleCount: 1, generateAudio: req.generateAudio,
+      ...(req.seed !== undefined ? { seed: req.seed } : {}) },
+  }) }, req, 'Google Cloud Veo create');
+  const taskId = String(created?.name || '');
+  if (!taskId) throw new Error('Google Cloud Veo returned no operation receipt.');
+  return pollCurrentVideo(req, 'google-cloud', taskId,
+    async () => queryCurrentVideo(`${base}:fetchPredictOperation`, { method: 'POST', headers: await headers(), body: JSON.stringify({ operationName: taskId }) }, req),
+    data => data?.error ? 'failed' : data?.done ? 'completed' : 'running', async data => {
+      const video = data?.response?.videos?.[0];
+      if (typeof video?.bytesBase64Encoded !== 'string' || video.mimeType !== 'video/mp4') throw new Error('Google Cloud Veo completed without inline MP4 output.');
+      const buffer = Buffer.from(video.bytesBase64Encoded, 'base64');
+      validateDownloadedVideo(buffer);
+      return { buffer, taskId, videoUrl: '', status: 'succeeded', model: req.model, duration: req.duration, resolution: req.resolution, ratio: req.ratio };
+    });
+}
+
+async function callOmniVideo(req: AdapterVideoRequest): Promise<AdapterVideoResult> {
+  const headers = { 'x-goog-api-key': req.apiKey, 'Content-Type': 'application/json' };
+  const input: Array<Record<string, unknown>> = [{ type: 'text', text: req.prompt }];
+  for (const url of req.referenceImageUrls) {
+    const image = await imageUrlToGoogleVideoImage(url, req);
+    input.push({ type: 'image', mime_type: image.mimeType, data: image.bytesBase64Encoded });
+  }
+  for (const url of req.referenceVideoUrls) {
+    const composed = composeAbortSignal(req.signal, DOWNLOAD_TIMEOUT_MS, 'Omni reference download timed out.');
+    try {
+      const { body } = await downloadBinaryWithProxyPolicy(url, { label: 'Omni reference video', signal: composed.signal, maxBytes: 20 * 1024 * 1024, validate: validateDownloadedVideo });
+      input.push({ type: 'video', mime_type: 'video/mp4', data: body.toString('base64') });
+    } finally { composed.cleanup(); }
+  }
+  const created = await requestJson(`${GOOGLE_VIDEO_BASE}/interactions`, { method: 'POST', headers, body: JSON.stringify({
+    model: req.model, input, background: true,
+    response_format: { type: 'video', delivery: 'uri', aspect_ratio: req.ratio, resolution: req.resolution },
+  }) }, req, 'Google Omni create');
+  const taskId = String(created?.id || '');
+  if (!taskId) throw new Error('Google Omni returned no interaction receipt.');
+  return pollCurrentVideo(req, 'google', taskId,
+    () => queryCurrentVideo(`${GOOGLE_VIDEO_BASE}/interactions/${encodeURIComponent(taskId)}`, { method: 'GET', headers }, req),
+    data => String(data?.status || ''), async data => {
+      const video = data?.steps?.filter((step: any) => step?.type === 'model_output')
+        .flatMap((step: any) => Array.isArray(step.content) ? step.content : []).find((item: any) => item?.type === 'video');
+      if (video?.mime_type !== 'video/mp4') throw new Error('Google Omni completed without MP4 video output.');
+      if (typeof video.data === 'string') {
+        const buffer = Buffer.from(video.data, 'base64'); validateDownloadedVideo(buffer);
+        return { buffer, taskId, videoUrl: '', status: 'succeeded', model: req.model, resolution: req.resolution };
+      }
+      // URI delivery uses the Files API. Never forward the user's key to a foreign host.
+      const uri = new URL(String(video.uri || ''));
+      if (uri.protocol !== 'https:' || uri.hostname !== 'generativelanguage.googleapis.com' || !uri.pathname.startsWith('/v1beta/files/')) throw new Error('Google Omni returned an unsupported file URI.');
+      const fileMatch = /^\/v1beta\/files\/([A-Za-z0-9_-]+)(?::download)?$/.exec(uri.pathname);
+      if (!fileMatch) throw new Error('Google Omni returned an unsupported file identifier.');
+      const name = fileMatch[1];
+      return pollCurrentVideo(req, 'google', taskId,
+        () => queryCurrentVideo(`${GOOGLE_VIDEO_BASE}/files/${encodeURIComponent(name)}`, { method: 'GET', headers }, req),
+        file => String(file?.state || ''), async () => {
+          const download = new URL(`${GOOGLE_VIDEO_BASE}/files/${encodeURIComponent(name)}:download?alt=media`);
+          return { buffer: await downloadVideo(download.href, taskId, req.signal, req.onProgress, { 'x-goog-api-key': req.apiKey }),
+            taskId, videoUrl: '', status: 'succeeded', model: req.model, resolution: req.resolution };
+        });
+    }, created);
+}

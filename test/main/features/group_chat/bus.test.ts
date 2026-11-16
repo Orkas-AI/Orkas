@@ -36,8 +36,6 @@ const streamProbe = vi.hoisted(() => ({
   dispatchResults: [] as string[],
   maxToolLoops: [] as Array<number | undefined>,
   toolLists: [] as Array<string[] | undefined>,
-  releaseDiagnostics: null as null | ((event: any) => void),
-  registerLateDiagnostics: null as null | ((pending: Promise<any>) => void),
 }));
 
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
@@ -57,21 +55,6 @@ vi.mock('../../../../src/main/model/client', () => ({
     streamProbe.maxToolLoops.push(typeof _opts?.maxToolLoops === 'number' ? _opts.maxToolLoops : undefined);
     streamProbe.toolLists.push(Array.isArray(_opts?.toolList) ? [..._opts.toolList] : undefined);
     const message = rawMessage;
-    if (message.includes('LATE_ROUTE_REGISTRATION_TEST')) {
-      streamProbe.registerLateDiagnostics = _opts.onDiagnosticsPending;
-      yield { type: 'final', text: 'Original task complete' };
-      yield { type: 'done' };
-      return;
-    }
-    if (message.includes('ASYNC_MODEL_ROUTE_TEST')) {
-      _opts.onDiagnosticsPending?.(new Promise(resolve => { streamProbe.releaseDiagnostics = resolve; }));
-      if (message.includes('CANCEL')) {
-        await new Promise<void>(resolve => _opts.abortSignal.addEventListener('abort', () => resolve(), { once: true }));
-        yield { type: 'error', text: 'Stopped', aborted: true };
-      } else yield { type: 'final', text: 'Answer delivered before diagnostics' };
-      yield { type: 'done' };
-      return;
-    }
     const reasoningMarker = 'REASONING_PROCESS_PERSISTENCE_TEST:';
     const reasoningIdx = message.indexOf(reasoningMarker);
     if (isCommanderTurn && reasoningIdx >= 0) {
@@ -231,26 +214,6 @@ vi.mock('../../../../src/main/model/client', () => ({
     }
     if (message.includes('AGENT_MARKERLESS_SUCCESS_TEST')) {
       yield { type: 'final', text: '已完成交付。' };
-      yield { type: 'done' };
-      return;
-    }
-    const xmlMarker = 'SYNC_CONFLICT_XML_RESULT:';
-    const xmlIdx = message.indexOf(xmlMarker);
-    if (xmlIdx >= 0) {
-      const encoded = message.slice(xmlIdx + xmlMarker.length).split(/\s/, 1)[0];
-      const esc = (value: string) => String(value || '')
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
-      const idName = data.attributeStyle === 'aliases' ? 'id' : 'conflict_id';
-      const relName = data.attributeStyle === 'aliases' ? 'relative_path' : 'rel_path';
-      const targetName = data.attributeStyle === 'aliases' ? 'current_path' : 'target_path';
-      yield {
-        type: 'final',
-        text: `<sync-conflict-result ${idName}="${esc(data.conflictId)}" ${relName}="${esc(data.relPath)}" ${targetName}="${esc(data.targetPath)}" status="${esc(data.status || 'resolved')}" action="${esc(data.action || 'use_current')}" />`,
-      };
       yield { type: 'done' };
       return;
     }
@@ -568,7 +531,9 @@ async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
       // Do not let tests capture the transient `running` + empty `in_flight`
       // snapshot between those two lifecycle boundaries.
       const durable = await state.readState(uid, cid);
-      if (durable.status !== 'running' && durable.in_flight.length === 0) return;
+      const runtime = bus._cidStateForTest(uid, cid);
+      if (durable.status !== 'running' && durable.in_flight.length === 0
+        && !runtime?.taskRun && (runtime?.backgroundWrites.size ?? 0) === 0) return;
     }
     await new Promise((r) => setTimeout(r, 20));
   }
@@ -6431,6 +6396,29 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     }
   });
 
+  it('executes revised queued app context while keeping only the user requirement in the visible message', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-hidden-app-edit'; cidsToDrop.add(cid);
+    let release = () => {};
+    streamProbe.slowGate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'DEFERRED_SLOW_TURN_TEST active' });
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Original change', model_text: 'Original hidden source context' });
+      const queued = (await bus.listConversationTasks(TEST_UID, cid)).find(row => row.status === 'queued')!;
+      expect(bus.beginConversationTaskEdit(TEST_UID, cid, queued.task_id)).toMatchObject({ ok: true });
+      const resources = { attachments: [], references: [], use_selections: [], model_text: 'Updated hidden source context\nUpdated change' };
+      const api = await import('../../../../src/main/features/group_chat');
+      expect(await api.editTask(TEST_UID, cid, queued.task_id, 'Updated change', 'Original change', { ...resources, model_text: 42 } as any))
+        .toMatchObject({ ok: false, error: 'invalid arguments' });
+      expect(await api.editTask(TEST_UID, cid, queued.task_id, 'Updated change', 'Original change', resources)).toMatchObject({ ok: true });
+    } finally { release(); streamProbe.slowGate = null; }
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const message = (await userRowRecords(cid)).find(row => row.text === 'Updated change');
+    expect(message.model_text).toBe('Updated hidden source context\nUpdated change');
+    expect(streamProbe.messages.some(text => text.includes('Updated hidden source context'))).toBe(true);
+    expect(message.text).not.toContain('hidden source');
+  });
+
   it.each(['save', 'cancel-edit', 'delete'])('holds queue admission while editing and resumes after %s', async (action) => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const cid = `cid-composer-edit-${action}`;
@@ -6928,3 +6916,48 @@ describe('execution facts reach the persisted reply', () => {
     expect(await readFacts('cid-facts-short', 3)).toBeUndefined();
   });
 });
+
+it('delivers a host send to its named recipient without moving the user reply target, and names the run it joined', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    spec.interactive = true;
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    cliRunMock.nextResult = { runId: 'chosen-agent-reply', status: 'completed', output: 'Done.\n<handback />' };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const cid = 'cid-host-forced-recipient';
+    cidsToDrop.add(cid);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} make the requested change` });
+    await waitForQuiescent(TEST_UID, cid);
+    expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(AGENT_ID);
+
+    const terminals: any[] = [];
+    const stop = bus.subscribeTaskTerminals(event => { if (event.conversation_id === cid) terminals.push(event); });
+    const admittedRuns: string[] = [];
+    const commanderTurnsBefore = streamProbe.messages.length;
+    try {
+      const sent = await groupChat.send({
+        userId: TEST_UID, cid, text: 'HOST_FORCED_COMMANDER_CHECK', notificationKind: 'automation',
+        forceTo: ['commander'],
+        beforeDispatch: async (run) => { admittedRuns.push(run.runId); },
+      });
+      expect(sent.ok).toBe(true);
+      await waitForQuiescent(TEST_UID, cid);
+      // Durable status can be read before its tracked terminal callback resumes.
+      // Drain the actual notification owner before unsubscribing.
+      expect(await bus.drainConversationWrites(TEST_UID, cid)).toBe(true);
+    } finally { stop(); }
+
+    // Commander, not the Agent the user chose, received it.
+    expect(cliRunMock.calls).toHaveLength(1);
+    expect(streamProbe.messages.slice(commanderTurnsBefore).join('\n')).toContain('HOST_FORCED_COMMANDER_CHECK');
+    const floor = await state.readState(TEST_UID, cid);
+    expect(floor.active_recipient).toBe(AGENT_ID);
+    expect(floor.active_recipient_source).toBe('user_selection');
+    expect(admittedRuns).toHaveLength(1);
+    expect(terminals.map(event => event.run_id)).toEqual(admittedRuns);
+  });

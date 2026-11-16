@@ -4,25 +4,16 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-function requireGateTool(name) {
-  try {
-    return require(name);
-  } catch (err) {
-    if (err.code !== 'MODULE_NOT_FOUND' || !String(err.message).includes(`'${name}'`)) throw err;
-    return require(path.join(__dirname, '..', 'product', 'node_modules', ...name.split('/')));
-  }
-}
-
-const asar = requireGateTool('@electron/asar');
-const semver = requireGateTool('semver');
-const minimatchModule = requireGateTool('minimatch');
+const asar = require('@electron/asar');
+const semver = require('semver');
+const minimatchModule = require('minimatch');
 const minimatch = minimatchModule.minimatch || minimatchModule;
 
 // Full package graphs consumed by ordinary bundled Node. Connector adapters
 // load selected SDK entrypoints; their smaller closure and executable smoke
 // remain owned by packaged-entrypoint-gate.cjs. Electron-only dependencies can
 // stay in app.asar. See docs/packaged-dependencies.md for the complete inventory.
-const NODE_RUNTIME_PACKAGE_ROOTS = Object.freeze(['sharp', 'tsx']);
+const NODE_RUNTIME_PACKAGE_ROOTS = Object.freeze(['sharp', 'tsx', 'ag-psd']);
 
 const TARGETS = new Set(['darwin-arm64', 'darwin-x64', 'win32-x64']);
 const PACKAGE_ROOT_PATTERN = /^(?:node_modules\/(?:@[^/]+\/)?[^/]+)(?:\/node_modules\/(?:@[^/]+\/)?[^/]+)*$/;
@@ -420,7 +411,8 @@ function verifyUnpackedNodeRuntime(appAsar, sourcePackage, records) {
     // Signing can change native binary sizes after the archive is written.
     // Architecture/integrity and executable behavior have their own gates.
   }
-  for (const root of inventory) visit(root, asar.statFile(appAsar, root));
+  // ASAR traverses directories with the host separator; lock roots use POSIX paths.
+  for (const root of inventory) visit(root, asar.statFile(appAsar, path.join(...root.split('/'))));
   return inventory;
 }
 

@@ -1,4 +1,9 @@
 {
+  "local.delete_file.user_continue": "Đã xác nhận xóa. Vui lòng tiếp tục.",
+  "apps.builtin_listing_title": "Không gian thương mại",
+  "apps.builtin_listing_description": "Kết nối cửa hàng và tạo nội dung sản phẩm, hình ảnh và video",
+  "apps.builtin_content_title": "Không gian nội dung",
+  "apps.builtin_content_description": "Bắt đầu từ ý tưởng hoặc tư liệu của bạn",
   "errors.conversation_recovery_conflict": "Tác vụ này cần được khôi phục trước khi mở. Các bản sao hiện có đã được giữ lại. Hãy liên hệ bộ phận hỗ trợ.",
   "connectors.account_choice.title": "Chọn tài khoản để kết nối",
   "connectors.account_choice.message": "Chọn tài khoản hoặc cửa hàng đã cấp quyền để dùng cho kết nối này.",
@@ -135,7 +140,6 @@
   "errors.model_currently_unavailable": "Mô hình này hiện không khả dụng",
   "errors.model_config_unavailable": "Đã cấu hình mô hình nhưng thông tin xác thực hiện không dùng được. Hãy kiểm tra khóa API, trạng thái đăng nhập hoặc mô hình dự phòng trong Cài đặt.",
   "errors.model_oauth_expired": "Quyền truy cập {provider} đã hết hạn. Hãy cấp quyền lại cho tài khoản này trong Cài đặt hoặc chuyển sang mô hình dự phòng.",
-  "errors.model_credits_insufficient": "Không đủ tín dụng nên tác vụ đã dừng. Sau khi nạp tín dụng, hãy quay lại tác vụ này và nhập “Tiếp tục” để làm tiếp từ chỗ đã dừng. Bạn cũng có thể chuyển sang mô hình khả dụng trong Cài đặt.",
   "errors.custom_endpoint_suspect": "Điểm cuối mô hình tùy chỉnh của bạn bị lỗi nhiều yêu cầu liên tiếp (HTTP {status}) — có thể đã ngừng hoạt động hoặc chuyển địa chỉ. Hãy kiểm tra URL và khóa API trong Cài đặt → Mô hình hoặc đổi mô hình để tiếp tục.",
   "errors.model_output_cap_repeated": "Mô hình này đã đạt giới hạn đầu ra mỗi phản hồi nhiều lần liên tiếp — giới hạn có thể quá nhỏ cho tác vụ này. Hãy chọn mô hình có giới hạn đầu ra lớn hơn trong Cài đặt hoặc chia nhỏ tác vụ.",
   "errors.model_provider_balance_insufficient": "Tài khoản nhà cung cấp mô hình đã cấu hình của bạn đã hết số dư (không phải tín dụng Orkas). Hãy nạp tiền tại nhà cung cấp đó hoặc đổi mô hình trong Cài đặt.",
@@ -168,10 +172,8 @@
   "agent.run_failed": "⚠️ Chạy tác tử thất bại: {message}",
   "model.retrying": "Đang thử lại",
   "model.retrying_n": "Lần thử lại {attempt}",
-  "model.dev_marker": "[DEV]",
   "model.credential_fallback": "Thông tin xác thực mô hình {provider} không còn hợp lệ. Đang chuyển sang mô hình dự phòng để tác vụ có thể tiếp tục; hãy cấp quyền lại hoặc cập nhật thông tin xác thực sau trong Cài đặt.",
   "model.timeout_fallback": "Mô hình {provider} không bắt đầu phản hồi kịp thời. Đang chuyển sang mô hình dự phòng để tác vụ có thể tiếp tục.",
-  "model.server_model_fallback": "{from} tạm thời không khả dụng. Đã chuyển sang {to}.",
   "model.tool_loop_limit_reached": "(Đã đạt giới hạn số vòng gọi công cụ)",
   "model.run_aborted": "Đã hủy chạy",
   "model.max_retries_exceeded": "Đã vượt số lần thử lại tối đa",
@@ -367,6 +369,11 @@
   "errors.model_request_rejected_repeated": "Yêu cầu này đã bị từ chối nhiều lần liên tiếp, nên thử lại y nguyên sẽ không cho kết quả khác. Hãy chuyển sang mô hình khác trong Cài đặt rồi thử lại, hoặc bỏ hình ảnh hay tệp đính kèm rồi gửi lại.",
   "errors.provider_reply_detail": "Phản hồi của nhà cung cấp: {detail}",
   "cli_agent.repeated_failure_hint": "“{name}” lại thất bại. Bạn có thể nhờ @Commander đảm nhận tác vụ này.",
-  "desktop.open": "Mở",
-  "desktop.exit": "Thoát"
+  "desktop.open": "Mở Orkas",
+  "desktop.exit": "Thoát Orkas",
+  "video_budget.own_key_notice": "Đã tạo {count} tệp bằng tài khoản dịch vụ của riêng bạn, được tính phí trực tiếp cho bạn.",
+  "errors.model_request_rejected_no_retry": "Dịch vụ mô hình đã từ chối yêu cầu này. Đã dừng tự động thử lại.",
+  "errors.model_context_capacity_insufficient": "Ngữ cảnh hiện tại vượt quá dung lượng an toàn của các mô hình đã chọn. Lần gọi mô hình này chưa được gửi. Hãy chọn mô hình có cửa sổ ngữ cảnh lớn hơn hoặc bắt đầu cuộc trò chuyện mới.",
+  "video.delivery_retained": "Tệp đính kèm {index}: phiên bản đã bàn giao {version} vẫn được giữ lại.",
+  "video.delivery_later_edits": "Các chỉnh sửa sau đó chưa được đưa vào phiên bản này."
 }

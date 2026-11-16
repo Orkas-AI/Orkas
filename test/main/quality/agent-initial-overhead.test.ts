@@ -1,4 +1,5 @@
 import { it, expect, vi } from 'vitest';
+import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,16 @@ it('keeps every shipped Agent within the uniform initial-overhead budget', async
   const closeLogs = await captureMainLogWorkers();
   const rows: any[] = [];
   let selected: any;
+  const skillBindings: Array<{ agentId: string; refs: string[] }> = [];
+  vi.doMock('../../../src/main/model/core-agent/runner', async () => {
+    const actual = await vi.importActual<any>('../../../src/main/model/core-agent/runner');
+    return { ...actual, buildRunner: async (...args: any[]) => {
+      const built = await actual.buildRunner(...args);
+      skillBindings.push({ agentId: selected.agentId,
+        refs: [...built.skillMetadataByReadRef.values()].flatMap((skill: any) => [skill.id, skill.name]) });
+      return built;
+    } };
+  });
   vi.doMock('#core-agent', async () => {
     const actual = await vi.importActual<any>('#core-agent');
     return { ...actual, createPiProvider: () => ({
@@ -49,7 +60,8 @@ it('keeps every shipped Agent within the uniform initial-overhead budget', async
     expect(seeded.failed).toEqual([]);
     const agents = await import('../../../src/main/features/agents');
     const entries = (await agents.listAgents()).filter(agent => agent.runtime?.kind !== 'cli');
-    expect(entries.length).toBeGreaterThanOrEqual(16);
+    const inventory = createRequire(import.meta.url)('../../../bin/builtin-resource-gate.cjs').REQUIRED_BUILTIN_INVENTORY;
+    expect(entries.map(agent => agent.agent_id).sort()).toEqual([...inventory.marketplace_agents].sort());
     const chats = await import('../../../src/main/features/chats');
     const state = await import('../../../src/main/features/group_chat/state');
     const bus = await import('../../../src/main/features/group_chat/bus');
@@ -60,10 +72,16 @@ it('keeps every shipped Agent within the uniform initial-overhead budget', async
       conversations.push(cid);
       if (agent.agent_id !== 'commander') await state.ensureAgentMember('initial-overhead-fixture', cid, agent.agent_id, agent.name);
       const before = rows.length;
+      const bindingsBefore = skillBindings.length;
       await bus.enqueue({ uid: 'initial-overhead-fixture', cid, fromActorId: 'user', text: 'Return the fixture reply.', forceTo: [agent.agent_id] });
       await vi.waitFor(() => expect(bus.isQuiescent('initial-overhead-fixture', cid)).toBe(true), { timeout: 20000 });
       expect(rows.length, agent.agent_id).toBe(before + 1);
       expect(rows.at(-1).toolNames).toContain('tool_result');
+      const bindings = skillBindings.slice(bindingsBefore).filter(row => row.agentId === agent.agent_id);
+      expect(bindings.length, `${agent.name} must assemble a real initial runner`).toBeGreaterThan(0);
+      for (const ref of ('skill_list' in agent ? agent.skill_list : []) ?? []) {
+        expect(bindings[0].refs, `${agent.name} initial request must include its declared Skill ${ref}`).toContain(ref);
+      }
     }
     const reportPath = process.env.ORKAS_INITIAL_OVERHEAD_REPORT;
     if (reportPath) fs.writeFileSync(reportPath, JSON.stringify({ sourceRevision: process.env.ORKAS_INITIAL_OVERHEAD_SOURCE_REVISION || null,
@@ -81,6 +99,7 @@ it('keeps every shipped Agent within the uniform initial-overhead budget', async
     await drainMainRuntimeForTest();
     await closeLogs();
     vi.doUnmock('#core-agent');
+    vi.doUnmock('../../../src/main/model/core-agent/runner');
     for (const [key, value] of Object.entries({ ORKAS_WORKSPACE_ROOT: previous.workspace, ORKAS_TEST_GLOBAL_SKILLS_ROOT: previous.skills, ORKAS_TOOL_LOADING_MODE: previous.mode })) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }

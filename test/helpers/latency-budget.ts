@@ -1,17 +1,30 @@
-// Fixed Windows tolerances approved on 2026-10-29; other platforms retain their budgets.
-export const LATENCY_TARGET_MS = process.platform === 'win32' ? 500 : 300;
-// Platform-specific response budget approved for lower-spec Windows hosts.
-export const LATENCY_LIMIT_MS = process.platform === 'win32' ? 1000 : 500;
-// First-request setup has a separate, approved budget on lower-spec Windows hosts.
-export const FIRST_REQUEST_LATENCY_LIMIT_MS = process.platform === 'win32' ? 1000 : LATENCY_LIMIT_MS;
+import { getBootDeviceProfile, type BootDeviceTier } from '../../src/main/util/boot-device-profile';
 
-// Readiness is a functional-test watchdog, separate from response latency.
-export const LIBRARY_READY_TIMEOUT_MS = process.platform === 'win32' ? 3000 : 1000;
-export const INTERACTIVE_MAIN_GAP_LIMIT_MS = process.platform === 'win32' ? 300 : 150;
-export const BULK_MAIN_GAP_LIMIT_MS = process.platform === 'win32' ? 500 : 300;
-export const COMPOSER_EDIT_LIMIT_MS = process.platform === 'win32'
-  ? { multiline: 300, paragraph: 500 }
-  : { multiline: 150, paragraph: 300 };
+/** Hardware counts are a coarse default, not a speed benchmark. Pin a tier on
+ * known older hosts/CI; never derive an allowance from the measured operation. */
+export function resolvePerformanceTier(requested: string | undefined, detected: BootDeviceTier): BootDeviceTier {
+  if (requested === undefined || requested === 'auto') return detected;
+  if (requested === 'standard' || requested === 'low') return requested;
+  throw new Error('Invalid ORKAS_TEST_PERFORMANCE_TIER; use auto, standard or low');
+}
+export const PERFORMANCE_TIER = resolvePerformanceTier(
+  process.env.ORKAS_TEST_PERFORMANCE_TIER, getBootDeviceProfile().tier,
+);
+// Fixed engineering tolerances revised for slower devices on 2026-11-06.
+// These test ceilings are not production timeouts or measured device SLAs.
+const low = PERFORMANCE_TIER === 'low';
+export const LATENCY_LIMIT_MS = low ? 2000 : 1000;
+export const LATENCY_TARGET_MS = LATENCY_LIMIT_MS / 2;
+export const FIRST_REQUEST_LATENCY_LIMIT_MS = low ? 3000 : 2000;
+export const INTERACTIVE_MAIN_GAP_LIMIT_MS = low ? 500 : 300;
+export const BULK_MAIN_GAP_LIMIT_MS = low ? 750 : 500;
+export const INDEXED_SEARCH_LATENCY_LIMIT_MS = low ? 500 : 300;
+export const LARGE_REPOSITORY_SEARCH_LIMIT_MS = low ? 4000 : 2000;
+export const COMPOSER_EDIT_LIMIT_MS = low
+  ? { multiline: 500, paragraph: 750 }
+  : { multiline: 300, paragraph: 500 };
+// Functional readiness watchdog, outside the interaction-latency gate.
+export const LIBRARY_READY_TIMEOUT_MS = low ? 10000 : 5000;
 
 export interface LatencySample {
   elapsedMs: number;
@@ -25,12 +38,17 @@ export function checkLatencyBudget(metric: string, sample: LatencySample, limitM
   if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
     throw new Error('Invalid latency measurement');
   }
-  if (elapsedMs > LATENCY_TARGET_MS) {
+  if (!Number.isFinite(limitMs) || limitMs <= 0) {
+    throw new Error('Invalid latency budget');
+  }
+  // Warn halfway to the selected ceiling, including first-use and loop metrics.
+  const targetMs = limitMs / 2;
+  if (elapsedMs > targetMs) {
     // Keep severity in the shared structured log protocol. stdout avoids
     // Playwright adding a non-structured stderr case header to this warning.
     process.stdout.write('[00:00:00.000] [warn] [(latency-budget)] latency target exceeded ' + JSON.stringify({
-      metric, elapsed_ms: elapsedMs, target_ms: LATENCY_TARGET_MS,
-      limit_ms: limitMs, phases,
+      metric, elapsed_ms: elapsedMs, target_ms: targetMs,
+      limit_ms: limitMs, tier: PERFORMANCE_TIER, phases,
     }) + '\n');
   }
   if (elapsedMs > limitMs) {

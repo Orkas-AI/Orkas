@@ -157,13 +157,6 @@ export function analyzeWebAppLogs(log: string, recovered: readonly RecoveredRend
       }
     }
     if (/^===/.test(line)) { stream = 'stdout'; fileLogs = true; }
-    if (/^Debugger (?:listening|ending) on ws:\/\/127\.0\.0\.1:\d+\/[a-f0-9-]+$/.test(line)
-      || line === 'For help, see: https://nodejs.org/learn/getting-started/debugging'
-      || line === 'Waiting for the debugger to disconnect...') {
-      original.ingest('stdout', '[playwright-debugger] lifecycle\n');
-      reviewed.ingest('stdout', '[playwright-debugger] lifecycle\n');
-      continue;
-    }
     if (line.startsWith('[fixture-cleanup] ')) {
       original.ingest('stdout', line + '\n');
       reviewed.ingest('stdout', line + '\n');

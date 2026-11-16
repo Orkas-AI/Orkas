@@ -78,14 +78,6 @@ function legacyFilePath(): string {
   return path.join(userLocalConfigDir(getActiveUserId()), 'permissions.json');
 }
 
-function _notifyDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('permissions', 'cloud/config/permissions.json');
-  } catch { /* sync is optional in stripped builds / before account init */ }
-}
-
 function parseStoredFile(raw: string): StoredState | null {
   const parsed = JSON.parse(raw) as StoredFile;
   const le = parsed?.localExec;
@@ -164,7 +156,6 @@ function writeStored(state: StoredState): void {
     _field_updated_at: { localExec: clock },
   }, null, 2), 'utf8');
   fs.renameSync(tmp, p);
-  _notifyDirty();
 }
 
 function toPublic(state: StoredState): LocalExecState {

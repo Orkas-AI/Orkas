@@ -57,6 +57,185 @@ async function setup(page: Page, content: string) {
 
 const preview = (page: Page) => page.locator('.chat-lightbox-img');
 
+for (const nativePreview of [true, false]) {
+  test(`zoom controls stay dim outside hover and zoom activity (${nativePreview ? 'preview window' : 'overlay'})`, async ({ page }, info) => {
+    const errors = await setup(page, picture('controls'));
+    if (nativePreview) {
+      await page.addStyleTag({ path: path.join(renderer, 'preview.css') });
+      await page.evaluate(() => document.body.classList.add('preview-window'));
+    }
+    await page.evaluate(src => (window as any).openChatImageLightbox(src, 'Image preview', { absPath: '/fixtures/controls.png', cid: 'task-a' }), svg);
+    const zoom = page.locator('.chat-lightbox-zoom');
+    const actions = page.locator('.chat-lightbox-actions');
+    const into = page.locator('.chat-lightbox-zoom-in');
+    await expect(preview(page)).toBeVisible();
+    await expect(zoom).toHaveCSS('opacity', '0.5');
+    if (nativePreview) {
+      expect(await zoom.evaluate(el => getComputedStyle(el).backgroundColor))
+        .toBe(await actions.evaluate(el => getComputedStyle(el).backgroundColor));
+    }
+    expect((await into.boundingBox())!.width).toBe(24);
+    expect((await zoom.boundingBox())!.width).toBeLessThan(142);
+    await page.mouse.move(400, 200);
+    await preview(page).click();
+    await preview(page).dispatchEvent('wheel', { deltaY: 80 });
+    // Allow the opacity transition to settle so a transient wake cannot pass.
+    await page.waitForTimeout(250);
+    await expect(zoom).toHaveCSS('opacity', '0.5', { timeout: 500 });
+    await zoom.hover();
+    await expect(zoom).toHaveCSS('opacity', '1');
+    // Hover must stay clear beyond the zoom activity timeout, without movement.
+    await page.waitForTimeout(2300);
+    await expect(zoom).toHaveCSS('opacity', '1');
+    await page.mouse.move(400, 200);
+    await expect(zoom).toHaveCSS('opacity', '0.5');
+    await page.keyboard.press('+');
+    await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('120%');
+    await expect(zoom).toHaveCSS('opacity', '1');
+    await expect(zoom).toHaveCSS('opacity', '0.5', { timeout: 4000 });
+    // A clicked button stays clear while hovered, then dims after leaving.
+    await into.click();
+    await expect(zoom).toHaveCSS('opacity', '1');
+    await page.mouse.move(400, 200);
+    await expect(zoom).toHaveCSS('opacity', '0.5', { timeout: 4000 });
+    // Panning the image does not wake the zoom group.
+    await preview(page).dispatchEvent('wheel', { deltaX: 18, deltaY: 50 });
+    await page.waitForTimeout(250);
+    await expect(zoom).toHaveCSS('opacity', '0.5', { timeout: 500 });
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.locator('.chat-lightbox-zoom-reset')).toBeFocused();
+    await expect(zoom).toHaveCSS('opacity', '1');
+    await page.keyboard.press('Tab');
+    await expect(into).toBeFocused();
+    await page.keyboard.press('+');
+    await expect(zoom).toHaveCSS('opacity', '1');
+    await page.evaluate(() => (document.activeElement as HTMLElement).blur());
+    await expect(zoom).toHaveCSS('opacity', '0.5', { timeout: 4000 });
+    for (const [width, height] of [[1040, 760], [480, 320]]) {
+      await page.setViewportSize({ width, height });
+      await page.mouse.move(0, 0);
+      await expect(zoom).toHaveCSS('opacity', '0.5', { timeout: 4000 });
+      await page.screenshot({ path: info.outputPath(`zoom-idle-${width}.png`) });
+      await zoom.hover();
+      await expect(zoom).toHaveCSS('opacity', '1');
+      await page.screenshot({ path: info.outputPath(`zoom-active-${width}.png`) });
+    }
+    await page.keyboard.press('Escape');
+    await page.mouse.move(0, 0);
+    await page.evaluate(src => (window as any).openChatImageLightbox(src, 'Reopened image'), svg);
+    await expect(zoom).toHaveCSS('opacity', '0.5');
+    expect(errors).toEqual([]);
+  });
+}
+
+test('zooms inside the preview with buttons, pinch and pan without moving its controls', async ({ page }, info) => {
+  const errors = await setup(page, picture('long-image'));
+  await page.addStyleTag({ path: path.join(renderer, 'preview.css') });
+  await page.evaluate(() => document.body.classList.add('preview-window'));
+  const tall = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="2400"><rect width="600" height="2400" fill="steelblue"/><text x="40" y="120" fill="white" font-size="48">Long image</text></svg>');
+  await page.evaluate(src => (window as any).openChatImageLightbox(src, 'Long image'), tall);
+  const img = preview(page);
+  await expect.poll(() => img.evaluate((el: HTMLImageElement) => el.naturalHeight)).toBe(2400);
+  const zoom = page.locator('.chat-lightbox-zoom');
+  await expect(zoom).toBeVisible();
+  const controls = await zoom.boundingBox();
+  const fitted = (await img.boundingBox())!;
+  await page.locator('.chat-lightbox-zoom-in').click();
+  await expect.poll(async () => (await img.boundingBox())!.height).toBeGreaterThan(fitted.height);
+  await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('120%');
+  await page.locator('.chat-lightbox-zoom-out').click();
+  await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('100%');
+  // Chromium delivers trackpad pinch as Ctrl+wheel. A jittering centroid must
+  // not move the original focal image pixel during one continuous gesture.
+  const anchor = { x: fitted.x + fitted.width * 0.7, y: fitted.y + fitted.height * 0.3 };
+  await img.dispatchEvent('wheel', { ctrlKey: true, deltaY: -20, clientX: anchor.x, clientY: anchor.y });
+  await img.dispatchEvent('wheel', { ctrlKey: true, deltaY: -20, clientX: anchor.x + 12, clientY: anchor.y - 8 });
+  const pinched = (await img.boundingBox())!;
+  expect(pinched.height / fitted.height).toBeGreaterThan(1.2);
+  expect(pinched.x + pinched.width * 0.7).toBeCloseTo(anchor.x, 0);
+  expect(pinched.y + pinched.height * 0.3).toBeCloseTo(anchor.y, 0);
+  await img.dispatchEvent('wheel', { deltaX: 18, deltaY: 50 });
+  const panned = (await img.boundingBox())!;
+  expect(panned.y).toBeCloseTo(pinched.y - 50, 0);
+  expect(panned.height).toBeCloseTo(pinched.height, 0);
+  expect(await zoom.boundingBox()).toEqual(controls);
+  expect(await page.evaluate(() => window.visualViewport!.scale)).toBe(1);
+  await page.locator('.chat-lightbox-zoom-reset').click();
+  await expect(img).toHaveCSS('transform', 'matrix(1, 0, 0, 1, 0, 0)');
+  for (const [width, height, locale] of [[1040, 760, 'zh'], [480, 320, 'en']] as const) {
+    await page.setViewportSize({ width, height });
+    const table = JSON.parse(fs.readFileSync(path.join(renderer, `locales/${locale}.json`), 'utf8'));
+    await page.evaluate(table => { (window as any).t = (key: string) => table[key] || key; window.dispatchEvent(new Event('i18n-change')); }, table);
+    await expect(page.locator('.chat-lightbox-zoom-reset')).toHaveAttribute('aria-label', table['chat.lightbox_zoom_reset']);
+    const bounds = (await zoom.boundingBox())!;
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(height);
+    await page.screenshot({ path: info.outputPath(`image-zoom-${locale}-${width}.png`) });
+  }
+  expect(errors).toEqual([]);
+});
+
+test('bounds zoom and resets gesture state when another image opens', async ({ page }) => {
+  const errors = await setup(page, `${picture('first')}${picture('second')}`);
+  await page.locator('#first').click();
+  const img = preview(page);
+  await expect(img).toBeVisible();
+  await img.dispatchEvent('wheel', { ctrlKey: true, deltaY: -100000 });
+  await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('800%');
+  await expect(page.locator('.chat-lightbox-zoom-in')).toBeDisabled();
+  await img.dispatchEvent('wheel', { ctrlKey: true, deltaY: 100000 });
+  await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('50%');
+  await expect(page.locator('.chat-lightbox-zoom-out')).toBeDisabled();
+  await page.keyboard.press('ArrowRight');
+  await expect(img).toHaveAttribute('alt', 'second');
+  await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('100%');
+  await expect(page.locator('.chat-lightbox-zoom')).toHaveCSS('opacity', '0.5');
+  await img.dispatchEvent('wheel', { deltaY: 80 });
+  await expect(img).toHaveCSS('transform', 'matrix(1, 0, 0, 1, 0, 0)');
+  await img.dblclick();
+  await expect(page.locator('.chat-lightbox-zoom-level')).toHaveText('200%');
+  await expect.poll(() => img.evaluate(el => new DOMMatrix(getComputedStyle(el).transform).a)).toBe(2);
+  const box = (await img.boundingBox())!;
+  const x = box.x + box.width / 2, y = box.y + box.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x + 45, y + 60);
+  await page.mouse.up();
+  const dragged = (await img.boundingBox())!;
+  expect(dragged.x).toBeCloseTo(box.x + 45, 0);
+  expect(dragged.y).toBeCloseTo(box.y + 60, 0);
+  await page.keyboard.press('Escape');
+  await page.locator('#first').click();
+  await expect(img).toHaveCSS('transform', 'matrix(1, 0, 0, 1, 0, 0)');
+  expect(errors).toEqual([]);
+});
+
+test('supports touchscreen pinch and continues panning after one finger lifts', async ({ page }) => {
+  const errors = await setup(page, picture('touch-image'));
+  await page.locator('#touch-image').click();
+  const img = preview(page);
+  const fitted = (await img.boundingBox())!;
+  const x = fitted.x + fitted.width / 2, y = fitted.y + fitted.height / 2;
+  const cdp = await page.context().newCDPSession(page);
+  const touch = (type: 'touchStart' | 'touchEnd' | 'touchMove' | 'touchCancel', points: { id: number; x: number; y: number }[]) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: points });
+  await touch('touchStart', [{ id: 1, x: x - 40, y }, { id: 2, x: x + 40, y }]);
+  await touch('touchMove', [{ id: 1, x: x - 80, y }, { id: 2, x: x + 80, y }]);
+  await expect.poll(async () => (await img.boundingBox())!.width).toBeCloseTo(fitted.width * 2, 0);
+  await touch('touchEnd', [{ id: 2, x: x + 80, y }]);
+  const before = (await img.boundingBox())!;
+  await touch('touchMove', [{ id: 1, x: x - 50, y: y + 40 }]);
+  await expect.poll(async () => (await img.boundingBox())!.x).toBeCloseTo(before.x + 30, 0);
+  const after = (await img.boundingBox())!;
+  expect(after.x).toBeCloseTo(before.x + 30, 0);
+  expect(after.y).toBeCloseTo(before.y + 40, 0);
+  await touch('touchCancel', []);
+  await page.locator('.chat-lightbox-zoom-reset').click();
+  await expect(img).toHaveCSS('transform', 'matrix(1, 0, 0, 1, 0, 0)');
+  await cdp.detach();
+  expect(errors).toEqual([]);
+});
+
 test('browses the whole transcript in order using keys and both side buttons', async ({ page }, testInfo) => {
   const errors = await setup(page, `${picture('first')}<p>Another message</p>${picture('middle')}${picture('last')}`);
   await page.locator('#composer').focus();
@@ -118,6 +297,7 @@ test('loads older pages through text-only gaps and allows retry after a failed p
     };
   }, picture('oldest'));
   await page.locator('#recent').click();
+  await expect(preview(page)).toBeVisible();
   await page.keyboard.press('ArrowLeft');
   await expect.poll(() => page.evaluate(() => (window as any).toasts.length)).toBe(1);
   await expect(preview(page)).toHaveAttribute('alt', 'recent');
@@ -137,6 +317,7 @@ test('ignores pending history completion after closing and opening another previ
     (window as any)._loadOlderConversationHistory = () => new Promise<void>((resolve) => { (window as any).releaseHistory = resolve; });
   });
   await page.locator('#recent').click();
+  await expect(preview(page)).toBeVisible();
   await page.keyboard.press('ArrowLeft');
   await expect(page.locator('.chat-lightbox')).toHaveClass(/is-loading/);
   await page.keyboard.press('Escape');

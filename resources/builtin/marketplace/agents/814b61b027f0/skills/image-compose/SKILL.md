@@ -1,30 +1,33 @@
 ---
 ownerAgent: 814b61b027f0
 name: image-compose
-description_zh: 路线锁定为 COMPOSE 后，或其他路线确实需要确定性排版、图表、覆盖层、裁切、遮罩与合成时，使用本地 HTML/CSS/SVG 和私有脚本制作图片。
-description_en: After route lock, produces COMPOSE work or deterministic layout, diagram, overlay, crop, mask, and composite phases with local HTML/CSS/SVG and private updateable scripts.
+description_zh: 路线锁定为 COMPOSE 后，或其他路线确实需要确定性排版、图表、覆盖层、裁切、遮罩、合成、SVG/HTML 转换或用户要求的矢量 PDF 交付时，使用本地 HTML/CSS/SVG 和私有脚本制作图片。
+description_en: After route lock, produces COMPOSE work or deterministic layout, diagram, overlay, crop, mask, composite, SVG/HTML conversion or requested vector PDF delivery with local HTML/CSS/SVG and private updateable scripts.
 ---
 
 # Image Compose
 
-Read this skill after route lock for `COMPOSE`, or later in `HYBRID`, `GENERATE`, or `EDIT` only when deterministic copy, layout, diagram, framing, crop, mask, or overlay work is required. Do not preload it during routing. Keep the artifact in one stable directory containing `image-manifest.json`, `index.html`, and local assets.
+Read this skill after route lock for `COMPOSE`, or later in `HYBRID`, `GENERATE`, or `EDIT` only when deterministic copy, layout, diagram, framing, crop, mask, overlay, SVG/HTML conversion or requested vector PDF delivery is required. Do not preload it during routing. Keep the artifact in one stable directory containing `image-manifest.json`, `index.html`, and local assets.
 
 ## Safe project bootstrap
 
 Create or repair `image-manifest.json` and `index.html` with `write_file` / `edit_file`. Do not assemble either file through `bash`, PowerShell, shell redirection, or an inline script: quoting damage can leave a partially written project and shell safety checks can block recovery.
 
+For a fixed-page booklet or catalogue, read [multipage-documents.md](references/multipage-documents.md) before creating its document manifest.
+
 This production skill is the earliest point at which a `COMPOSE` manifest may be created. Initialize it from the `Canonical image-manifest v1` block in `image-router`; that block is the single structural source, so do not redefine or reconstruct the manifest shape here. Replace every example value with the current brief and planning output. Keep its nesting and value types exactly: `brief.purpose` and every `art_direction` field are required by native inspection, and any region coordinates belong under `visual_plan.regions[].bounds`.
 
-For `HYBRID`, `GENERATE`, or `EDIT`, keep the locked lowercase route and the approved generation budget (zero for deterministic EDIT), then add the route-specific reference and request fields required by `image-router` / `image-generate`. After the first write, read the manifest back once and repair it with `edit_file` if needed before calling `project.inspect`.
+For `HYBRID`, `GENERATE`, or `EDIT`, keep the locked lowercase route and the approved generation budget (zero for deterministic EDIT), then add the route-specific reference and request fields required by `image-router` / `image-generate`. After the first write, read the manifest back once and repair it with `edit_file` if needed before the native workflow below.
 
 Declare one final source: `entry` for an HTML composition, or `raster_source` for a finished raster. Remove the other final-source field when the candidate changes form; keep generated layers as local HTML assets. Set `entry` explicitly for HTML work under EDIT or GENERATE. After a script transform, bind its actual output as `raster_source` and inspect that path.
 
 ## Authoring contract
 
 - Start from the canvas and art direction in the manifest. Make the first render meaningful without network access or user interaction.
+- For new product-led artwork, complete [source-region preparation](references/photo-processing.md#source-region-before-placement) before sizing and placing the supplied product or package asset.
 - Keep decorative rules, strokes, and signature geometry outside every required-text bounding box. After any headline revision, recheck the full phrase at thumbnail size and repair any line or shape that crosses, crowds, masks, or visually splits a glyph or line of copy.
 - Fit every multi-glyph required headline as a complete phrase before snapshot. Automatic wrapping must never leave a line with only one glyph: widen the text box, reduce the type size, or author an intentional balanced `<br>` before capture. Do not approve a source merely because the DOM contains the exact string; line-by-line rendered legibility is the gate.
-- For a multi-image set, reuse the first passing image's concrete CSS/SVG design decisions—palette variables, type roles, spacing/grid, radii, strokes, icon treatment, material effects, and signature device—in every later member. Change the content and the layout details needed by that content; do not redesign the visual system per image.
+- For a non-generation multi-image set, follow [multi-image-sets.md](references/multi-image-sets.md) for the shared production and acceptance contract.
 - Use semantic HTML for text and SVG for geometry, diagrams, strokes, charts, patterns, and masks. Use CSS for layout, texture, lighting, and controlled effects.
 - Preserve every required-copy string exactly in visible DOM text. Keep important text out of raster assets.
 - For COMPOSE copy revisions in a supplied raster, cover only the old text area and typeset the replacement as a complete glyph or text run; guessing extra strokes onto raster digits can leave the old number readable. Match the original typeface, weight, size, color and baseline, and preserve the surrounding pixels. Verify the replacement in the current snapshot at export size against the source: dimensions, a changed-pixel box, and image metadata do not prove that the visible wording or its styling is correct.
@@ -46,12 +49,20 @@ Do not add native `image_studio` operations for authoring libraries. Run these p
 
 Use `structured_visual` for deterministic `diagram`, `bar`, `line`, and `donut` SVGs. Read [structured-visuals.md](references/structured-visuals.md) before writing its JSON input. The output is static local SVG with no script, CDN, browser library, or model call. Use it for Mermaid/ECharts-class needs when a structured chart or graph is enough; author custom SVG when the visual idea needs an irregular editorial composition.
 
+For supported local raster processing, prefer `image_asset` through the runner above: it uses the application's existing Sharp dependency. If another Python image library is needed, first verify the selected interpreter and required imports; do not assume Pillow (`PIL`) is installed.
+
 Use `image_asset` with a project-local request JSON:
 
 - `capabilities`: report Sharp, optional `rembg`, and optional host-configured Real-ESRGAN.
-- `process`: Sharp-backed orientation, resize, crop, extend, rotate, blur/sharpen, flatten/trim, format conversion, and compositing.
+- `process`: Sharp-backed orientation, resize, crop, extend, rotate, blur/sharpen, flatten/trim, format conversion, compositing, `linear` RGB gain/offset, and `modulate` brightness/saturation/hue/lightness.
+- `batch`: apply shared photo settings with explicit per-photo replacements and resume verified completed items.
+- `masked_composite`: replace only a binary mask's white pixels while retaining the source's exact RGBA in black regions, including partial alpha.
 - `remove_background`: use host-managed `rembg` only when capability evidence says available.
 - `upscale`: use host-managed `ORKAS_REALESRGAN_BIN` only when capability evidence says available. This is local enhancement and does not consume the paid image-generation budget.
+
+Before raster cropping, edge trimming, resizing, RAW development, ICC conversion, photo adjustments, batches, or exact masked composition, read [photo-processing.md](references/photo-processing.md) for request fields, runnable examples, limits, and recovery.
+
+Use `layered_document` for a durable layered source, PNG preview and verified PSD export; read [layered-documents.md](references/layered-documents.md). Preserve existing layer structure; a flattened image stays a single layer, and unsupported native editability must be disclosed.
 
 Never install packages, download weights, or start a service. Keep input, request, and output paths inside the project. Prefer a new output path; set `overwrite:true` only for an explicitly replaceable intermediate.
 
@@ -63,17 +74,17 @@ If the required authoring, snapshot, or export tools are unavailable, do not cla
 
 ## Native workflow
 
-1. Call `image_studio` with `project.inspect` after the manifest and entry exist. Repair all structural blockers before creating visual evidence. A failed structural inspection carries no model image. The native tool is a stable capture/evidence/export security kernel, not an authoring library registry.
-2. For an HTML final source, only after inspection passes, call `image_studio` with `project.snapshot` and an output path. The passing snapshot attaches the exact full-color candidate as model-visible evidence. Inspect that attachment directly; do not reopen the same path through generic `read_files`, which is not the design-evidence transport.
+1. For an HTML final source, call `image_studio` with `project.snapshot` and an output path after the manifest and entry exist. Snapshot validates structure before capture; repair returned blockers before recapturing. A failed structural inspection carries no model image.
+2. The passing snapshot attaches the exact full-color candidate as model-visible evidence. Inspect that attachment directly; do not reopen the same path through generic `read_files`, which is not the design-evidence transport.
 For a raster final source, `project.inspect` supplies the evidence and next operation directly. The host derives `is_generation` from verified production records: direct model outputs and verified format/proportional-size normalization may remain generation artifacts; crop, mask, overlays and composites do not inherit that exemption. Do not write this host property into the manifest. Follow the returned next operation, skipping the scored-review steps only for `is_generation:true`.
 
-3. For each repair, identify a concrete issue in the current evidence, make a change that can affect it, then capture fresh evidence through inspect (raster) or inspect and snapshot (HTML) to check the result. Continue while a concrete issue remains and a viable new correction exists, even across several rounds. Once requirements pass, deliver; optional polish must not delay delivery.
-4. Inspect the current evidence and submit a structured verdict with `project.submit_design_review`.
+3. For each repair, identify a concrete issue in the current evidence, make a change that can affect it, then capture fresh evidence through inspect (raster) or snapshot (HTML) to check the result. Continue while a concrete issue remains and a viable new correction exists, even across several rounds. Once requirements pass, deliver; optional polish must not delay delivery.
+4. For non-generation artifacts, after current visual evidence is attached, read `image-design-review` unless already loaded, then inspect that evidence and submit a structured verdict with `project.submit_design_review`.
 5. Call `project.export` only after a passing review of the exact current signature.
 
 `project.export` is the delivery gate. A changed manifest, HTML file, or local resource invalidates the prior review and requires a new snapshot.
 
-The first `project.export` call must use an explicit workspace-relative `output_path` ending in `.png`. After success, answer with the image instead of handing a completed direct request back to Commander.
+The first `project.export` call must use an explicit workspace-relative `output_path` ending in `.png`. After PNG export succeeds, also export any requested PSD from the same verified layered source and any requested PDF from the current HTML/SVG source, then deliver the requested files instead of handing a completed direct request back to Commander.
 
 Put essential export dimensions/format before the first preview. Show only exported final deliverables unless the user asks for review evidence, and write nothing after the last preview; the host may add its own produced-file footer.
 

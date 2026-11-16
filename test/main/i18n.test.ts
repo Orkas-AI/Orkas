@@ -96,6 +96,19 @@ describe('i18n › isLang', () => {
 });
 
 describe('i18n › t() lookup', () => {
+  it.each(LOCALES.map(locale => locale.code))('names Orkas in both tray actions without fallback in %s', code => {
+    const table = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/main/locales', `${code}.json`), 'utf8'));
+    setCurrentLang(code);
+    for (const key of ['desktop.open', 'desktop.exit']) {
+      expect(table[key]).toContain('Orkas');
+      expect(t(key)).toBe(table[key]);
+      if (code !== 'en') expect(table[key]).not.toBe(t(key, undefined, 'en'));
+    }
+    expect(table['desktop.open']).not.toBe(table['desktop.exit']);
+    if (code === 'zh') expect([t('desktop.open'), t('desktop.exit')]).toEqual(['打开 Orkas', '退出 Orkas']);
+    if (code === 'en') expect([t('desktop.open'), t('desktop.exit')]).toEqual(['Open Orkas', 'Quit Orkas']);
+  });
+
   it('returns current-lang string when present', () => {
     setCurrentLang('zh');
     expect(t('errors.not_utf8')).toBe('文本类文件必须是 UTF-8 编码');
@@ -130,24 +143,6 @@ describe('i18n › t() lookup', () => {
     setCurrentLang('zh');
     expect(t('component.skill_disabled_request', { name: 'arxiv-reader' }))
       .toBe('技能「arxiv-reader」已被停用，请重新启用后再使用。');
-  });
-
-  it('localizes the fallback notice in every supported language', () => {
-    const vars = { from: 'Orkas-1.5 Pro', to: 'Orkas-1.5' };
-    expect(t('model.server_model_fallback', vars, 'zh'))
-      .toBe('Orkas-1.5 Pro 暂不可用，已由 Orkas-1.5 处理。');
-    expect(t('model.server_model_fallback', vars, 'en'))
-      .toBe('Orkas-1.5 Pro is temporarily unavailable. Orkas-1.5 handled the request.');
-    expect(t('model.server_model_fallback', vars, 'ja'))
-      .toBe('Orkas-1.5 Pro は一時的に利用できないため、Orkas-1.5 が処理しました。');
-    expect(t('model.server_model_fallback', vars, 'pt'))
-      .toBe('Orkas-1.5 Pro está temporariamente indisponível. Orkas-1.5 processou a solicitação.');
-  });
-
-  it('provides the development-only marker in every supported language', () => {
-    for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
-      expect(t('model.dev_marker', undefined, lang)).toBe('[DEV]');
-    }
   });
 
   it('localizes actionable external-agent terminal states', () => {

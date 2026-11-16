@@ -2868,6 +2868,8 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     }
 
     expect(seenOpts.message).toBe('请基于名称和简介完善智能体工作流。');
+    expect(Object.prototype.hasOwnProperty.call(seenOpts, 'skillList')).toBe(false);
+    expect(seenOpts.systemSkillList).toEqual(['agent-creator']);
     const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
     const first = JSON.parse(fs.readFileSync(chatPath, 'utf8').trim().split('\n')[0]);
     expect(first.role).toBe('user');
@@ -3612,3 +3614,47 @@ describe('agents › built-in tool-only definition persistence', () => {
     expect(saved?.skill_list ?? []).toEqual([]);
   });
 });
+
+it('warns with counts when profile lists drop or truncate authored lines', async () => {
+    const a = await loadAgents();
+    const warn = loggerSpies.byName.get('agents')!.warn;
+    warn.mockClear();
+
+    // 18 distinct lines (2 over the 16-item cap) plus one over-length line.
+    const knowhow = Array.from({ length: 18 }, (_, i) => `distinct knowhow line ${i + 1}`);
+    knowhow[0] = `overlong ${'x'.repeat(300)}`;
+    const norm = a.normalizeAgent({ agent_id: 'abcdef123456', name: 'N', knowhow }, 'custom');
+
+    // Output contract unchanged: first 16 unique lines, over-length one cut.
+    expect(norm?.profile?.knowhow).toHaveLength(16);
+    expect(norm?.profile?.knowhow?.[0].length).toBe(220);
+    // The loss is no longer silent: one warn with counts only, no content.
+    const overflowCalls = warn.mock.calls.filter((call) => call[0] === 'agent profile list over budget');
+    expect(overflowCalls).toHaveLength(1);
+    expect(overflowCalls[0][1]).toMatchObject({
+      field: 'knowhow', kept: 16, dropped: 2, truncated: 1, limit: 16, max_chars: 220,
+    });
+    expect(JSON.stringify(overflowCalls[0][1])).not.toContain('distinct knowhow line');
+
+    // Same damage again → deduped; a clean list → no warn at all.
+    a.normalizeAgent({ agent_id: 'abcdef123456', name: 'N', knowhow }, 'custom');
+    expect(warn.mock.calls.filter((call) => call[0] === 'agent profile list over budget')).toHaveLength(1);
+    warn.mockClear();
+    a.normalizeAgent({ agent_id: 'abcdef123456', name: 'N', knowhow: ['fits fine'] }, 'custom');
+    expect(warn).not.toHaveBeenCalled();
+  });
+it('normalizes valid tool groups and contains malformed metadata as host-only', async () => {
+    const a = await loadAgents();
+    expect(a.normalizeAgent({
+      agent_id: 'x',
+      tool_list: ['workspace.read', 'shell', 'web', 'workspace.execute'],
+    }, 'custom')?.tool_list).toEqual(['workspace.read', 'workspace.execute', 'web']);
+    expect(a.normalizeAgent({ agent_id: 'x', tool_list: [] }, 'custom')?.tool_list).toEqual([]);
+    expect(a.normalizeAgent({
+      agent_id: 'x',
+      tool_list: ['web', 'context', 'management'],
+    }, 'custom')?.tool_list).toEqual([]);
+    expect(a.normalizeAgent({ agent_id: 'x', tool_list: 'web' }, 'custom'))
+      .toMatchObject({ tool_list: [] });
+    expect(a.normalizeAgent({ agent_id: 'x' }, 'custom')).not.toHaveProperty('tool_list');
+  });

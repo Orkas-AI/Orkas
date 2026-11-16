@@ -34,6 +34,17 @@ afterEach(() => {
 });
 
 describe('bundled-runtime', () => {
+  it('exports the bundled RAW engine to Skill processes without requiring a PATH installation', async () => {
+    const key = `${process.platform}-${process.arch}`, dir = path.join(process.env.ORKAS_RUNTIME_DIR!, 'libraw', key, 'bin');
+    fs.mkdirSync(dir, { recursive: true });
+    const binary = path.join(dir, process.platform === 'win32' ? 'dcraw_emu.exe' : 'dcraw_emu');
+    fs.writeFileSync(binary, 'fixture');
+    const runtime = await import('../../../src/main/util/bundled-runtime');
+    expect(runtime.bundledLibRawExecutable()).toBe(binary);
+    expect(runtime.bundledRuntimeEnv().ORKAS_LIBRAW).toBe(binary);
+    fs.rmSync(binary);
+    expect(runtime.bundledLibRawExecutable()).not.toBe(binary);
+  });
   it('exposes bundled runtime executable directories for sandbox PATH precedence', async () => {
     const key = `${process.platform}-${process.arch}`;
     const runtimeRoot = process.env.ORKAS_RUNTIME_DIR!;

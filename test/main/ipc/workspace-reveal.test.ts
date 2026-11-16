@@ -1,8 +1,10 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { expectTestLog } from '../../helpers/test-log-analysis';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
@@ -13,6 +15,7 @@ let tempRoot: string;
 let workspace: string;
 let outsideFile: string;
 let previousWorkspaceRoot: string | undefined;
+let closeLogWorkers: () => Promise<void>;
 const shell = vi.hoisted(() => ({
   showItemInFolder: vi.fn(),
   openPath: vi.fn(async () => ''),
@@ -34,26 +37,32 @@ vi.mock('electron', () => ({
   },
 }));
 
-beforeAll(async () => {
+beforeAll(() => {
   tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-reveal-'));
   previousWorkspaceRoot = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = path.join(tempRoot, 'data');
-  vi.resetModules();
-  const users = await import('../../../src/main/features/users');
-  users.activateUser('reveal-user');
   workspace = path.join(tempRoot, 'workspace');
   fs.mkdirSync(workspace);
-  const ws = await import('../../../src/main/features/user_workspace');
-  ws.setWorkspacePath('reveal-user', workspace);
   outsideFile = path.join(tempRoot, 'outside workspace', '封面 image.png');
   fs.mkdirSync(path.dirname(outsideFile));
   fs.writeFileSync(outsideFile, 'original image');
+});
+beforeEach(async () => {
+  vi.resetModules();
+  vi.clearAllMocks();
+  closeLogWorkers = await captureMainLogWorkers();
+  const users = await import('../../../src/main/features/users');
+  users.activateUser('reveal-user');
+  const ws = await import('../../../src/main/features/user_workspace');
+  ws.setWorkspacePath('reveal-user', workspace);
   const ipc = await import('../../../src/main/ipc/index');
   ipc.register();
 });
-beforeEach(() => { vi.clearAllMocks(); });
-afterAll(async () => {
+afterEach(async () => {
   await drainMainRuntimeForTest();
+  await closeLogWorkers();
+});
+afterAll(() => {
   if (previousWorkspaceRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previousWorkspaceRoot;
   fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -62,6 +71,19 @@ function call(channel: string, payload: unknown) {
   return invokeHandler({ sender: trustedIpcSender() }, { channel, payload });
 }
 function reveal(target: unknown) { return call('workspace.revealPath', { path: target }); }
+function expectMutationDenialLogs() {
+  expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.writeText failed \{$/ });
+  expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.deletePath failed \{$/ });
+}
+async function expectReadOnly(payload: Record<string, unknown>, text: string) {
+  await expect(call('workspace.statPath', payload))
+    .resolves.toMatchObject({ ok: true, exists: true, isFile: true, readOnly: true });
+  await expect(call('produced.readText', payload)).resolves.toMatchObject({ ok: true, text });
+  for (const channel of ['produced.writeText', 'workspace.deletePath']) {
+    await expect(call(channel, { ...payload, content: 'replacement' }))
+      .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+  }
+}
 function expectNoShellAction() {
   expect(shell.showItemInFolder).not.toHaveBeenCalled();
   expect(shell.openPath).not.toHaveBeenCalled();
@@ -102,6 +124,7 @@ describe('user-requested reveal in the OS file manager', () => {
   it.each([undefined, null, 123, '', 'package.json', '../escape.png',
     'https://example.com/image.png', 'file:///tmp/image.png', 'javascript:alert(1)',
     'data:text/plain,hello', '/tmp/image\0.png'])('rejects invalid input %j without opening anything', async (target) => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.revealPath failed \{$/ });
     const res = await reveal(target);
     expect(res.ok).toBe(false);
     expect(res.error).toBeTruthy();
@@ -109,6 +132,7 @@ describe('user-requested reveal in the OS file manager', () => {
   });
 
   it('reports a removed file and succeeds when it becomes available again', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.revealPath failed \{$/ });
     const file = path.join(tempRoot, 'restored.png');
     const missing = await reveal(file);
     expect(missing.ok).toBe(false);
@@ -120,6 +144,7 @@ describe('user-requested reveal in the OS file manager', () => {
   });
 
   it('reports an OS folder-open failure and allows retry', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.revealPath failed \{$/ });
     shell.openPath.mockResolvedValueOnce('OS folder opening failed');
     const directory = path.dirname(outsideFile);
     const failed = await reveal(directory);
@@ -129,12 +154,11 @@ describe('user-requested reveal in the OS file manager', () => {
     await expect(reveal(directory)).resolves.toMatchObject({ ok: true });
   });
 
-  it('does not grant read, write, stat, or delete access after revealing an outside file', async () => {
+  it('keeps an outside file read-only before and after revealing it', async () => {
+    expectMutationDenialLogs();
+    await expectReadOnly({ path: outsideFile }, 'original image');
     await expect(reveal(outsideFile)).resolves.toMatchObject({ ok: true });
-    for (const channel of ['workspace.statPath', 'produced.readText', 'produced.writeText', 'workspace.deletePath']) {
-      await expect(call(channel, { path: outsideFile, content: 'replacement' }))
-        .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
-    }
+    await expectReadOnly({ path: outsideFile }, 'original image');
     expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
     expect(shell.trashItem).not.toHaveBeenCalled();
   });
@@ -169,19 +193,21 @@ describe('file actions in the conversation-selected coding workspace', () => {
   });
 
   it('does not promote a symlink in an ordinary task folder into a new allowed root', async () => {
+    expectMutationDenialLogs();
     const { createConversation } = await import('../../../src/main/features/chats');
     const { setWorkspaceDirOnce } = await import('../../../src/main/features/group_chat/state');
     const conv = await createConversation('reveal-user', {});
     const linked = path.join(workspace, 'ordinary-task-folder');
     fs.symlinkSync(path.dirname(outsideFile), linked, 'junction');
     await setWorkspaceDirOnce('reveal-user', conv.conversation_id, 'ordinary-task-folder');
-    await expect(call('produced.readText', {
+    await expectReadOnly({
       cid: conv.conversation_id, path: path.join(linked, path.basename(outsideFile)),
-    })).resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    }, 'original image');
     expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
   });
 
   it('opens existing source files in a project task even without a produced-file record', async () => {
+    expectMutationDenialLogs();
     const projects = await import('../../../src/main/features/projects');
     const chats = await import('../../../src/main/features/chats');
     const directories = await import('../../../src/main/features/local_agents/project-directory');
@@ -196,34 +222,31 @@ describe('file actions in the conversation-selected coding workspace', () => {
     directories.writeCodingDirectory('reveal-user', cid, directory, true);
 
     await expect(call('workspace.statPath', { cid, path: file }))
-      .resolves.toMatchObject({ ok: true, exists: true, isFile: true });
+      .resolves.toMatchObject({ ok: true, exists: true, isFile: true, readOnly: false });
     await expect(call('produced.readText', { cid, path: file }))
       .resolves.toMatchObject({ ok: true, text: 'export const ready = true;' });
 
     // A link or caller-supplied cwd cannot establish workspace authority.
     for (const payload of [{ path: file }, { cid: 'another-task', path: file },
       { cid: 'another-task', path: file, coding_project_dir: directory }]) {
-      await expect(call('produced.readText', payload)).resolves.toMatchObject({ ok: false });
+      await expectReadOnly(payload, 'export const ready = true;');
     }
     const escaped = path.join(directory, 'linked.png');
     fs.symlinkSync(outsideFile, escaped);
-    await expect(call('produced.readText', { cid, path: escaped }))
-      .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    await expectReadOnly({ cid, path: escaped }, 'original image');
 
-    // Replacing a device selection immediately revokes the former root.
+    // Replacing a device selection revokes mutation authority for the former root.
     directories.writeCodingDirectory('reveal-user', cid, workspace, true);
-    await expect(call('workspace.statPath', { cid, path: file })).resolves.toMatchObject({ ok: false });
+    await expectReadOnly({ cid, path: file }, 'export const ready = true;');
     expect(fs.readFileSync(file, 'utf8')).toBe('export const ready = true;');
     expectNoShellAction();
   });
 
-  it('does not authorize a directory awaiting confirmation on this device', async () => {
+  it('keeps an unconfirmed directory read-only on this device', async () => {
+    expectMutationDenialLogs();
     const { writeCodingDirectory } = await import('../../../src/main/features/local_agents/project-directory');
     writeCodingDirectory('reveal-user', 'pending-code-task', path.dirname(outsideFile), true, true);
-    for (const channel of ['workspace.statPath', 'produced.readText', 'produced.writeText', 'workspace.deletePath']) {
-      await expect(call(channel, { cid: 'pending-code-task', path: outsideFile, content: 'replacement' }))
-        .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
-    }
+    await expectReadOnly({ cid: 'pending-code-task', path: outsideFile }, 'original image');
     expect(fs.readFileSync(outsideFile, 'utf8')).toBe('original image');
     expectNoShellAction();
   });

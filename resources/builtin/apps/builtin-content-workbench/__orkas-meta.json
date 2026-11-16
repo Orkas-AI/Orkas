@@ -1,0 +1,9 @@
+{
+  "version": "1.19.4",
+  "title": "Content workspace",
+  "icon": "image",
+  "titleKey": "apps.builtin_content_title",
+  "descriptionKey": "apps.builtin_content_description",
+  "appType": "local",
+  "entry": "index.html"
+}

@@ -23,6 +23,55 @@ Run this checklist when the Office agent, Office skills, built-in Office tools, 
 - PDF inputs are limited to 128 MiB and 2,000 pages; PDF rendering is capped at
   4,096 pixels per dimension and roughly 8 million pixels total.
 
+### Initial creation recovery
+
+DOCX/XLSX/PPTX share a host-owned creation journal in the conversation directory
+(session retained results for non-conversation callers). A native batch's JSON
+`invalid_value` failures, complete operation accounting and `atomicRolledBack:true`
+permit one corrected call with `retry_of` equal to its returned operation id.
+The requested path is retained; unchanged input, another path/conversation,
+missing or corrupt evidence, uncertain completion and a consumed retry refuse
+before another native creation. Reservation precedes dispatch, so concurrent
+calls and actor rebuilds cannot replenish it. This does not retry a model or
+automatically choose corrected values.
+
+Successful publication closes recovery permanently for that operation, even
+when its receipt fails, or the requested/collision-safe file is later removed.
+PPTX/XLSX corrections use `edit_office`. Ordinary replacement of an existing
+DOCX remains supported; distinct requested artifacts have independent identities.
+PDF export is unchanged. Existing files/history have no fabricated creation
+evidence; the guarantee starts with journalled operations. Conversation removal
+owns journal retention. Arbitrary shell writes and independent-device coordination
+are not certified by this local journal.
+
+The owning tool cases exercise all three formats, concurrency, corrupted state,
+post-publication loss and protocol look-alikes. The real runner case crosses
+actor sessions within one conversation and rejects a foreign conversation.
+`office-readonly_e2e.test.ts` additionally runs a real invalid chart request,
+corrects it once, opens the native chart XML and validates the recovered PPTX,
+then deletes it and verifies that recreation dispatches nothing. Its native
+locale-inference note is explicitly classified as informational. Run this on
+Windows too before claiming native Windows recovery verification.
+
+### Saved output followed by failure
+
+Register a successfully promoted DOCX/XLSX/PPTX before publication-record writes
+or backup cleanup. If that later work fails, keep the error and the saved file
+in the turn's produced outputs; never replay creation. This does not certify
+content completeness or QA. A previously committed stage file may accompany a
+failed turn, including one with no final prose; an uncommitted or invalid
+working copy is not a deliverable.
+
+`office-tools.test.ts` injects post-publication record failures for all three
+formats, verifies exact saved bytes and registration, and refuses recreation
+after deletion. The native saved-before-record cases in
+`office-readonly_e2e.test.ts` open and validate actual packages, including six
+worksheets and editable XLSX/PPTX charts, then pass the registered file through
+the existing output selector and turn decider while retaining failure status.
+`bus-integration.test.ts` separately verifies the produced-file reference in
+durable chat history with empty final prose or an explicit stage limitation.
+These controls do not establish autonomous model recovery or Windows execution.
+
 ## Deterministic checks
 
 Run from the repository root:
@@ -39,16 +88,28 @@ must stop before rendering on invalid OpenXML; a multi-page render with one
 failed page must retain successful page evidence while returning an overall
 failure, so callers can repair or retry without a false all-pages success.
 
+Failed renders retain `E_OFFICE_RENDER_FAILED` and append an
+`office-render-error` JSON receipt with the page, artifact revision, bounded
+redacted message and any explicit source error/exit code. Codes are never
+inferred from prose; no recovery advice or automatic retry is added. Optional
+create/edit previews remain best-effort. Tool and renderer cases cover native
+stderr/stdout, absent details, cancellation, timeout, privacy and partial batches;
+the native missing-page/cancellation journeys verify the same source codes.
+
 `office-readonly_e2e.test.ts` runs the real bundled engine and embedded Chromium
-through `office_review` and `edit_office`. Its scenarios cover combined
-check/render, a missing page followed by a successful retry, cancellation after
-a completed issue scan, invalid OpenXML, and an intentional edit followed by
-review of the saved copy. They verify source bytes/mtime, receipt hashes, decoded
+through `office_review`, `edit_office` and `office_read`. Scenarios cover combined
+check/render, missing-page recovery, cancellation after an issue scan, invalid
+OpenXML, edit/review, workbook/presentation rendering, paragraph batches and a
+true footer. DOCX default reads cover footnotes, endnotes, both, absent parts and
+eighty footnotes plus an endnote, retaining native IDs, paths and every known
+note. They verify source bytes/mtime, receipt hashes, decoded
 PNG content, resident/window cleanup, and absence of write registrations during
 review. The missing-page and cancellation scenarios each assert one expected
 render warning; other application/browser logs and command stderr fail the run.
-The fixture replaces only the log sink and observes real command completion
-to trigger cancellation; it does not stub engine results or Chromium rendering.
+The fixture observes real command completion to trigger cancellation and does
+not stub engine results or Chromium rendering. Saved-output fault cases replace
+only the host journal finish operation to simulate a post-publication storage
+failure; the log sink captures all application output.
 Run these cases after artifact provisioning.
 
 The workbook scenario reviews positions 1, 3 and 4 of an independently authored
@@ -60,6 +121,15 @@ worksheet despite `--page`; the embedded renderer must select the requested
 zero-based `data-sheet` before capture. Duplicate image hashes alone are not
 an error. Word pagination and PowerPoint rendering retain their existing checks.
 
+
+`office_read` default DOCX text returns scoped JSON sections for `/body`,
+`/footnotes` and `/endnotes`; complete refers only to that scope. Other regions
+are explicitly unread. The focused tool suite checks partial/malformed failures,
+shared source time/byte limits, cancellation and lossless Result Store retention
+of late notes after a long body. Structured missing-part results mean absent;
+failed reads must not become empty lists. Explicit get/query, outline and other
+formats retain their contracts. Native Windows execution remains a separate
+platform check.
 
 ## Real Binary Smoke
 
@@ -110,7 +180,7 @@ mistake seeded input for a new output. Model quality checks require their own
 authorized run; these scenarios do not claim a model pass in this build.
 
 For unsupported `.xlsm` and proprietary WPS inputs, the Agent must load the
-matching Skill and `stat_file` the actual source before returning the complete
+matching Skill and inspect actual source metadata through `read_files` before returning the complete
 capability boundary through the group handback protocol. The Commander
 continuation treats that report as authoritative: it must not search for a
 shell/process conversion, publish an empty or placeholder output, or retry the

@@ -521,6 +521,7 @@ function verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch
   // which the remote extracted; it also keeps marker/pip-shim/arch/dir-allowlist checks.
   const options = {
     requireExecutable: true,
+    ...(context.__orkasTestLibRawContract ? { librawContract: context.__orkasTestLibRawContract } : {}),
     ...(context.__orkasTestWhisperContract ? { whisperContract: context.__orkasTestWhisperContract } : {}),
     ...(context.__orkasTestWindowsVcContract ? { windowsVcContract: context.__orkasTestWindowsVcContract } : {}),
   };

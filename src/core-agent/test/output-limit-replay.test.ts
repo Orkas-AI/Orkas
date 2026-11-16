@@ -41,6 +41,7 @@ afterEach(() => vi.unstubAllGlobals());
 it.each([
   { label: 'completed tool response control', truncated: false, hasCall: true, reasonDone: true, wireReasoning: 1, executions: 1 },
   { label: 'truncated tool response', truncated: true, hasCall: true, reasonDone: true, wireReasoning: 1, executions: 0 },
+  { label: 'truncated malformed tool response', truncated: true, hasCall: true, reasonDone: true, wireReasoning: 1, executions: 0, malformed: true },
   { label: 'truncated text response control', truncated: true, hasCall: false, reasonDone: true, wireReasoning: 1, executions: 0 },
   { label: 'truncated tool response without public text', truncated: true, hasCall: true, reasonDone: true, wireReasoning: 1, executions: 0, noText: true },
   { label: 'plaintext item with protocol-null encrypted content', truncated: true, hasCall: true, reasonDone: true, wireReasoning: 1, executions: 0, nullCipher: true },
@@ -54,7 +55,7 @@ it.each([
     expect(bodies.length).toBeLessThanOrEqual(2);
     return bodies.length === 1
       ? response([sourceReason, ...('noText' in scenario ? [] : [message('Ready to save.')]),
-          ...(scenario.hasCall ? [toolCall] : [])], scenario.truncated, scenario.reasonDone)
+          ...(scenario.hasCall ? [{ ...toolCall, ...('malformed' in scenario ? { arguments: '{"value":' } : {}) }] : [])], scenario.truncated, scenario.reasonDone)
       : response([message('Seven.')]);
   }));
   const native = createPiProvider({ provider: 'fixture-provider', apiKey: 'synthetic', customModel: model });
@@ -141,6 +142,7 @@ it.each([
   { label: 'reasoning only', text: '', proposal: false, field: 'reasoning_content' },
   { label: 'whitespace body', text: ' \n ', proposal: false, field: 'reasoning_content' },
   { label: 'discarded tool without text', text: '', proposal: true, field: 'reasoning_content' },
+  { label: 'malformed discarded tool without text', text: '', proposal: true, field: 'reasoning_content', malformed: true },
   { label: 'portable reasoning field', text: '', proposal: false, field: 'reasoning' },
   { label: 'portable reasoning_text field', text: '', proposal: false, field: 'reasoning_text' },
 ])('replays original Chat reasoning without a placeholder: $label', async scenario => {
@@ -151,7 +153,7 @@ it.each([
     expect(bodies.length).toBeLessThanOrEqual(2);
     const first = bodies.length === 1;
     const delta = first ? { role: 'assistant', content: scenario.text, [scenario.field]: originalReason,
-      ...(scenario.proposal ? { tool_calls: [{ index: 0, id: 'discard', type: 'function', function: { name: 'write_file', arguments: '{}' } }] } : {}) }
+      ...(scenario.proposal ? { tool_calls: [{ index: 0, id: 'discard', type: 'function', function: { name: 'write_file', arguments: 'malformed' in scenario ? '{"value":' : '{}' } }] } : {}) }
       : { role: 'assistant', content: 'Finished.' };
     return new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: first ? 'length' : 'stop' }] })}\n\ndata: [DONE]\n\n`,
       { headers: { 'content-type': 'text/event-stream' } });

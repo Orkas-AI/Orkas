@@ -3,12 +3,15 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
+import { PHRASE_VIEW_NOTE } from '../../../src/main/features/video_phrases';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const scriptContainer = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-video-skill-container-'));
+afterAll(() => fs.rmSync(scriptContainer, { recursive: true, force: true }));
 
 function pcDir() {
-  return process.cwd();
+  return path.resolve(__dirname, '../../..');
 }
 
 function skillDir(skillId: 'stage-edit' | 'stage-plan') {
@@ -41,11 +44,7 @@ function runSkill(
         ...process.env,
         ORKAS_PC_DIR: dir,
         ORKAS_RUN_SKILL_DIR: skillDir(skillId),
-        ORKAS_WORKSPACE_ROOT: path.join(
-          os.tmpdir(),
-          `orkas-video-media-skill-${process.pid}`,
-          'data',
-        ),
+        ORKAS_WORKSPACE_ROOT: path.join(scriptContainer, 'data'),
         ...extraEnv,
       },
     },
@@ -54,6 +53,12 @@ function runSkill(
 
 function parseJson(text: string) {
   return JSON.parse(text.trim());
+}
+
+/** The result line of a script that also prints progress lines. */
+function lastJson(text: string) {
+  const lines = text.trim().split('\n').filter((line) => line.trim().startsWith('{'));
+  return JSON.parse(lines[lines.length - 1]);
 }
 
 function makeFakeFfmpegEnv(tmp: string) {
@@ -108,7 +113,6 @@ describe('video media skill scripts', () => {
     const reference = fs.readFileSync(path.join(skillDir('stage-edit'), 'references', 'transcript-and-screen-grounded-editing.md'), 'utf8');
     for (const body of [reference,
       fs.readFileSync(path.join(skillDir('stage-edit'), 'SKILL.md'), 'utf8'),
-      fs.readFileSync(path.join(skillDir('stage-plan'), 'SKILL.md'), 'utf8'),
     ]) {
       expect(body).not.toMatch(/ocr_file|--op ocr|OCR is mandatory|OCR runtime/);
       expect(body).toContain('extract_frame');
@@ -127,9 +131,6 @@ describe('video media skill scripts', () => {
       path.join(skillDir('stage-edit'), 'scripts', 'edit_video.js'),
       path.join(skillDir('stage-edit'), 'scripts', 'lib', 'video_analyze_core.cjs'),
       path.join(skillDir('stage-edit'), 'scripts', 'lib', 'video_edit_core.cjs'),
-      path.join(skillDir('stage-plan'), 'scripts', 'video_plan.js'),
-      path.join(skillDir('stage-plan'), 'scripts', 'lib', 'video_decide_core.cjs'),
-      path.join(skillDir('stage-plan'), 'scripts', 'lib', 'video_edl_core.cjs'),
     ];
     const forbidden = [
       /\bpcRequire\b/,
@@ -173,8 +174,192 @@ describe('video media skill scripts', () => {
     expect(res.status).toBe(1);
     expect(res.stdout).toBe('');
     expect(parseJson(res.stderr)).toMatchObject({ code: 'E_ARGS' });
-    expect(parseJson(res.stderr).message).toBe('op must be one of: silence, scenes, quality');
+    expect(parseJson(res.stderr).message).toBe('op must be one of: silence, scenes, quality, phrases, activity, beats');
   });
+
+  const realFfmpegDir = path.join(pcDir(), 'resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`);
+  const realFfmpeg = path.join(realFfmpegDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+  it.skipIf(!fs.existsSync(realFfmpeg))('splits a transcript at the pauses measured in the recording', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-phrases-'));
+    try {
+      // Speech, 0.6 s of silence, speech: the transcript stretches the first word
+      // over the pause, as speech recognition does.
+      const media = path.join(tmp, 'talk.m4a');
+      const made = spawnSync(realFfmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'sine=f=300:r=48000:d=1', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono:d=0.6',
+        '-f', 'lavfi', '-i', 'sine=f=300:r=48000:d=1',
+        '-filter_complex', '[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]', '-map', '[a]', '-c:a', 'aac', media], { encoding: 'utf8' });
+      expect(made.status, made.stderr).toBe(0);
+      const transcript = path.join(tmp, 'talk.transcript.json');
+      fs.writeFileSync(transcript, JSON.stringify({ words: [
+        { text: '第一句', startSec: 0, endSec: 1.5 }, { text: '第二句', startSec: 1.5, endSec: 2.6 },
+      ] }));
+      const ffprobe = path.join(realFfmpegDir, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+      const env = { ORKAS_BUNDLED_FFMPEG: realFfmpeg, ORKAS_BUNDLED_FFPROBE: ffprobe };
+      const inline = runSkill('stage-edit', 'analyze_media', ['--op', 'phrases', '--input', media, '--transcript', transcript], env);
+      expect(inline.status, inline.stderr).toBe(0);
+      const out = lastJson(inline.stdout);
+      expect(out.summary).toMatchObject({ lines: 2, measuredPauses: 1 });
+      // The same caution the transcription result carries with its view.
+      expect(out.summary.note).toBe(PHRASE_VIEW_NOTE);
+      expect(out.text).toMatch(/^\[0\.00–1\.0\d\] 第一句\n  — 0\.[56]\ds —\n\[1\.[56]\d–2\.60\] 第二句$/);
+
+      const saved = path.join(tmp, 'cuts', 'phrases.txt');
+      const filed = runSkill('stage-edit', 'analyze_media', ['--op', 'phrases', '--input', media, '--transcript', transcript, '--output', saved], env);
+      expect(filed.status, filed.stderr).toBe(0);
+      expect(lastJson(filed.stdout)).toMatchObject({ path: saved });
+      expect(fs.readFileSync(saved, 'utf8')).toBe(`${out.text}\n`);
+
+      // A long recording: the reply carries the first 200 lines and asks for --output.
+      // Its audio never falls silent, so the words' own gaps split the lines.
+      const steady = path.join(tmp, 'steady.m4a');
+      const toned = spawnSync(realFfmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'sine=f=300:r=48000:d=3', '-c:a', 'aac', steady], { encoding: 'utf8' });
+      expect(toned.status, toned.stderr).toBe(0);
+      const long = path.join(tmp, 'long.transcript.json');
+      fs.writeFileSync(long, JSON.stringify({ words: Array.from({ length: 250 }, (_, i) => ({ text: `w${i}`, startSec: i, endSec: i + 0.4 })) }));
+      const capped = lastJson(runSkill('stage-edit', 'analyze_media', ['--op', 'phrases', '--input', steady, '--transcript', long], env).stdout);
+      expect(capped.summary).toMatchObject({ lines: 250, truncated: true });
+      expect(capped.text.split('\n').filter((row: string) => row.startsWith('['))).toHaveLength(200);
+      expect(capped.text).toMatch(/50 more lines\. Run again with --output/);
+
+      const clobber = runSkill('stage-edit', 'analyze_media', ['--op', 'phrases', '--input', media, '--transcript', transcript, '--output', transcript], env);
+      expect(clobber.status).toBe(1);
+      expect(parseJson(clobber.stderr)).toMatchObject({ code: 'E_ARGS' });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it.skipIf(!fs.existsSync(realFfmpeg))('follows whoever is talking from mouth motion to a vertical cut', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-activity-'));
+    try {
+      // Two faces on a still camera; noise in a mouth box stands in for speech. Left talks
+      // 0–3 s, right 3–6.5 s, left says one half-second word, right talks again to 9 s.
+      const media = path.join(tmp, 'talk.mp4');
+      const made = spawnSync(realFfmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'color=c=0x404850:s=1280x720:r=30:d=9',
+        '-f', 'lavfi', '-i', 'color=c=0x808080:s=128x64:r=30:d=9,noise=alls=100:allf=t+u',
+        '-filter_complex', "[0:v]drawbox=x=190:y=200:w=260:h=320:color=0xd8b090:t=fill,drawbox=x=830:y=200:w=260:h=320:color=0xc0a080:t=fill[base];"
+          + "[1:v]split=2[n1][n2];[base][n1]overlay=x=256:y=400:enable='between(t,0,3)+between(t,6.5,7)'[a];"
+          + "[a][n2]overlay=x=896:y=400:enable='between(t,3,6.5)+between(t,7,9)'[v]",
+        '-map', '[v]', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', media], { encoding: 'utf8' });
+      expect(made.status, made.stderr).toBe(0);
+      const ffprobe = path.join(realFfmpegDir, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+      const env = { ORKAS_BUNDLED_FFMPEG: realFfmpeg, ORKAS_BUNDLED_FFPROBE: ffprobe };
+      const sourceBytes = fs.readFileSync(media);
+      const regions = JSON.stringify([{ id: '__proto__', box: [0.18, 0.52, 0.38, 0.68] }, { id: 'right', box: [0.68, 0.52, 0.88, 0.68] }]);
+      const measured = runSkill('stage-edit', 'analyze_media', ['--op', 'activity', '--input', media, '--regions', regions], env);
+      expect(measured.status, measured.stderr).toBe(0);
+      const summary = lastJson(measured.stdout).summary;
+      expect(summary.turns.map((t: any) => [t.start, t.end, t.region])).toEqual([[0, 3, '__proto__'], [3, 9, 'right']]);
+      expect(summary.plan).toEqual([{ start: 0, centre_x: 0.28, centre_y: 0.6 }, { start: 3, centre_x: 0.78, centre_y: 0.6 }]);
+
+      const fine = runSkill('stage-edit', 'analyze_media', ['--op', 'activity', '--input', media,
+        '--regions', regions, '--window', '0.05'], env);
+      expect(fine.status, fine.stderr).toBe(0);
+      const fineSummary = lastJson(fine.stdout).summary;
+      expect(fineSummary.windowCount).toBe(180);
+      expect(fineSummary.windows[0]).toMatchObject({ start: 0, end: 0.05 });
+      // At 10Hz the first measured difference after the 3s handoff is at 3.1s;
+      // a 50ms window must retain it, rather than reuse the coarse 0.5s boundary.
+      expect(fineSummary.plan).toEqual([{ start: 0, centre_x: 0.28, centre_y: 0.6 },
+        { start: 3.1, centre_x: 0.78, centre_y: 0.6 }]);
+      expect(fineSummary.turns[0]).toMatchObject({ start: 0, region: '__proto__' });
+      expect(fineSummary.turns.at(-1)).toMatchObject({ end: 9, region: 'right' });
+      expect(fs.readFileSync(media)).toEqual(sourceBytes);
+
+      const planFile = path.join(tmp, 'plan.json');
+      fs.writeFileSync(planFile, JSON.stringify(summary.plan));
+      const vertical = path.join(tmp, 'vertical.mp4');
+      const cut = runSkill('stage-edit', 'edit_video', ['--op', 'reframe', '--input', media, '--aspect', '9:16', '--plan', `@${planFile}`, '--output', vertical], env);
+      expect(cut.status, cut.stderr).toBe(0);
+      // The middle of the frame shows the lighter left face at 1 s and the darker right face at 5 s.
+      const centreLuma = (sec: number): number => {
+        const r = spawnSync(realFfmpeg, ['-v', 'error', '-ss', String(sec), '-i', vertical, '-frames:v', '1',
+          '-vf', 'crop=200:200:440:560,scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1']);
+        expect(r.status, String(r.stderr)).toBe(0);
+        return r.stdout[0];
+      };
+      const left = centreLuma(1);
+      const right = centreLuma(5);
+      expect(Math.abs(left - 184)).toBeLessThan(8);
+      expect(Math.abs(right - 166)).toBeLessThan(8);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it.skipIf(!fs.existsSync(realFfmpeg)).each([false, true])('covers existing captions and preserves an occupied command-line output (collision=%s)', collision => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-cover-'));
+    try {
+      const ffprobe = path.join(realFfmpegDir, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+      const env = { ORKAS_BUNDLED_FFMPEG: realFfmpeg, ORKAS_BUNDLED_FFPROBE: ffprobe };
+      const media = path.join(tmp, 'clip.mp4');
+      const made = spawnSync(realFfmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0x506070:s=360x640:r=30:d=1',
+        '-vf', 'drawbox=x=40:y=ih*0.80:w=280:h=ih*0.07:color=red@1:t=fill', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', media], { encoding: 'utf8' });
+      expect(made.status, made.stderr).toBe(0);
+      const subtitles = path.join(tmp, 'en.srt');
+      fs.writeFileSync(subtitles, '1\n00:00:00,000 --> 00:00:01,000\nEasy on your eyes\n');
+      const out = path.join(tmp, 'en.mp4');
+      const original = fs.readFileSync(media);
+      if (collision) fs.writeFileSync(out, original);
+      const expectedOutput = collision ? path.join(tmp, 'en-2.mp4') : out;
+      const res = runSkill('stage-edit', 'edit_video', ['--op', 'burnsubs', '--input', media, '--subtitles', subtitles, '--cover', '0.78,0.89', '--output', out], env);
+      expect(res.status, res.stderr).toBe(0);
+      expect(lastJson(res.stdout)).toMatchObject({ ok: true, path: expectedOutput });
+      expect(fs.readFileSync(media)).toEqual(original);
+      if (collision) expect(fs.readFileSync(out)).toEqual(original);
+      const band = spawnSync(realFfmpeg, ['-v', 'error', '-ss', '0.5', '-i', expectedOutput, '-frames:v', '1',
+        '-vf', 'crop=iw:ih*0.11:0:ih*0.78', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], { maxBuffer: 1 << 24 });
+      expect(band.status, String(band.stderr)).toBe(0);
+      let red = 0;
+      for (let i = 0; i + 2 < band.stdout.length; i += 3) if (band.stdout[i] > 150 && band.stdout[i + 1] < 90 && band.stdout[i + 2] < 90) red += 1;
+      expect(red).toBe(0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it.skipIf(!fs.existsSync(realFfmpeg))('lists a track\'s beats and says which cuts of a montage miss them', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-beats-'));
+    try {
+      const ffprobe = path.join(realFfmpegDir, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+      const env = { ORKAS_BUNDLED_FFMPEG: realFfmpeg, ORKAS_BUNDLED_FFPROBE: ffprobe };
+      const B = 0.46875; // 128 BPM
+      const music = path.join(tmp, 'music.wav');
+      const made = spawnSync(realFfmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i',
+        `aevalsrc='0.8*sin(2*PI*60*mod(t\\,${B}))*exp(-mod(t\\,${B})*18)+0.15*sin(2*PI*(220+110*floor(mod(t/(4*${B})\\,2)))*t)':s=44100:d=16`, music], { encoding: 'utf8' });
+      expect(made.status, made.stderr).toBe(0);
+      const listed = runSkill('stage-edit', 'analyze_media', ['--op', 'beats', '--input', music, '--fps', '30'], env);
+      expect(listed.status, listed.stderr).toBe(0);
+      const beats = lastJson(listed.stdout).summary;
+      expect(beats).toMatchObject({ steady: true, fps: 30 });
+      expect(beats.bpm).toBeCloseTo(128, 0);
+      expect(beats.beats[0]).toEqual({ t: expect.any(Number), frame: Math.round(beats.beats[0].t * 30), strength: expect.any(Number) });
+
+      // A montage that changes colour on every bar, then the same cut three frames late.
+      const montage = (shift: number, name: string): string => {
+        const colors = ['red', 'blue', 'green', 'yellow', 'white', 'purple', 'orange', 'cyan'];
+        const edges = [0, ...[1, 2, 3, 4, 5, 6, 7].map((k) => Math.round(k * 4 * B * 30) + shift), 480];
+        const inputs = colors.flatMap((c) => ['-f', 'lavfi', '-i', `color=c=${c}:s=160x90:r=30`]);
+        const chains = colors.map((_, i) => `[${i}:v]trim=end_frame=${edges[i + 1] - edges[i]},setpts=PTS-STARTPTS[v${i}]`);
+        const out = path.join(tmp, name);
+        const r = spawnSync(realFfmpeg, ['-hide_banner', '-loglevel', 'error', '-y', ...inputs, '-i', music,
+          '-filter_complex', `${chains.join(';')};${colors.map((_, i) => `[v${i}]`).join('')}concat=n=${colors.length}:v=1:a=0[v]`,
+          '-map', '[v]', '-map', `${colors.length}:a`, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', out], { encoding: 'utf8' });
+        expect(r.status, r.stderr).toBe(0);
+        return out;
+      };
+      const onBeat = lastJson(runSkill('stage-edit', 'analyze_media', ['--op', 'beats', '--input', montage(0, 'on.mp4')], env).stdout).summary;
+      expect(onBeat.cuts.count).toBeGreaterThan(3);
+      expect(onBeat.cuts.off_beat).toBe(0);
+      const late = lastJson(runSkill('stage-edit', 'analyze_media', ['--op', 'beats', '--input', montage(3, 'late.mp4')], env).stdout).summary;
+      expect(late.cuts.off_beat).toBe(late.cuts.count);
+      expect(late.cuts.list.every((c: any) => c.offset_frames >= 2)).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it('exposes edit_video through the stage-edit skill runner', () => {
     const res = runSkill('stage-edit', 'edit_video', ['--help']);

@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { inspect } from 'node:util';
 import { sanitizeLogTextForUpload } from '../../../src/main/util/log-sanitize';
 
 describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
@@ -102,9 +103,43 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     expect(out).toBe('refresh_token=*** session_id=*** cid=*** uid=ABCD...7890 ok=true');
   });
 
+  it('masks the account identifier used by conversation lifecycle logs', () => {
+    expect(sanitizeLogTextForUpload('turn-start user=ABCDEF1234567890 status=running'))
+      .toBe('turn-start user=ABCD...7890 status=running');
+    expect(sanitizeLogTextForUpload('turn-start user=anonymous status=running'))
+      .toBe('turn-start user=anonymous status=running');
+  });
+
   it('masks secret-looking JSON fields', () => {
     const out = sanitizeLogTextForUpload('{"access_token":"at-value","name":"visible"}');
     expect(out).toBe('{"access_token":"***","name":"visible"}');
+  });
+
+  it('masks private fields in the multi-line object format attached to feedback', () => {
+    const input = inspect({
+      cid: 'synthetic-conversation',
+      session_id: 'synthetic-session',
+      user_id: 'ABCDEF1234567890',
+      nested: { token: 'synthetic-token', status: 'completed' },
+      pending: 0,
+    }, { compact: false });
+    expect(sanitizeLogTextForUpload(input)).toBe(inspect({
+      cid: '***', session_id: '***', user_id: 'ABCD...7890',
+      nested: { token: '***', status: 'completed' }, pending: 0,
+    }, { compact: false }));
+  });
+
+  it.each([
+    "secret-head'quoted\"secret-tail",
+    "secret-head'quoted\"backtick`secret-tail",
+    'secret-head\\escaped-secret-tail',
+  ])('masks the complete inspected string including escaped quotes: %j', (secret) => {
+    const input = inspect({ session_id: secret, status: 'completed' });
+    const out = sanitizeLogTextForUpload(input);
+    expect(out).not.toContain('secret-head');
+    expect(out).not.toContain('secret-tail');
+    expect(out).toContain("status: 'completed'");
+    expect(sanitizeLogTextForUpload(out)).toBe(out);
   });
 
   it('masks sensitive URL query params while preserving harmless params', () => {
@@ -129,7 +164,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     );
     expect(out).toContain('<abs-path:');
     expect(out).toContain('<file-url-path:');
-    expect(out).not.toContain('/Users/alice');
+    expect(out).not.toContain('/Users/test');
     expect(out).not.toContain('Secret Project');
   });
 
@@ -172,6 +207,13 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
 });
 
 describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
+  it('preserves similarly named object fields and non-private diagnostic values', () => {
+    const input = inspect({
+      custom_session_id: 'visible', session_id_count: 3, cid_suffix: 'visible',
+      session_id: null, token_count: 42, status: 'completed',
+    }, { compact: false });
+    expect(sanitizeLogTextForUpload(input)).toBe(input);
+  });
   it('leaves the word "basic" in prose untouched', () => {
     // Basic credentials are base64 of "user:password"; a plain word after
     // "basic" is not one and must stay readable in the log.

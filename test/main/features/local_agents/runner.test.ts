@@ -535,6 +535,7 @@ describe('local_agents/runner', () => {
     expect(meta.currentMessageId).toBe('persisted-user-trigger');
     expect(meta.cli).toBe('claude');
     expect(meta.cliPath).toBe('/fake/claude');
+    expect(meta).not.toHaveProperty('model');
     expect(meta.endedAt).toBeTruthy();
   });
 
@@ -1321,8 +1322,8 @@ describe('local_agents/runner', () => {
     fs.writeFileSync(output, 'Exact output');
     const selected: string[][] = [];
     mockBackendImpl = async ({ bridge, onEvent }) => {
-      expect((await callRunnerBridge(bridge, 'publish_outputs', { paths: ['report.txt'] })).result).toEqual({ requested: 1, published: 1 });
-      expect((await callRunnerBridge(bridge, 'publish_outputs', { paths: [] })).result).toEqual({ requested: 0, published: 0 });
+      expect((await callRunnerBridge(bridge, 'publish_outputs', { paths: ['report.txt'] })).result).toMatchObject({ requested: 1, published: 1, outputs: [{ path: output }] });
+      expect((await callRunnerBridge(bridge, 'publish_outputs', { paths: [] })).result).toEqual({ requested: 0, published: 0, outputs: [] });
       onEvent({ type: 'done', status: 'completed', output: 'Ready' });
     };
     const runner = await loadRunner();
@@ -1731,7 +1732,7 @@ describe('local_agents/runner', () => {
     expect(result.stderrExcerpt).toContain('Run `claude /login` and try again.');
     expect(result.stderrExcerpt).not.toContain('older context line');
     expect(result.stderrExcerpt).not.toContain('\u001b[');
-    expect(result.stderrExcerpt).not.toContain('/Users/alice');
+    expect(result.stderrExcerpt).not.toContain('/Users/test');
     expect(result.stderrExcerpt).not.toContain(privateToken);
   });
 
@@ -3123,3 +3124,61 @@ describe('local_agents/runner', () => {
     expect(result.error).toMatch(/not implemented/);
   });
 });
+
+
+
+it.each(['completed', 'cancelled'] as const)('clears read-only run diagnostics after %s, preserving real activity across user waits', async status => {
+  mockDetect.mockResolvedValue({ type: 'codex', available: true, path: '/fake/codex', version: '0.156.1' });
+  const permissions = await import('../../../../src/main/features/local_agents/cli_permissions');
+  const inputs = await import('../../../../src/main/features/local_agents/cli_user_input');
+  let read: (() => any) | null = null;
+  let captured: (() => any) | null = null;
+  let now = Date.now();
+  const date = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  permissions._setBroadcastForTest((channel, payload: any) => {
+    if (channel !== 'local-agent:permission') return;
+    expect(read?.()).toMatchObject({ phase: 'waiting_approval', wait_elapsed_ms: 0 });
+    now += 2000;
+    expect(read?.()).toMatchObject({ phase: 'waiting_approval', wait_elapsed_ms: 2000, last_activity_age_ms: 2000 });
+    queueMicrotask(() => permissions.respond(payload.request_id, 'allow_once'));
+  });
+  inputs._setBroadcastForTest((channel, payload: any) => {
+    if (channel !== 'local-agent:user-input') return;
+    expect(read?.()).toMatchObject({ phase: 'waiting_input', wait_elapsed_ms: 0, last_activity_age_ms: 2000 });
+    void inputs.respond(payload.request_id, TEST_UID, { scope: ['Current'] });
+  });
+  mockCodexBackendImpl = async opts => {
+    expect(read?.()).toMatchObject({ cli: 'codex', phase: 'unknown', last_activity_age_ms: null });
+    opts.onEvent({ type: 'thinking', chars: 12 });
+    expect(read?.()).toMatchObject({ phase: 'reasoning', last_activity_age_ms: 0 });
+    await opts.requestPermission({ tool: 'command', command: 'npm test' });
+    expect(read?.()).toMatchObject({ phase: 'reasoning', wait_elapsed_ms: null, last_activity_age_ms: 2000 });
+    await opts.requestUserInput({ questions: [{ id: 'scope', question: 'Which scope?' }] });
+    opts.onEvent({ type: 'thinking', synthetic: true, heartbeat: true });
+    expect(read?.()).toMatchObject({ last_activity_age_ms: 2000 });
+    opts.onActivity();
+    expect(read?.()).toMatchObject({ last_activity_age_ms: 0 });
+    opts.onEvent({ type: 'done', status, output: 'Done.' });
+  };
+  try {
+    const result = await (await loadRunner()).run({ uid: TEST_UID, cid: 'diagnostic-waits', agentId: 'a',
+      currentMessageId: 'request', cli: 'codex', prompt: 'Inspect.', cwd: tmpDir, permissionPolicy: 'ask',
+      signal: new AbortController().signal, onEvent: () => {}, saveUserInput: async () => {},
+      onDiagnostics: getter => { read = getter; if (getter) captured = getter; },
+    });
+    expect(result.status).toBe(status);
+    expect(read).toBeNull();
+    expect(captured?.()).toBeNull();
+  } finally { permissions._resetForTest(); inputs._resetForTest(); date.mockRestore(); }
+});
+
+it('does not dispatch a CLI backend after pre-dispatch cancellation', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = vi.fn(async () => {});
+    const runner = await loadRunner();
+    const controller = new AbortController();
+    controller.abort();
+    await runner.run({ uid: TEST_UID, cid: 'c-cancel-before-start', agentId: 'PRIVATE_AGENT',
+      cli: 'claude', prompt: 'task', cwd: tmpDir, signal: controller.signal, onEvent: () => {} });
+    expect(mockBackendImpl).not.toHaveBeenCalled();
+  });

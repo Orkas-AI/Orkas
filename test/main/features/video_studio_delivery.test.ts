@@ -1,21 +1,96 @@
-import { spawnSync } from 'node:child_process';
+
+
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { bundledFfmpegPaths } from '../../../src/main/util/bundled-runtime';
+import { BEAT_SEC, driftingCuts, makeBeatMontage, onBeatCuts } from '../../fixtures/beat-montage';
+
+import * as studio from '../../../src/main/features/video_studio';
 
 import {
+  assessCutsOffBeat,
   assessDeliveredNarration,
   assessDeliveredSpec,
+  cutsOffBeatIssues,
   parseAspectRatio,
   parseIntegratedLufs,
+  parseDeliveredAudioMeasurement,
+  measureDeliveredAudio,
+  measureVoicedSpan,
   parseVoicedSpan,
-  verifyProductionDelivery,
   type DeliveryNarrationLine,
 } from '../../../src/main/features/video_studio_delivery';
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('narration measurement completion', () => {
+  it.each(['probe-failed', 'decode-failed', 'decode-aborted', 'decode-timedOut'])('keeps %s evidence unknown', async (state) => {
+    const run = vi.spyOn(studio, 'runVideoProcessForTest');
+    run.mockResolvedValueOnce({
+      code: state === 'probe-failed' ? 1 : 0, stdout: '1.000000', stderr: '', timedOut: false, aborted: false,
+    });
+    run.mockResolvedValueOnce({
+      code: state === 'decode-failed' ? 1 : 0, stdout: 'lavfi.silence_start=0.5', stderr: '',
+      timedOut: state === 'decode-timedOut', aborted: state === 'decode-aborted',
+    });
+    expect(await measureVoicedSpan('/unused/synthetic.wav')).toBeNull();
+    expect(run).toHaveBeenCalledTimes(state === 'probe-failed' ? 1 : 2);
+  });
+
+  it.each(['Infinity', 'NaN', '0', '-1', ''])('rejects an invalid probed duration %j', async (stdout) => {
+    const run = vi.spyOn(studio, 'runVideoProcessForTest').mockResolvedValue({
+      code: 0, stdout, stderr: '', timedOut: false, aborted: false,
+    });
+    expect(await measureVoicedSpan('/unused/synthetic.wav')).toBeNull();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('complete digital-silence evidence', () => {
+  const summary = (id: string, peak: string, samples = '48000') => [
+    `[Parsed_astats_0 @ ${id}] Overall`,
+    `[Parsed_astats_0 @ ${id}] Peak level dB: ${peak}`,
+    `[Parsed_astats_0 @ ${id}] Number of samples: ${samples}`,
+  ].join('\n');
+  const silent = summary('0x123', '-inf');
+  const lufs = '\n[Parsed_ebur128_1 @ 0x456] Summary:\n Integrated loudness:\n I: -70.0 LUFS';
+
+  it('distinguishes exact zeros from a quiet signal at the same loudness gate floor', () => {
+    expect(parseDeliveredAudioMeasurement(silent + lufs, 1)).toEqual({ digitalSilence: true, integratedLufs: -70 });
+    expect(parseDeliveredAudioMeasurement(summary('0x123', '-110.123') + lufs, 1))
+      .toEqual({ digitalSilence: false, integratedLufs: -70 });
+  });
+
+  it.each([
+    ['', 1], [silent, 2], [silent, 0], [summary('0x123', '-inf', '0'), 1],
+    [summary('0x123', 'nan'), 1], [silent.replace('Number of samples: 48000', ''), 1],
+  ])('leaves missing, empty or incomplete evidence unknown (%#)', (stderr, streams) => {
+    expect(parseDeliveredAudioMeasurement(String(stderr), Number(streams)).digitalSilence).toBeNull();
+  });
+
+  it('requires complete summaries for every stream, and never adds programs into one loudness claim', () => {
+    expect(parseDeliveredAudioMeasurement(silent + '\n' + summary('0x789', '-10') + lufs, 2))
+      .toEqual({ digitalSilence: false, integratedLufs: null });
+    expect(parseDeliveredAudioMeasurement(silent + '\n' + summary('0x789', '-inf') + lufs, 2))
+      .toEqual({ digitalSilence: true, integratedLufs: null });
+  });
+
+  it.each(['failed', 'timedOut', 'aborted'] as const)('does not trust a silent summary from a %s process', async (state) => {
+    const run = vi.spyOn(studio, 'runVideoProcessForTest').mockResolvedValue({
+      code: state === 'failed' ? 1 : 0, stdout: '', stderr: silent + lufs,
+      timedOut: state === 'timedOut', aborted: state === 'aborted',
+    });
+    const signal = new AbortController().signal;
+    expect(await measureDeliveredAudio('/unused/video.mp4', 1, signal))
+      .toEqual({ digitalSilence: null, integratedLufs: null });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][1]).toEqual(expect.arrayContaining(['-xerror', '-map', '0:a', '-vn']));
+    expect(run.mock.calls[0][2]).toMatchObject({ signal, timeoutMs: 600_000 });
+  });
+});
 
 // The 2026-08-10 hand-assembled delivery, measured off the shipped file. The
 // run wrote its own ffmpeg instead of the assembly ops — a legitimate fallback
@@ -60,7 +135,7 @@ describe('assessDeliveredNarration', () => {
   });
 
   it('leaves held silence alone', () => {
-    // Gaps were measured across 13 historical plans and no usable threshold
+    // Gaps were measured across 13 older productions and no usable threshold
     // separated a designed pause from a mis-authored window, so silence is the
     // author's call and only collisions and losses are defects.
     const gapped: DeliveryNarrationLine[] = [
@@ -84,15 +159,15 @@ describe('assessDeliveredSpec', () => {
     spec: {
       durationSec: 60, width: 1920, height: 1080, fps: 30, hasAudio: true, subtitleStreams: 0,
     },
-    planTotalTargetSec: 60,
-    planAspect: '16:9',
-    narrationLineCount: 7,
-    captionLineCount: 0,
+    expectedDurationSec: 60,
+    expectedAspect: '16:9',
+    expectsAudio: true,
+    expectsCaptions: false,
     integratedLufs: -14.2,
     sidecarSubtitleFound: false,
   };
 
-  it('passes the delivered spec when it matches the signed plan', () => {
+  it('passes the delivered spec when it matches what was expected', () => {
     expect(assessDeliveredSpec(base)).toEqual([]);
   });
 
@@ -105,18 +180,18 @@ describe('assessDeliveredSpec', () => {
     expect(loud?.message).toContain('quieter by 4.3 LU');
   });
 
-  it('catches captions the plan declared and the file does not carry', () => {
-    const issues = assessDeliveredSpec({ ...base, captionLineCount: 8 });
+  it('catches captions that were asked for and the file does not carry', () => {
+    const issues = assessDeliveredSpec({ ...base, expectsCaptions: true });
     const captions = issues.find((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING');
-    expect(captions?.message).toContain('8 caption line(s)');
+    expect(captions?.message).toContain('Captions were asked for');
     // Burned-in captions are pixels; the check says so instead of accusing.
     expect(captions?.message).toContain('Burned-in captions cannot be detected');
     // A sidecar counts as produced.
-    expect(assessDeliveredSpec({ ...base, captionLineCount: 8, sidecarSubtitleFound: true })
+    expect(assessDeliveredSpec({ ...base, expectsCaptions: true, sidecarSubtitleFound: true })
       .some((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING')).toBe(false);
     // So does a real subtitle stream.
     expect(assessDeliveredSpec({
-      ...base, captionLineCount: 8, spec: { ...base.spec, subtitleStreams: 1 },
+      ...base, expectsCaptions: true, spec: { ...base.spec, subtitleStreams: 1 },
     }).some((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING')).toBe(false);
   });
 
@@ -124,6 +199,15 @@ describe('assessDeliveredSpec', () => {
     const drifted = assessDeliveredSpec({ ...base, spec: { ...base.spec, durationSec: 75.04 } });
     expect(drifted.find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.message)
       .toContain('75.04s');
+    // The length the Agent passed for its own cut asks for the real length back, never a
+    // stretched file (2026-11-14: a 14.4 s montage was slowed to the 15 s it had passed).
+    const requested = assessDeliveredSpec({ ...base, durationSource: 'requested', spec: { ...base.spec, durationSec: 75.04 } })
+      .find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.message ?? '';
+    expect(requested).toContain('expect_duration_sec says');
+    expect(requested).toContain('real length as expect_duration_sec');
+    expect(requested).toContain('Do not speed up, slow down or pad');
+    expect(requested).not.toContain('Narration and captions');
+    expect(drifted.find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.message).toContain('Narration and captions');
     const wrongCanvas = assessDeliveredSpec({
       ...base, spec: { ...base.spec, width: 1080, height: 1920 },
     });
@@ -135,170 +219,24 @@ describe('assessDeliveredSpec', () => {
       .some((issue) => issue.code === 'DELIVERY_ASPECT_MISMATCH')).toBe(false);
   });
 
-  it('catches a narrated plan delivered with no audio at all', () => {
+  it('catches a narrated video delivered with no audio at all', () => {
     const issues = assessDeliveredSpec({ ...base, spec: { ...base.spec, hasAudio: false } });
     expect(issues.find((issue) => issue.code === 'DELIVERY_NO_AUDIO')?.severity).toBe('error');
     // No audio means no loudness verdict to add on top of it.
     expect(issues.some((issue) => issue.code === 'DELIVERY_LOUDNESS_OFF_TARGET')).toBe(false);
   });
-});
 
-describe('verifyProductionDelivery unverifiable narration', () => {
-  // Run against the real 2026-08-10 hand-assembled deliverable, the first
-  // artifact this checker ever saw: it reported ok:true. Every narration
-  // produced_path was null, because that route mixes the audio files directly
-  // and never writes the paths back — so the one check built for that route
-  // passed the very delivery that shipped two overlapping lines. A declared
-  // narration track that cannot be judged is unverified, not clean.
-  it('refuses to call a delivery clean when it judged no narration line', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-unverifiable-'));
-    try {
-      const planAbsPath = path.join(dir, 'plan.json');
-      const plan = {
-        aspect: '16:9',
-        total_target_sec: 10,
-        tracks: {
-          narration: {
-            segments: [
-              { text: 'a', start_sec: 0, target_sec: 5 },
-              { text: 'b', start_sec: 5, target_sec: 5 },
-            ],
-          },
-        },
-      };
-      fs.writeFileSync(planAbsPath, JSON.stringify(plan));
-      const video = path.join(dir, 'final.mp4');
-      fs.writeFileSync(video, 'not a video');
+  it('blocks proven zeros only when sound is required, without telling the caller to normalize silence', () => {
+    expect(assessDeliveredSpec({ ...base, digitalSilence: true, integratedLufs: -70 }))
+      .toMatchObject([{ code: 'DELIVERY_AUDIO_SILENT', severity: 'error' }]);
+    expect(assessDeliveredSpec({ ...base, expectsAudio: false, digitalSilence: true, integratedLufs: -70 })).toEqual([]);
+  });
 
-      const verdict = await verifyProductionDelivery({
-        planAbsPath,
-        plan: plan as unknown as Record<string, unknown>,
-        videoAbsPath: video,
-        allowedRoots: [dir],
-      });
-
-      expect(verdict.ok).toBe(false);
-      expect(verdict.narration_lines_measured).toBe(0);
-      const unverifiable = verdict.issues.find((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE');
-      expect(unverifiable?.severity).toBe('error');
-      // Says what is missing and what to do, not just that it failed.
-      expect(unverifiable?.message).toContain('2 of 2 narration line(s)');
-      // Names the field each line actually lacks. 2026-08-10: the message said
-      // "no readable produced_path" for lines that HAD produced_path and were
-      // missing start_sec, and the model rewrote correct paths seven times.
-      expect(unverifiable?.message).toContain('line 0 — no produced_path');
-      // And says why the artifact alone cannot answer it, so nobody "fixes"
-      // this by trying to read overlap off the mixed track.
-      expect(unverifiable?.message).toContain('mixed track cannot supply');
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it('names start_sec when JSON null or an empty string leaves the timeline position missing', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-no-start-'));
-    try {
-      // The plan lives at <video>/project/plan.json and produced_path reads
-      // `project/audio/...` — relative to the VIDEO dir, not the plan's own
-      // folder. Resolving one level deep made every line unreadable and the
-      // refusal blamed the path.
-      const projectDir = path.join(dir, 'project');
-      const audioDir = path.join(projectDir, 'audio');
-      fs.mkdirSync(audioDir, { recursive: true });
-      const bins = bundledFfmpegPaths();
-      if (!bins.ffmpeg) return;
-      const r = spawnSync(bins.ffmpeg, [
-        '-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
-        '-c:a', 'libmp3lame', path.join(audioDir, 'line-0.mp3'),
-      ], { encoding: 'utf8' });
-      expect(r.status, r.stderr).toBe(0);
-
-      const planAbsPath = path.join(projectDir, 'plan.json');
-      const plan = {
-        aspect: '16:9',
-        total_target_sec: 10,
-        tracks: {
-          narration: {
-            // produced_path is present and correct; neither JSON null nor an
-            // empty string is a real timeline position.
-            segments: [
-              { text: 'a', start_sec: null, target_sec: 5, produced_path: 'project/audio/line-0.mp3' },
-              { text: 'b', start_sec: '', target_sec: 5, produced_path: 'project/audio/line-0.mp3' },
-            ],
-          },
-        },
-      };
-      fs.writeFileSync(planAbsPath, JSON.stringify(plan));
-      const video = path.join(projectDir, 'final.mp4');
-      fs.writeFileSync(video, 'not a video');
-
-      const verdict = await verifyProductionDelivery({
-        planAbsPath,
-        plan: plan as unknown as Record<string, unknown>,
-        videoAbsPath: video,
-        allowedRoots: [dir],
-      });
-      const unverifiable = verdict.issues.find((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE');
-      expect(unverifiable?.message).toContain('line 0 — no start_sec');
-      expect(unverifiable?.message).toContain('line 1 — no start_sec');
-      expect(unverifiable?.message).not.toContain('no produced_path');
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it('says nothing about narration when the plan declares none', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-no-narration-'));
-    try {
-      const planAbsPath = path.join(dir, 'plan.json');
-      const plan = { aspect: '16:9', total_target_sec: 10, tracks: {} };
-      fs.writeFileSync(planAbsPath, JSON.stringify(plan));
-      const video = path.join(dir, 'final.mp4');
-      fs.writeFileSync(video, 'not a video');
-      const verdict = await verifyProductionDelivery({
-        planAbsPath,
-        plan: plan as unknown as Record<string, unknown>,
-        videoAbsPath: video,
-        allowedRoots: [dir],
-      });
-      expect(verdict.issues.some((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE')).toBe(false);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it('does not probe narration audio outside the approved roots', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delivery-scope-'));
-    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delivery-outside-'));
-    try {
-      const outsideAudio = path.join(outsideDir, 'line-0.mp3');
-      fs.writeFileSync(outsideAudio, 'not audio, and must never be probed');
-      const planAbsPath = path.join(dir, 'project', 'plan.json');
-      fs.mkdirSync(path.dirname(planAbsPath), { recursive: true });
-      const plan = {
-        tracks: {
-          narration: {
-            segments: [{ text: 'a', start_sec: 0, target_sec: 5, produced_path: outsideAudio }],
-          },
-        },
-      };
-      const video = path.join(dir, 'project', 'final.mp4');
-      fs.writeFileSync(video, 'not a video');
-
-      const verdict = await verifyProductionDelivery({
-        planAbsPath,
-        plan: plan as unknown as Record<string, unknown>,
-        videoAbsPath: video,
-        allowedRoots: [dir],
-      });
-
-      expect(verdict.narration_lines_measured).toBe(0);
-      expect(verdict.issues.find((i) => i.code === 'DELIVERY_NARRATION_UNVERIFIABLE')?.message)
-        .toContain('outside allowed scope');
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-      fs.rmSync(outsideDir, { recursive: true, force: true });
-    }
+  it('reports unavailable measurement as a warning rather than proven silence or a clean audio verdict', () => {
+    expect(assessDeliveredSpec({ ...base, digitalSilence: null, integratedLufs: null }))
+      .toMatchObject([{ code: 'DELIVERY_AUDIO_UNVERIFIABLE', severity: 'warning' }]);
+    expect(assessDeliveredSpec({ ...base, digitalSilence: false, integratedLufs: -70 }))
+      .toMatchObject([{ code: 'DELIVERY_LOUDNESS_OFF_TARGET', severity: 'warning' }]);
   });
 });
 
@@ -357,7 +295,7 @@ describe('parseIntegratedLufs', () => {
 });
 
 describe('parseAspectRatio', () => {
-  it('parses the shapes plans use', () => {
+  it('parses the shapes in use', () => {
     expect(parseAspectRatio('16:9')).toBeCloseTo(16 / 9, 6);
     expect(parseAspectRatio('9:16')).toBeCloseTo(9 / 16, 6);
     expect(parseAspectRatio('1920x1080')).toBeCloseTo(16 / 9, 6);
@@ -370,132 +308,51 @@ describe('parseAspectRatio', () => {
   });
 });
 
-describe('verifyProductionDelivery', () => {
-  const bins = bundledFfmpegPaths();
+describe('cuts against the beat of a video cut to its music', () => {
+  const beats = Array.from({ length: 40 }, (_unused, index) => Math.round((index + 1) * BEAT_SEC * 1000) / 1000);
 
-  it.skipIf(!bins.ffmpeg || !bins.ffprobe)('delivers direct generate and semantic-edit media despite spec drift, but verifies a later local caption version', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-direct-delivery-'));
-    try {
-      const video = path.join(dir, 'model.mp4');
-      const mk = spawnSync(bins.ffmpeg!, ['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=15:d=1',
-        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-af', 'volume=0.01',
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', video], { encoding: 'utf8' });
-      expect(mk.status, mk.stderr).toBe(0);
-      const originalBytes = fs.readFileSync(video);
-      for (const operation of ['generate', 'edit']) {
-        const plan = { aspect: '9:16', total_target_sec: 5, tracks: {},
-          segments: [{ source: 'generate', layer: 'primary', spec: { media_kind: 'video', operation } }] };
-        const input = { planAbsPath: path.join(dir, 'project/plan.json'), plan, videoAbsPath: video, allowedRoots: [dir] };
-        const verdict = await verifyProductionDelivery(input);
-        expect(verdict).toMatchObject({ ok: true, is_generation: true, canvas: '320x180',
-          integrated_lufs: null, narration_lines_measured: 0 });
-        expect(verdict.issues.map((issue) => [issue.code, issue.severity])).toEqual([
-          ['DELIVERY_DURATION_DRIFT', 'warning'], ['DELIVERY_ASPECT_MISMATCH', 'warning'],
-        ]);
-        expect(fs.readFileSync(video)).toEqual(originalBytes);
-        // A forged annotation cannot hide local output work, including after
-        // the model source has already been delivered in a previous turn.
-        const edited = await verifyProductionDelivery({ ...input, plan: { ...plan,
-          _runtime: { is_generation: true }, tracks: { captions: { lines: [{ text: '$19.99' }] } } } });
-        expect(edited).toMatchObject({ ok: false, is_generation: false });
-        expect(edited.integrated_lufs).not.toBeNull();
-        expect(edited.issues.find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.severity).toBe('error');
-        expect(edited.issues.some((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING')).toBe(true);
-      }
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  it('passes cuts within a frame of a beat and names the ones further off, the way the beat check counts them', () => {
+    // At 30 fps a frame is 33 ms: 1.89 s sits a frame from the 1.875 s beat, 9.30 s two frames
+    // before 9.375 s and 11.17 s two before 11.25 s.
+    expect(assessCutsOffBeat([0.933, 1.89, 2.8], beats, 30)).toEqual([]);
+    const issues = assessCutsOffBeat([1.875, 9.3, 11.17], beats, 30);
+    expect(issues).toEqual([{
+      code: 'DELIVERY_CUTS_OFF_BEAT',
+      severity: 'warning',
+      message: "2 of 3 cuts are more than a frame off the beat: 9.30s (beat 9.38s), 11.17s (beat 11.25s). Take each cut's frame from the beat list rather than adding up a beat length, then render and deliver again.",
+    }]);
   });
 
-  it.skipIf(!bins.ffmpeg || !bins.ffprobe)('does not accept missing, corrupt or audio-only model output as a finished video', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bad-generation-'));
-    try {
-      const audio = path.join(dir, 'audio.mp4');
-      const mk = spawnSync(bins.ffmpeg!, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:a', 'aac', audio], { encoding: 'utf8' });
-      expect(mk.status, mk.stderr).toBe(0);
-      fs.writeFileSync(path.join(dir, 'corrupt.mp4'), 'invalid provider payload');
-      for (const file of ['missing.mp4', 'corrupt.mp4', 'audio.mp4']) {
-        const verdict = await verifyProductionDelivery({
-          planAbsPath: path.join(dir, 'project/plan.json'),
-          plan: { segments: [{ source: 'generate', layer: 'primary', spec: { media_kind: 'video' } }] },
-          videoAbsPath: path.join(dir, file), allowedRoots: [dir],
-        });
-        expect(verdict).toMatchObject({ ok: false, is_generation: true, integrated_lufs: null });
-        expect(verdict.issues).toEqual([expect.objectContaining({ code: 'DELIVERY_VIDEO_UNREADABLE', severity: 'error' })]);
-      }
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  it('names four cuts and counts the rest', () => {
+    const late = [3, 5, 7, 9, 11, 13].map((beat) => Math.round((beat * BEAT_SEC + 0.1) * 1000) / 1000);
+    expect(assessCutsOffBeat(late, beats, 30)[0].message).toMatch(/^6 of 6 cuts .*, and 2 more\. Take each cut/);
   });
 
-  it.skipIf(!bins.ffmpeg || !bins.ffprobe)('finds real collisions in a hand-assembled file', async () => {
-    // End to end against real media, because the whole point is that the check
-    // reads the artifact rather than trusting the route that made it. Two
-    // narration lines whose speech collides by ~1s, mixed into a silent 10s
-    // clip the way a hand-written ffmpeg pipeline would.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-delivery-'));
+  it('says nothing without cuts, beats or a frame rate', () => {
+    expect(assessCutsOffBeat([], beats, 30)).toEqual([]);
+    expect(assessCutsOffBeat([9.33], [], 30)).toEqual([]);
+    expect(assessCutsOffBeat([9.33], beats, 0)).toEqual([]);
+  });
+
+  it('reads the cuts and the beat from the delivered file: a montage on the beat passes, one that adds up a rounded beat fails', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-beat-check-'));
     try {
-      // Real layout: the plan lives at <video>/project/plan.json and its paths
-      // read `project/audio/...`. The first version of this test put both in
-      // one flat directory, which matched the resolution bug rather than
-      // production and so stayed green while every real run measured 0 lines.
-      const projectDir = path.join(dir, 'project');
-      const audioDir = path.join(projectDir, 'audio');
-      fs.mkdirSync(audioDir, { recursive: true });
-      const tone = (name: string, seconds: number): string => {
-        const out = path.join(audioDir, name);
-        const r = spawnSync(bins.ffmpeg!, [
-          '-y', '-f', 'lavfi', '-i', `sine=frequency=440:duration=${seconds}`,
-          '-c:a', 'libmp3lame', out,
-        ], { encoding: 'utf8' });
-        expect(r.status, r.stderr).toBe(0);
-        return out;
-      };
-      tone('line-0.mp3', 4);
-      tone('line-1.mp3', 2);
-      const video = path.join(projectDir, 'final.mp4');
-      const mk = spawnSync(bins.ffmpeg!, [
-        '-y', '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=15:d=10',
-        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-        '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', video,
-      ], { encoding: 'utf8' });
-      expect(mk.status, mk.stderr).toBe(0);
-
-      const planPath = path.join(projectDir, 'plan.json');
-      const plan = {
-        aspect: '16:9',
-        total_target_sec: 10,
-        language: 'en',
-        tracks: {
-          narration: {
-            segments: [
-              { text: 'first', start_sec: 0, target_sec: 3, produced_path: 'project/audio/line-0.mp3' },
-              { text: 'second', start_sec: 3, target_sec: 4, produced_path: 'project/audio/line-1.mp3' },
-            ],
-          },
-          captions: { lines: [{ text: 'a', start_sec: 0, target_sec: 3 }] },
-        },
-      };
-      fs.writeFileSync(planPath, JSON.stringify(plan));
-
-      const verdict = await verifyProductionDelivery({
-        planAbsPath: planPath,
-        plan: plan as unknown as Record<string, unknown>,
-        videoAbsPath: video,
-        allowedRoots: [dir],
-      });
-
-      expect(verdict.ok).toBe(false);
-      expect(verdict.narration_lines_measured).toBe(2);
-      expect(verdict.duration_sec).toBeGreaterThan(9.5);
-      expect(verdict.canvas).toBe('320x180');
-      const codes = verdict.issues.map((issue) => issue.code);
-      // Line 0 speaks 0–4s, line 1 starts at 3s: one second of two voices in a
-      // file no assembly operation ever saw.
-      expect(codes).toContain('DELIVERY_NARRATION_OVERLAP');
-      // The plan declared a caption line and nothing carries it.
-      expect(codes).toContain('DELIVERY_CAPTIONS_MISSING');
-      // 320x180 is 16:9 and 10s matches the plan, so neither is reported.
-      expect(codes).not.toContain('DELIVERY_ASPECT_MISMATCH');
-      expect(codes).not.toContain('DELIVERY_DURATION_DRIFT');
+      const onBeat = path.join(dir, 'on-beat.mp4');
+      const drifting = path.join(dir, 'drifting.mp4');
+      const toneOnly = path.join(dir, 'tone.mp4');
+      makeBeatMontage(onBeat, 16, onBeatCuts(16));
+      makeBeatMontage(drifting, 16, driftingCuts(16));
+      makeBeatMontage(toneOnly, 16, driftingCuts(16), 'tone');
+      expect(await cutsOffBeatIssues(onBeat, 30)).toEqual([]);
+      const off = await cutsOffBeatIssues(drifting, 30);
+      expect(off.map((issue) => issue.code)).toEqual(['DELIVERY_CUTS_OFF_BEAT']);
+      // Every one of the sixteen joins is read as a cut; the later ones have drifted off.
+      expect(off[0].message).toMatch(/^[1-9]\d* of 16 cuts are more than a frame off the beat: /);
+      // A soundtrack with no steady beat has nothing to cut on, so nothing is reported.
+      expect(await cutsOffBeatIssues(toneOnly, 30)).toEqual([]);
+      expect(await cutsOffBeatIssues(drifting, null)).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, 60_000);
 });

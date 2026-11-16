@@ -62,6 +62,26 @@ function expectPrivateFailureSummary(method: 'warn' | 'error', label: string) {
 }
 
 describe('IPC failure log privacy and caller recovery', () => {
+  it('reports deliberate history closure as cancellation and keeps unexpected worker failures observable', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const client = await import('../../../src/main/features/conversation-history-client');
+    vi.spyOn(chats, 'getConversationMetadata').mockResolvedValue({ project_id: null } as any);
+    const read = vi.spyOn(chats, 'getConversationTurnPage');
+    const event = { sender: trustedIpcSender() };
+    const request = { channel: 'conversations.turns', payload: { cid: 'history-close' } };
+    read.mockRejectedValueOnce(new client.ConversationHistoryClosedError());
+    expect(await invoke(event, request)).toMatchObject({ ok: false, code: 'E_HISTORY_CLOSED' });
+    expect(mocks.log.warn).toHaveBeenCalledWith('conversation history request cancelled on close', {
+      channel: 'conversations.turns', code: 'E_HISTORY_CLOSED',
+    });
+    expect(mocks.log.error).not.toHaveBeenCalled();
+    // The same prose or even a copied code cannot impersonate owner cancellation.
+    read.mockRejectedValueOnce(Object.assign(new Error('Conversation history worker stopped'), { code: 'E_HISTORY_CLOSED' }));
+    expect(await invoke(event, request)).toMatchObject({ ok: false });
+    expect(mocks.log.error).toHaveBeenCalledWith('invoke conversations.turns failed', expect.any(Object));
+    read.mockResolvedValueOnce({ turns: [], total: 0, nextCursor: null, pageSize: 15 });
+    expect(await invoke(event, request)).toMatchObject({ ok: true, turns: [], total: 0, next_cursor: null, page_size: 15 });
+  });
   it('keeps a duplicate-name reply intact while excluding the name from exception logs', async () => {
     const agents = await import('../../../src/main/features/agents');
     const error = Object.assign(new Error(`agent name "${privateText}" is already in use`), {
@@ -108,6 +128,23 @@ describe('IPC failure log privacy and caller recovery', () => {
     sender.send.mockClear();
     const agents = await import('../../../src/main/features/agents');
     vi.spyOn(agents, 'streamSendToAgentEditChat').mockImplementationOnce(async function* () {});
+    await startStream({ sender }, request);
+    expect(sender.send.mock.calls).toEqual([['stream:privacy-stream', { type: 'done' }]]);
+  });
+  it('preserves global-search stream failure privacy and permits reuse of its settled request id', async () => {
+    const users = await import('../../../src/main/features/users');
+    vi.spyOn(users, 'getOrCreateSelfUser').mockRejectedValueOnce(new Error(privateText));
+    const sender = Object.assign(trustedIpcSender(), { isDestroyed: () => false, send: vi.fn() });
+    const request = { channel: 'search.global', requestId: 'privacy-stream', payload: { query: '' } };
+    await startStream({ sender }, request);
+    expect(sender.send.mock.calls).toEqual([
+      ['stream:privacy-stream', { type: 'error', text: privateText }],
+      ['stream:privacy-stream', { type: 'done' }],
+    ]);
+    expectPrivateFailureSummary('error', 'stream search.global failed');
+    sender.send.mockClear();
+    const search = await import('../../../src/main/features/search');
+    vi.spyOn(search, 'streamSearch').mockImplementationOnce(async function* () {});
     await startStream({ sender }, request);
     expect(sender.send.mock.calls).toEqual([['stream:privacy-stream', { type: 'done' }]]);
   });

@@ -6,6 +6,53 @@ import type { AddressInfo } from 'node:net';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 
+test('official web starter exposes all 101 messages through paging after save and reopening', async ({ orkas }, info) => {
+  const source = path.resolve('resources/builtin/system/skills/web-app-sdk/assets/web');
+  const app: any = await orkas.electronApp!.evaluate(async (_electron, input) => {
+    const main = (process as any).mainModule;
+    const chats = main.require(input.chats), artifacts = main.require(input.artifacts), saved = main.require(input.saved);
+    const task = await chats.createConversation('account-e2e', { title: 'Official web starter' });
+    const artifact = await artifacts.createArtifact('account-e2e', task.conversation_id, 'commander', { appType: 'web', files: input.files });
+    if (!artifact.ok) throw new Error('Starter artifact failed');
+    return saved.saveFromArtifact('account-e2e', task.conversation_id, artifact.artifactId);
+  }, { chats: path.resolve('src/main/features/chats.ts'), artifacts: path.resolve('src/main/features/chat_artifacts.ts'), saved: path.resolve('src/main/features/saved_apps.ts'),
+    files: ['index.html', 'orkas-app.json'].map(file => ({ path: file, content: readFileSync(path.join(source, file), 'utf8') })) });
+  expect(app.ok).toBe(true);
+  await openSidebarEntry(orkas.page, '#apps-btn');
+  const open = () => orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());
+  let preview = await open();
+  let frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.locator('#listStatus')).toHaveText('No messages yet.');
+  await preview.screenshot({ path: info.outputPath('official-web-starter-empty.png') });
+  await frame.getByRole('textbox', { name: 'Message', exact: true }).fill('Saved through the form');
+  await frame.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(frame.locator('#saveStatus')).toHaveText('Saved.');
+  await expect(frame.locator('li')).toHaveText(['Saved through the form']);
+  // Independent data setup through the real declared SDK. Only visible list
+  // controls below establish whether the user can access every saved record.
+  await frame.locator('body').evaluate(async () => {
+    for (let i = 0; i < 100; i++) await (window as any).orkasApp.data.insert({ table: 'messages', values: { body: `Seeded message ${i}` } });
+  });
+  await frame.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(frame.locator('li')).toHaveCount(20);
+  for (let i = 0; i < 5; i++) await frame.getByRole('button', { name: 'Load more', exact: true }).click();
+  await expect(frame.locator('li')).toHaveCount(101);
+  const expected = ['Saved through the form', ...Array.from({ length: 100 }, (_, i) => `Seeded message ${i}`)].sort();
+  expect((await frame.locator('li').allTextContents()).sort()).toEqual(expected);
+  await expect(frame.getByRole('button', { name: 'Load more', exact: true })).toBeHidden();
+  await frame.getByRole('heading', { name: 'Messages', exact: true }).scrollIntoViewIfNeeded();
+  await preview.screenshot({ path: info.outputPath('official-web-starter-populated.png') });
+  await orkas.closePreview(preview);
+  preview = await open(); frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.locator('li')).toHaveCount(20);
+  for (let i = 0; i < 5; i++) await frame.getByRole('button', { name: 'Load more', exact: true }).click();
+  expect((await frame.locator('li').allTextContents()).sort()).toEqual(expected);
+  await preview.setViewportSize({ width: 420, height: 700 });
+  await frame.getByRole('heading', { name: 'Messages', exact: true }).scrollIntoViewIfNeeded();
+  await preview.screenshot({ path: info.outputPath('official-web-starter-narrow.png') });
+  expect(orkas.modelRequests).toHaveLength(0);
+});
+
 test('closing a saved app during a committed write preserves the entry in its local durable database', async ({ orkas }, info) => {
   const entry = orkas.createWorkspaceFile('closing-data/index.html', '<!doctype html><script src="__orkas/sdk.js"></script><label>Note<input id="note"></label><button id="save">Save</button><output id="status"></output><script>document.querySelector("#save").onclick=async()=>{try{await orkasApp.data.insert({table:"notes",values:{body:document.querySelector("#note").value}});document.querySelector("#status").textContent="Saved";}catch{document.querySelector("#status").textContent="Unavailable";}};</script>');
   const definition = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
@@ -650,11 +697,23 @@ test('local SDK chat artifacts submit results but external destinations cannot s
         .toEqual({ sdk: 'undefined', ipc: 'undefined', node: 'undefined' });
       expectedRequests.push('/' + method);
       expect(requests).toEqual(expectedRequests);
-      await orkas.page.evaluate(id => {
-        const host = document.getElementById('sdk-artifact-test')!;
-        host.replaceChildren();
-        (window as any).renderChatArtifact(host, { cid: 'sdk-chat-test', artifactId: id, title: 'SDK chat', agentId: 'commander' });
-      }, artifact.artifactId);
+      // Recover through the owning card lifecycle: user Reload and a streamed
+      // revision both replace the frame without deleting and rebuilding its host.
+      if (method === 'redirect') {
+        await orkas.page.locator('#sdk-artifact-test .chat-artifact-more').click();
+        const menu = orkas.page.locator('.chat-artifact-menu');
+        await expect(menu).toBeVisible();
+        // A scroll notification that leaves the header in place must not
+        // dismiss Reload; actual navigation still uses the owning card.
+        await orkas.page.evaluate(() => window.dispatchEvent(new Event('scroll')));
+        await expect(menu).toBeVisible();
+        await menu.locator('[data-action="reload"]').click();
+      } else {
+        await orkas.page.evaluate(id => (window as any).mountMessageArtifacts(
+          document.getElementById('sdk-artifact-test'),
+          [{ id, title: 'SDK chat', agent_id: 'commander', revision: 1 }], 'sdk-chat-test'), artifact.artifactId);
+      }
+      await expect(orkas.page.locator('#sdk-artifact-test .chat-artifact-card')).toHaveCount(1);
       await expect(frame.locator('h1')).toHaveText('SDK App');
       expect(await frame.locator('body').evaluate(() => (window as any).orkasApp.storage.get({ key: 'working' }))).toEqual({ value: true });
       expect(await orkas.page.evaluate(() => (window as any).artifactSubmissions)).toBe(1);
@@ -922,14 +981,20 @@ test('local SDK form results reach their original conversation from the card and
   await expect.poll(() => orkas.modelRequests.length).toBe(1);
   await expect(orkas.page.locator('#chat-history')).toContainText('Hello from the local E2E model.');
   await expect(orkas.page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
-  const preview = await orkas.openPreview(() => orkas.page.evaluate(source =>
-    (window as any).OrkasPreviewWindows.open(source), { kind: 'artifact', cid, artifactId: artifact.artifactId, agentId: 'commander', title: 'Travel form' }));
-  await orkas.page.evaluate(cid => (window as any).setView('conversation', cid), otherCid);
+  // Use the actual controls so native iframe focus changes before navigation.
+  await card.locator('.chat-artifact-more').click();
+  const preview = await orkas.openPreview(() => orkas.page.locator('.chat-artifact-menu [data-action="open"]').click());
+  const otherTask = orkas.page.locator(`#conversation-list .conv-item[data-cid="${otherCid}"]`);
+  await otherTask.click();
+  await expect(otherTask).toHaveClass(/\bactive\b/);
   await preview.locator('iframe.chat-artifact-frame').contentFrame().getByRole('button', { name: 'Send preferences' }).click();
   await expect.poll(() => results(transcript).length).toBe(2);
   expect(results(foreignTranscript)).toEqual([]);
   await expect.poll(() => orkas.modelRequests.length).toBe(2);
   expect(results(transcript)[1].text).toContain('"budget":1200');
+  await expect.poll(() => readFileSync(transcript, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
+    .filter(message => message.from === 'commander' && message.text === 'Hello from the local E2E model.').length).toBe(2);
+  await expect(orkas.page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
 });
 
 

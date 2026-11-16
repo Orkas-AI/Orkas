@@ -46,7 +46,7 @@ export type { Logger, LogLevel } from "./shared/logger.js";
 export type { ProviderRequestFailure } from "./providers/request-diagnostics.js";
 
 // Providers (backed by @earendil-works/pi-ai)
-export type { LLMProvider, CompletionParams, CompletionResult, ToolDefinition } from "./providers/index.js";
+export type { LLMProvider, ProviderContextBudget, CompletionParams, CompletionResult, ToolDefinition } from "./providers/index.js";
 export { createAnthropicProvider, createOpenAIProvider, createPiProvider } from "./providers/index.js";
 export { listPiProviders, listPiModels, getPiModel } from "./providers/index.js";
 export { ProviderRegistry } from "./providers/index.js";
@@ -122,6 +122,8 @@ export {
   processStopTool,
   processWriteTool,
   stopAllProcessSessions,
+  runningProcessSessions,
+  runningCommandSessions,
   workspaceDiffTool,
   WORKSPACE_DIFF_PROVIDER_STATE_KEY,
   defineTool,

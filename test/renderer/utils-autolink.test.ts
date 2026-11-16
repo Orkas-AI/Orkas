@@ -51,7 +51,7 @@ const {
   _mediaDedupKey: (src: string) => string;
   _localMediaReferenceBasename: (src: string) => string;
   _parseOrkasMediaTitle: (title: string) => { kind: 'image' | 'video'; remoteSrc: string } | null;
-  _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
+  _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number, clientX?: number, rectRight?: number) => boolean;
   renderMarkdown: (md: string) => string;
 };
 
@@ -400,10 +400,13 @@ describe('markdown media links', () => {
 
   it('reserves native video controls while allowing the rest of the surface to toggle playback', () => {
     expect(_chatVideoNativeControlsHit(351, 100, 360)).toBe(true);
-    expect(_chatVideoNativeControlsHit(312, 100, 360)).toBe(true);
-    expect(_chatVideoNativeControlsHit(311, 100, 360)).toBe(false);
+    expect(_chatVideoNativeControlsHit(304, 100, 360)).toBe(true);
+    expect(_chatVideoNativeControlsHit(303, 100, 360)).toBe(false);
     expect(_chatVideoNativeControlsHit(200, 100, 360)).toBe(false);
     expect(_chatVideoNativeControlsHit(361, 100, 360)).toBe(false);
+    expect(_chatVideoNativeControlsHit(296, 100, 360, 540, 664)).toBe(true);
+    expect(_chatVideoNativeControlsHit(296, 100, 360, 220, 344)).toBe(true);
+    expect(_chatVideoNativeControlsHit(296, 100, 360, 200, 664)).toBe(false);
   });
 
   it('renders a normal markdown link to chat-media mp3 as an inline audio player', () => {

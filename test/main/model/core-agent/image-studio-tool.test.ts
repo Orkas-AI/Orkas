@@ -3,9 +3,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
 
-const productionCredits = vi.hoisted(() => ({
+const appMedia=vi.hoisted(()=>({route:vi.fn()}));
+vi.mock('../../../../src/main/features/app_media_route',()=>({appTaskMediaRoute:appMedia.route}));
+beforeEach(()=>{appMedia.route.mockReset();});
+import sharp from '../../../helpers/fixture-sharp';
+
+const servicePreflight = vi.hoisted(() => ({
   estimate: vi.fn(),
 }));
 
@@ -74,8 +78,8 @@ vi.mock('electron', () => ({
   },
 }));
 
-vi.mock('../../../../src/main/features/image_production_credits', () => ({
-  estimateImageProductionCredits: (...args: unknown[]) => productionCredits.estimate(...args),
+vi.mock('../../../../src/main/features/image_production_services', () => ({
+  checkImageProductionServices: (...args: unknown[]) => servicePreflight.estimate(...args),
 }));
 
 import {
@@ -108,18 +112,13 @@ beforeEach(() => {
     fs.writeFileSync(request.outputAbsPath, bytes);
     return { ok: true, path: request.outputAbsPath, width: 128, height: 128, bytes: bytes.length, provider: 'fixture', model: 'fixture' };
   });
-  productionCredits.estimate.mockReset();
-  productionCredits.estimate.mockResolvedValue({
-    expected_credits_milli: 22_000,
-    required_credits_milli: 22_000,
-    available_credits_milli: 100_000,
+  servicePreflight.estimate.mockReset();
+  servicePreflight.estimate.mockResolvedValue({
     sufficient: true,
-    fallback_fully_covered: true,
-    orkas_credit_estimate_exact: true,
-    externally_billed_segment_ids: [],
-    managed_fallback_segment_ids: [],
+    external_billing_estimate_available: false,
+    externally_billed_segment_ids: ['hero-initial'],
     unavailable_segment_ids: [],
-    segments: [{ segment_id: 'hero-initial', billing_mode: 'managed' }],
+    segments: [{ segment_id: 'hero-initial', billing_mode: 'external' }],
   });
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-image-studio-tool-'));
   projectDir = path.join(root, 'image-project');
@@ -173,6 +172,39 @@ async function generateProviderOutput(outputPath: string, extra: Record<string, 
 }
 
 describe('image_studio tool', () => {
+  it('returns a recoverable SVG reference error without rewriting the source or losing the candidate', async () => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const source = '<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"><image href="https://example.com/outside.png"/></svg>';
+    fs.writeFileSync(path.join(projectDir, 'source.svg'), source);
+    manifest.references = [{ id: 'source', path: 'source.svg', role: 'content', strength: 1, required: true,
+      preserve: ['Source contents'], may_change: [], region_ids: [] }];
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root] });
+    const result = await tool.execute({ op: 'project.snapshot', project_dir: projectDir, output_path: path.join(projectDir, 'candidate.png') }, { workingDir: root } as any);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ error_code: 'E_IMAGE_SVG_REFERENCE', recovery_context: { evidence_available: true } });
+    expect(fs.readFileSync(path.join(projectDir, 'source.svg'), 'utf8')).toBe(source);
+    expect(fs.existsSync(path.join(projectDir, 'candidate.png'))).toBe(true);
+  });
+  it('advertises optional PDF delivery while keeping the default format implicit', () => {
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID });
+    expect((tool.inputSchema.properties as any).format.enum).toContain('pdf');
+    expect((tool.inputSchema.required || [])).not.toContain('format');
+  });
+  it('keeps PSD export explicit and rejects a missing or foreign candidate without publishing', async () => {
+    const onOutputsPublished = vi.fn();
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, onOutputsPublished });
+    expect((tool.inputSchema.properties as any).format.enum).toContain('psd');
+    for (const input_path of [undefined, path.join(root, 'foreign.psd')]) {
+      const result = await tool.execute!({ op: 'project.export', project_dir: projectDir,
+        format: 'psd', output_path: path.join(root, 'final.psd'), input_path }, { workingDir: root } as any);
+      expect(result.isError).toBe(true); expect(result.content).toContain('E_IMAGE_PSD_INPUT_REQUIRED');
+    }
+    expect(onOutputsPublished).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(root, 'final.psd'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'final.png'))).toBe(false);
+  });
   it('directly executes structural project inspection for its owner', async () => {
     const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root] });
     const result = await tool.execute({ op: 'project.inspect', project_dir: projectDir }, { workingDir: root } as any);
@@ -197,7 +229,21 @@ describe('image_studio tool', () => {
 
     expect(result.isError).toBe(true);
     expect(result.images).toBeUndefined();
-    expect(JSON.parse(result.content)).toMatchObject({ ok: false });
+    expect(JSON.parse(result.content)).toMatchObject({
+      ok: false,
+      recovery_context: { next_operation: 'repair_project_then_project.snapshot' },
+    });
+    expect(fs.existsSync(path.join(root, 'evidence', 'blocked.png'))).toBe(false);
+    fs.writeFileSync(path.join(projectDir, 'index.html'), '<html><body><h1>A deliberate image</h1><svg></svg></body></html>');
+    const repaired = await tool.execute({
+      op: 'project.snapshot', project_dir: projectDir,
+      output_path: path.join(root, 'evidence', 'repaired.png'),
+    }, { workingDir: root } as any);
+    expect(repaired.isError).not.toBe(true);
+    expect(repaired.images).toHaveLength(1);
+    expect(JSON.parse(repaired.content)).toMatchObject({
+      recovery_context: { next_operation: 'project.submit_design_review' },
+    });
   });
 
   it('keeps a scrolling composition out of delivered files and gives a layout repair handoff', async () => {
@@ -212,7 +258,7 @@ describe('image_studio tool', () => {
     expect(result.images).toBeUndefined();
     expect(JSON.parse(result.content)).toMatchObject({ ok: false, current_candidate: null,
       inspection: { blockers: [expect.objectContaining({ code: 'E_IMAGE_LAYOUT_SCROLLING' })] },
-      recovery_context: { next_operation: 'repair_project_then_project.inspect' } });
+      recovery_context: { next_operation: 'repair_project_then_project.snapshot' } });
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(onFileWritten).not.toHaveBeenCalled();
     expect(onOutputsPublished).not.toHaveBeenCalled();
@@ -369,7 +415,7 @@ describe('image_studio tool', () => {
     }, { workingDir: root } as any);
 
     expect(result.isError).not.toBe(true);
-    expect(productionCredits.estimate).toHaveBeenCalledWith({
+    expect(servicePreflight.estimate).toHaveBeenCalledWith({
       requestId: 'hero-initial',
       size: '2048x2048',
       referenceCount: 1,
@@ -379,7 +425,7 @@ describe('image_studio tool', () => {
       op: 'generation.quote',
       source: 'local_provider_configuration',
       generation: { calls_started: 0, max_calls: 2, calls_remaining: 2 },
-      credit_quote: { expected_credits_milli: 22_000, sufficient: true },
+      service_availability: { sufficient: true, external_billing_estimate_available: false, externally_billed_segment_ids: ['hero-initial'] },
     });
   });
 
@@ -821,7 +867,7 @@ describe('image_studio tool', () => {
     expect(reused.isError).not.toBe(true);
     expect(String(reused.content)).toContain('reused completed generation');
     expect(imageProvider.generate).toHaveBeenCalledOnce();
-    expect(productionCredits.estimate).toHaveBeenCalledOnce();
+    expect(servicePreflight.estimate).toHaveBeenCalledOnce();
     expect(fs.readFileSync(outputPath)).toEqual(original);
     expect(fs.existsSync(path.join(projectDir, 'generated-2.png'))).toBe(false);
 
@@ -1399,6 +1445,7 @@ describe('image_studio tool', () => {
     expect(JSON.parse(repair.content)).toMatchObject({
       ok: true,
       status: 'repair',
+      next_action: 'repair_then_snapshot',
       current_candidate: {
         status: 'current_unapproved',
         path: firstEvidence,
@@ -1406,7 +1453,7 @@ describe('image_studio tool', () => {
         review_findings: ['The title lacks sufficient contrast against the background.'],
       },
       recovery_context: {
-        next_operation: 'repair_candidate_then_reinspect',
+        next_operation: 'repair_candidate_then_project.snapshot',
       },
     });
 
@@ -1460,7 +1507,7 @@ describe('image_studio tool', () => {
         path: recapturedEvidence,
         review_verdict: 'repair',
       },
-      recovery_context: { next_operation: 'repair_candidate_then_reinspect' },
+      recovery_context: { next_operation: 'repair_candidate_then_project.snapshot' },
     });
     const recapturedPass = await tool.execute({
       op: 'project.submit_design_review',
@@ -1488,7 +1535,7 @@ describe('image_studio tool', () => {
         path: sourceOnlyEvidence,
         review_verdict: 'repair',
       },
-      recovery_context: { next_operation: 'repair_candidate_then_reinspect' },
+      recovery_context: { next_operation: 'repair_candidate_then_project.snapshot' },
     });
 
     fs.writeFileSync(
@@ -1750,4 +1797,89 @@ describe('image_studio tool', () => {
       },
     });
   });
+});
+
+
+describe('image_studio fixed-page document journeys', () => {
+  function book() {
+    const file = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+    manifest.schema_version = 2;
+    manifest.document = { pages: ['cover', 'detail'].map(id => ({ id, entry: `${id}.html`, required_copy: [id] })) };
+    for (const id of ['cover', 'detail']) fs.writeFileSync(path.join(projectDir, `${id}.html`),
+      `<!doctype html><html><body><h1>A deliberate image</h1><p>${id}</p><svg></svg></body></html>`);
+    fs.writeFileSync(file, JSON.stringify(manifest));
+  }
+  it('discovers all pages without selecting one and refuses ambiguous writes without a network call', async () => {
+    book(); const publish = vi.fn();
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, onOutputsPublished: publish });
+    for (const op of ['project.status', 'project.inspect']) {
+      const result = await tool.execute({ op, project_dir: projectDir }, { workingDir: root } as any);
+      expect(result.isError, result.content).not.toBe(true);
+      expect(JSON.parse(result.content).document.pages.map((page: any) => page.id)).toEqual(['cover', 'detail']);
+      expect(result.images).toBeUndefined();
+    }
+    for (const op of ['project.snapshot', 'project.submit_design_review', 'project.export']) {
+      const result = await tool.execute({ op, project_dir: projectDir, output_path: path.join(root, 'out.png') }, { workingDir: root } as any);
+      expect(JSON.parse(result.content)).toMatchObject({ ok: false, error_code: 'E_IMAGE_DOCUMENT_PAGE_REQUIRED' });
+    }
+    for (const op of ['generation.quote', 'workflow.run']) {
+      const result = await tool.execute({ op, project_dir: projectDir }, { workingDir: root } as any);
+      expect(result.isError).toBe(true); expect(result.content).toContain('E_IMAGE_DOCUMENT_ROUTE');
+    }
+    fs.unlinkSync(path.join(projectDir, 'detail.html'));
+    const invalid = await tool.execute({ op: 'project.inspect', project_dir: projectDir }, { workingDir: root } as any);
+    expect(invalid.isError).toBe(true);
+    expect(JSON.parse(invalid.content).document.pages[1]).toMatchObject({
+      id: 'detail', ok: false, next_operation: 'repair_project_then_project.snapshot',
+    });
+    expect(servicePreflight.estimate).not.toHaveBeenCalled(); expect(publish).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(root, 'out.png'))).toBe(false);
+  });
+  it('isolates page review state across turns and invalidates only the revised page', async () => {
+    book(); const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID });
+    for (const page_id of ['cover', 'detail']) {
+      const evidence_path = path.join(root, `${page_id}.png`);
+      const captured = await tool.execute({ op: 'project.snapshot', project_dir: projectDir, page_id, output_path: evidence_path }, { workingDir: root } as any);
+      expect(captured.isError, captured.content).not.toBe(true); expect(captured.images).toHaveLength(1);
+      const reviewed = await tool.execute({ op: 'project.submit_design_review', project_dir: projectDir, page_id, evidence_path,
+        review_verdict: 'passed', review_scope: 'Checked exact current page, hierarchy and legibility.', review_findings: [],
+        quality_scores: { intent_alignment: 90, composition: 90, craft: 90, text_legibility: 90, defect_freedom: 90, specificity: 90 } }, { workingDir: root } as any);
+      expect(reviewed.isError, reviewed.content).not.toBe(true);
+    }
+    expect(imageStudioStatePath({ userId: USER_ID }, projectDir, 'cover')).not.toBe(imageStudioStatePath({ userId: USER_ID }, projectDir, 'detail'));
+    const later = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, turnId: 'later-turn' });
+    let inventory = JSON.parse((await later.execute({ op: 'project.status', project_dir: projectDir }, { workingDir: root } as any)).content).document;
+    expect(inventory.ready_to_export).toBe(true);
+    const detailState = imageStudioStatePath({ userId: USER_ID }, projectDir, 'detail');
+    const previous = fs.readFileSync(detailState);
+    fs.copyFileSync(imageStudioStatePath({ userId: USER_ID }, projectDir, 'cover'), detailState);
+    const foreignState = JSON.parse((await later.execute({ op: 'project.status', project_dir: projectDir }, { workingDir: root } as any)).content).document;
+    expect(foreignState.pages[1].evidence_current).toBe(false);
+    fs.writeFileSync(detailState, previous);
+    fs.appendFileSync(path.join(projectDir, 'detail.html'), '<!-- revised -->');
+    inventory = JSON.parse((await later.execute({ op: 'project.status', project_dir: projectDir }, { workingDir: root } as any)).content).document;
+    expect(inventory.pages.map((page: any) => page.review_current)).toEqual([true, false]);
+    const reused = await later.execute({ op: 'project.export', project_dir: projectDir, page_id: 'cover', output_path: path.join(root, 'cover-final.png') }, { workingDir: root } as any);
+    expect(reused.isError, reused.content).not.toBe(true); expect(JSON.parse(reused.content).format).toBe('png');
+  });
+  it('rejects unknown, malformed and single-page selectors while preserving the legacy state path', async () => {
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID });
+    const legacy = imageStudioStatePath({ userId: USER_ID }, projectDir);
+    let result = await tool.execute({ op: 'project.inspect', project_dir: projectDir, page_id: 'cover' }, { workingDir: root } as any);
+    expect(result.isError).toBe(true); expect(result.content).toContain('E_IMAGE_DOCUMENT_PAGE_UNEXPECTED');
+    book();
+    for (const page_id of ['missing', '../cover', '', 1]) {
+      result = await tool.execute({ op: 'project.snapshot', project_dir: projectDir, page_id, output_path: path.join(root, 'bad.png') }, { workingDir: root } as any);
+      expect(result.isError).toBe(true);
+    }
+    expect(imageStudioStatePath({ userId: USER_ID }, projectDir)).toBe(legacy);
+    expect(fs.existsSync(path.join(root, 'bad.png'))).toBe(false);
+  });
+});
+
+it('quotes the app-selected image service without changing the project or provider settings',async()=>{
+ appMedia.route.mockResolvedValue('selected-image');const manifest=JSON.parse(fs.readFileSync(path.join(projectDir,'image-manifest.json'),'utf8'));manifest.route='generate';manifest.generation_budget.max_calls=2;fs.writeFileSync(path.join(projectDir,'image-manifest.json'),JSON.stringify(manifest));
+ const result=await createImageStudioTool({userId:USER_ID,cid:'app-owned',agentId:IMAGE_STUDIO_AGENT_ID,extraRoots:[root]}).execute({op:'generation.quote',project_dir:projectDir,image_request_id:'hero-initial',size:'2048x2048',reference_count:1},{workingDir:root} as any);
+ expect(result.isError).not.toBe(true);expect(servicePreflight.estimate).toHaveBeenCalledWith(expect.objectContaining({profileId:'selected-image'}),undefined);
 });

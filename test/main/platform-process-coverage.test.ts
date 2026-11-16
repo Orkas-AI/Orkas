@@ -157,6 +157,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
     suite: 'test/main/util/windows-shutdown-processes.test.ts',
     evidence: 'captureWindowsShutdownProcesses',
   },
+  'src/main/util/tts-audio.ts': {
+    suite: 'test/main/util/tts-audio.test.ts',
+    evidence: 'convertTtsWav',
+  },
   'src/main/util/media_probe.ts': {
     suite: 'test/main/util/media_probe.test.ts',
     evidence: 'runMediaProbeProcessForTest',
@@ -290,3 +294,18 @@ describe('platform process test ownership', () => {
   });
 
 });
+
+it('runs real environment regressions in the runtime-path lane', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8'));
+    const command = pkg.scripts['test:runtime-path'];
+    expect(command).toBeTypeOf('string');
+    expect(command).toMatch(/^node scripts\/run-tests\.mjs run /);
+    const selected = command.split(' ');
+    for (const suite of [
+      'test/main/platform-process-coverage.test.ts',
+      'test/main/features/connectors/local-cli.test.ts',
+      'test/main/features/local_agents/bridge_skill_runner.test.ts',
+      'test/main/features/generation_reference_assets.test.ts',
+      'test/main/util/bundled-runtime.test.ts',
+    ]) expect(selected).toContain(suite);
+  });

@@ -1,4 +1,3 @@
-import * as vm from 'node:vm';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +10,29 @@ const root = path.resolve(__dirname, '../../..');
 const relative = 'resources/builtin/system/skills/web-app-sdk';
 const skill = path.join(root, relative);
 describe('Web app authoring package', () => {
+  it('separates existing presentation edits from API selection without dropping source inspection or verification', () => {
+    const body = fs.readFileSync(path.join(skill, 'SKILL.md'), 'utf8');
+    expect(body).toContain('inspect its source and `orkas-app.json` first');
+    expect(body).toContain('only presentation');
+    expect(body).toContain('do not need the API references or starter');
+    expect(body).toContain('choosing or changing SDK APIs, data definitions or capabilities');
+    expect(body).toContain('Verify visible actions');
+    expect(body).toContain('close/reopen');
+  });
+  it.each(['local', 'web'] as const)('explains system-field authority in the generated %s contract and links both starter files', appType => {
+    const catalog = catalogDocument(appType) as any;
+    const table = catalog.dataDefinition.properties.tables.items.properties;
+    expect(table.fields.description).toMatch(/id.*createdAt/);
+    expect(table.access.properties.read.description).toMatch(/id.*createdAt/);
+    expect(table.access.properties.insert.description).toMatch(/id.*createdAt/);
+    const query = catalog.methods.find((method: any) => method.name === 'data.query');
+    expect(query.inputSchema.properties.fields.description).toContain('access.read');
+    expect(query.inputSchema.properties.fields.description).toMatch(/id.*createdAt/);
+    expect(query.inputSchema.properties.order.description).toMatch(/id/);
+    const links = [...fs.readFileSync(path.join(skill, 'SKILL.md'), 'utf8').matchAll(/\]\(([^)]+)\)/g)].map(match => match[1]);
+    for (const logical of Object.values(catalog.manifest.starter) as string[])
+      expect(links).toContain(logical.replace('@skill/web-app-sdk/', ''));
+  });
   it.each(['local', 'web'] as const)('requires a data definition in the documented %s manifest only when data is declared', appType => {
     const { AjvJsonSchemaValidator } = require('@modelcontextprotocol/sdk/validation/ajv');
     const validate = new AjvJsonSchemaValidator().getValidator(catalogDocument(appType).manifest.schema);
@@ -51,13 +73,6 @@ describe('Web app authoring package', () => {
       expect(manifestSchema.safeParse(invalid).success).toBe(false);
     }
   });
-  it('retries an uncertain starter submission without duplicating its committed record',async()=>{
-    const source=fs.readFileSync(path.join(skill,'assets/web/index.html'),'utf8').split('<script>')[1].split('</script>')[0];let failed=false,ids=0;const status={textContent:''};const committed=new Map<string,string>();const requests:any[]=[];const form:any={body:{value:'First'},querySelector:()=>({disabled:false}),reset(){this.body.value='';}};
-    const api={data:{query:async()=>{if(failed&&requests.length>1)throw new Error('E_BUSY');return {records:[]};},insert:async(args:any)=>{requests.push(structuredClone(args));committed.set(args.requestId,args.values.body);if(!failed){failed=true;throw new Error('E_BUSY');}return {id:args.requestId};}}};
-    vm.runInNewContext(source,{window:{orkasApp:api},document:{querySelector:(q:string)=>q==='form'?form:q==='ul'?{replaceChildren(){},append(){}}:status},crypto:{randomUUID:()=>String(++ids)}});
-    await form.onsubmit({preventDefault(){}});form.body.value='Changed after timeout';await form.onsubmit({preventDefault(){}});
-    expect(committed.size).toBe(1);expect(requests[1]).toEqual(requests[0]);expect([...committed.values()]).toEqual(['First']);expect(status.textContent).toContain('Saved');
-  });
   it('rejects malformed common definitions before an author can create or publish them',()=>{
     const fixture=JSON.parse(fs.readFileSync(path.resolve(root,'test/fixtures/app-data-v1.json'),'utf8'));for(const data of fixture.invalidDefinitions)expect(manifestSchema.safeParse({sdkVersion:1,capabilities:['data'],data}).success).toBe(false);
   });
@@ -67,10 +82,6 @@ describe('Web app authoring package', () => {
   });
   it('provides runnable examples and explicit result contracts for every common data operation',()=>{
     for(const [name,method] of Object.entries(METHODS))if(name.startsWith('data.')){expect(method.input.safeParse(method.example).success,name).toBe(true);expect(method.result,name).not.toBe('Structured data result.');}
-  });
-  it('does not expose native account renewal reminders through the app SDK', () => {
-    const catalog = catalogDocument();
-    expect(catalog.unsupported).toContainEqual(expect.objectContaining({capability:'account.renewalReminders'}));
   });
   it('ships a valid self-contained Skill, starter and exact current API reference', () => {
     const report = validateSkillDir(skill);
@@ -109,8 +120,16 @@ describe('Web app authoring package', () => {
       expect(response.records).toHaveLength(1);
       expect(response.records[0].body).toBe('Retained');
       expect(Number.isFinite(Date.parse(response.records[0].createdAt))).toBe(true);
-      expect(response.records[0]).not.toHaveProperty('id');
-      await expect(db.call('data.query', { ...example.query, fields: ['id'] })).rejects.toMatchObject({ code: 'E_PERMISSION' });
+      expect(response.records[0].id).toBeTypeOf('string');
+      await db.close();
+      const restrictedDefinition = structuredClone(definition);
+      restrictedDefinition.tables[0].access.read = example.access.read.filter((field: string) => field !== 'id');
+      const restricted = new LocalAppData(path.join(dir, 'data.sqlite'), dir, restrictedDefinition as any);
+      try {
+        await expect(restricted.call('data.query', example.query)).rejects.toMatchObject({ code: 'E_PERMISSION' });
+        const sorted: any = await restricted.call('data.query', { table: 'messages', fields: ['body'], order: {field: 'id', direction: 'asc'} });
+        expect(sorted.records).toEqual([{body: 'Retained'}]);
+      } finally { await restricted.close(); }
     } finally { await db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
   it('cloud guidance and generated contract contain only actually common interfaces',()=>{

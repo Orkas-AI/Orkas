@@ -282,6 +282,12 @@ export function hasPendingConversationFiling(userId: string, cid: string): boole
   return _pendingFilings.has(_pendingKey(userId, cid));
 }
 
+/** Only creation grants same-turn backlog access; moving into an existing project does not. */
+export function pendingCreatedProjectId(userId: string, cid: string): string | undefined {
+  const pending = _pendingFilings.get(_pendingKey(userId, cid));
+  return pending?.kind === 'file' ? pending.projectId : undefined;
+}
+
 /** Rename the conversation's existing project, including one just created in
  * this turn. The host-bound conversation selects identity, never model input. */
 export async function renameConversationProject(userId: string, cid: string, name: string) {

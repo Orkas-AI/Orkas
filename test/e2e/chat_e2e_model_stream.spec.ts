@@ -941,6 +941,32 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog).toBeVisible({ timeout: 20_000 });
     await expect(dialog).toContainText('curl --data-binary');
     await expect(dialog).toContainText('upload-source.txt');
+    const modeTrigger = dialog.locator('.bash-permission-mode-trigger');
+    await expect(modeTrigger).toBeVisible();
+    await modeTrigger.click();
+    const modeMenu = page.locator('.bash-permission-mode-menu');
+    await expect(modeMenu).toBeVisible();
+    const modeOptions = modeMenu.locator('.bash-permission-mode-option');
+    await expect(modeOptions).toHaveCount(3);
+    expect(await modeOptions.evaluateAll((options) => options.map((option) => (
+      option.getAttribute('data-mode')
+    )))).toEqual([
+      'workspace_approval',
+      'all_files_approval',
+      'all_files_auto',
+    ]);
+    const standardMode = modeMenu.locator('[data-mode="all_files_approval"]');
+    const trustedMode = modeMenu.locator('[data-mode="all_files_auto"]');
+    await expect(standardMode).toHaveAttribute('aria-selected', 'true');
+    await expect(standardMode.locator('.bash-permission-mode-check')).toHaveText('✓');
+    await expect(trustedMode).toHaveAttribute('aria-selected', 'false');
+    await trustedMode.click();
+    await expect(modeMenu).toBeHidden();
+    await expect(modeTrigger).toHaveAttribute('aria-expanded', 'false');
+    await expect(standardMode).toHaveAttribute('aria-selected', 'false');
+    await expect(standardMode.locator('.bash-permission-mode-check')).toHaveText('');
+    await expect(trustedMode).toHaveAttribute('aria-selected', 'true');
+    await expect(trustedMode.locator('.bash-permission-mode-check')).toHaveText('✓');
     expect(existsSync(sentinelPath)).toBe(false);
 
     await dialog.locator('[data-act="cancel"]').click();

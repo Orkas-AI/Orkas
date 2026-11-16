@@ -623,33 +623,22 @@ function _writePersistedSkillCatalog(rootStamp: string, stamp: string, data: Ski
   }
 }
 
-function _invalidateSkillListCache(opts: { markDirty?: boolean; userId?: string } = {}): void {
+function _invalidateSkillListCache(opts: { userId?: string } = {}): void {
   const userId = opts.userId || getActiveUserId();
   _skillListCache = null;
   try { fs.rmSync(userSkillCatalogCacheFile(userId), { force: true }); } catch { /* cache is best-effort */ }
-  if (opts.markDirty === false) return;
-  // Sync engine dirty signal (lazy-require — stripped in the open-source build). Mirrors the pattern in
-  // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
-  // point, co-locating keeps wiring tight.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('skills', 'cloud/skills');
-  } catch { /* features/sync stripped */ }
+
 }
 
-/** Internal cache invalidator + core-agent registry invalidator. Exported for
- *  the dev-only `skills_dev` module so its dual-write path goes through the
- *  same cache-busting chain as `writeCustomSkillFile`. */
+/** Invalidate the local Skill list and core-agent registry after an edit. */
 export function invalidateSkillCachesForEdit(): void {
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
 }
 
-/** Drop only the renderer-facing list cache. Marketplace reconcile writes local marketplace
- *  installs, not cloud/custom skill files, so it should not mark the sync domain dirty. */
+/** Drop the derived Skill list after local marketplace reconciliation. */
 export function clearSkillListCache(): void {
-  _invalidateSkillListCache({ markDirty: false });
+  _invalidateSkillListCache();
 }
 
 /** A skill id resolves to a built-in iff there's a directory with that name
@@ -3521,13 +3510,7 @@ async function _applySkillContainerEdit(
     }
     return { ok: false, error: t('skills.errors.skill_not_found', { id: skillId }) };
   }
-  // Marketplace skills are dev-mode-only from any write path (commander
-  // here + inline edit chat at sendToSkillChat). Mirrors the agent edit
-  // policy at `bus.ts` post-stream parsing. Downstream
-  // `writeSkillFileForEditChecked` routes the dev branch through
-  // `skills_dev.writeBuiltinSkillFile`, which writes the local marketplace
-  // install dir.
-  if (skill.source !== 'custom' && !false) {
+  if (skill.source !== 'custom') {
     return { ok: false, error: t('errors.builtin_skill_not_editable') };
   }
   const written: string[] = [];
@@ -3704,7 +3687,7 @@ export async function sendToSkillChat(
 ): Promise<SkillChatResult> {
   const skill = await getSkillForEdit(skillId);
   if (!skill) return { ok: false, error: 'skill not found' };
-  if (isMarketplaceSource(skill.source) && !false) {
+  if (isMarketplaceSource(skill.source)) {
     return { ok: false, error: t('errors.builtin_skill_not_editable') };
   }
 
@@ -3839,7 +3822,7 @@ export async function* streamSendToSkillChat(
     yield { type: 'done' };
     return;
   }
-  if (isMarketplaceSource(skill.source) && !false) {
+  if (isMarketplaceSource(skill.source)) {
     yield { type: 'error', text: t('errors.builtin_skill_not_editable') };
     yield { type: 'done' };
     return;

@@ -56,6 +56,10 @@ describe('TTS provider request-to-file lifecycle', () => {
       path: outputPath,
       bytes: audio.length,
       backend: 'openai-compatible',
+      // A configured service bills the user's own account, and the voice it used is named.
+      billedToOwnAccount: true,
+      routeRef: expect.any(String),
+      voiceRef: expect.any(String),
     });
     expect(existsSync(outputPath)).toBe(true);
     expect(fetchStub).toHaveBeenCalledOnce();

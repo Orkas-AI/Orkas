@@ -2059,24 +2059,29 @@ if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
   if (unreadable) (target.closest?.('.chat-md-audio-card') || target).remove();
 }, true);
 
-const _CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX = 48;
+const _CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX = 56;
 
 // Chromium retargets clicks from the closed native media-controls shadow DOM
-// to the <video> element. Keep the bottom control strip native so seeking,
-// volume, and play-button clicks are not turned into a second surface toggle.
-function _chatVideoNativeControlsHit(clientY, rectTop, rectBottom) {
+// to the <video> element. Reserve the row and its volume popup so native
+// control clicks are not turned into a second surface toggle.
+function _chatVideoNativeControlsHit(clientY, rectTop, rectBottom, clientX, rectRight) {
   const y = Number(clientY);
   const top = Number(rectTop);
   const bottom = Number(rectBottom);
   if (!Number.isFinite(y) || !Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= top) return false;
   const guard = Math.min(_CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX, bottom - top);
-  return y >= bottom - guard && y <= bottom;
+  if (y >= bottom - guard && y <= bottom) return true;
+  const x = Number(clientX);
+  const right = Number(rectRight);
+  return Number.isFinite(x) && Number.isFinite(right)
+    && y >= Math.max(top, bottom - 88) && y < bottom - guard
+    && x >= right - 160 && x <= right - 48;
 }
 
 function _chatVideoClickHitsNativeControls(e, video) {
   if (!e || !video || e.target !== video || !video.controls || typeof video.getBoundingClientRect !== 'function') return false;
   const rect = video.getBoundingClientRect();
-  return _chatVideoNativeControlsHit(e.clientY, rect.top, rect.bottom);
+  return _chatVideoNativeControlsHit(e.clientY, rect.top, rect.bottom, e.clientX, rect.right);
 }
 
 function _toggleChatVideoFromSurface(e, surface) {
@@ -2458,7 +2463,6 @@ function _aiSelectPopoverZIndexFor(el) {
     const layerSelector = [
       '.modal-overlay.open',
       '.ui-dialog-overlay.open',
-      '.account-login-overlay.open',
       '[role="dialog"][aria-modal="true"]',
     ].join(',');
     for (const n of document.querySelectorAll(layerSelector)) {
@@ -2489,13 +2493,13 @@ function _aiSelectMount(el, config) {
   state.value = typeof state.value === 'string' ? state.value : '';
   state.placeholder = String(state.placeholder || t('ai_select.placeholder'));
   if (state.value && !state.options.some(
-    option => option.value === state.value && !option.disabled,
+    option => option.value === state.value && !option.disabled && typeof option.action !== 'function',
   )) state.value = '';
 
   state.multiple = state.allowMultiple && state.multiple === true;
   const disabled = option => option.disabled || (state.multiple && option.singleOnly);
   const normalizeValues = values => state.options
-    .filter(option => !disabled(option) && values.includes(option.value)).map(option => option.value);
+    .filter(option => !disabled(option) && typeof option.action !== 'function' && values.includes(option.value)).map(option => option.value);
   state.values = state.multiple ? normalizeValues(state.values) : (state.value ? [state.value] : []);
 
   const caretIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
@@ -2595,7 +2599,7 @@ function _aiSelectMount(el, config) {
     }
     state.options.forEach((opt, idx) => {
       const item = document.createElement('div');
-      item.className = 'ai-select-item';
+      item.className = 'ai-select-item' + (typeof opt.action === 'function' ? ' is-action' : '');
       item.id = `${listboxId}-option-${idx}`;
       item.dataset.value = opt.value;
       item.setAttribute('role', 'option');
@@ -2653,6 +2657,14 @@ function _aiSelectMount(el, config) {
   let portalNextSibling = null;
   const reposition = () => {
     if (!state.open) return;
+    // Establish the portal's final positioning before measuring. An absolute
+    // popover under body can temporarily add a scrollbar and shift a centered
+    // trigger; the scrollbar vanishes once the menu is positioned in view.
+    popover.style.position = 'fixed';
+    // The in-slot CSS sets both edges. With an explicit portal width, RTL
+    // resolves that overconstraint by ignoring left; release the opposite edge.
+    popover.style.right = 'auto';
+    popover.style.top = '0px';
     const rect = trigger.getBoundingClientRect();
     popover.dataset.uiOverlay = '';
     popover.style.position = 'fixed';
@@ -2662,6 +2674,11 @@ function _aiSelectMount(el, config) {
     popover.style.width = rect.width + 'px';
     popover.style.maxHeight = '';
     const popH = popover.offsetHeight || 260;
+    // A reserved RTL scrollbar gutter can offset the fixed containing block
+    // from viewport coordinates. Correct from the rendered menu, retaining
+    // the shared trigger measurement and any app-owned CSS positioning.
+    const horizontalOffset = rect.left - popover.getBoundingClientRect().left;
+    if (horizontalOffset) popover.style.left = (rect.left + horizontalOffset) + 'px';
     const placement = _dropdownVerticalPlacement(rect, popH, window.innerHeight, {
       edge: 8,
       gap: 4,
@@ -2778,7 +2795,7 @@ function _aiSelectMount(el, config) {
       if (typeof placeholder === 'string') state.placeholder = placeholder;
       // Normalize value if not in options
       if (state.value && !state.options.some(
-        option => option.value === state.value && !option.disabled,
+        option => option.value === state.value && !option.disabled && typeof option.action !== 'function',
       )) state.value = '';
       if (
         state.activeIdx >= state.options.length
@@ -2793,7 +2810,7 @@ function _aiSelectMount(el, config) {
     },
     setValue(value) {
       state.value = typeof value === 'string' && state.options.some(
-        option => option.value === value && !option.disabled,
+        option => option.value === value && !option.disabled && typeof option.action !== 'function',
       )
         ? value
         : '';
@@ -2840,6 +2857,7 @@ function _aiSelectMount(el, config) {
 function _aiSelectPick(api, value) {
   const next = api.state.options.find(option => option.value === value);
   if (!next || next.disabled || (api.state.multiple && next.singleOnly)) return;
+  if (typeof next.action === 'function') { api.close(); next.action(); return; }
   if (api.state.multiple) { api.toggleValue(value); return; }
   const prev = api.state.value;
   api.state.value = value || '';
