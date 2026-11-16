@@ -492,7 +492,7 @@ describe('renderResultForModel', () => {
 describe('video.import', () => {
   it('imports workspace media and keeps prior copies, identities and source bytes on repeated or changed input', async () => {
     await makeVideo('products/source.mp4', 0.3);
-    const { default: sharp } = await import('sharp');
+    const { default: sharp } = await import('../../../helpers/fixture-sharp');
     await sharp({ create: { width: 40, height: 60, channels: 3, background: 'blue' } }).png().toFile(path.join(workspace, 'products/blue.png'));
     const source = path.join(workspace, 'products/source.mp4');
     const before = fs.readFileSync(source);

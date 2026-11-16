@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
+import sharp from '../../../helpers/fixture-sharp';
 import { runProgramWithTools } from '../../../helpers/programmatic-tools';
 
 const UID = 'html-preview-tool-user';

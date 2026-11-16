@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const appMedia=vi.hoisted(()=>({route:vi.fn()}));
 vi.mock('../../../../src/main/features/app_media_route',()=>({appTaskMediaRoute:appMedia.route}));
 beforeEach(()=>{appMedia.route.mockReset();});
-import sharp from 'sharp';
+import sharp from '../../../helpers/fixture-sharp';
 
 const servicePreflight = vi.hoisted(() => ({
   estimate: vi.fn(),

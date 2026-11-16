@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import sharp from 'sharp';
+import sharp from '../../helpers/fixture-sharp';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 

@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
-import sharp from 'sharp';
+import sharp from '../../helpers/fixture-sharp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { imageStudioFileHash, isImageStudioGeneration } from '../../../src/main/features/image_studio_provenance';
 const require = createRequire(import.meta.url);
