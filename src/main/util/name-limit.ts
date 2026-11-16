@@ -23,6 +23,7 @@ function codePointWidth(cp: number | undefined): number {
     || (n >= 0xfe10 && n <= 0xfe6f)
     || (n >= 0xff00 && n <= 0xffef)
     || (n >= 0x1f300 && n <= 0x1faff)
+    || (n >= 0x20000 && n <= 0x3fffd)
   ) return 2;
   return 1;
 }

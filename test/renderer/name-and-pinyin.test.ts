@@ -66,6 +66,12 @@ describe('renderer name length limit', () => {
     expect(api.nameDisplayWidth('A中😀')).toBe(5);
   });
 
+  it('counts CJK Extension B and later ideographs as two', () => {
+    const { api } = loadNameLimit();
+    expect(api.nameDisplayWidth('\u{20BB7}')).toBe(2);
+    expect(api.limitNameDisplayText('a\u{20BB7}b', 2)).toBe('a');
+  });
+
   it('keeps combining marks and joined emoji within one grapheme width', () => {
     const { api } = loadNameLimit();
     expect(api.nameDisplayWidth('e\u0301')).toBe(1);

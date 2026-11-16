@@ -19,4 +19,11 @@ describe('name limit util', () => {
     expect(limitNameDisplayText('中'.repeat(31))).toBe('中'.repeat(30));
     expect(limitNameDisplayText('あ'.repeat(31))).toBe('あ'.repeat(30));
   });
+
+  it('counts CJK Extension B and later ideographs as 2', () => {
+    // U+20BB7 and U+2A6A5 sit outside the BMP (Extension B), U+30000 is Extension G.
+    expect(nameDisplayWidth('\u{20BB7}')).toBe(2);
+    expect(nameDisplayWidth('\u{2A6A5}\u{30000}')).toBe(4);
+    expect(limitNameDisplayText('\u{20BB7}'.repeat(31))).toBe('\u{20BB7}'.repeat(30));
+  });
 });
