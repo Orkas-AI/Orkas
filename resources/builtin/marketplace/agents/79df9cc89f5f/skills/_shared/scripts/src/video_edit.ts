@@ -631,12 +631,14 @@ export function buildMixFilter(opts: {
     // with silence: otherwise the base is cut off where the last added segment
     // ends. Open-ended apad is safe here (unlike on the output) because the
     // compressor still ends with the base.
+    // Align the split source, padded key and base before either branch drains.
+    // The known duration or the caller's video-master -shortest removes padding.
     const keyPad = padWholeDurSec && padWholeDurSec > 0 ? `apad=whole_dur=${padWholeDurSec.toFixed(3)}` : 'apad';
-    chains.push(`${bed}asplit=2[bedmix][bedkey0]`);
-    chains.push(`[bedkey0]${keyPad}[bedkey]`);
-    chains.push(`[0:a]aresample=${sr}[base0]`);
+    chains.push(`${bed}asetnsamples=n=1024:p=1,asplit=2[bedmix][bedkey0]`);
+    chains.push(`[bedkey0]${keyPad},asetnsamples=n=1024:p=1[bedkey]`);
+    chains.push(`[0:a]aresample=${sr},asetnsamples=n=1024:p=1[base0]`);
     chains.push(`[base0][bedkey]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[base]`);
-    chains.push(`[base][bedmix]amix=inputs=2:duration=longest:normalize=0,${tail}[aout]`);
+    chains.push(`[base][bedmix]amix=inputs=2:duration=longest:normalize=0,${tail}${padWholeDurSec && padWholeDurSec > 0 ? `,atrim=duration=${padWholeDurSec.toFixed(3)}` : ''}[aout]`);
   } else if (baseHasAudio && mode === 'mix') {
     chains.push(`[0:a]aresample=${sr}[base]`);
     chains.push(`[base]${bed}amix=inputs=2:duration=longest:normalize=0,${tail}[aout]`);

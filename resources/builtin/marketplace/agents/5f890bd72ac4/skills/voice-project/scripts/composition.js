@@ -106,12 +106,14 @@ async function compose(root, temp, voice, voiceDuration, plan, signal, h) {
   const args = ['-i', voice], graph = [], labels = ['[voice]'];
   tracks.forEach(t => args.push('-i', t.clip));
   const ducked = tracks.filter(t => t.duck);
-  if (ducked.length) graph.push(`[0:a]apad=whole_dur=${duration},asplit=${ducked.length + 1}[voice]${ducked.map((_, i) => `[key${i}]`).join('')}`);
+  // Align before splitting so the mixer and compressor drain the same frames.
+  // The final timeline trim removes only final-frame padding.
+  if (ducked.length) graph.push(`[0:a]apad=whole_dur=${duration},asetnsamples=n=1024:p=1,asplit=${ducked.length + 1}[voice]${ducked.map((_, i) => `[key${i}]`).join('')}`);
   else graph.push(`[0:a]apad=whole_dur=${duration}[voice]`);
   let k = 0;
   tracks.forEach((t, i) => {
     graph.push(`[${i + 1}:a]adelay=${Math.round(t.at_sec * RATE)}S:all=1,apad=whole_dur=${duration}[placed${i}]`);
-    if (t.duck) { const d = t.duck; graph.push(`[placed${i}][key${k++}]sidechaincompress=threshold=${10 ** (d.threshold_db / 20)}:ratio=${d.ratio}:attack=${d.attack_ms}:release=${d.release_ms}[mixed${i}]`); labels.push(`[mixed${i}]`); }
+    if (t.duck) { const d = t.duck; graph.push(`[placed${i}]asetnsamples=n=1024:p=1[duckMusic${i}];[duckMusic${i}][key${k++}]sidechaincompress=threshold=${10 ** (d.threshold_db / 20)}:ratio=${d.ratio}:attack=${d.attack_ms}:release=${d.release_ms}[mixed${i}]`); labels.push(`[mixed${i}]`); }
     else labels.push(`[placed${i}]`);
   });
   graph.push(`${labels.join('')}amix=inputs=${labels.length}:duration=first:normalize=0,atrim=duration=${duration}[out]`);

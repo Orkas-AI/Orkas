@@ -320,8 +320,10 @@ async function render(root, plan, state, input, signal) {
       await run(ffmpeg, ['-v', 'error', '-nostdin', '-stream_loop', '-1', '-i', music,
         '-t', String(cursor), '-ar', '48000', '-ac', String(channels), '-c:a', 'pcm_s16le', musicClip], signal);
       const duck = transfer.duck(plan.music.duck);
+      // Align the split source and music before either branch can reach EOF.
+      // Trim only the bounded final-frame padding after mixing.
       const graph = duck
-        ? `[0:a]asplit=2[voice][key];[1:a]volume=${plan.music.volume ?? 0.15}[music];[music][key]sidechaincompress=threshold=${10 ** (duck.threshold_db / 20)}:ratio=${duck.ratio}:attack=${duck.attack_ms}:release=${duck.release_ms}[background];[voice][background]amix=inputs=2:duration=first:normalize=0`
+        ? `[0:a]asetnsamples=n=1024:p=1,asplit=2[voice][key];[1:a]volume=${plan.music.volume ?? 0.15},asetnsamples=n=1024:p=1[music];[music][key]sidechaincompress=threshold=${10 ** (duck.threshold_db / 20)}:ratio=${duck.ratio}:attack=${duck.attack_ms}:release=${duck.release_ms}[background];[voice][background]amix=inputs=2:duration=first:normalize=0,atrim=duration=${cursor}`
         : `[1:a]volume=${plan.music.volume ?? 0.15}[music];[0:a][music]amix=inputs=2:duration=first:normalize=0`;
       args.push('-i', musicClip, '-filter_complex', `${graph},${transfer.loudness(options)}[out]`, '-map', '[out]');
     } else args.push('-af', transfer.loudness(options));

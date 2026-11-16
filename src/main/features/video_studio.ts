@@ -1900,9 +1900,11 @@ function buildAudioMixGraph(audioTracksIn: AudioTrack[], durationSec: number): {
       : `${indexes.map(label).join('')}amix=inputs=${indexes.length}:duration=longest:normalize=0[${out}]`);
     const others = tracks.flatMap((track, index) => (track.voice || (track.duck && !track.voice) ? [] : [index]));
     filters.push(mixed(voices, 'voice_mix'));
-    filters.push('[voice_mix]asplit=2[voice_out][voice_key]');
+    filters.push('[voice_mix]asetnsamples=n=1024:p=1,asplit=2[voice_out][voice_key]');
     filters.push(mixed(ducked, 'duck_mix'));
-    filters.push('[duck_mix][voice_key]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[duck_out]');
+    // Complete frames keep compressor EOF from discarding the music tail.
+    filters.push('[duck_mix]asetnsamples=n=1024:p=1[duck_aligned]');
+    filters.push('[duck_aligned][voice_key]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[duck_out]');
     filters.push(`[voice_out][duck_out]${others.map(label).join('')}amix=inputs=${2 + others.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);
   } else {
     filters.push(`${tracks.map((_track, index) => `[a${index}]`).join('')}amix=inputs=${tracks.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);

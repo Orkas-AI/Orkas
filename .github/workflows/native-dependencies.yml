@@ -155,6 +155,18 @@ jobs:
           test/main/features/video_studio_bitmap.test.ts
       - name: Prepare the declared video runtimes for delivery checks
         run: npm run ffmpeg:fetch
+      - name: Verify audio frame draining and background music recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/voice_studio_core.test.ts
+          test/main/features/voice_studio_e2e_channels.test.ts
+          test/main/features/voice_studio_processing.test.ts
+          test/main/features/voice_studio_enhancement.test.ts
+          test/main/features/voice_studio_e2e_delivery.test.ts
+          test/main/features/video_ducking_e2e_frames.test.ts
+          test/main/features/video_edit_mix_filter.test.ts
+          test/main/features/video_edit_assembly_fixes.test.ts
+          test/main/features/video_studio_core_freshness.test.ts
       - name: Verify HTML copy references and project acceptance
         run: >-
           npm run test:js -- --maxWorkers=1
