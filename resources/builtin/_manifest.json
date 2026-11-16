@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "02dcee7335937dab5c2b552111445d13756d0a5bdb596cab508b0114025f3cf0",
+  "content_tree_sha256": "a8796c1c4ee2cce317bd6d6d402e99915ab712c226a3817fb33c11b3b789b6b6",
   "files": [
     {
       "path": "apps/builtin-content-workbench/__orkas-meta.json",
@@ -275,7 +275,7 @@
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
       "bytes": 5069,
-      "sha256": "919f70cea54442f9f5555567d956cb44ca530c5bebd62ff2d9853b9cf544ef20"
+      "sha256": "b626e0474c38c416f040fb66527059059a73ab305086318f8935b475e4ca8b78"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/audio_rhythm.ts",
@@ -314,8 +314,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit.ts",
-      "bytes": 105874,
-      "sha256": "17feeaa6347a2bdb61ce0fac7f4897a79a238dc569a73d55e24a7dd309dc96fc"
+      "bytes": 106009,
+      "sha256": "d941a210eb868baad214bc4a70f978ee2fcc75f3461b419826768d588c995fe5"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/design-system-importer/SKILL.md",
@@ -449,8 +449,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/lib/video_edit_core.cjs",
-      "bytes": 77174,
-      "sha256": "bf0aabacfe9506d592daaec15d500866d80c4364a51a76b052052cb3d334b50a"
+      "bytes": 77196,
+      "sha256": "7748bed16eca1855f815616fac538f1b1d367143388a0d1ee136dfbfa5ace220"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/SKILL.md",
@@ -2221,10 +2221,10 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "2.0.65",
+        "version": "2.0.66",
         "icon": "film",
         "color": "violet",
-        "updated_at": "2026-11-16T22:55:11.272Z",
+        "updated_at": "2026-11-16T23:31:00.000Z",
         "skill_list": [
           "design-system-importer",
           "frontend-design",
