@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { expect, test } from './fixtures/orkas';
 
 declare const _settingsState: {
@@ -392,27 +393,13 @@ test.describe('settings modules and model guard', () => {
 // Settings saves must remain local: a mistaken test/production dispatch cannot
 // reach a real provider with even these synthetic keys.
 async function denyExternalProviderRequests(app: import('./fixtures/orkas').OrkasTestApp): Promise<void> {
-  await app.electronApp!.evaluate(() => {
-    const state = globalThis as typeof globalThis & { __settingsExternalRequestCount?: number };
-    state.__settingsExternalRequestCount = 0;
-    const original = globalThis.fetch;
-    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-      const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      const url = new URL(raw);
-      if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
-        state.__settingsExternalRequestCount! += 1;
-        return Promise.reject(new Error('E_E2E_UNEXPECTED_EXTERNAL_REQUEST'));
-      }
-      return original(input, init);
-    }) as typeof fetch;
-  });
+  await app.guardExternalFetches();
 }
 
 async function expectSettingsOnly(app: import('./fixtures/orkas').OrkasTestApp): Promise<void> {
-  expect(await app.electronApp!.evaluate(() => (globalThis as any).__settingsExternalRequestCount)).toBe(0);
+  expect(await app.externalFetchAttempts()).toBe(0);
   expect(app.modelRequests).toHaveLength(0);
-  expect(app.imageGenerationRequests).toHaveLength(0);
-  expect(app.videoGenerationRequests).toHaveLength(0);
+  expect(app.apiRequests).toEqual([]);
 }
 
 type MediaModelChoice = readonly [option: string, provider: string, model: string];
@@ -427,13 +414,25 @@ const PUBLIC_MEDIA_CHOICES: Record<'image' | 'video', readonly MediaModelChoice[
     ['doubao:doubao-seedream-5-0-pro-260628', 'doubao', 'doubao-seedream-5-0-pro-260628'],
   ],
   video: [
+    ['doubao:doubao-seedance-2-5-260628', 'doubao', 'doubao-seedance-2-5-260628'],
+    ['doubao:doubao-seedance-2-5-flash', 'doubao', 'doubao-seedance-2-5-flash'],
     ['doubao:doubao-seedance-2-0-260128', 'doubao', 'doubao-seedance-2-0-260128'],
     ['doubao:doubao-seedance-2-0-fast-260128', 'doubao', 'doubao-seedance-2-0-fast-260128'],
     ['doubao:doubao-seedance-2-0-mini', 'doubao', 'doubao-seedance-2-0-mini'],
-    ['minimax', 'minimax', 'MiniMax-Hailuo-2.3'],
-    ['vidu', 'vidu', 'viduq3-pro'],
-    ['kling', 'kling', 'kling-v3-0-turbo'],
-    ['google', 'google', 'veo-3.1-generate-preview'],
+    ['minimax:MiniMax-H3', 'minimax', 'MiniMax-H3'],
+    ['minimax:MiniMax-H3-Highspeed', 'minimax', 'MiniMax-H3-Highspeed'],
+    ['minimax:MiniMax-H3-Lite', 'minimax', 'MiniMax-H3-Lite'],
+    ['minimax:MiniMax-H3-Max', 'minimax', 'MiniMax-H3-Max'],
+    ['vidu:viduq3-pro', 'vidu', 'viduq3-pro'],
+    ['vidu:viduq3-turbo', 'vidu', 'viduq3-turbo'],
+    ['kling:kling-v4-0', 'kling', 'kling-v4-0'],
+    ['kling:kling-v4-0-flash', 'kling', 'kling-v4-0-flash'],
+    ['google', 'google', 'gemini-omni-1.1-flash'],
+    ['google-cloud:veo-3.1-generate-001', 'google-cloud', 'veo-3.1-generate-001'],
+    ['google-cloud:veo-3.1-fast-generate-001', 'google-cloud', 'veo-3.1-fast-generate-001'],
+    ['google-cloud:veo-3.1-lite-generate-001', 'google-cloud', 'veo-3.1-lite-generate-001'],
+    ['aliyun:wan3.0-video', 'aliyun', 'wan3.0-video'],
+    ['aliyun:wan3.0-video-prime', 'aliyun', 'wan3.0-video-prime'],
     ['runway', 'runway', 'gen4.5'],
   ],
 };
@@ -446,7 +445,14 @@ for (const kind of ['image', 'video'] as const) {
     await page.locator(`[data-settings-model-tab="${kind}"]`).click();
     const choices = PUBLIC_MEDIA_CHOICES[kind];
     const secret = `sk-e2e-${kind}-no-provider-call-xxxxxxxx`;
-    for (const [index, [option]] of choices.entries()) {
+    // The private key is generated only for this isolated local-save journey.
+    // Saving validates its shape; the egress guard prevents token/provider calls.
+    const cloudSecret = kind === 'video' ? JSON.stringify({
+      type: 'service_account', project_id: 'e2e-video-project',
+      client_email: 'video@e2e-video-project.iam.gserviceaccount.com',
+      private_key: generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    }) : '';
+    for (const [index, [option, provider]] of choices.entries()) {
       await page.locator(`[data-settings-add="${kind}"]`).click();
       const modal = page.locator('#settings-add-modal');
       await expect(modal).toHaveClass(/\bopen\b/);
@@ -461,11 +467,16 @@ for (const kind of ['image', 'video'] as const) {
         await menu.screenshot({ path: testInfo.outputPath(`${kind}-public-picker-bottom.png`) });
       }
       await menu.locator(`.ai-select-item[data-value="${option}"]`).click();
-      await page.locator(`#settings-${kind}-key-input`).fill(secret);
+      await page.locator(`#settings-${kind}-key-input`).fill(provider === 'google-cloud' ? cloudSecret : secret);
+      if (provider === 'aliyun') {
+        await expect(page.locator('#settings-video-workspace-row')).toBeVisible();
+        await page.locator('#settings-video-workspace-input').fill('e2e-workspace');
+      }
       await page.locator(`#settings-${kind}-add-btn`).click();
       await expect(modal).not.toHaveClass(/\bopen\b/);
       await expect(page.locator(`#settings-${kind}-entries .entry-row`)).toHaveCount(index + 1);
       await expect(page.locator(`#settings-${kind}-entries`)).not.toContainText(secret);
+      if (cloudSecret) await expect(page.locator(`#settings-${kind}-entries`)).not.toContainText(cloudSecret);
     }
     type Listed = { profiles: Array<{ id: string; provider: string; model: string; apiKey?: string; apiKeyMasked: string }> };
     const before = await orkas.invoke<Listed>(`${kind}Auth.list`);
@@ -474,6 +485,7 @@ for (const kind of ['image', 'video'] as const) {
     for (const profile of before.profiles) {
       expect(profile).not.toHaveProperty('apiKey');
       expect(profile.apiKeyMasked).not.toBe(secret);
+      if (profile.provider === 'google-cloud') expect(profile.apiKeyMasked).toBe('********');
     }
     await expectSettingsOnly(orkas);
     page = await orkas.relaunch();
@@ -499,12 +511,18 @@ for (const kind of ['image', 'video'] as const) {
 
 test('keeps a legacy small-context model visible for removal without ranking it', async ({ modelOrkas: orkas }, testInfo) => {
   await denyExternalProviderRequests(orkas);
+  const existing = (await orkas.invoke<{ entries: Array<{ entryId: string }> }>('auth.listComposerEntries')).entries.map(entry => entry.entryId);
   const good = await orkas.invoke<{ entryId: string; profileId: string }>('auth.addCustomModelEntry', {
     label: 'E2E Capacity Good', model: 'e2e-capacity-good',
     baseUrl: 'https://capacity-fixture.invalid/v1', apiKey: 'synthetic-capacity-key',
     contextWindow: 32000, maxTokens: 8192,
   });
   expect(good).toMatchObject({ entryId: expect.any(String), profileId: expect.any(String) });
+  const peer = await orkas.invoke<{ entryId: string }>('auth.addCustomModelEntry', {
+    label: 'E2E Capacity Peer', model: 'e2e-capacity-peer',
+    baseUrl: 'https://capacity-fixture.invalid/v1', apiKey: 'synthetic-peer-key',
+    contextWindow: 32000, maxTokens: 8192,
+  });
   // Reproduce a real older encrypted profile through the existing storage seam,
   // exactly as the owning auth compatibility case does. No real user data.
   await orkas.electronApp!.evaluate((_electron, input) => {
@@ -522,14 +540,30 @@ test('keeps a legacy small-context model visible for removal without ranking it'
     store.entries.unshift({ ...entry, entryId: 'e2e-legacy-small', profileId: 'custom:e2e-legacy-small' });
     fs.writeFileSync(file, secrets.encryptLocalSecret(context, JSON.stringify(store)));
   }, good);
-  const page = orkas.page!;
+  let page = orkas.page!;
   await openSettingsTab(page, 'credentials');
-  const row = page.locator('#settings-entries [data-entry-id="e2e-legacy-small"]');
+  let row = page.locator('#settings-entries [data-entry-id="e2e-legacy-small"]');
   await expect(row).toBeVisible();
   await expect(row.locator('.entry-status.error')).toContainText(/32[,. ]?000/);
   await expect(row).toHaveAttribute('draggable', 'false');
   await expect(row.locator('.entry-rank')).toBeEmpty();
   await expect(row.locator('.entry-sort')).toHaveCount(0);
+  // Moving a usable row must retain the disabled remediation row immediately,
+  // and preserve the new usable priority after a genuine application restart.
+  const goodRow = page.locator(`#settings-entries [data-entry-id="${good.entryId}"]`);
+  await goodRow.locator('.entry-sort-btn').first().click();
+  await expect(row).toBeVisible();
+  await expect.poll(async () => (await orkas.invoke<{ entries: Array<{ entryId: string }> }>('auth.listComposerEntries')).entries.map(entry => entry.entryId))
+    .toEqual([good.entryId, peer.entryId, ...existing]);
+  page = await orkas.relaunch();
+  await denyExternalProviderRequests(orkas);
+  await openSettingsTab(page, 'credentials');
+  row = page.locator('#settings-entries [data-entry-id="e2e-legacy-small"]');
+  await expect(row).toBeVisible();
+  await expect(row).toHaveAttribute('draggable', 'false');
+  expect((await orkas.invoke<{ entries: Array<{ entryId: string }> }>('auth.listComposerEntries')).entries.map(entry => entry.entryId))
+    .toEqual([good.entryId, peer.entryId, ...existing]);
+
   const composer = await orkas.invoke<{ entries: Array<{ entryId: string }> }>('auth.listComposerEntries');
   expect(composer.entries.map(entry => entry.entryId)).toContain(good.entryId);
   expect(composer.entries.map(entry => entry.entryId)).not.toContain('e2e-legacy-small');

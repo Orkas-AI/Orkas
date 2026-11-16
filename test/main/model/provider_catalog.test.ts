@@ -11,6 +11,9 @@ import {
   EXTERNAL_API_PROVIDERS,
   OAUTH_ALIAS_FOR,
   EXTRA_LABELS,
+  configuredOpenAICompatibleProviders,
+  getConfiguredOpenAICompatibleProvider,
+  isExternalApiProvider,
   isVisibleProvider,
   isKnownModelProvider,
   isUserAddableProvider,
@@ -19,26 +22,23 @@ import {
   providerSubscriptionNote,
   sortProviderIds,
   curatedModelsFor,
-  configuredOpenAICompatibleProviders,
-  getConfiguredOpenAICompatibleProvider,
-  isExternalApiProvider,
-  modelInputFromConfiguredCapabilities,
-  modelInputImageLimit,
-  resolveConfiguredPiModel,
   isSelectableModel,
-  resolveModelUpgrade,
-  pickLatestGenerations,
-  modelCatalogEntryFromModel,
   findImageGenCapability,
+  resolveConfiguredPiModel,
+  resolveModelUpgrade,
+  modelCatalogEntryFromModel,
+  modelOutputLimitExceedsWindow,
+  modelInputImageLimit,
+  modelInputFromConfiguredCapabilities,
+  pickLatestGenerations,
 } from '../../../src/main/model/provider_catalog';
 
 describe('provider_catalog › CATALOG', () => {
   it('holds unique provider ids in display order', () => {
     const ids = CATALOG.map((p) => p.id);
     expect(new Set(ids).size).toBe(ids.length);
-    // DeepSeek 直连先（pi-ai 不带，自建适配），然后全球前沿（OpenAI Codex /
-    // OpenAI / Google / Anthropic），CN 主流（Zhipu / Moonshot / Kimi-Coding /
-    // MiniMax × 3 / Doubao），最后聚合器（OpenRouter）。
+    // Preserve the public user-owned API service alongside the shared direct
+    // providers and aggregators. Official account-managed models stay absent.
     expect(ids).toEqual([
       'orkas-api',
       'deepseek',
@@ -57,6 +57,8 @@ describe('provider_catalog › CATALOG', () => {
       'custom',
     ]);
   });
+
+  
 
   it('has VISIBLE_PROVIDERS derived from CATALOG order', () => {
     expect([...VISIBLE_PROVIDERS]).toEqual(CATALOG.map((p) => p.id));
@@ -85,30 +87,34 @@ describe('provider_catalog › CATALOG', () => {
     ]);
   });
 
-  it('aliases minimax-cn → minimax-portal-cn (same CN endpoint, 不同 auth)', () => {
-    // OpenAI 和 OpenAI Codex 仍是两张独立卡（OAUTH_ALIAS_FOR 不含 openai）。
-    // MiniMax 的 API-key 与 OAuth 走同一 endpoint (api.minimaxi.com)，折到
-    // 同一张卡更符合用户直觉。
+  it('aliases minimax-cn to minimax-portal-cn with distinct authentication at the same endpoint', () => {
+    // OpenAI and Codex keep separate cards. MiniMax API-key and OAuth access
+    // share the same endpoint, so their aliases resolve to one provider card.
     expect(OAUTH_ALIAS_FOR).toEqual({ 'minimax-cn': 'minimax-portal-cn' });
   });
 });
 
 describe('provider_catalog › CURATED_MODELS', () => {
-  it('describes both Orkas official models with their product-facing names', () => {
-    expect(providerLabel('orkas-api')).toBe('Orkas');
-    expect(curatedModelsFor('orkas-api')).toEqual([
-      expect.objectContaining({
-        id: 'orkas-llm-1.5',
-        name: 'Orkas-1.5',
-        recommended: true,
-        includedModels: ['DeepSeek V4.1 Flash', 'GPT-6 Luna', 'Claude-Sonnet-5', 'Gemini-3.8 Flash'],
-      }),
-      expect.objectContaining({
-        id: 'orkas-llm-1.5-pro',
-        name: 'Orkas-1.5 Pro',
-        includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
-      }),
-    ]);
+  it.each([
+    ['anthropic', 'claude-fable-5-2'],
+    ['openrouter', 'anthropic/claude-fable-5.2'],
+  ])('offers %s Fable 5.2 with its native protocol and retains the previous generation', (providerId, modelId) => {
+    expect(isSelectableModel(providerId, modelId)).toBe(true);
+    const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, providerId, modelId);
+    expect(resolved).toMatchObject({ isConfiguredFallback: false, templateModelId: modelId,
+      model: { id: modelId, provider: providerId, api: 'anthropic-messages',
+        contextWindow: 1_000_000, maxTokens: 128_000, input: ['text', 'image'] },
+    });
+    expect(modelInputImageLimit(providerId, modelId, resolved!.model)).toBe(20);
+    expect(isSelectableModel(providerId, providerId === 'anthropic' ? 'claude-fable-5-1' : 'anthropic/claude-fable-5.1')).toBe(true);
+  });
+
+  it('keeps the existing OpenRouter M2.7 output reservation when its upstream ceiling grows', () => {
+    const native = (getBuiltinModel as any)('openrouter', 'minimax/minimax-m2.7');
+    const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, 'openrouter', 'minimax/minimax-m2.7');
+    expect(resolved!.model.maxTokens).toBe(131_072);
+    expect(resolved!.model.contextWindow).toBe(native.contextWindow);
+    expect(resolved!.model.maxTokens).toBeLessThanOrEqual(native.maxTokens);
   });
 
   it.each([
@@ -236,6 +242,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
     // through to pickLatestGenerations for providers we advertise.
     for (const p of CATALOG) {
       if (p.customOpenAICompatible) {
+        // The exact model id is part of the user's custom endpoint config.
         expect(CURATED_MODELS[p.id]).toBeUndefined();
         continue;
       }
@@ -259,6 +266,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
   it('moonshot catalog exposes only K3 and K2.7', () => {
     const ids = (CURATED_MODELS['moonshot'] || []).map((m) => m.id);
+    // Order matters: the UI dropdown defaults to the first listed model.
     expect(ids).toEqual(['kimi-k3', 'kimi-k2.7-code']);
   });
 
@@ -303,7 +311,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
     });
   });
 
-  it('minimax catalog exposes M3 before the M2.7 generation', () => {
+  it('offers MiniMax Flash and M3 while retaining hidden M2.7 compatibility', () => {
     const directIds = (CURATED_MODELS['minimax-cn'] || []).map((m) => m.id);
     expect(directIds).toEqual([
       'MiniMax-M3.1-Flash',
@@ -588,33 +596,35 @@ describe('provider_catalog › CURATED_MODELS', () => {
     }
   });
 
-  it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
-    const ids = (CURATED_MODELS.openrouter || []).map((m) => m.id);
-    expect(ids.some((id) => id.startsWith('deepseek/'))).toBe(true);
-    expect(ids.some((id) => id.startsWith('qwen/'))).toBe(true);
-    expect(ids.some((id) => id.startsWith('z-ai/'))).toBe(true);
-    expect(ids.some((id) => id.startsWith('moonshotai/'))).toBe(true);
-    expect(ids.some((id) => id.startsWith('minimax/'))).toBe(true);
-    expect(ids).toContain('minimax/minimax-m3');
-    expect(ids).toContain('minimax/minimax-m2.7');
+  it('resolves every OpenRouter shortcut or its declared compatibility template', () => {
+    expect(CURATED_MODELS.openrouter.length).toBeGreaterThan(0);
+    for (const model of CURATED_MODELS.openrouter || []) {
+      const nativeId = model.template || model.id;
+      expect(getBuiltinModel('openrouter', nativeId), model.id).toBeDefined();
+    }
   });
 
-  it('openrouter Claude shortcuts keep every Claude 5 variant', () => {
+  it('resolves current OpenRouter Claude variants through the native Anthropic relay', () => {
     const claudeIds = (CURATED_MODELS.openrouter || [])
       .map((m) => m.id)
       .filter((id) => id.includes('/claude-'));
-    expect(claudeIds).toEqual([
-      'anthropic/claude-opus-5.5',
-      'anthropic/claude-opus-5',
-      'anthropic/claude-fable-5.1',
-      'anthropic/claude-fable-5',
-      'anthropic/claude-sonnet-5.5',
-      'anthropic/claude-sonnet-5',
-      'anthropic/claude-haiku-5.5',
-    ]);
+    expect(claudeIds.length).toBeGreaterThan(0);
+    for (const modelId of claudeIds) {
+      const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, 'openrouter', modelId);
+      expect(resolved).toMatchObject({
+        isConfiguredFallback: false,
+        model: {
+          id: modelId,
+          provider: 'openrouter',
+          api: 'anthropic-messages',
+          baseUrl: 'https://openrouter.ai/api',
+          input: ['text', 'image'],
+        },
+      });
+    }
   });
 
-  it('openrouter GPT shortcuts keep every GPT-5.6 variant', () => {
+  it('openrouter GPT shortcuts expose GPT-6 and keep every GPT-5.6 variant', () => {
     const ids = (CURATED_MODELS.openrouter || [])
       .map((m) => m.id)
       .filter((id) => id.startsWith('openai/gpt-'));
@@ -796,39 +806,117 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(modelInputImageLimit('openrouter', modelId, resolved?.model)).toBe(20);
   });
 
-  it('curatedModelsFor returns a shallow copy safe to mutate', () => {
-    const a = curatedModelsFor('anthropic');
-    const b = curatedModelsFor('anthropic');
-    expect(a).not.toBe(b);
-    a.pop();
-    expect(curatedModelsFor('anthropic').length).toBe(b.length);
+  it.each([
+    ['kimi-coding', 'k2p6', 'k2p7', 'k3'],
+    ['doubao', 'doubao-seed-2-1-pro-260628', 'doubao-seed-2-1-pro-260915', 'doubao-seed-2-1-turbo-260628'],
+    ['google', 'gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.7-flash'],
+    ['anthropic', 'claude-opus-4-8', 'claude-opus-5', 'claude-fable-5'],
+    ['openrouter', 'google/gemini-3.6-flash', 'google/gemini-3.8-flash', 'google/gemini-3.7-flash'],
+    ['openrouter', 'anthropic/claude-opus-4.8', 'anthropic/claude-opus-5', 'anthropic/claude-fable-5'],
+    ['openrouter', 'qwen/qwen3.7-max', 'qwen/qwen3.8-max-0902', 'qwen/qwen3-coder-next'],
+    ['openrouter', 'qwen/qwen3.7-flash', 'qwen/qwen3.8-flash', 'qwen/qwen3.7-plus'],
+  ])('migrates %s %s only when the trusted catalog retires it and offers its replacement', async (provider, retired, replacement, retained) => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgupgradevisible';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const publish = (ids: string[]) => storage.writeJsonSync(file, {
+      version: 1,
+      active: { immediate: { model_catalog: {
+        providers: { [provider]: ids.map((id) => ({ id, name: id })) },
+      } } },
+    });
+    try {
+      publish([replacement, retired, retained]);
+      expect(curatedModelsFor(provider).map((model) => model.id)).toEqual([replacement, retired, retained]);
+      expect(resolveModelUpgrade(provider, retired)).toMatchObject({ modelId: retired, upgraded: false });
+      expect(isSelectableModel(provider, retired)).toBe(true);
+
+      publish([retained]);
+      expect(resolveModelUpgrade(provider, retired)).toMatchObject({ modelId: retired, upgraded: false });
+      // OpenRouter still accepts user-entered ids outside its shortcuts.
+      expect(isSelectableModel(provider, retired)).toBe(provider === 'openrouter');
+
+      publish([replacement, retained]);
+      const migrated = resolveModelUpgrade(provider, retired);
+      expect(migrated).toMatchObject({ modelId: replacement, previousModelId: retired, upgraded: true });
+      expect(resolveModelUpgrade(provider, migrated.modelId)).toMatchObject({ modelId: replacement, upgraded: false });
+      expect(resolveModelUpgrade(provider, retained)).toMatchObject({ modelId: retained, upgraded: false });
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 
-  it('curatedModelsFor returns [] for unknown providers (triggers pi-ai fallback)', () => {
+  it('curatedModelsFor returns a deep-enough copy safe to mutate', () => {
+    const a = curatedModelsFor('orkas-api');
+    const b = curatedModelsFor('orkas-api');
+    expect(a).not.toBe(b);
+    expect(a[0].includedModels).not.toBe(b[0].includedModels);
+    a.pop();
+    a[0].includedModels?.pop();
+    expect(curatedModelsFor('orkas-api')).toEqual(b);
+  });
+
+  it('curatedModelsFor returns [] for unknown providers', () => {
     expect(curatedModelsFor('no-such-provider-id')).toEqual([]);
   });
 
   it.each([
-    { input: ['text'] as const, configured: {}, expected: ['text'] },
-    { input: ['text', 'image'] as const, configured: {}, expected: ['text', 'image'] },
-    { input: ['text'] as const, configured: { supportsVision: true }, expected: ['text', 'image'] },
-    { input: ['text', 'image'] as const, configured: { supportsVision: false }, expected: ['text'] },
-    { input: ['text'] as const, configured: { maxInputImages: 12 }, expected: ['text', 'image'] },
-    { input: ['text', 'image'] as const, configured: { maxInputImages: 0 }, expected: ['text'] },
-    { input: ['text'] as const, configured: { supportsVision: true, maxInputImages: 12 }, expected: ['text', 'image'] },
-    { input: ['text', 'image'] as const, configured: { supportsVision: false, maxInputImages: 0 }, expected: ['text'] },
-  ])('applies configured vision capabilities: $configured', ({ input, configured, expected }) => {
+    {
+      name: 'preserves text-only protocol metadata when both fields are omitted',
+      input: ['text'] as const,
+      configured: {},
+      expected: ['text'],
+    },
+    {
+      name: 'preserves multimodal protocol metadata when both fields are omitted',
+      input: ['text', 'image'] as const,
+      configured: {},
+      expected: ['text', 'image'],
+    },
+    {
+      name: 'enables vision from supportsVision alone',
+      input: ['text'] as const,
+      configured: { supportsVision: true },
+      expected: ['text', 'image'],
+    },
+    {
+      name: 'disables vision from supportsVision alone',
+      input: ['text', 'image'] as const,
+      configured: { supportsVision: false },
+      expected: ['text'],
+    },
+    {
+      name: 'enables vision from a legacy positive maxInputImages alone',
+      input: ['text'] as const,
+      configured: { maxInputImages: 12 },
+      expected: ['text', 'image'],
+    },
+    {
+      name: 'disables vision from a legacy zero maxInputImages alone',
+      input: ['text', 'image'] as const,
+      configured: { maxInputImages: 0 },
+      expected: ['text'],
+    },
+    {
+      name: 'accepts the consistent vision-plus-positive-limit pair',
+      input: ['text'] as const,
+      configured: { supportsVision: true, maxInputImages: 12 },
+      expected: ['text', 'image'],
+    },
+    {
+      name: 'accepts the consistent text-only-plus-zero-limit pair',
+      input: ['text', 'image'] as const,
+      configured: { supportsVision: false, maxInputImages: 0 },
+      expected: ['text'],
+    },
+  ])('$name', ({ input, configured, expected }) => {
     expect(modelInputFromConfiguredCapabilities([...input], configured)).toEqual(expected);
   });
 
-  it('uses the product image limit for a multimodal model without a provider limit', () => {
-    expect(modelInputImageLimit('unknown-provider', 'vision-next', {
-      id: 'vision-next',
-      input: ['text', 'image'],
-    } as any)).toBe(20);
-  });
-
-  it('accepts the capability-field matrix and rejects conflicts or invalid field types', async () => {
+  it('accepts the complete capability-field matrix and rejects conflicts or invalid field types', async () => {
     const users = await import('../../../src/main/features/users');
     const paths = await import('../../../src/main/paths');
     const storage = await import('../../../src/main/storage');
@@ -863,22 +951,36 @@ describe('provider_catalog › CURATED_MODELS', () => {
       { id: 'null-limit', maxInputImages: null, accepted: false },
       { id: 'object-limit', maxInputImages: { count: 12 }, accepted: false },
     ];
-    const providers = Object.fromEntries(cases.map((entry) => [entry.id, [{
+    const models = Object.fromEntries(cases.map((entry) => [entry.id, [{
       id: `${entry.id}-model`,
-      ...('supportsVision' in entry ? { supportsVision: entry.supportsVision } : {}),
+      ...(entry.supportsVision !== undefined ? { supportsVision: entry.supportsVision } : {}),
       ...('maxInputImages' in entry ? { maxInputImages: entry.maxInputImages } : {}),
     }]]));
+    const definitions = Object.fromEntries(cases.map((entry) => [entry.id, {
+      label: entry.id,
+      baseUrl: `https://api.${entry.id}.example/v1`,
+    }]));
     storage.writeJsonSync(file, {
       version: 1,
-      active: { immediate: { model_catalog: { providers } } },
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: models,
+            openai_compatible_providers: definitions,
+          },
+        },
+      },
     });
     try {
+      expect(configuredOpenAICompatibleProviders().map((provider) => provider.id)).toEqual(
+        cases.filter((entry) => entry.accepted).map((entry) => entry.id),
+      );
       for (const entry of cases) {
-        const models = curatedModelsFor(entry.id);
+        const provider = getConfiguredOpenAICompatibleProvider(entry.id);
         if (entry.accepted) {
-          expect(models, entry.id).toHaveLength(1);
+          expect(provider, entry.id).not.toBeNull();
         } else {
-          expect(models, entry.id).toEqual([]);
+          expect(provider, entry.id).toBeNull();
         }
       }
       expect(curatedModelsFor('false-zero')).toEqual([{
@@ -892,7 +994,71 @@ describe('provider_catalog › CURATED_MODELS', () => {
     }
   });
 
-  it('curatedModelsFor can be overridden by Server remote-config cache', async () => {
+  it('accepts safe Server-configured providers and rejects unsafe or reserved definitions', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'configuredopenaiproviders';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              acme: [
+                { id: 'acme-vision', name: 'Acme Vision', supportsVision: true, maxInputImages: 12 },
+                { id: 'acme-default', name: 'Acme Default' },
+                { id: 'acme-text', name: 'Acme Text', supportsVision: false },
+              ],
+              unsafe: [{ id: 'unsafe-model', name: 'Unsafe Model' }],
+              conflict: [{ id: 'conflict-model', supportsVision: false, maxInputImages: 3 }],
+            },
+            openai_compatible_providers: {
+              acme: {
+                label: 'Acme AI',
+                baseUrl: 'https://api.acme.example/v1/',
+                docsUrl: 'https://docs.acme.example/keys',
+              },
+              unsafe: { label: 'Unsafe', baseUrl: 'http://127.0.0.1:9000/v1' },
+              conflict: { label: 'Conflict', baseUrl: 'https://api.conflict.example/v1' },
+              openai: { label: 'Imposter', baseUrl: 'https://evil.example/v1' },
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(configuredOpenAICompatibleProviders()).toEqual([{
+        id: 'acme',
+        label: 'Acme AI',
+        baseUrl: 'https://api.acme.example/v1',
+        docsUrl: 'https://docs.acme.example/keys',
+      }]);
+      expect(getConfiguredOpenAICompatibleProvider('acme')).toMatchObject({ label: 'Acme AI' });
+      expect(getConfiguredOpenAICompatibleProvider('unsafe')).toBeNull();
+      expect(getConfiguredOpenAICompatibleProvider('conflict')).toBeNull();
+      expect(getConfiguredOpenAICompatibleProvider('openai')).toBeNull();
+      expect(isVisibleProvider('acme')).toBe(true);
+      expect(isKnownModelProvider('acme')).toBe(true);
+      expect(isUserAddableProvider('acme')).toBe(true);
+      expect(isExternalApiProvider('acme')).toBe(true);
+      expect(providerLabel('acme')).toBe('Acme AI');
+      expect(providerDocsUrl('acme')).toBe('https://docs.acme.example/keys');
+      expect(isSelectableModel('acme', 'acme-vision')).toBe(true);
+      expect(isSelectableModel('acme', 'not-configured')).toBe(false);
+      expect(curatedModelsFor('acme')).toEqual([
+        { id: 'acme-vision', name: 'Acme Vision', supportsVision: true, maxInputImages: 12 },
+        { id: 'acme-default', name: 'Acme Default' },
+        { id: 'acme-text', name: 'Acme Text', supportsVision: false },
+      ]);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('preserves every ordered Server override without a hard generation cap', async () => {
     const users = await import('../../../src/main/features/users');
     const paths = await import('../../../src/main/paths');
     const storage = await import('../../../src/main/storage');
@@ -905,7 +1071,22 @@ describe('provider_catalog › CURATED_MODELS', () => {
         immediate: {
           model_catalog: {
             providers: {
-              openai: [{ id: 'gpt-test-next', name: 'GPT Test Next' }],
+              openai: [
+                { id: 'gpt-7.2-sol', name: 'GPT 7.2 Sol' },
+                { id: 'gpt-7.2-terra', name: 'GPT 7.2 Terra' },
+                { id: 'gpt-7.1', name: 'GPT 7.1' },
+                { id: 'gpt-6.9', name: 'GPT 6.9' },
+                { id: 'gpt-next', name: 'GPT Next' },
+              ],
+              openrouter: [
+                { id: 'vendor-a/model-3-pro', name: 'Vendor A 3 Pro' },
+                { id: 'vendor-a/model-3-flash', name: 'Vendor A 3 Flash' },
+                { id: 'vendor-a/model-2', name: 'Vendor A 2' },
+                { id: 'vendor-a/model-1', name: 'Vendor A 1' },
+                { id: 'vendor-b/model-2', name: 'Vendor B 2' },
+                { id: 'vendor-b/model-1', name: 'Vendor B 1' },
+                { id: 'vendor-b/model-0', name: 'Vendor B 0' },
+              ],
             },
           },
         },
@@ -913,10 +1094,290 @@ describe('provider_catalog › CURATED_MODELS', () => {
     });
     try {
       expect(curatedModelsFor('openai')).toEqual([
-        { id: 'gpt-test-next', name: 'GPT Test Next' },
+        { id: 'gpt-7.2-sol', name: 'GPT 7.2 Sol' },
+        { id: 'gpt-7.2-terra', name: 'GPT 7.2 Terra' },
+        { id: 'gpt-7.1', name: 'GPT 7.1' },
+        { id: 'gpt-6.9', name: 'GPT 6.9' },
+        { id: 'gpt-next', name: 'GPT Next' },
+      ]);
+      expect(curatedModelsFor('openrouter').map((model) => model.id)).toEqual([
+        'vendor-a/model-3-pro',
+        'vendor-a/model-3-flash',
+        'vendor-a/model-2',
+        'vendor-a/model-1',
+        'vendor-b/model-2',
+        'vendor-b/model-1',
+        'vendor-b/model-0',
       ]);
       expect(curatedModelsFor('anthropic').length).toBeGreaterThan(0);
-      expect(CURATED_MODELS.openai?.[0]?.id).not.toBe('gpt-test-next');
+      expect(CURATED_MODELS.openai?.[0]?.id).not.toBe('gpt-7.2-sol');
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('uses the public API fallback, normalizes catalog metadata, and restores fallback when withdrawn', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'publicapicatalogoverride';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const builtin = [
+      {
+        id: 'orkas-llm-1.5',
+        name: 'Orkas-1.5',
+        recommended: true,
+        includedModels: ['DeepSeek V4.1 Flash', 'GPT-6 Luna', 'Claude-Sonnet-5', 'Gemini-3.8 Flash'],
+      },
+      expect.objectContaining({
+        id: 'orkas-llm-1.5-pro',
+        name: 'Orkas-1.5 Pro',
+        includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
+      }),
+    ];
+    try {
+      expect(curatedModelsFor('orkas-api')).toEqual(builtin);
+      storage.writeJsonSync(file, {
+        version: 1,
+        active: {
+          immediate: {
+            model_catalog: {
+              providers: {
+                'orkas-api': [{
+                  id: 'orkas-llm-1.5',
+                  name: 'Orkas-1.5 Dynamic',
+                  recommended: true,
+                  description: '  Catalog daily paragraph.  ',
+                  includedModels: ['  DeepSeek V5  ', 'DeepSeek V5', 'Future Display Model'],
+                  maxInputImages: 12,
+                }, {
+                  id: 'orkas-llm-1.5-pro',
+                  name: 'Orkas-1.5 Pro Dynamic',
+                  description: 'Catalog complex paragraph.',
+                  includedModels: ['GPT Next', 'Claude Next'],
+                  template: 'gpt-5.5',
+                }],
+              },
+            },
+          },
+        },
+      });
+      expect(curatedModelsFor('orkas-api')).toEqual([{
+        id: 'orkas-llm-1.5',
+        name: 'Orkas-1.5 Dynamic',
+        recommended: true,
+        description: 'Catalog daily paragraph.',
+        includedModels: ['DeepSeek V5', 'Future Display Model'],
+        maxInputImages: 12,
+      }, {
+        id: 'orkas-llm-1.5-pro',
+        name: 'Orkas-1.5 Pro Dynamic',
+        description: 'Catalog complex paragraph.',
+        includedModels: ['GPT Next', 'Claude Next'],
+        template: 'gpt-5.5',
+      }]);
+
+      storage.writeJsonSync(file, {
+        version: 1,
+        active: { immediate: { model_catalog: { providers: { openai: [{ id: 'gpt-only', name: 'GPT Only' }] } } } },
+      });
+      expect(curatedModelsFor('orkas-api')).toEqual(builtin);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed remote model descriptions as a whole provider override', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'publicapicataloginvaliddescription';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const builtinIds = ['orkas-llm-1.5', 'orkas-llm-1.5-pro'];
+    const invalidDescriptions: unknown[] = ['', '   ', 'x'.repeat(501), 42, { zh: 'not-a-string' }];
+    try {
+      for (const [index, description] of invalidDescriptions.entries()) {
+        storage.writeJsonSync(file, {
+          version: 1,
+          active: {
+            immediate: {
+              model_catalog: {
+                providers: {
+                  'orkas-api': [{
+                    id: 'orkas-llm-1.5',
+                    name: `Invalid description ${index}`,
+                    description,
+                    includedModels: ['Model A'],
+                  }],
+                },
+              },
+            },
+          },
+        });
+        expect(curatedModelsFor('orkas-api').map((model) => model.id)).toEqual(builtinIds);
+      }
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed remote included-model arrays as a whole provider override', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'publicapicataloginvalid';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const builtinIds = ['orkas-llm-1.5', 'orkas-llm-1.5-pro'];
+    const invalidLists: unknown[] = [
+      ['valid', '   '],
+      Array.from({ length: 13 }, (_, index) => `Model ${index}`),
+      ['x'.repeat(81)],
+      ['valid', 42],
+      'not-an-array',
+    ];
+    try {
+      for (const [index, includedModels] of invalidLists.entries()) {
+        storage.writeJsonSync(file, {
+          version: 1,
+          active: {
+            immediate: {
+              model_catalog: {
+                providers: {
+                  'orkas-api': [{
+                    id: 'orkas-llm-1.5',
+                    name: `Invalid ${index}`,
+                    includedModels,
+                  }],
+                },
+              },
+            },
+          },
+        });
+        expect(curatedModelsFor('orkas-api').map((model) => model.id)).toEqual(builtinIds);
+      }
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('curatedModelsFor preserves Server model metadata fields', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgmetadata';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              anthropic: [{
+                id: 'claude-opus-4-9',
+                name: 'Claude Opus 4.9',
+                template: 'claude-opus-4-8',
+                contextWindow: 210000,
+                maxTokens: 64000,
+                maxInputImages: 7,
+                includedModels: ['Model A', 'Model B'],
+                ignored: 'nope',
+              }, {
+                id: 'claude-text-only',
+                name: 'Claude Text Only',
+                maxInputImages: 0,
+              }],
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(curatedModelsFor('anthropic')).toEqual([{
+        id: 'claude-opus-4-9',
+        name: 'Claude Opus 4.9',
+        template: 'claude-opus-4-8',
+        contextWindow: 210000,
+        maxTokens: 64000,
+        maxInputImages: 7,
+        includedModels: ['Model A', 'Model B'],
+      }, {
+        id: 'claude-text-only',
+        name: 'Claude Text Only',
+        maxInputImages: 0,
+      }]);
+      expect(modelInputImageLimit('anthropic', 'claude-opus-4-9', {
+        id: 'claude-opus-4-9',
+        input: ['text', 'image'],
+      } as any)).toBe(7);
+      expect(modelInputImageLimit('anthropic', 'claude-text-only', {
+        id: 'claude-text-only',
+        input: ['text', 'image'],
+      } as any)).toBe(0);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('uses zero for text-only models and a conservative fallback for unknown vision models', () => {
+    expect(modelInputImageLimit('anthropic', 'claude-opus-4-8', {
+      id: 'claude-opus-4-8',
+      input: ['text'],
+    } as any)).toBe(0);
+    expect(modelInputImageLimit('unknown-provider', 'vision-next', {
+      id: 'vision-next',
+      input: ['text', 'image'],
+    } as any)).toBe(20);
+  });
+
+  it('uses only canonical Server model catalog fields', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgcanonical';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              openai: [{ id: 'gpt-canonical', name: 'GPT Canonical' }],
+            },
+            curated_models: {
+              anthropic: [{ id: 'ignored-model', name: 'Ignored Model' }],
+            },
+            image_generation: {
+              'custom-image': { model: 'img-canonical', api: 'openai', supports_edit: true },
+              'wrong-edit-field': { model: 'img-no-edit', api: 'openai', supportsEdit: true },
+            },
+            imageGeneration: {
+              ignored: { model: 'img-ignored', api: 'openai', supportsEdit: true },
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(curatedModelsFor('openai')).toEqual([
+        { id: 'gpt-canonical', name: 'GPT Canonical' },
+      ]);
+      expect(curatedModelsFor('anthropic').map((m) => m.id)).not.toContain('ignored-model');
+      expect(findImageGenCapability('custom-image')).toEqual({
+        model: 'img-canonical',
+        api: 'openai',
+        supportsEdit: true,
+      });
+      expect(findImageGenCapability('wrong-edit-field')).toEqual({
+        model: 'img-no-edit',
+        api: 'openai',
+        supportsEdit: false,
+      });
+      expect(findImageGenCapability('ignored')).toBeNull();
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }
@@ -1032,6 +1493,300 @@ describe('provider_catalog › CURATED_MODELS', () => {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }
   });
+
+  it('resolves configured model ids by cloning a Server-declared template and applying limits', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgtemplate';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              anthropic: [{
+                id: 'claude-opus-4-9',
+                name: 'Claude Opus 4.9',
+                template: 'claude-opus-4-8',
+                contextWindow: 210000,
+                maxTokens: 64000,
+              }],
+            },
+          },
+        },
+      },
+    });
+    const template = {
+      id: 'claude-opus-4-8',
+      name: 'Claude Opus 4.8',
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+      reasoning: true,
+      input: ['text'],
+      cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1 },
+      contextWindow: 200000,
+      maxTokens: 32000,
+    };
+    const catalog = {
+      getPiModel(provider: string, model: string) {
+        return provider === 'anthropic' && model === 'claude-opus-4-8'
+          ? template as any
+          : undefined;
+      },
+    };
+    try {
+      const resolved = resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-4-9');
+      expect(resolved?.needsCustomModel).toBe(true);
+      expect(resolved?.isConfiguredFallback).toBe(true);
+      expect(resolved?.templateModelId).toBe('claude-opus-4-8');
+      expect(resolved?.model.id).toBe('claude-opus-4-9');
+      expect(resolved?.model.name).toBe('Claude Opus 4.9');
+      expect(resolved?.model.api).toBe(template.api);
+      expect(resolved?.model.contextWindow).toBe(210000);
+      expect(resolved?.model.maxTokens).toBe(64000);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('applies Server limits to exact pi-ai model matches', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgexactlimits';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              anthropic: [{
+                id: 'claude-opus-4-8',
+                name: 'Claude Opus 4.8',
+                contextWindow: 180000,
+                maxTokens: 24000,
+              }],
+            },
+          },
+        },
+      },
+    });
+    const catalog = {
+      getPiModel(provider: string, model: string) {
+        return provider === 'anthropic' && model === 'claude-opus-4-8'
+          ? {
+              id: 'claude-opus-4-8',
+              name: 'Claude Opus 4.8',
+              api: 'anthropic-messages',
+              provider: 'anthropic',
+              baseUrl: 'https://api.anthropic.com',
+              input: ['text'],
+              cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1 },
+              contextWindow: 200000,
+              maxTokens: 32000,
+            } as any
+          : undefined;
+      },
+    };
+    try {
+      const resolved = resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-4-8');
+      expect(resolved?.isConfiguredFallback).toBe(false);
+      expect(resolved?.needsCustomModel).toBe(true);
+      expect(resolved?.model.contextWindow).toBe(180000);
+      expect(resolved?.model.maxTokens).toBe(24000);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('applies explicit Server vision declarations to exact and template models without changing omitted capabilities', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgvisionoverride';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              anthropic: [
+                { id: 'exact-preserved', name: 'Exact Preserved' },
+                { id: 'exact-text', name: 'Exact Text', supportsVision: false },
+                { id: 'exact-vision', name: 'Exact Vision', maxInputImages: 20 },
+                {
+                  id: 'future-vision',
+                  name: 'Future Vision',
+                  template: 'template-text',
+                  supportsVision: true,
+                },
+                {
+                  id: 'future-text',
+                  name: 'Future Text',
+                  template: 'template-vision',
+                  maxInputImages: 0,
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const model = (id: string, input: ('text' | 'image')[]) => ({
+      id,
+      name: id,
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+      reasoning: true,
+      input,
+      cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1 },
+      contextWindow: 200000,
+      maxTokens: 32000,
+    });
+    const known = new Map([
+      ['exact-preserved', model('exact-preserved', ['text', 'image'])],
+      ['exact-text', model('exact-text', ['text', 'image'])],
+      ['exact-vision', model('exact-vision', ['text'])],
+      ['template-text', model('template-text', ['text'])],
+      ['template-vision', model('template-vision', ['text', 'image'])],
+    ]);
+    const catalog = {
+      getPiModel(provider: string, modelId: string) {
+        return provider === 'anthropic' ? known.get(modelId) as any : undefined;
+      },
+    };
+    try {
+      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'exact-preserved')).toMatchObject({
+        needsCustomModel: false,
+        model: { input: ['text', 'image'] },
+      });
+      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'exact-text')).toMatchObject({
+        needsCustomModel: true,
+        model: { input: ['text'] },
+      });
+      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'exact-vision')).toMatchObject({
+        needsCustomModel: true,
+        model: { input: ['text', 'image'] },
+      });
+      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'future-vision')).toMatchObject({
+        needsCustomModel: true,
+        templateModelId: 'template-text',
+        model: { input: ['text', 'image'] },
+      });
+      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'future-text')).toMatchObject({
+        needsCustomModel: true,
+        templateModelId: 'template-vision',
+        model: { input: ['text'] },
+      });
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('resolves configured model ids by cloning an explicit pi-ai template alias', () => {
+    const template = {
+      id: 'kimi-for-coding',
+      name: 'Kimi For Coding',
+      api: 'anthropic-messages',
+      provider: 'kimi-coding',
+      baseUrl: 'https://api.kimi.com/coding',
+      headers: { 'User-Agent': 'KimiCLI/1.5' },
+      reasoning: true,
+      input: ['text', 'image'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 262144,
+      maxTokens: 32768,
+    };
+    const catalog = {
+      getPiModel(provider: string, model: string) {
+        return provider === 'kimi-coding' && model === 'kimi-for-coding'
+          ? template as any
+          : undefined;
+      },
+    };
+
+    for (const modelId of ['k2p7', 'k2p6']) {
+      const resolved = resolveConfiguredPiModel(catalog, 'kimi-coding', modelId);
+      expect(resolved?.needsCustomModel).toBe(true);
+      expect(resolved?.isConfiguredFallback).toBe(true);
+      expect(resolved?.templateModelId).toBe('kimi-for-coding');
+      expect(resolved?.model.id).toBe('k2p7');
+      expect(resolved?.model.name).toBe('Kimi K2.7 Code');
+      expect(resolved?.model.api).toBe('anthropic-messages');
+      expect(resolved?.model.provider).toBe('kimi-coding');
+    }
+  });
+});
+
+describe('provider_catalog › modelCatalogEntryFromModel', () => {
+  it('maps pi-ai window fields to a core-agent catalog entry (maxTokens → maxOutputTokens)', () => {
+    expect(modelCatalogEntryFromModel({ contextWindow: 1_048_576, maxTokens: 32_768 })).toEqual({
+      contextWindow: 1_048_576,
+      maxOutputTokens: 32_768,
+    });
+  });
+
+  it('drops missing or non-positive fields so the runner keeps its fallback for them', () => {
+    expect(modelCatalogEntryFromModel({ contextWindow: 200_000 })).toEqual({ contextWindow: 200_000 });
+    expect(modelCatalogEntryFromModel({ maxTokens: 8_192 })).toEqual({ maxOutputTokens: 8_192 });
+    // Zero/negative are not real windows — treat as unknown.
+    expect(modelCatalogEntryFromModel({ contextWindow: 0, maxTokens: -1 })).toBeNull();
+  });
+
+  // Two catalog rows shipped as contextWindow 256000 / maxTokens 256000. Every
+  // provider this host talks to shares the window between input and output,
+  // so that row left 1,024 tokens of usable input: a 61-token compaction
+  // trigger and an emergency reduction on every request. The row is still
+  // usable once the impossible limit is dropped — the runner reserves its
+  // default output allowance — and the caller must be able to report it.
+  it('drops an output limit that is not smaller than the window and lets the caller report it', () => {
+    const row = { contextWindow: 256_000, maxTokens: 256_000 };
+    expect(modelOutputLimitExceedsWindow(row)).toBe(true);
+    expect(modelCatalogEntryFromModel(row)).toEqual({ contextWindow: 256_000 });
+    expect(modelOutputLimitExceedsWindow({ contextWindow: 256_000, maxTokens: 300_000 })).toBe(true);
+    // A limit inside the window is a normal row.
+    expect(modelOutputLimitExceedsWindow({ contextWindow: 256_000, maxTokens: 255_999 })).toBe(false);
+    expect(modelCatalogEntryFromModel({ contextWindow: 256_000, maxTokens: 255_999 }))
+      .toEqual({ contextWindow: 256_000, maxOutputTokens: 255_999 });
+    // Without a window there is nothing to compare against.
+    expect(modelOutputLimitExceedsWindow({ maxTokens: 256_000 })).toBe(false);
+  });
+
+  it('returns null when nothing is known (so 200K fallback stays in effect)', () => {
+    expect(modelCatalogEntryFromModel(null)).toBeNull();
+    expect(modelCatalogEntryFromModel(undefined)).toBeNull();
+    expect(modelCatalogEntryFromModel({})).toBeNull();
+  });
+
+  it('a buildRunner-shaped catalog entry satisfies core-agent ModelConfigSchema', async () => {
+    // Regression for P1-6: buildRunner fills `models.catalog`, whose entries
+    // must satisfy ModelConfigSchema (provider + model REQUIRED; windows
+    // optional). modelCatalogEntryFromModel supplies only the windows, so the
+    // caller MUST add provider/model — omitting them crashed createConfig with
+    // a Zod "provider/model Required" error once a candidate carried a window.
+    const { ModelConfigSchema } = await import('../../../src/core-agent/src/config/schema');
+    const windows = modelCatalogEntryFromModel({ contextWindow: 1_048_576, maxTokens: 32_768 });
+    // The shape buildRunner now writes — valid.
+    expect(ModelConfigSchema.safeParse({ provider: 'openai', model: 'gpt-5.5', ...windows }).success).toBe(true);
+    // The bug shape (window-only, no provider/model) — must NOT validate.
+    expect(ModelConfigSchema.safeParse({ ...windows }).success).toBe(false);
+    // The impossible row, sanitized by the mapper, is a valid entry; the same
+    // row written straight into a config is rejected by the library itself.
+    const sanitized = modelCatalogEntryFromModel({ contextWindow: 256_000, maxTokens: 256_000 });
+    expect(ModelConfigSchema.safeParse({ provider: 'doubao', model: 'seed', ...sanitized }).success).toBe(true);
+    expect(ModelConfigSchema.safeParse({
+      provider: 'doubao', model: 'seed', contextWindow: 256_000, maxOutputTokens: 256_000,
+    }).success).toBe(false);
+  });
 });
 
 describe('provider_catalog › labels and docs', () => {
@@ -1055,18 +1810,16 @@ describe('provider_catalog › labels and docs', () => {
     expect(providerDocsUrl('huggingface')).toBeUndefined();
   });
 
-  it('providerSubscriptionNote 在两条 Moonshot endpoint 上都给出明确前提', () => {
-    // 用户反馈：开放平台按量付费和 Moonshot Coding Plan 订阅是两套独立账户，
-    // 一张 key 不能两边通用。UI 必须在卡片/表单上把前提标清楚。
-    // catalog 把前提存成 i18n key（renderer 端 t() 翻译），这里验 key 命名
-    // 语义自带"paygo / subscription"区分，避免上线时两条混淆。
+  it('distinguishes Moonshot pay-as-you-go credentials from Coding Plan subscriptions', () => {
+    // These endpoints require distinct credentials. Their localized note keys
+    // must preserve the pay-as-you-go versus subscription distinction.
     expect(providerSubscriptionNote('moonshot')).toBe('provider.moonshot.note_paygo');
     expect(providerSubscriptionNote('kimi-coding')).toBe('provider.kimi_coding.note_subscription');
   });
 
-  it('providerSubscriptionNote 对没前提要求的 provider 返 undefined / 空串', () => {
-    // anthropic / openai 没声明 subscriptionNote → undefined；
-    // doubao 在 catalog 里显式写了空串占位 → 空串。两种都视为"无前提"。
+  it('keeps providers without subscription prerequisites free of a subscription note', () => {
+    // Missing notes and the explicit empty Doubao placeholder both mean
+    // there is no subscription prerequisite.
     expect(providerSubscriptionNote('anthropic')).toBeUndefined();
     expect(providerSubscriptionNote('openai')).toBeUndefined();
     expect(providerSubscriptionNote('totally-unknown')).toBeUndefined();
@@ -1075,12 +1828,10 @@ describe('provider_catalog › labels and docs', () => {
 });
 
 describe('provider_catalog › EXTERNAL_API_PROVIDERS', () => {
-  it('列出所有走 Orkas 自建适配层的 provider（pi-ai 不认识）', () => {
-    // EXTERNAL_API_PROVIDERS 是 `listProviders` / `runner.ts::buildRunner` /
-    // `auth.ts::testConnection` 的分发依据——名单必须和 CATALOG 里真实
-    // 标记为"外部"的 provider 严格一致，否则会出现"能选但调用报
-    // No model found for provider"。
-    // 当前外部适配层还包含公开 Orkas API（OpenAI-compatible chat）。
+  it('lists providers routed through Orkas custom adapters', () => {
+    // EXTERNAL_API_PROVIDERS drives listProviders, runner build dispatch, and
+    // auth testConnection. It must match the CATALOG entries backed by custom
+    // adapters, otherwise a selectable provider can fail with "No model found".
     expect([...EXTERNAL_API_PROVIDERS]).toEqual([
       'orkas-api',
       'moonshot',
@@ -1090,11 +1841,10 @@ describe('provider_catalog › EXTERNAL_API_PROVIDERS', () => {
     ]);
   });
 
-  it('每个外部 provider 都在 CATALOG + CURATED_MODELS 有对应条目', () => {
+  it('keeps every external provider visible and every curated adapter modeled', () => {
     for (const id of EXTERNAL_API_PROVIDERS) {
-      const entry = CATALOG.find((p) => p.id === id);
-      expect(entry).toBeTruthy();
-      if (entry?.customOpenAICompatible) {
+      expect(CATALOG.find((p) => p.id === id)).toBeTruthy();
+      if (id === 'custom') {
         expect(CURATED_MODELS[id]).toBeUndefined();
       } else {
         expect(CURATED_MODELS[id]?.length).toBeGreaterThan(0);
@@ -1156,69 +1906,53 @@ describe('provider_catalog › pickLatestGenerations (fallback)', () => {
   });
 });
 
-describe('configured provider trust boundary',()=>{it('accepts safe Server-configured providers and rejects unsafe or reserved definitions', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'configuredopenaiproviders';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    storage.writeJsonSync(file, {
-      version: 1,
-      active: {
-        immediate: {
-          model_catalog: {
-            providers: {
-              acme: [
-                { id: 'acme-vision', name: 'Acme Vision', supportsVision: true, maxInputImages: 12 },
-                { id: 'acme-default', name: 'Acme Default' },
-                { id: 'acme-text', name: 'Acme Text', supportsVision: false },
-              ],
-              unsafe: [{ id: 'unsafe-model', name: 'Unsafe Model' }],
-              conflict: [{ id: 'conflict-model', supportsVision: false, maxInputImages: 3 }],
-            },
-            openai_compatible_providers: {
-              acme: {
-                label: 'Acme AI',
-                baseUrl: 'https://api.acme.example/v1/',
-                docsUrl: 'https://docs.acme.example/keys',
-              },
-              unsafe: { label: 'Unsafe', baseUrl: 'http://127.0.0.1:9000/v1' },
-              conflict: { label: 'Conflict', baseUrl: 'https://api.conflict.example/v1' },
-              openai: { label: 'Imposter', baseUrl: 'https://evil.example/v1' },
-            },
-          },
-        },
-      },
-    });
-    try {
-      expect(configuredOpenAICompatibleProviders()).toEqual([{
-        id: 'acme',
-        label: 'Acme AI',
-        baseUrl: 'https://api.acme.example/v1',
-        docsUrl: 'https://docs.acme.example/keys',
-      }]);
-      expect(getConfiguredOpenAICompatibleProvider('acme')).toMatchObject({ label: 'Acme AI' });
-      expect(getConfiguredOpenAICompatibleProvider('unsafe')).toBeNull();
-      expect(getConfiguredOpenAICompatibleProvider('conflict')).toBeNull();
-      expect(getConfiguredOpenAICompatibleProvider('openai')).toBeNull();
-      expect(isVisibleProvider('acme')).toBe(true);
-      expect(isKnownModelProvider('acme')).toBe(true);
-      expect(isUserAddableProvider('acme')).toBe(true);
-      expect(isExternalApiProvider('acme')).toBe(true);
-      expect(providerLabel('acme')).toBe('Acme AI');
-      expect(providerDocsUrl('acme')).toBe('https://docs.acme.example/keys');
-      expect(isSelectableModel('acme', 'acme-vision')).toBe(true);
-      expect(isSelectableModel('acme', 'not-configured')).toBe(false);
-      expect(curatedModelsFor('acme')).toEqual([
-        { id: 'acme-vision', name: 'Acme Vision', supportsVision: true, maxInputImages: 12 },
-        { id: 'acme-default', name: 'Acme Default' },
-        { id: 'acme-text', name: 'Acme Text', supportsVision: false },
-      ]);
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
-  });});
+
+it('describes the existing public API models with their product-facing names', () => {
+    expect(providerLabel('orkas-api')).toBe('Orkas');
+    expect(curatedModelsFor('orkas-api')).toEqual([
+      expect.objectContaining({
+        id: 'orkas-llm-1.5',
+        name: 'Orkas-1.5',
+        recommended: true,
+        includedModels: ['DeepSeek V4.1 Flash', 'GPT-6 Luna', 'Claude-Sonnet-5', 'Gemini-3.8 Flash'],
+      }),
+      expect.objectContaining({
+        id: 'orkas-llm-1.5-pro',
+        name: 'Orkas-1.5 Pro',
+        includedModels: ['GPT-6.1 Sol', 'Claude Opus 5.5', 'Kimi K3'],
+      }),
+    ]);
+  });
+
+
+it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
+    const ids = (CURATED_MODELS.openrouter || []).map((m) => m.id);
+    expect(ids.some((id) => id.startsWith('deepseek/'))).toBe(true);
+    expect(ids.some((id) => id.startsWith('qwen/'))).toBe(true);
+    expect(ids.some((id) => id.startsWith('z-ai/'))).toBe(true);
+    expect(ids.some((id) => id.startsWith('moonshotai/'))).toBe(true);
+    expect(ids.some((id) => id.startsWith('minimax/'))).toBe(true);
+    expect(ids).toContain('minimax/minimax-m3');
+    expect(ids).toContain('minimax/minimax-m2.7');
+  });
+
+
+it('openrouter Claude shortcuts keep every Claude 5 variant', () => {
+    const claudeIds = (CURATED_MODELS.openrouter || [])
+      .map((m) => m.id)
+      .filter((id) => id.includes('/claude-'));
+    expect(claudeIds).toEqual([
+      'anthropic/claude-opus-5.5',
+      'anthropic/claude-opus-5',
+      'anthropic/claude-fable-5.2',
+      'anthropic/claude-fable-5.1',
+      'anthropic/claude-fable-5',
+      'anthropic/claude-sonnet-5.5',
+      'anthropic/claude-sonnet-5',
+      'anthropic/claude-haiku-5.5',
+    ]);
+  });
+
 
 describe('current public model upgrade aliases', () => {
   it.each([
@@ -1232,82 +1966,11 @@ describe('current public model upgrade aliases', () => {
   });
 });
 
-describe('configured provider capability declaration',()=>{
-it('accepts the complete capability-field matrix and rejects conflicts or invalid field types', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'configuredcapabilitymatrix';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    const cases: Array<{
-      id: string;
-      supportsVision?: unknown;
-      maxInputImages?: unknown;
-      accepted: boolean;
-    }> = [
-      { id: 'omitted-omitted', accepted: true },
-      { id: 'omitted-zero', maxInputImages: 0, accepted: true },
-      { id: 'omitted-positive', maxInputImages: 12, accepted: true },
-      { id: 'true-omitted', supportsVision: true, accepted: true },
-      { id: 'true-zero', supportsVision: true, maxInputImages: 0, accepted: false },
-      { id: 'true-positive', supportsVision: true, maxInputImages: 12, accepted: true },
-      { id: 'false-omitted', supportsVision: false, accepted: true },
-      { id: 'false-zero', supportsVision: false, maxInputImages: 0, accepted: true },
-      { id: 'false-positive', supportsVision: false, maxInputImages: 12, accepted: false },
-      { id: 'invalid-omitted', supportsVision: 'yes', accepted: false },
-      { id: 'invalid-zero', supportsVision: 'yes', maxInputImages: 0, accepted: false },
-      { id: 'invalid-positive', supportsVision: 'yes', maxInputImages: 12, accepted: false },
-      { id: 'invalid-invalid', supportsVision: 'yes', maxInputImages: '12', accepted: false },
-      { id: 'omitted-invalid', maxInputImages: '12', accepted: false },
-      { id: 'true-invalid', supportsVision: true, maxInputImages: '12', accepted: false },
-      { id: 'false-invalid', supportsVision: false, maxInputImages: '12', accepted: false },
-      { id: 'negative-limit', maxInputImages: -1, accepted: false },
-      { id: 'fractional-limit', maxInputImages: 1.5, accepted: false },
-      { id: 'boolean-limit', maxInputImages: true, accepted: false },
-      { id: 'null-limit', maxInputImages: null, accepted: false },
-      { id: 'object-limit', maxInputImages: { count: 12 }, accepted: false },
-    ];
-    const models = Object.fromEntries(cases.map((entry) => [entry.id, [{
-      id: `${entry.id}-model`,
-      ...(entry.supportsVision !== undefined ? { supportsVision: entry.supportsVision } : {}),
-      ...('maxInputImages' in entry ? { maxInputImages: entry.maxInputImages } : {}),
-    }]]));
-    const definitions = Object.fromEntries(cases.map((entry) => [entry.id, {
-      label: entry.id,
-      baseUrl: `https://api.${entry.id}.example/v1`,
-    }]));
-    storage.writeJsonSync(file, {
-      version: 1,
-      active: {
-        immediate: {
-          model_catalog: {
-            providers: models,
-            openai_compatible_providers: definitions,
-          },
-        },
-      },
-    });
-    try {
-      expect(configuredOpenAICompatibleProviders().map((provider) => provider.id)).toEqual(
-        cases.filter((entry) => entry.accepted).map((entry) => entry.id),
-      );
-      for (const entry of cases) {
-        const provider = getConfiguredOpenAICompatibleProvider(entry.id);
-        if (entry.accepted) {
-          expect(provider, entry.id).not.toBeNull();
-        } else {
-          expect(provider, entry.id).toBeNull();
-        }
-      }
-      expect(curatedModelsFor('false-zero')).toEqual([{
-        id: 'false-zero-model',
-        name: 'false-zero-model',
-        supportsVision: false,
-        maxInputImages: 0,
-      }]);
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
-  });
+
+it('static OAuth capabilities match installed native providers and the two local MiniMax adapters', async () => {
+  const { builtinProviders } = await import('@earendil-works/pi-ai/providers/all');
+  const { OAUTH_PROVIDERS } = await import('../../../src/main/model/provider_catalog');
+  const native = builtinProviders().filter(provider => !!provider.auth.oauth).map(provider => provider.id);
+  const declared = OAUTH_PROVIDERS.filter(provider => provider.supportsOAuth !== false).map(provider => provider.id);
+  expect([...declared].sort()).toEqual([...native, 'minimax-portal', 'minimax-portal-cn'].sort());
 });

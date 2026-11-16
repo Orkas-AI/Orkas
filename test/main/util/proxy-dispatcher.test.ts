@@ -138,7 +138,7 @@ describe('Electron system-proxy transport failures', () => {
       await Promise.all([new Promise<void>(resolve => server.close(() => resolve())), new Promise<void>(resolve => proxy.close(() => resolve()))]);
     }
   });
-  it.each(['success', 'abort', 'error'] as const)('tracks Chromium upload bytes and disposes polling on %s without a direct fallback', async outcome => {
+  it.each(['success', 'rejected', 'abort', 'error', 'response-error', 'response-aborted'] as const)('awaits the Chromium upload receipt after writable close and disposes polling on %s without a direct fallback', async outcome => {
     vi.useFakeTimers();
     const request = Object.assign(new EventEmitter(), {
       getUploadProgress: vi.fn(() => ({active: true, started: true, current: 4, total: 8})),
@@ -152,22 +152,33 @@ describe('Electron system-proxy transport failures', () => {
       await installSystemProxyDispatcher(vi.fn(), async () => 'SOCKS5 proxy.example:1080');
       work = fetchUploadWithProxyPolicy('https://upload.example/chunk', {
         method: 'POST', body: '12345678', headers: {user_id: 'test', session_id: 'test-session'}, signal: controller.signal,
-      }, progress).then(response => response.text(), error => error.message);
+      }, progress).then(async response => ({status:response.status,body:await response.text()}), error => error.message);
       await vi.waitFor(() => expect(request.end).toHaveBeenCalled());
       await vi.advanceTimersByTimeAsync(100);
       expect(progress).toHaveBeenCalledWith(4, 8);
       expect(request.end).toHaveBeenCalledWith(Buffer.from('12345678'));
       expect(request.setHeader).toHaveBeenCalledWith('session_id', 'test-session');
-      if (outcome === 'success') {
-        const response = Object.assign(new EventEmitter(), {statusCode: 200, headers: {'Content-Type': ['application/json']}});
-        request.emit('response', response); response.emit('data', Buffer.from('ok')); response.emit('end');
-        expect(await work).toBe('ok');
+      // Captured in real Chromium: finish/close may precede response headers
+      // while the server has already accepted bytes.
+      request.emit('finish'); request.emit('close'); await Promise.resolve();
+      if (outcome === 'success' || outcome === 'rejected') {
+        const status = outcome === 'success' ? 200 : 409;
+        const response = Object.assign(new EventEmitter(), {statusCode: status, headers: {'Content-Type': ['application/json']}});
+        request.emit('response', response); response.emit('data', Buffer.from('receipt')); response.emit('end'); response.emit('close');
+        expect(await work).toEqual({status,body:'receipt'});
       } else if (outcome === 'abort') {
         controller.abort(new Error('cancelled'));
         expect(await work).toBe('cancelled'); expect(request.abort).toHaveBeenCalledOnce();
-      } else {
+      } else if (outcome === 'error') {
         request.emit('error', new Error('proxy unavailable'));
         expect(await work).toBe('proxy unavailable');
+      } else {
+        const response = Object.assign(new EventEmitter(), {statusCode:200,headers:{}});
+        request.emit('response',response); response.emit('data',Buffer.from('partial'));
+        if(outcome === 'response-error')response.emit('error',new Error('response failed'));
+        else response.emit('aborted');
+        expect(await work).toBe(outcome === 'response-error' ? 'response failed'
+          : 'upload response aborted');
       }
       const count = progress.mock.calls.length;
       await vi.advanceTimersByTimeAsync(500);
@@ -181,7 +192,7 @@ describe('Electron system-proxy transport failures', () => {
     expect(classifyTransientNetworkError(rejection)).toBeNull();
 
     const normalized = normalizeElectronNetFetchError(rejection);
-    expect(normalized).toMatchObject({ code: 'ENETUNREACH', cause: rejection });
+    expect(normalized).toMatchObject({ code: 'EHOSTUNREACH', cause: rejection });
     expect(classifyTransientNetworkError(normalized)).toBe('network');
   });
 

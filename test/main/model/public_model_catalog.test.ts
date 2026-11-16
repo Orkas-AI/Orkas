@@ -41,6 +41,7 @@ describe('public model catalog', () => {
     expect(PUBLIC_PROVIDER_MODELS.anthropic?.map((model) => model.id)).toEqual([
       'claude-opus-5-5',
       'claude-opus-5',
+      'claude-fable-5-2',
       'claude-fable-5-1',
       'claude-fable-5',
       'claude-sonnet-5-5',
@@ -124,6 +125,7 @@ describe('public model catalog', () => {
     expect(PUBLIC_PROVIDER_MODELS.openrouter?.map((model) => model.id)).toEqual([
       'anthropic/claude-opus-5.5',
       'anthropic/claude-opus-5',
+      'anthropic/claude-fable-5.2',
       'anthropic/claude-fable-5.1',
       'anthropic/claude-fable-5',
       'anthropic/claude-sonnet-5.5',

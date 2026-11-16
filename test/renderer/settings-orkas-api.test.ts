@@ -116,6 +116,84 @@ function loadQuickSetupHarness(language = 'en') {
 }
 
 describe('Orkas public API quick setup', () => {
+  it.each([
+    { kind: 'image', initial: 'openai:gpt-image-2', next: 'google:gemini-3.1-flash-image-preview' },
+    { kind: 'search', initial: 'tavily', next: 'deepseek' },
+  ])('clears the previous key error when changing the $kind service without sending credentials', async ({ kind, initial, next }) => {
+    const { context, elements, invoke } = loadQuickSetupHarness();
+    for (const suffix of ['provider', 'key-input', 'status', 'add-btn']) {
+      elements.set(`settings-${kind}-${suffix}`, new FakeElement());
+    }
+    let value = initial;
+    const callbacks: Array<(id: string) => unknown> = [];
+    context._aiSelectMount = () => ({
+      getValue: () => value,
+      setOptions: (_options: unknown, options: { value?: string }) => { value = options.value || value; },
+      onChange: (callback: (id: string) => unknown) => { callbacks.push(callback); },
+    });
+    const title = kind === 'image' ? 'Image' : 'Search';
+    vm.runInContext(`_settingsRender${title}Picker()`, context);
+    await vm.runInContext(`_settingsClickAdd${title}Key()`, context);
+    const status = elements.get(`settings-${kind}-status`)!;
+    expect(status.textContent).toBe(`settings.${kind}.error_key_needed`);
+    value = next;
+    for (const callback of callbacks) await callback(next);
+    expect(status.textContent).toBe('');
+    expect(status.className).toBe('settings-status');
+    expect(elements.get(`settings-${kind}-key-input`)!.value).toBe('');
+    expect(invoke).not.toHaveBeenCalledWith(`${kind}Auth.add`, expect.anything());
+  });
+
+  it('keeps configured speech voice identifiers out of visible rows while retaining model and account details', () => {
+    const { context, elements } = loadQuickSetupHarness();
+    vm.runInContext(`
+      _settingsAttachReorderDnd = () => {};
+      _settingsState.ttsPresets = [{ id: 'openai', label: 'OpenAI' }];
+      _settingsState.ttsProfiles = [{ id: 'speech-personal', provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini-tts', voice: 'alloy',
+        format: 'mp3', resourceId: '', workspaceId: '', label: 'Personal voice',
+        createdAt: 1, apiKeyMasked: 'synthetic-mask' }];
+      _settingsRenderTtsEntries();
+    `, context);
+    const primary = elements.get('settings-tts-entries')!.children[0]!.children[1]!.children[0]!;
+    expect(primary.innerHTML).toContain('>gpt-4o-mini-tts</span>');
+    expect(primary.innerHTML).not.toContain('alloy');
+    expect(primary.innerHTML).toContain('@ Personal voice</span>');
+    expect(primary.innerHTML).toContain('synthetic-mask');
+  });
+
+  it('keeps a retired saved video service removable below active services and out of priority or drag ordering', async () => {
+    const { context, elements, invoke } = loadQuickSetupHarness();
+    const bindings: Array<{ id: string; getIds: () => string[] }> = [];
+    context.recordReorder = (_row: unknown, options: { id: string; getIds: () => string[] }) => bindings.push(options);
+    vm.runInContext(`
+      _settingsAttachReorderDnd = recordReorder;
+      _settingsState.videoProfiles = [
+        { id: 'video-retired', provider: 'google', model: 'veo-3.1-generate-preview',
+          label: 'Old video', createdAt: 1, apiKeyMasked: 'synthetic-mask',
+          available: false, selectable: false, availability: 'model_unavailable' },
+        { id: 'video-first', provider: 'doubao', model: 'doubao-seedance-2-5-260628',
+          label: 'First video', createdAt: 2, apiKeyMasked: 'synthetic-mask', available: true },
+        { id: 'video-second', provider: 'kling', model: 'kling-v4-0',
+          label: 'Second video', createdAt: 3, apiKeyMasked: 'synthetic-mask', available: true }
+      ];
+      _settingsRenderVideoEntries();
+    `, context);
+    const rows = elements.get('settings-video-entries')!.children;
+    expect(rows.map(row => row.dataset.profileId)).toEqual(['video-first', 'video-second', 'video-retired']);
+    expect(rows.map(row => row.children[0]!.textContent)).toEqual([
+      'settings.video.active_tag', '#2', 'new_chat.model_picker.unavailable',
+    ]);
+    expect(rows[0]!.className).toContain('is-default');
+    expect(rows[2]!.className).not.toContain('is-default');
+    expect(bindings.map(binding => binding.id)).toEqual(['video-first', 'video-second']);
+    for (const binding of bindings) expect(binding.getIds()).toEqual(['video-first', 'video-second']);
+    const remove = rows[2]!.children[2]!.children[0]!;
+    expect(remove.textContent).toBe('settings.delete');
+    await remove.click();
+    expect(invoke).toHaveBeenCalledWith('videoAuth.remove', { id: 'video-retired' });
+  });
+
   it('uses the approved maximum saving in every locale and the initial settings paint', () => {
     const html = readFileSync(resolve(__dirname, '../../src/renderer/index.html'), 'utf8');
     for (const { code } of LOCALES) {

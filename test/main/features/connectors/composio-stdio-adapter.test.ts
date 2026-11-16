@@ -94,6 +94,26 @@ function loadMcpHandlers() {
 }
 
 describe('Composio stdio proxy adapter', () => {
+  it('preserves file content inputs and downloadable file receipts without exposing host paths', async () => {
+    configureAdapterEnv();
+    const adapter = loadAdapter();
+    const file = { name: 'report.pdf', mimetype: 'application/pdf', content_base64: 'JVBERgAB' };
+    const uploaded = { successful: true, data: { id: 'drive-file', parents: ['folder-1'] } };
+    const request = vi.fn(async (_path: string, _body: Record<string, unknown>) => ({ result: uploaded }));
+    const result = await adapter.callComposioTool('GOOGLEDRIVE_UPLOAD_FILE', {
+      file_to_upload: file, folder_to_upload_to: 'folder-1',
+    }, request);
+    expect(request.mock.calls[0][1]).toMatchObject({ arguments: { file_to_upload: file, folder_to_upload_to: 'folder-1' } });
+    expect(JSON.parse((result.content as any)[0].text)).toEqual(uploaded);
+    const download = { successful: true, data: { file: {
+      name: 'report.pdf', mimetype: 'application/pdf', s3url: 'https://files.example/temporary-file',
+    } } };
+    const read = await adapter.callComposioTool('GMAIL_GET_ATTACHMENT', {
+      message_id: 'message', attachment_id: 'attachment', file_name: 'report.pdf',
+    }, async () => ({ result: download }));
+    expect(JSON.parse((read.content as any)[0].text)).toEqual(download);
+  });
+
   it('keeps the Server execution deadline inside the adapter deadline', () => {
     const adapter = loadAdapter();
     expect(adapter.TOOLS_REQUEST_TIMEOUT_MS).toBe(25_000);

@@ -1,4 +1,4 @@
-import * as fs from 'node:fs';
+import { fileSystemForPath } from '../util/user-file-fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -230,7 +230,7 @@ export interface LocationOnlyRead {
 }
 
 function realpathOr(candidate: string): string {
-  try { return fs.realpathSync.native(candidate); }
+  try { return fileSystemForPath(candidate).realpathSync.native(candidate); }
   catch { return candidate; }
 }
 
@@ -249,7 +249,7 @@ export function locationOnlyRead(
   const realPath = realpathOr(lexical);
   if (realPath !== lexical && intrinsicReasons(realPath).length) return undefined;
   let isDirectory = false;
-  try { isDirectory = fs.statSync(realPath).isDirectory(); }
+  try { isDirectory = fileSystemForPath(realPath).statSync(realPath).isDirectory(); }
   catch { /* a missing path is read as a file in its parent */ }
   const folder = isDirectory ? lexical : path.dirname(lexical);
   return { folder, realPath, realFolder: isDirectory ? realPath : realpathOr(folder) };

@@ -12,6 +12,7 @@ import { getActiveUserId, hasActiveUser } from './users';
 import { userRemoteConfigFile } from '../paths';
 import { readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
+import { logErrorSummary } from '../util/log-redact';
 import { fetchAndReadWithRetry } from '../util/retry';
 import { desktopPlatform } from '../system_info';
 import { withCommonHeaders } from './api_common';
@@ -22,9 +23,10 @@ export type { RetryErrorPolicyConfig } from '../../core-agent/src/shared/errors'
 export type { ProviderModelEntry } from '../model/public_model_catalog';
 
 export type ClientConfigEffect = 'immediate' | 'restart';
+export type ClientConfigDefaultValue<T> = T | (() => T);
 
 export interface ClientConfigDefinition<T = unknown> {
-  defaultValue: T;
+  defaultValue: ClientConfigDefaultValue<T>;
   effect?: ClientConfigEffect;
   merge?: (defaultValue: T, serverValue: unknown) => T;
 }
@@ -40,7 +42,13 @@ export type ClientConfigListener<T = unknown> = (value: T | undefined, key: stri
 export type ClientConfigAnyListener = (keys: string[], values: Record<string, unknown>) => void;
 
 type ConfigRefreshReason = 'startup' | 'return' | 'manual';
-type ConfigRefreshResult = { updated: boolean; notModified?: boolean; skipped?: boolean; error?: string };
+type ConfigRefreshResult = {
+  updated: boolean;
+  notModified?: boolean;
+  skipped?: boolean;
+  stale?: boolean;
+  error?: string;
+};
 type ElectronAppLike = {
   isPackaged: boolean;
   getVersion(): string;
@@ -54,6 +62,10 @@ type ElectronPowerMonitorLike = {
 };
 
 const log = createLogger('client-config');
+
+function configFailureDiagnostic(error: unknown): Record<string, unknown> {
+  return logErrorSummary(error, { closed: true });
+}
 const CLIENT_CONFIG_REFRESH_TIMEOUT_MS = 60_000;
 const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const PROD_DEFAULT = 'https://orkas.ai/api';
@@ -206,7 +218,7 @@ export class ClientConfigManager {
 
   registerDefault<T>(
     key: string,
-    defaultValue: T,
+    defaultValue: ClientConfigDefaultValue<T>,
     options: Omit<ClientConfigDefinition<T>, 'defaultValue'> = {},
   ): void {
     const k = normalizeKey(key);
@@ -262,9 +274,15 @@ export class ClientConfigManager {
     }
   }
 
+  private resolveDefault<T = unknown>(definition: ClientConfigDefinition<T> | undefined, fallback?: T): T | undefined {
+    if (!definition) return fallback;
+    const value = definition.defaultValue;
+    return (typeof value === 'function' ? (value as () => T)() : value) as T;
+  }
+
   getDefault<T = unknown>(key: string): T | undefined {
-    const definition = this.definitions.get(normalizeKey(key));
-    return definition?.defaultValue as T | undefined;
+    const definition = this.definitions.get(normalizeKey(key)) as ClientConfigDefinition<T> | undefined;
+    return this.resolveDefault(definition);
   }
 
   getServerValue(key: string): unknown {
@@ -288,15 +306,19 @@ export class ClientConfigManager {
   get<T = unknown>(key: string, fallback?: T): T | undefined {
     const k = normalizeKey(key);
     if (!k) return fallback;
-    const definition = this.definitions.get(k);
-    if (this.hasServerValue(k)) {
-      const serverValue = this.getServerValue(k);
+    const definition = this.definitions.get(k) as ClientConfigDefinition<T> | undefined;
+    const defaultValue = this.resolveDefault(definition, fallback);
+    const cache = readRemoteConfigCache();
+    const source = own(cache.active.immediate, k) ? cache.active.immediate : cache.active.restart;
+    if (own(source, k)) {
+      // Callers and custom merge functions own their value, never the cached snapshot.
+      const serverValue = structuredClone(source[k]);
       if (definition?.merge) {
-        return definition.merge(definition.defaultValue, serverValue) as T;
+        return definition.merge(defaultValue as T, serverValue) as T;
       }
       return serverValue as T;
     }
-    if (definition) return definition.defaultValue as T;
+    if (definition) return defaultValue;
     return fallback;
   }
 
@@ -492,14 +514,14 @@ export async function refresh(
         log.debug('client config not modified', { reason });
         return { updated: false, notModified: true };
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
       if (!parsed.ok) throw parsed.error;
       const body = parsed.body;
       if (body.code !== 0) throw new Error(String(body.msg || body.code || 'client config error'));
       return { updated: applyPayload(body, etag) };
     } catch (err) {
       const error = (err as Error)?.message || String(err);
-      log.warn('client config refresh failed', { reason, error });
+      log.warn('client config refresh failed', { diagnostic_id: 'D301', reason, error: configFailureDiagnostic(err) });
       return { updated: false, error };
     }
   })();
@@ -530,7 +552,7 @@ export function start(opts: ClientConfigStartOptions = {}): void {
         log.info('promoted pending restart config');
       }
     } catch (err) {
-      log.warn('promote pending restart config failed', { error: (err as Error).message });
+      log.warn('promote pending restart config failed', { diagnostic_id: 'D303', error: configFailureDiagnostic(err) });
     }
     const runStartupRefresh = (): void => { void refresh('startup', { force: forceStartupRefresh }); };
     if (startupDelayMs > 0) {
@@ -544,7 +566,7 @@ export function start(opts: ClientConfigStartOptions = {}): void {
     powerMonitor.on('resume', onReturnToApp);
   }).catch((err) => {
     started = false;
-    log.warn('client config start failed', { error: (err as Error).message });
+    log.warn('client config start failed', { diagnostic_id: 'D304', error: configFailureDiagnostic(err) });
   });
 }
 
@@ -576,6 +598,40 @@ export interface GoogleConnectorsConfig {
   gmail: ConnectorSwitchState;
 }
 
+export type DcrConnectorCategory =
+  | 'developer'
+  | 'productivity'
+  | 'communication'
+  | 'search'
+  | 'data'
+  | 'commerce';
+
+export type ServerConnectorCategory = DcrConnectorCategory;
+
+export interface ServerDcrConnectorConfig {
+  id: string;
+  display_name: string;
+  icon_svg?: string;
+  category: DcrConnectorCategory;
+  description_zh: string;
+  description_en: string;
+  description_ja?: string;
+  description_pt?: string;
+  description_es?: string;
+  description_fr?: string;
+  description_ko?: string;
+  description_de?: string;
+  description_ru?: string;
+  description_it?: string;
+  requires_credits?: boolean;
+  auth_mode: 'mcp_dcr';
+  transport_template: {
+    kind: 'streamable-http';
+    url: string;
+    oauth_header_key?: string;
+  };
+}
+
 export interface ServerComposioToolConfig {
   slug: string;
   name?: string;
@@ -595,11 +651,17 @@ export interface ServerComposioConnectorConfig {
   id: string;
   display_name: string;
   icon_svg?: string;
-  category: 'developer' | 'productivity' | 'communication' | 'search' | 'data' | 'commerce';
+  category: ServerConnectorCategory;
   description_zh: string;
   description_en: string;
   description_ja?: string;
   description_pt?: string;
+  description_es?: string;
+  description_fr?: string;
+  description_ko?: string;
+  description_de?: string;
+  description_ru?: string;
+  description_it?: string;
   requires_credits: true;
   auth_mode: 'composio';
   composio: {
@@ -608,8 +670,13 @@ export interface ServerComposioConnectorConfig {
     tools?: ServerComposioToolConfig[];
   };
   transport_template: null;
-  usage_metering: { provider: 'composio'; credits_milli_per_call: number };
+  usage_metering: {
+    provider: 'composio';
+    credits_milli_per_call: number;
+  };
 }
+
+export type ServerConnectorCatalogConfig = ServerDcrConnectorConfig | ServerComposioConnectorConfig;
 
 export interface AppUpdatePolicyConfig {
   min_version: string;
@@ -643,6 +710,13 @@ interface ModelCatalogConfig {
   providers: Record<string, ProviderModelEntry[]>;
   openAICompatibleProviders: Record<string, OpenAICompatibleProviderConfig>;
   imageGeneration: Record<string, ImageGenCapability>;
+}
+
+function cloneProviderModelEntry(model: ProviderModelEntry): ProviderModelEntry {
+  return {
+    ...model,
+    ...(model.includedModels ? { includedModels: [...model.includedModels] } : {}),
+  };
 }
 
 const VALID_IMAGE_APIS = new Set(['openai', 'gemini', 'doubao']);
@@ -794,7 +868,7 @@ function normalizeImageGenCapability(value: unknown): ImageGenCapability | null 
     ? r.api as ImageGenCapability['api']
     : '';
   if (!model || !api) return null;
-  return { model, api, supportsEdit: (r.supports_edit ?? r.supportsEdit) === true };
+  return { model, api, supportsEdit: r.supports_edit === true };
 }
 
 function mergeProviderSection(target: Record<string, ProviderModelEntry[]>, value: unknown): void {
@@ -821,9 +895,12 @@ function normalizeModelCatalogConfig(raw: unknown): ModelCatalogConfig {
   const out = emptyModelCatalog();
   if (!raw || typeof raw !== 'object') return out;
   const r = raw as Record<string, unknown>;
-  mergeProviderSection(out.providers, r.providers ?? r.curated_models);
-  mergeOpenAICompatibleProviderSection(out.openAICompatibleProviders, r.openai_compatible_providers ?? r.openAICompatibleProviders);
-  mergeImageGenerationSection(out.imageGeneration, r.image_generation ?? r.imageGeneration);
+  mergeProviderSection(out.providers, r.providers);
+  mergeOpenAICompatibleProviderSection(
+    out.openAICompatibleProviders,
+    r.openai_compatible_providers,
+  );
+  mergeImageGenerationSection(out.imageGeneration, r.image_generation);
   return out;
 }
 
@@ -864,9 +941,82 @@ function mergeGoogleConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): Go
   };
 }
 
-const CONNECTOR_CATEGORIES = new Set([
-  'developer', 'productivity', 'communication', 'search', 'data', 'commerce',
+const DCR_CONNECTOR_CATEGORIES = new Set<DcrConnectorCategory>([
+  'developer',
+  'productivity',
+  'communication',
+  'search',
+  'data',
+  'commerce',
 ]);
+
+function normalizeServerDcrConnectorConfig(raw: unknown): ServerDcrConnectorConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === 'string' ? r.id.trim().toLowerCase() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id)) return null;
+  if (r.auth_mode !== 'mcp_dcr') return null;
+  const categoryRaw = typeof r.category === 'string' ? r.category.trim() : '';
+  const category = categoryRaw as DcrConnectorCategory;
+  if (!DCR_CONNECTOR_CATEGORIES.has(category)) return null;
+  const transport = r.transport_template as Record<string, unknown> | null;
+  if (!transport || transport.kind !== 'streamable-http') return null;
+  const url = typeof transport.url === 'string' ? transport.url.trim() : '';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return null;
+  } catch {
+    return null;
+  }
+  const displayName = typeof r.display_name === 'string' && r.display_name.trim() ? r.display_name.trim() : id;
+  const iconSvg = typeof r.icon_svg === 'string' && r.icon_svg.trim() ? r.icon_svg.trim() : undefined;
+  const oauthHeaderKey = typeof transport.oauth_header_key === 'string' && transport.oauth_header_key.trim()
+    ? transport.oauth_header_key.trim()
+    : undefined;
+  return {
+    id,
+    display_name: displayName,
+    ...(iconSvg ? { icon_svg: iconSvg } : {}),
+    category,
+    description_zh: typeof r.description_zh === 'string' ? r.description_zh.trim() : '',
+    description_en: typeof r.description_en === 'string' ? r.description_en.trim() : '',
+    description_ja: typeof r.description_ja === 'string' ? r.description_ja.trim() : '',
+    description_pt: typeof r.description_pt === 'string' ? r.description_pt.trim() : '',
+    description_es: typeof r.description_es === 'string' ? r.description_es.trim() : '',
+    description_fr: typeof r.description_fr === 'string' ? r.description_fr.trim() : '',
+    description_ko: typeof r.description_ko === 'string' ? r.description_ko.trim() : '',
+    description_de: typeof r.description_de === 'string' ? r.description_de.trim() : '',
+    description_ru: typeof r.description_ru === 'string' ? r.description_ru.trim() : '',
+    description_it: typeof r.description_it === 'string' ? r.description_it.trim() : '',
+    ...(typeof r.requires_credits === 'boolean' ? { requires_credits: r.requires_credits } : {}),
+    auth_mode: 'mcp_dcr',
+    transport_template: {
+      kind: 'streamable-http',
+      url,
+      ...(oauthHeaderKey ? { oauth_header_key: oauthHeaderKey } : {}),
+    },
+  };
+}
+
+function normalizeServerDcrConnectorsConfig(raw: unknown): ServerDcrConnectorConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ServerDcrConnectorConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const entry = normalizeServerDcrConnectorConfig(item);
+    if (!entry || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
+  }
+  return out;
+}
+
+function mergeServerDcrConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): ServerDcrConnectorConfig[] {
+  const byId = new Map<string, ServerDcrConnectorConfig>();
+  for (const entry of normalizeServerDcrConnectorsConfig(baseRaw)) byId.set(entry.id, entry);
+  for (const entry of normalizeServerDcrConnectorsConfig(overrideRaw)) byId.set(entry.id, entry);
+  return Array.from(byId.values());
+}
 
 function normalizeComposioToolConfig(raw: unknown): ServerComposioToolConfig | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -915,39 +1065,51 @@ function normalizeComposioToolConfig(raw: unknown): ServerComposioToolConfig | n
   };
 }
 
-function normalizeServerComposioConnector(raw: unknown): ServerComposioConnectorConfig | null {
+function normalizeServerComposioConnectorConfig(raw: unknown): ServerComposioConnectorConfig | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const value = raw as Record<string, unknown>;
-  const id = typeof value.id === 'string' ? value.id.trim().toLowerCase() : '';
-  const category = typeof value.category === 'string' ? value.category.trim() : '';
-  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id) || !CONNECTOR_CATEGORIES.has(category)) return null;
-  if (value.auth_mode !== 'composio') return null;
-  const composio = value.composio && typeof value.composio === 'object' && !Array.isArray(value.composio)
-    ? value.composio as Record<string, unknown>
-    : value;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === 'string' ? r.id.trim().toLowerCase() : '';
+  if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(id)) return null;
+  if (r.auth_mode !== 'composio') return null;
+  const categoryRaw = typeof r.category === 'string' ? r.category.trim() : '';
+  const category = categoryRaw as ServerConnectorCategory;
+  if (!DCR_CONNECTOR_CATEGORIES.has(category)) return null;
+  const composio = r.composio && typeof r.composio === 'object' && !Array.isArray(r.composio)
+    ? r.composio as Record<string, unknown>
+    : r;
   const toolkit = typeof composio.toolkit === 'string' ? composio.toolkit.trim().toLowerCase() : '';
   const authConfigId = typeof composio.auth_config_id === 'string' ? composio.auth_config_id.trim() : '';
   if (!/^[a-z0-9][a-z0-9_-]{0,80}$/.test(toolkit) || !/^ac_[A-Za-z0-9_-]{6,}$/.test(authConfigId)) return null;
-  const metering = value.usage_metering as Record<string, unknown> | null | undefined;
+  const metering = r.usage_metering as Record<string, unknown> | null | undefined;
   const tariff = metering?.provider === 'composio' ? metering.credits_milli_per_call : undefined;
   const toolsRaw = Array.isArray(composio.tools) ? composio.tools : [];
   const tools = toolsRaw
     .map((tool) => normalizeComposioToolConfig(tool))
     .filter((tool): tool is ServerComposioToolConfig => !!tool);
+  const displayName = typeof r.display_name === 'string' && r.display_name.trim() ? r.display_name.trim() : id;
+  const iconSvg = typeof r.icon_svg === 'string' && r.icon_svg.trim() ? r.icon_svg.trim() : undefined;
   return {
     id,
-    display_name: typeof value.display_name === 'string' && value.display_name.trim()
-      ? value.display_name.trim()
-      : id,
-    ...(typeof value.icon_svg === 'string' && value.icon_svg.trim() ? { icon_svg: value.icon_svg.trim() } : {}),
-    category: category as ServerComposioConnectorConfig['category'],
-    description_zh: typeof value.description_zh === 'string' ? value.description_zh.trim() : '',
-    description_en: typeof value.description_en === 'string' ? value.description_en.trim() : '',
-    ...(typeof value.description_ja === 'string' ? { description_ja: value.description_ja.trim() } : {}),
-    ...(typeof value.description_pt === 'string' ? { description_pt: value.description_pt.trim() } : {}),
+    display_name: displayName,
+    ...(iconSvg ? { icon_svg: iconSvg } : {}),
+    category,
+    description_zh: typeof r.description_zh === 'string' ? r.description_zh.trim() : '',
+    description_en: typeof r.description_en === 'string' ? r.description_en.trim() : '',
+    description_ja: typeof r.description_ja === 'string' ? r.description_ja.trim() : '',
+    description_pt: typeof r.description_pt === 'string' ? r.description_pt.trim() : '',
+    description_es: typeof r.description_es === 'string' ? r.description_es.trim() : '',
+    description_fr: typeof r.description_fr === 'string' ? r.description_fr.trim() : '',
+    description_ko: typeof r.description_ko === 'string' ? r.description_ko.trim() : '',
+    description_de: typeof r.description_de === 'string' ? r.description_de.trim() : '',
+    description_ru: typeof r.description_ru === 'string' ? r.description_ru.trim() : '',
+    description_it: typeof r.description_it === 'string' ? r.description_it.trim() : '',
     requires_credits: true,
     auth_mode: 'composio',
-    composio: { toolkit, auth_config_id: authConfigId, ...(tools.length ? { tools } : {}) },
+    composio: {
+      toolkit,
+      auth_config_id: authConfigId,
+      ...(tools.length ? { tools } : {}),
+    },
     transport_template: null,
     usage_metering: {
       provider: 'composio',
@@ -957,28 +1119,30 @@ function normalizeServerComposioConnector(raw: unknown): ServerComposioConnector
   };
 }
 
-function normalizeServerComposioCatalog(raw: unknown): ServerComposioConnectorConfig[] {
+function normalizeServerConnectorCatalogConfig(raw: unknown): ServerConnectorCatalogConfig[] {
   if (!Array.isArray(raw)) return [];
-  const byId = new Map<string, ServerComposioConnectorConfig>();
+  const out: ServerConnectorCatalogConfig[] = [];
+  const seen = new Set<string>();
   for (const item of raw) {
-    const entry = normalizeServerComposioConnector(item);
-    if (entry) byId.set(entry.id, entry);
+    const entry = normalizeServerDcrConnectorConfig(item) || normalizeServerComposioConnectorConfig(item);
+    if (!entry || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
   }
-  return Array.from(byId.values());
+  return out;
 }
 
-function mergeServerComposioCatalog(baseRaw: unknown, overrideRaw: unknown): ServerComposioConnectorConfig[] {
-  const byId = new Map<string, ServerComposioConnectorConfig>();
-  for (const entry of normalizeServerComposioCatalog(baseRaw)) byId.set(entry.id, entry);
-  for (const entry of normalizeServerComposioCatalog(overrideRaw)) byId.set(entry.id, entry);
+function mergeServerConnectorCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ServerConnectorCatalogConfig[] {
+  const byId = new Map<string, ServerConnectorCatalogConfig>();
+  for (const entry of normalizeServerConnectorCatalogConfig(baseRaw)) byId.set(entry.id, entry);
+  for (const entry of normalizeServerConnectorCatalogConfig(overrideRaw)) byId.set(entry.id, entry);
   return Array.from(byId.values());
 }
 
 function normalizeAppUpdatePolicyConfig(raw: unknown): Partial<AppUpdatePolicyConfig> {
-  if (typeof raw === 'string') return { min_version: raw.trim() };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const r = raw as Record<string, unknown>;
-  const min = r.min_version ?? r.minimum_version ?? r.minimumVersion ?? r.minVersion;
+  const min = r.min_version;
   return typeof min === 'string' ? { min_version: min.trim() } : {};
 }
 
@@ -1065,10 +1229,21 @@ function mergeModelCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ModelC
   };
 }
 
-const DEFAULT_MODEL_CATALOG = normalizeModelCatalogConfig({
-  providers: DEFAULT_PROVIDER_MODELS,
-  image_generation: DEFAULT_IMAGE_GEN_BY_PROVIDER,
-});
+const DEFAULT_MODEL_CATALOG: ModelCatalogConfig = {
+  providers: Object.fromEntries(
+    Object.entries(DEFAULT_PROVIDER_MODELS).map(([providerId, models]) => [
+      providerId,
+      models.map(cloneProviderModelEntry),
+    ]),
+  ),
+  openAICompatibleProviders: {},
+  imageGeneration: Object.fromEntries(
+    Object.entries(DEFAULT_IMAGE_GEN_BY_PROVIDER).map(([providerId, capability]) => [
+      providerId,
+      { ...capability },
+    ]),
+  ),
+};
 
 clientConfig.registerDefault<ModelCatalogConfig>('model_catalog', DEFAULT_MODEL_CATALOG, {
   effect: 'immediate',
@@ -1085,9 +1260,14 @@ clientConfig.registerDefault<GoogleConnectorsConfig>('google_connectors', DEFAUL
   merge: mergeGoogleConnectorsConfig,
 });
 
-clientConfig.registerDefault<ServerComposioConnectorConfig[]>('connectors.catalog', [], {
+clientConfig.registerDefault<ServerDcrConnectorConfig[]>('connectors.dcr_catalog', [], {
   effect: 'immediate',
-  merge: mergeServerComposioCatalog,
+  merge: mergeServerDcrConnectorsConfig,
+});
+
+clientConfig.registerDefault<ServerConnectorCatalogConfig[]>('connectors.catalog', [], {
+  effect: 'immediate',
+  merge: mergeServerConnectorCatalogConfig,
 });
 
 clientConfig.registerDefault<boolean>('model.deepseek.enabled', true, {
@@ -1099,18 +1279,12 @@ clientConfig.registerDefault<AppUpdatePolicyConfig>('app_update', { min_version:
   merge: mergeAppUpdatePolicyConfig,
 });
 
-clientConfig.registerDefault<string>('app_update.min_version', '', {
-  effect: 'immediate',
-});
-
-clientConfig.registerDefault<QuickStartConfigEntry[]>(
-  'commander.quick_start',
-  DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry })),
-  {
+clientConfig.registerDefault<QuickStartConfigEntry[]>('commander.quick_start', () => (
+  DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry }))
+), {
   effect: 'immediate',
   merge: mergeQuickStartConfig,
-  },
-);
+});
 
 clientConfig.registerDefault<RetryErrorPolicyConfig>(
   'model.retry_error_policy',
@@ -1122,7 +1296,18 @@ clientConfig.registerDefault<RetryErrorPolicyConfig>(
 );
 
 function loadModelCatalog(): ModelCatalogConfig {
-  return normalizeModelCatalogConfig(clientConfig.get('model_catalog', DEFAULT_MODEL_CATALOG));
+  const cfg = clientConfig.get<ModelCatalogConfig>('model_catalog', DEFAULT_MODEL_CATALOG);
+  if (!cfg || typeof cfg !== 'object') return DEFAULT_MODEL_CATALOG;
+  return {
+    providers: cfg.providers && typeof cfg.providers === 'object' ? cfg.providers : DEFAULT_MODEL_CATALOG.providers,
+    openAICompatibleProviders: cfg.openAICompatibleProviders
+      && typeof cfg.openAICompatibleProviders === 'object'
+      ? cfg.openAICompatibleProviders
+      : DEFAULT_MODEL_CATALOG.openAICompatibleProviders,
+    imageGeneration: cfg.imageGeneration && typeof cfg.imageGeneration === 'object'
+      ? cfg.imageGeneration
+      : DEFAULT_MODEL_CATALOG.imageGeneration,
+  };
 }
 
 export function getConfiguredProviderModels(providerId: string): { models: ProviderModelEntry[] } | null {
@@ -1130,7 +1315,9 @@ export function getConfiguredProviderModels(providerId: string): { models: Provi
   if (!id) return null;
   const cfg = loadModelCatalog();
   if (!Object.prototype.hasOwnProperty.call(cfg.providers, id)) return null;
-  return { models: cfg.providers[id].map((m) => ({ ...m })) };
+  return {
+    models: cfg.providers[id].map(cloneProviderModelEntry),
+  };
 }
 
 export function getConfiguredImageGenCapability(providerId: string): ImageGenCapabilityOverride | null {
@@ -1149,8 +1336,17 @@ export function getGoogleConnectorsConfig(): GoogleConnectorsConfig {
   );
 }
 
-export function getServerConnectorCatalogConfig(): ServerComposioConnectorConfig[] {
-  return mergeServerComposioCatalog([], clientConfig.get('connectors.catalog', []));
+export function getServerDcrConnectorCatalogConfig(): ServerDcrConnectorConfig[] {
+  return mergeServerDcrConnectorsConfig([], clientConfig.get('connectors.dcr_catalog', []));
+}
+
+export function getServerConnectorCatalogConfig(): ServerConnectorCatalogConfig[] {
+  const unified = mergeServerConnectorCatalogConfig([], clientConfig.get('connectors.catalog', []));
+  const legacyDcr = getServerDcrConnectorCatalogConfig();
+  const byId = new Map<string, ServerConnectorCatalogConfig>();
+  for (const entry of legacyDcr) byId.set(entry.id, entry);
+  for (const entry of unified) byId.set(entry.id, entry);
+  return Array.from(byId.values());
 }
 
 export function isDeepSeekModelConfigEnabled(): boolean {
@@ -1158,8 +1354,6 @@ export function isDeepSeekModelConfigEnabled(): boolean {
 }
 
 export function getMinimumAppVersion(): string {
-  const direct = clientConfig.get<string>('app_update.min_version', '');
-  if (typeof direct === 'string' && direct.trim()) return direct.trim();
   const policy = mergeAppUpdatePolicyConfig(
     { min_version: '' },
     clientConfig.get('app_update', { min_version: '' }),
