@@ -105,7 +105,7 @@ describe('auth retained recovery boundaries', () => {
     const key = 'fixture-opaque-secret-123456';
     vi.doMock('#core-agent', async (importOriginal) => ({
       ...await importOriginal<typeof import('#core-agent')>(),
-      createPiProvider: () => ({ complete: async () => { throw new Error(`Rejected ${key} at https://private.fixture.example/v1?signature=secret`); } }),
+      createPiProvider: () => ({ async *stream() { throw new Error(`Rejected ${key} at https://private.fixture.example/v1?signature=secret`); } }),
     }));
     const auth = await import('../../../src/main/features/auth');
     const profile = await auth.addApiKey('openai', key);

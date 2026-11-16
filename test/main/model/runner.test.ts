@@ -69,7 +69,112 @@ async function loadRunner() {
   return import('../../../src/main/model/core-agent/runner');
 }
 
+function mockOAuthRefreshFailure(providerId: string, providerName: string): void {
+  vi.doMock('@earendil-works/pi-ai/oauth', () => {
+    const registry = new Map<string, any>();
+    registry.set(providerId, {
+      id: providerId,
+      name: providerName,
+      usesCallbackServer: true,
+      login: vi.fn(),
+      refreshToken: vi.fn(async () => {
+        throw new Error('refresh grant expired');
+      }),
+      getApiKey: (credentials: any) => credentials.access,
+    });
+    return {
+      getOAuthProvider: (id: string) => registry.get(id),
+      getOAuthProviders: () => Array.from(registry.values()),
+      registerOAuthProvider: (provider: any) => {
+        registry.set(provider.id, provider);
+      },
+    };
+  });
+}
+
+async function writeExpiredOAuthEntry({
+  providerId,
+  model,
+  uid,
+}: {
+  providerId: string;
+  model: string;
+  uid: string;
+}): Promise<void> {
+  const paths = await import('../../../src/main/paths');
+  const localSecrets = await import('../../../src/main/util/local-secret-store');
+  const file = paths.userAuthProfilesFile(uid);
+  const ctx = { namespace: 'auth.profiles', ownerId: uid, recordId: 'auth-profiles.json' };
+  const profileId = `${providerId}:default`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+    version: 4,
+    profiles: {
+      [profileId]: {
+        type: 'oauth',
+        provider: providerId,
+        label: 'default',
+        access: 'expired-access-token',
+        refresh: 'expired-refresh-token',
+        expires: Date.now() - 1000,
+        createdAt: 1,
+        lastUsed: 0,
+        accountId: 'acct-test',
+      },
+    },
+    entries: [{
+      entryId: `entry-${providerId}`,
+      provider: providerId,
+      model,
+      profileId,
+      createdAt: 1,
+      lastUsed: 0,
+    }],
+    searchProfiles: [],
+    imageProfiles: [],
+    videoProfiles: [],
+    ttsProfiles: [],
+  })), 'utf8');
+}
+
 describe('runner › buildRunner auth gate', () => {
+  it('retains the explicit user across active-account switches before deferred native/custom construction', async () => {
+    const createPiProvider = vi.fn(({ provider }: any) => ({ id: provider, name: 'Scope fixture',
+      complete: async () => ({ content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn' }),
+      async *stream() {}, validateAuth: async () => true }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const auth = await import('../../../src/main/features/auth');
+    const users = await import('../../../src/main/features/users');
+    const choices = ['openai', 'custom'].map(provider => ({ provider, model: provider === 'openai' ? 'gpt-6.1-sol' : 'fixture',
+      entryId: provider, profileId: provider, apiKey: 'shared-fixture-key',
+      ...(provider === 'custom' ? { customConfig: { protocol: 'responses' as const,
+        baseUrl: 'https://fixture.invalid/v1', contextWindow: 128000, maxTokens: 1024 } } : {}) }));
+    const pick = vi.spyOn(auth, 'pickChatEntryGroup');
+    const { buildRunner } = await loadRunner();
+    const keys: string[][] = [];
+    for (const uid of ['scope-user-a', 'scope-user-a', 'scope-user-b']) {
+      users.activateUser(uid);
+      const row: string[] = [];
+      for (const choice of choices) {
+        users.activateUser(uid);
+        pick.mockResolvedValue([choice]);
+        const built = await buildRunner({ sessionId: `gconv-scope-${keys.length}-${choice.provider}`, userId: uid });
+        users.activateUser('different-active-account');
+        await (built.runner as any).providers.get(choice.provider).complete({ model: choice.model,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'fixture' }] }] });
+        const config = createPiProvider.mock.calls.at(-1)![0];
+        expect(config.userCacheKey).toMatch(/^[a-f0-9]{64}$/);
+        expect(config.userCacheKey).not.toContain(uid);
+        row.push(config.userCacheKey);
+      }
+      expect(row[0]).toBe(row[1]);
+      keys.push(row);
+    }
+    expect(keys[0]).toEqual(keys[1]);
+    expect(keys[0][0]).not.toBe(keys[2][0]);
+  });
+
+
   it('forwards the caller failure observer through its real rotating provider without adding model metadata', async () => {
     const failure = { code: 'rate_limit_error', phase: 'after_response', elapsedMs: 12,
       httpStatus: 429, aborted: false, source: 'http', lastEvent: 'none', requestSequence: 1 };
@@ -95,6 +200,68 @@ describe('runner › buildRunner auth gate', () => {
     for await (const _ of provider.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })) { }
     expect(onRequestFailure).toHaveBeenCalledExactlyOnceWith(failure);
     expect(built.resolvedSystemPrompt).not.toContain('rate_limit_error');
+  });
+
+  it('uses configured candidate windows to skip an oversized prompt before constructing the provider', async () => {
+    const calls: any[] = [];
+    const createPiProvider = vi.fn(({ customModel }: any) => ({
+      id: 'custom', name: 'Capacity fixture',
+      async *stream(params: any) { calls.push(params); yield { type: 'text_delta', text: 'done' };
+        yield { type: 'message_end', model: customModel.id, stopReason: 'end_turn' }; },
+      complete: vi.fn(), validateAuth: vi.fn(),
+    }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const auth = await import('../../../src/main/features/auth');
+    const entries = [32000, 64000].map((contextWindow, index) => ({
+      entryId: `capacity-${index}`, profileId: `capacity-${index}`, provider: 'custom',
+      model: `capacity-${index}`, apiKey: 'synthetic',
+      customConfig: { protocol: 'openai' as const, baseUrl: 'https://capacity-fixture.invalid/v1', contextWindow, maxTokens: 1024 },
+    }));
+    const pick = vi.spyOn(auth, 'pickChatEntryGroup').mockResolvedValue(entries);
+    try {
+      const { buildRunner } = await loadRunner();
+      const built = await buildRunner({ sessionId: 'gconv-capacity-wiring', userId: RUNNER_TEST_UID });
+      const provider = (built.runner as any).providers.get('custom');
+      const systemPrompt = '汉'.repeat(20000);
+      for await (const _ of provider.stream({ model: entries[0].model, systemPrompt,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Complete the task' }] }] })) { }
+      expect(createPiProvider).toHaveBeenCalledTimes(1);
+      expect(createPiProvider).toHaveBeenCalledWith(expect.objectContaining({ customModel:
+        expect.objectContaining({ id: entries[1].model, contextWindow: 64000 }) }));
+      expect(calls[0].systemPrompt).toBe(systemPrompt);
+      expect(calls[0].requestMetadata.contextBudgetDiagnostics).toMatchObject({ budget_context_window: 64000, output_reservation: 1024 });
+    } finally { pick.mockRestore(); }
+  });
+
+  it('prices a same-name gateway fallback with its own limits instead of the first catalog row', async () => {
+    const createPiProvider = vi.fn(({ customModel }: any) => ({
+      id: 'custom', name: 'Capacity fixture',
+      async *stream() {
+        if (customModel.contextWindow === 272000) throw Object.assign(new Error('Synthetic throttle'), { status: 429 });
+        yield { type: 'text_delta', text: 'done' };
+        yield { type: 'message_end', model: customModel.id, stopReason: 'end_turn' };
+      }, complete: vi.fn(), validateAuth: vi.fn(),
+    }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const auth = await import('../../../src/main/features/auth');
+    const entries = [272000, 131072].map((contextWindow, index) => ({
+      entryId: `capacity-${index}`, profileId: `capacity-${index}`, provider: 'custom',
+      model: 'shared-model', apiKey: 'synthetic',
+      customConfig: { protocol: 'openai' as const, baseUrl: `https://capacity-${index}.invalid/v1`,
+        contextWindow, maxTokens: index === 0 ? 32000 : 32768 },
+    }));
+    const pick = vi.spyOn(auth, 'pickChatEntryGroup').mockResolvedValue(entries);
+    try {
+      const { buildRunner } = await loadRunner();
+      const built = await buildRunner({ sessionId: 'gconv-same-name-capacity', userId: RUNNER_TEST_UID });
+      const runner = built.runner as any;
+      const provider = runner.providers.get('custom');
+      for await (const _ of provider.stream({ model: 'shared-model',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Complete the task' }] }] })) { }
+      const nextBudget = provider.contextBudget?.() ?? runner.config.models.catalog[provider.contextBudgetModel()];
+      expect(nextBudget).toMatchObject({ contextWindow: 131072, maxOutputTokens: 32768 });
+      expect(createPiProvider).toHaveBeenCalledTimes(2);
+    } finally { pick.mockRestore(); }
   });
 
   it('propagates custom Anthropic metadata to the runner provider without catalog lookup', async () => {
@@ -207,7 +374,7 @@ describe('runner › buildRunner auth gate', () => {
     );
   });
 
-  it('reports a temporary model pause when the only configured entry has credential cooldown', async () => {
+  it('reports a temporary model pause without a retry countdown when the only configured entry has credential cooldown', async () => {
     const users = await import('../../../src/main/features/users');
     users.activateUser('runnercooldown');
     const i18n = await import('../../../src/main/i18n');
@@ -230,8 +397,93 @@ describe('runner › buildRunner auth gate', () => {
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toMatch(/configured model is temporarily unavailable/i);
+    expect(message).toMatch(/model credential is not usable/i);
     expect(message).not.toMatch(/30s|30 seconds|seconds?/i);
+  });
+
+  it('reports provider balance shortfall without status code or retry countdown for balance cooldown', async () => {
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('runnerbalance');
+    const i18n = await import('../../../src/main/i18n');
+    i18n.setCurrentLang('zh');
+    const auth = await import('../../../src/main/features/auth');
+    const cooldown = await import('../../../src/main/model/core-agent/profile-cooldown');
+
+    const profile = await auth.addApiKey('anthropic', 'k-balance-xxxxxxxx');
+    await auth.addEntry({
+      provider: 'anthropic',
+      model: 'claude-opus-4-8',
+      profileId: profile.profileId,
+    });
+    cooldown.markCooldown(profile.profileId, 'balance', '402 积分不足', 30_000);
+
+    const { buildRunner } = await loadRunner();
+    let message = '';
+    try {
+      await buildRunner({ sessionId: 'u1-gconv-x' });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('余额不足');
+    expect(message).toContain('这不是 Orkas 积分');
+    expect(message).not.toContain('402');
+    expect(message).not.toMatch(/\d+\s*秒/);
+  });
+
+  it.each(['rate_limit', 'auth', 'permission', 'balance'] as const)(
+    'preserves the %s cause when a configured model is blocked before dispatch', async (kind) => {
+      // The preflight block is asserted as the single error event below.
+      expectTestLog({ level: 'error', source: 'model', message: /^model turn stream error \{/ });
+      const createPiProvider = vi.fn();
+      vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+      const users = await import('../../../src/main/features/users');
+      users.activateUser('preflight-cause');
+      const auth = await import('../../../src/main/features/auth');
+      const cooldown = await import('../../../src/main/model/core-agent/profile-cooldown');
+      const profile = await auth.addApiKey('anthropic', 'fixture-preflight-key');
+      await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+      cooldown.markCooldown(profile.profileId, kind, 'fixture', 30_000);
+
+      const { streamChatWithModel } = await import('../../../src/main/model/core-agent/client');
+      const events = [];
+      for await (const event of streamChatWithModel({
+        userId: 'preflight-cause', sessionId: 'gconv-preflight-cause', message: 'fixture',
+      })) events.push(event);
+
+      // An unavailable configured credential is still a preflight block,
+      // but diagnostics must retain the reason without parsing localized prose.
+      expect(events.filter((event) => event.type === 'error')).toEqual([
+        expect.objectContaining({
+          failureKind: 'config', failurePhase: 'preflight', failureCode: `provider_${kind}`,
+        }),
+      ]);
+      expect(events.some((event) => event.type === 'final' || event.type === 'delta')).toBe(false);
+      const result = events.find((event) => event.type === 'event' && event.event?.stream === 'agent_run_terminal');
+      expect(result?.event?.data).toMatchObject({ error_code: `provider_${kind}`, terminal_status: 'error', failure_phase: 'preflight' });
+      expect(events.at(-1)?.type).toBe('done');
+      expect(createPiProvider).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reports expired OAuth authorization after the model call path tries refresh', async () => {
+    mockOAuthRefreshFailure('anthropic', 'Anthropic');
+    const uid = 'runneroauthauth';
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(uid);
+    const i18n = await import('../../../src/main/i18n');
+    i18n.setCurrentLang('en');
+    await writeExpiredOAuthEntry({ providerId: 'anthropic', model: 'claude-opus-4-8', uid });
+
+    const { buildRunner } = await loadRunner();
+    let message = '';
+    try {
+      await buildRunner({ sessionId: `${uid}-gconv-x` });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/Anthropic authorization has expired/i);
+    expect(message).toMatch(/Reauthorize this account in Settings/i);
+    expect(message).not.toMatch(/could not be refreshed|无法自动刷新/i);
   });
 
   it('snapshots one turn model while a later runner build reads the reordered selection', async () => {
@@ -600,6 +852,102 @@ describe('runner › buildRunner auth gate', () => {
     }));
   });
 
+  it.each([false, true])('routes configured providers through the registry with required image input %s', async requireImageInput => {
+    const createPiProvider = vi.fn(() => ({
+      id: 'acme',
+      name: 'Acme AI',
+      async *stream() {
+        yield { type: 'text_delta' as const, text: 'ok' };
+      },
+      async complete() {
+        throw new Error('not used');
+      },
+      async validateAuth() {
+        return true;
+      },
+    }));
+    vi.doMock('#core-agent', async () => ({
+      ...(await vi.importActual<any>('#core-agent')),
+      createPiProvider,
+    }));
+
+    const uid = 'runner-server-configured-provider';
+    const users = await import('../../../src/main/features/users');
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    users.activateUser(uid);
+    clientConfig.applyServerPayload({
+      immediate: {
+        model_catalog: {
+          providers: {
+            acme: [
+              {
+                id: 'acme-vision',
+                name: 'Acme Vision',
+                contextWindow: 262_144,
+                maxTokens: 16_384,
+                maxInputImages: 12,
+              },
+              {
+                id: 'acme-text',
+                name: 'Acme Text',
+                contextWindow: 262_144,
+                maxTokens: 16_384,
+                maxInputImages: 0,
+              },
+            ],
+          },
+          openai_compatible_providers: {
+            acme: {
+              label: 'Acme AI',
+              baseUrl: 'https://api.acme.example/v1',
+            },
+          },
+        },
+      },
+      restart: {},
+      config_hash: 'sha256:runner-server-configured-provider',
+    }, '"runner-server-configured-provider"');
+
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addApiKeyEntry(
+      'acme',
+      'acme-vision',
+      'sk-acme-runtime-test',
+      'Acme primary',
+    );
+    // New entries are inserted first, so the text-only candidate must be added last.
+    if (requireImageInput) await auth.addApiKeyEntry('acme', 'acme-text', 'sk-text', 'Text primary');
+
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({
+      sessionId: 'gconv-server-configured-provider',
+      userId: uid,
+      requireImageInput,
+    });
+    const provider = (built.runner as any).providers.get('acme');
+    const iterator = provider.stream({
+      model: built.modelId,
+      messages: [{ role: 'user', content: [{ type: 'image', data: 'pixels', mediaType: 'image/png' }] }],
+    })[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.return?.();
+
+    expect(built.modelId).toBe(requireImageInput ? 'acme-text' : 'acme-vision');
+    expect(createPiProvider).toHaveBeenCalledTimes(1);
+    expect(createPiProvider).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'acme',
+      apiKey: 'sk-acme-runtime-test',
+      customModel: expect.objectContaining({
+        id: 'acme-vision',
+        api: 'openai-completions',
+        baseUrl: 'https://api.acme.example/v1',
+        input: ['text', 'image'],
+        contextWindow: 262_144,
+        maxTokens: 16_384,
+      }),
+    }));
+  });
+
   it.each([false, true])('routes public native candidates through the registry with required image input %s', async requireImageInput => {
     const createPiProvider = vi.fn(() => ({id:'anthropic',name:'Image requirement fixture',
       async *stream() {yield {type:'text_delta' as const,text:'ok'};},
@@ -700,6 +1048,54 @@ describe('runner › metacognition closed loop', () => {
 });
 
 describe('runner › retired OCR tool exposure', () => {
+  it('retains one Office creation across actor rebuilds and refuses foreign conversation recovery', async () => {
+    const uid = 'runner-office-recovery';
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', 'synthetic-never-sent', 'Recovery fixture');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+    const engine = await import('../../../src/main/features/office/office_engine');
+    vi.spyOn(engine, 'officeCliAvailable').mockReturnValue(true);
+    vi.spyOn(engine, 'closeOfficeFile').mockResolvedValue(undefined);
+    let reject = true;
+    const native = vi.spyOn(engine, 'runOfficeCli').mockImplementation(async (args, options) => {
+      if (args[0] === 'create') fs.writeFileSync(args[1], 'editable-fixture');
+      if (args[0] === 'batch' && reject) {
+        const ops = JSON.parse(options.stdin!);
+        return { code: 1, stderr: '', stdout: JSON.stringify({ success: false, data: {
+          results: ops.map((_: unknown, index: number) => ({ index, success: false, code: 'invalid_value' })),
+          summary: { total: ops.length, executed: ops.length, succeeded: 0, failed: ops.length, skipped: 0, atomicRolledBack: true },
+        } }) };
+      }
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    const { getWorkspacePath } = await import('../../../src/main/features/user_workspace');
+    const { buildRunner } = await loadRunner();
+    const build = async (cid: string, actor: string) => {
+      const built = await buildRunner({ sessionId: `gmember-${cid}-${actor}`, userId: uid,
+        cid, agentId: actor, toolList: ['office.presentation'] });
+      expect((built.toolDefs.find(tool => tool.name === 'create_pptx')!.inputSchema as any).properties.retry_of.type).toBe('string');
+      return (built.runner as any).tools.get('create_pptx');
+    };
+    const context = { workingDir: getWorkspacePath(uid), state: {} };
+    const input = { path: 'recovered.pptx', slides: [{ title: 'Initial' }], preview: false };
+    const receipt = (result: { content: string }) => JSON.parse(result.content.match(/<office-creation>(.+)<\/office-creation>/)![1]);
+    const failed = await (await build('office-flow', OFFICE_WORKER_AGENT_ID)).execute(input, context);
+    expect(receipt(failed).retry_available).toBe(true);
+    reject = false;
+    const corrected = { ...input, slides: [{ title: 'Corrected' }], retry_of: receipt(failed).operation_id };
+    const resumed = await (await build('office-flow', 'other-office-actor')).execute(corrected, context);
+    expect(resumed.isError).toBeUndefined();
+    expect(fs.readFileSync(path.join(context.workingDir, input.path), 'utf8')).toBe('editable-fixture');
+    fs.unlinkSync(path.join(context.workingDir, input.path));
+    const calls = native.mock.calls.length;
+    expect((await (await build('office-flow', OFFICE_WORKER_AGENT_ID)).execute(input, context)).isError).toBe(true);
+    expect((await (await build('other-conversation', OFFICE_WORKER_AGENT_ID)).execute(corrected, context)).isError).toBe(true);
+    expect(native.mock.calls).toHaveLength(calls);
+    expect(fs.existsSync(path.join(context.workingDir, input.path))).toBe(false);
+  });
+
   it('keeps document and image tools without OCR for images, PDFs, explicit requests and rich steer', async () => {
     const uid = 'runner-ocr-policy';
     const users = await import('../../../src/main/features/users');
@@ -1302,15 +1698,16 @@ describe('runner › scoped tool loading', () => {
     const tools = (built.runner as any).tools;
     expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('todo_tasks');
     expect(built.turnEphemeral).not.toContain('## Global open work');
-    expect(built.turnEphemeral).toMatch(/explain that this non-project conversation cannot access them/);
+    expect(built.turnEphemeral).toContain('except that Commander can manage the project it creates for this conversation during this turn immediately');
     expect(built.turnEphemeral.match(/## Global to-do scope/g)).toHaveLength(1);
     const context = { workingDir: tmpDir, state: {} };
     expect((await tools.get('tool_load').execute({ groups: ['management.todos'] }, context)).isError).toBeFalsy();
     expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('project_setup');
     const tool = tools.get('todo_tasks');
-    expect(tool.inputSchema.properties.project.enum).toEqual(['__global__']);
+    expect(tool.inputSchema.properties.project.type).toBe('string');
+    expect(tool.inputSchema.properties.project.description).toContain('Only that new project ID is accepted');
     expect(tool.inputSchema.properties.action.enum).not.toContain('list_projects');
-    expect(tool.description).toContain('Project to-dos are unavailable');
+    expect(tool.inputSchema.properties.project.description).toContain('other projects are unavailable');
     expect(tool.description).not.toContain('When asked about them, explain');
     const created = JSON.parse((await tool.execute({ action: 'create', project: '__global__', content: 'Global work' }, context)).content);
     expect(created).toMatchObject({ ok: true, outcome: 'task_created' });
@@ -1569,8 +1966,10 @@ describe('runner › scoped tool loading', () => {
 
     const referenceRoots = [path.join(tmpDir, 'referenced-attachments')];
     const runtimeRoots: string[] = [];
+    const currentUserMessage = { text: '<msg from="user">approve</msg>' };
     const video = await buildRunner({
       sessionId: 'gmember-owner-studio-video',
+      currentUserMessage,
       userId: uid,
       agentId: VIDEO_STUDIO_AGENT_ID,
       toolList: ['media.video'],
@@ -1581,6 +1980,7 @@ describe('runner › scoped tool loading', () => {
     expect(video.toolDefs.map((tool) => tool.name)).toContain('video_studio');
     expect(videoOptions.mock.calls[0][0].readOnlyExtraRoots).toEqual(referenceRoots);
     expect(videoOptions.mock.calls[0][0].runtimeReadOnlyRoots).toBe(runtimeRoots);
+    expect(videoOptions.mock.calls[0][0].currentUserMessage).toBe(currentUserMessage);
     expect(videoOptions.mock.calls[0][0].extraRoots || []).not.toContain(referenceRoots[0]);
   });
 
@@ -2045,6 +2445,35 @@ describe('runner › scoped tool loading', () => {
     expect(appLoadedNames).toContain('skill_search');
     expect(appLoadedNames).not.toContain('marketplace_search');
     expect(commander.resolvedSystemPrompt).toBe(initialPrompt);
+  });
+
+  it('delivers local app CSP dependencies in the loaded artifact schema before authoring', async () => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const uid = 'runner-artifact-csp-contract';
+    await configureUser(uid);
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({
+      sessionId: 'gconv-artifact-csp-contract', userId: uid, cid: 'artifact-csp-contract',
+      onArtifactCreated: () => {},
+    });
+    expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('create_artifact');
+    const initialPrompt = built.resolvedSystemPrompt;
+    const runner = built.runner as unknown as {
+      tools: Map<string, { execute: (input: unknown, ctx: unknown) => Promise<{ isError?: boolean }> }>;
+    };
+    const loaded = await runner.tools.get('tool_load')!.execute(
+      { groups: ['workspace.artifact'] }, { workingDir: tmpDir, state: {} },
+    );
+    expect(loaded.isError).toBeFalsy();
+    const definition = built.runner.getActiveToolDefinitions().find(tool => tool.name === 'create_artifact')!;
+    const schema = definition.inputSchema as { properties: { files: { description: string }; appType: { enum: string[] } } };
+    expect(schema.properties.files.description).toContain('Local apps receive __orkas/bridge.js');
+    expect(schema.properties.files.description).toContain('unless provided or self-sizing');
+    expect(schema.properties.files.description).toContain('If supplying a CSP, allow that same-origin script');
+    expect(schema.properties.files.description).toContain('effective script-src/script-src-elem directive');
+    expect(schema.properties.files.description).toContain('retaining other restrictions');
+    expect(schema.properties.appType.enum).toEqual(['local', 'web']);
+    expect(built.resolvedSystemPrompt).toBe(initialPrompt);
   });
 
   it('does not serialize a deferred tool schema until its group is loaded', async () => {
@@ -3090,6 +3519,62 @@ describe('runner › ImageStudio turn-scoped generation accounting', () => {
 });
 
 describe('runner › conversation-history scope exposure', () => {
+  it('preserves revised and unchanged requirements through the real history projector and provider request', async () => {
+    // The provider is scripted only to observe input. This does not grade
+    // whether a live model generates or obeys the delegated instruction.
+    const requests: any[] = [];
+    vi.doMock('#core-agent', async () => ({
+      ...(await vi.importActual<any>('#core-agent')),
+      createPiProvider: ({ provider }: any) => ({
+        id: provider, name: 'Input observer', validateAuth: async () => true,
+        async complete() { throw new Error('Unexpected nonstream request'); },
+        async *stream(params: any) {
+          requests.push(JSON.parse(JSON.stringify(params)));
+          yield { type: 'message_start' };
+          yield { type: 'message_end', stopReason: 'end_turn', model: params.model,
+            usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+            content: [{ type: 'text', text: 'Input observed.' }] };
+        },
+      }),
+    }));
+    const uid = RUNNER_TEST_UID;
+    const auth = await import('../../../src/main/features/auth');
+    const profile = await auth.addApiKey('anthropic', 'synthetic-observer-key', 'Fixture');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+    const { buildGroupConversationHistory } = await import('../../../src/main/features/group_chat/visibility');
+    const { _buildAgentInGroupSystemPromptForTest } = await import('../../../src/main/features/group_chat/bus');
+    const initial = 'Inspect the archive. Return JSON with status and size; use at most two requests.';
+    const update = 'Change only the read scope: keep the archive without inspecting its contents.';
+    const staleBrief = 'Inspect the archive source and return prose.';
+    const rows = [
+      { id: 'first', ts: '2026-11-09T01:00:00', from: 'user', to: ['commander'], text: initial },
+      { id: 'ack', ts: '2026-11-09T01:00:01', from: 'commander', to: ['user'], text: 'Noted.' },
+      { id: 'update', ts: '2026-11-09T01:00:02', from: 'user', to: ['commander'], text: update },
+      { id: 'delegate', ts: '2026-11-09T01:00:03', from: 'commander', to: ['reader'], text: staleBrief, dispatch: true },
+    ];
+    const history = buildGroupConversationHistory(rows, 'delegate', new Map([
+      ['user', 'User'], ['commander', 'Commander'], ['reader', 'Reader'],
+    ]), undefined, 'reader');
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({
+      sessionId: 'gmember-requirement-continuity-reader', userId: uid, agentId: 'reader', toolList: [],
+      systemPrompt: await _buildAgentInGroupSystemPromptForTest({ agent_id: 'reader', name: 'Reader' }, tmpDir, 'en'),
+      conversationHistory: { source: 'group-main-v4:requirement-continuity:reader', messages: history },
+      userMessage: staleBrief,
+    });
+    for await (const _event of built.runner.runStream({
+      message: `<msg from="commander" to="reader">${staleBrief}</msg>`,
+      turnEphemeral: built.turnEphemeral,
+    })) { /* Provider requests, not the scripted answer, are the oracle. */ }
+    expect(requests).toHaveLength(1);
+    const wireInput = JSON.stringify(requests[0].messages);
+    expect(wireInput).toContain(initial);
+    expect(wireInput).toContain(update);
+    expect(wireInput).toContain(staleBrief);
+    expect(wireInput.indexOf(initial)).toBeLessThan(wireInput.indexOf(update));
+    expect(wireInput.indexOf(update)).toBeLessThan(wireInput.indexOf(staleBrief));
+  });
+
   it.each(['gworker', 'agent', 'reflect'])('does not add history access to %s sessions', async (kind) => {
     const uid = 'runner-history-non-conversation';
     const users = await import('../../../src/main/features/users');
@@ -3440,7 +3925,7 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
     expect(fs.readFileSync(path.join(tmpDir, uid, 'cloud', 'chats', `${cid}.jsonl`), 'utf8')).toBe('');
   });
 
-  it.each(['local'] as const)('offers create_artifact only the original %s type inside an application editing task', async appType => {
+  it.each(['web', 'local'] as const)('offers create_artifact only the original %s type inside an application editing task', async appType => {
     const uid = `app-edit-runner-${appType}`;
     const users = await import('../../../src/main/features/users');
     const auth = await import('../../../src/main/features/auth');
@@ -3466,7 +3951,7 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
     expect(ordinary.toolDefs.find(definition => definition.name === 'create_artifact')?.inputSchema.properties.appType.enum).toEqual(['local', 'web']);
   });
 
-  it.each(['damaged', 'invalid'] as const)('keeps an editing conversation usable but fails create_artifact closed when the binding is %s', async failure => {
+  it.each(['damaged', 'invalid', 'deleted'] as const)('keeps an editing conversation usable but fails create_artifact closed when the binding is %s', async failure => {
     const uid = `app-edit-binding-${failure}`;
     const users = await import('../../../src/main/features/users');
     const auth = await import('../../../src/main/features/auth');
@@ -3488,7 +3973,8 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
     else {
       const context = JSON.parse(fs.readFileSync(contextFile, 'utf8')); delete context.appType;
       fs.writeFileSync(contextFile, JSON.stringify(context));
-      fs.writeFileSync(path.join(appDir, '__orkas-meta.json'), '{ damaged');
+      if (failure === 'deleted') fs.rmSync(appDir, { recursive: true, force: true });
+      else fs.writeFileSync(path.join(appDir, '__orkas-meta.json'), '{ damaged');
     }
     process.env.ORKAS_TOOL_LOADING_MODE = 'legacy';
     const { buildRunner } = await loadRunner();
@@ -3757,4 +4243,27 @@ describe('runner legacy capacity remediation', () => {
       .rejects.toThrow(t('errors.model_context_too_small', { minimum: 32000 }));
     expect(fs.readFileSync(file, 'utf8')).toBe(before);
   });
+});
+
+it('applies the shared retry blacklist on runner load and after immediate configuration changes', async () => {
+  const {clientConfig} = await import('../../../src/main/features/client_config');
+  const errors = await import('../../../src/core-agent/src/shared/errors');
+  const auth = await import('../../../src/main/features/auth');
+  const key = await auth.addApiKey('anthropic', 'synthetic-retry-policy-key', 'Retry fixture');
+  await auth.addEntry({provider: 'anthropic', model: 'claude-opus-5', profileId: key.profileId});
+  const failure = () => Object.assign(new Error('Controlled request failure'), {status: 500});
+  errors.configureRetryErrorPolicy();
+  expect(errors.classifyRetryableError(failure())).not.toBeNull();
+  const apply = (permanent: number[]) => clientConfig.applyServerPayload({immediate: {
+    'model.retry_error_policy': {permanent_statuses: permanent},
+  }, restart: {}}, '');
+  try {
+    apply([500]);
+    const {buildRunner} = await loadRunner();
+    await buildRunner({sessionId: 'gconv-retry-policy', userId: RUNNER_TEST_UID});
+    expect(errors.classifyRetryableError(failure())).toBeNull();
+    apply([400]);
+    await vi.waitFor(() => expect(errors.classifyRetryableError(failure())).not.toBeNull());
+    expect(errors.classifyRetryableError(Object.assign(new Error('Controlled request failure'), {status: 400}))).toBeNull();
+  } finally { errors.configureRetryErrorPolicy(); }
 });

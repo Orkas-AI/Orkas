@@ -100,11 +100,13 @@ import {
   _buildSeedTextForTest,
   _onTimerFireForTest,
   _setMarkRanFailureForTest,
+  activeRunTaskId,
+  recordRunStart,
   type AutoFireEvent,
   type AutoTask,
   type Schedule,
 } from '../../../src/main/features/auto_tasks';
-import { readState } from '../../../src/main/features/group_chat/state';
+import { readState, setToolExtraRoots } from '../../../src/main/features/group_chat/state';
 import { setCurrentLang } from '../../../src/main/i18n';
 import { _setDeviceFingerprintForTests } from '../../../src/main/util/device';
 import { activateUser } from '../../../src/main/features/users';
@@ -112,6 +114,10 @@ import { activateUser } from '../../../src/main/features/users';
 const autoRuntime = vi.hoisted(() => ({
   createConversation: vi.fn(),
   deleteConversation: vi.fn(),
+  getConversationMetadata: vi.fn(),
+  /** Conversations that exist for the account, as the chat index would report them. */
+  conversations: new Map<string, { conversation_id: string; project_id?: string }>(),
+  runSeq: 0,
   send: vi.fn(),
   getAgent: vi.fn(),
   terminalListeners: new Set<(event: Record<string, unknown>) => void>(),
@@ -120,7 +126,27 @@ const autoRuntime = vi.hoisted(() => ({
 vi.mock('../../../src/main/features/chats', () => ({
   createConversation: autoRuntime.createConversation,
   deleteConversation: autoRuntime.deleteConversation,
+  getConversationMetadata: autoRuntime.getConversationMetadata,
 }));
+
+function openConversation(cid: string, projectId?: string) {
+  const conversation = { conversation_id: cid, ...(projectId ? { project_id: projectId } : {}) };
+  autoRuntime.conversations.set(cid, conversation);
+  return conversation;
+}
+
+/** A conversation the next fire creates, recorded like the chat index would. */
+function createsConversation(cid: string) {
+  return async (_uid: string, opts: { projectId?: string } = {}) => openConversation(cid, opts.projectId);
+}
+
+/** The next send is accepted into the bus run `runId`. */
+function admitsInto(runId: string) {
+  autoRuntime.send.mockImplementationOnce(async input => {
+    await input.beforeDispatch?.({ runId });
+    return { ok: true };
+  });
+}
 
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: autoRuntime.send,
@@ -196,12 +222,17 @@ beforeEach(async () => {
   fs.rmSync(userRoot(TEST_UID), { recursive: true, force: true });
   autoRuntime.createConversation.mockReset();
   autoRuntime.deleteConversation.mockReset();
+  autoRuntime.getConversationMetadata.mockReset();
   autoRuntime.send.mockReset();
   autoRuntime.terminalListeners.clear();
-  autoRuntime.createConversation.mockResolvedValue({ conversation_id: 'cid_auto' });
-  autoRuntime.deleteConversation.mockResolvedValue(true);
+  autoRuntime.conversations.clear();
+  autoRuntime.createConversation.mockImplementation(createsConversation('cid_auto'));
+  autoRuntime.deleteConversation.mockImplementation(async (_uid: string, cid: string) => autoRuntime.conversations.delete(cid));
+  autoRuntime.getConversationMetadata.mockImplementation(async (_uid: string, cid: string) => (
+    autoRuntime.conversations.get(cid) ?? null
+  ));
   autoRuntime.send.mockImplementation(async input => {
-    await input.beforeDispatch?.();
+    await input.beforeDispatch?.({ runId: `run_${++autoRuntime.runSeq}` });
     return { ok: true };
   });
   autoRuntime.getAgent.mockResolvedValue(null);
@@ -580,6 +611,8 @@ describe('task CRUD normalization', () => {
     expect(updated).toEqual({ ok: false, error: 'invalid_recipient' });
   });
 
+  
+
   it('rejects invalid drafts and ignores malformed on-disk configs', async () => {
     expect((await createTask(TEST_UID, {
       id: 'not-safe',
@@ -752,6 +785,77 @@ describe('private automation diagnostics', () => {
 });
 
 describe('attachments', () => {
+  it('preserves a reused conversation attachment and reuses the distinct task copy on later runs', async () => {
+    const taskId = 'at_13572468';
+    openConversation('cid_source');
+    await uploadAttachment(TEST_UID, taskId, 'brief.md', Buffer.from('automation input'));
+    expect((await createTask(TEST_UID, { id: taskId, content: 'Read the brief', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 }, attachments: ['brief.md'],
+    }, { conversationId: 'cid_source' })).ok).toBe(true);
+    const dir = chatAttachmentDir(TEST_UID, 'cid_source');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'brief.md'), 'earlier user input');
+    for (let run = 0; run < 2; run += 1) {
+      expect((await runTaskNow(TEST_UID, taskId)).ok).toBe(true);
+      const names = autoRuntime.send.mock.calls.at(-1)![0].attachments;
+      expect(names).toHaveLength(1);
+      expect(names[0]).not.toBe('brief.md');
+      expect(fs.readFileSync(path.join(dir, names[0]), 'utf8')).toBe('automation input');
+      expect(fs.readFileSync(path.join(dir, 'brief.md'), 'utf8')).toBe('earlier user input');
+    }
+    expect(autoRuntime.send.mock.calls[0][0].attachments).toEqual(autoRuntime.send.mock.calls[1][0].attachments);
+    expect(fs.readdirSync(dir)).toHaveLength(2);
+    const [previousCopy] = autoRuntime.send.mock.calls[0][0].attachments;
+    fs.writeFileSync(path.join(dir, previousCopy), 'user edited the earlier copy');
+    expect((await runTaskNow(TEST_UID, taskId)).ok).toBe(true);
+    const [nextCopy] = autoRuntime.send.mock.calls.at(-1)![0].attachments;
+    expect(nextCopy).not.toBe(previousCopy);
+    expect(fs.readFileSync(path.join(dir, previousCopy), 'utf8')).toBe('user edited the earlier copy');
+    expect(fs.readFileSync(path.join(dir, nextCopy), 'utf8')).toBe('automation input');
+    expect(fs.readFileSync(path.join(autoTaskAttachmentsDir(TEST_UID, taskId), 'brief.md'), 'utf8')).toBe('automation input');
+  });
+
+  it.skipIf(process.platform === 'win32')('does not copy a task attachment through a linked conversation directory', async () => {
+    const taskId = 'at_35792468';
+    openConversation('cid_source');
+    await uploadAttachment(TEST_UID, taskId, 'brief.md', Buffer.from('automation input'));
+    await createTask(TEST_UID, { id: taskId, content: 'Read the brief', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 }, attachments: ['brief.md'],
+    }, { conversationId: 'cid_source' });
+    const dir = chatAttachmentDir(TEST_UID, 'cid_source');
+    const outside = path.join(userLocalRoot(TEST_UID), 'preserved-attachments');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'brief.md'), 'untouched');
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    fs.symlinkSync(outside, dir, 'dir');
+    expect((await runTaskNow(TEST_UID, taskId)).ok).toBe(true);
+    expect(fs.readFileSync(path.join(outside, 'brief.md'), 'utf8')).toBe('untouched');
+    expect(fs.readdirSync(outside)).toEqual(['brief.md']);
+    expect(autoRuntime.send.mock.calls.at(-1)![0].attachments).toBeUndefined();
+    expect(automationLogs.records.some(row => String(row[0]).startsWith('attachment destination out of scope'))).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('never writes through an existing attachment symlink when a conversation is reused', async () => {
+    const taskId = 'at_24681357';
+    openConversation('cid_source');
+    await uploadAttachment(TEST_UID, taskId, 'brief.md', Buffer.from('automation input'));
+    await createTask(TEST_UID, { id: taskId, content: 'Read the brief', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 }, attachments: ['brief.md'],
+    }, { conversationId: 'cid_source' });
+    const dir = chatAttachmentDir(TEST_UID, 'cid_source');
+    const outside = path.join(userLocalRoot(TEST_UID), 'preserved.md');
+    fs.mkdirSync(path.dirname(outside), { recursive: true });
+    fs.writeFileSync(outside, 'untouched');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, 'brief.md'));
+    expect((await runTaskNow(TEST_UID, taskId)).ok).toBe(true);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('untouched');
+    expect(fs.lstatSync(path.join(dir, 'brief.md')).isSymbolicLink()).toBe(true);
+    const [name] = autoRuntime.send.mock.calls.at(-1)![0].attachments;
+    expect(name).not.toBe('brief.md');
+    expect(fs.readFileSync(path.join(dir, name), 'utf8')).toBe('automation input');
+  });
+
   it.each(['file', 'directory'])('scope migration preserves attachments when a destination %s conflicts', async (conflict) => {
     const projectId = 'p_auto_move';
     const taskId = 'at_56565656';
@@ -931,12 +1035,12 @@ describe('run facts and handoff', () => {
     throw new Error(`run status never became ${status}`);
   };
 
-  it.each(['during-send', 'during-start-save'])('retains a terminal received %s before fire preparation finishes', async timing => {
+  it.each(['before-send-returns', 'during-start-save'])('retains its run terminal received %s', async timing => {
     const taskId = 'at_61616161';
     expect((await createTask(TEST_UID, { id: taskId, content: 'quick job', schedule: daily })).ok).toBe(true);
     const endedAt = Date.now();
-    const terminal = () => emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto',
-      status: 'failed', finished_at_ms: endedAt });
+    const terminal = () => emitTerminal({ run_id: 'run_quick', user_id: TEST_UID, conversation_id: 'cid_auto',
+       status: 'failed', finished_at_ms: endedAt });
     const writeJson = storage.writeJson;
     let emitted = false;
     const writing = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, value) => {
@@ -946,10 +1050,16 @@ describe('run facts and handoff', () => {
         terminal();
       }
     });
-    if (timing === 'during-send') autoRuntime.send.mockImplementationOnce(async () => {
-      terminal();
-      return { ok: true };
-    });
+    // A fast run can finish before send returns.
+    if (timing === 'before-send-returns') {
+      autoRuntime.send.mockImplementationOnce(async input => {
+        await input.beforeDispatch?.({ runId: 'run_quick' });
+        terminal();
+        return { ok: true };
+      });
+    } else {
+      admitsInto('run_quick');
+    }
     try {
       expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
       await untilStatus(taskId, 'failed');
@@ -963,7 +1073,8 @@ describe('run facts and handoff', () => {
     const taskId = 'at_62626262';
     expect((await createTask(TEST_UID, { id: taskId, content: 'not admitted', schedule: daily })).ok).toBe(true);
     autoRuntime.send.mockImplementationOnce(async () => {
-      emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto', status: 'failed', finished_at_ms: Date.now() });
+      emitTerminal({ run_id: 'run_rejected', user_id: TEST_UID, conversation_id: 'cid_auto', 
+        status: 'failed', finished_at_ms: Date.now() });
       if (outcome === 'thrown') throw new Error('dispatch unavailable');
       return { ok: false, error: 'dispatch unavailable' };
     });
@@ -977,6 +1088,7 @@ describe('run facts and handoff', () => {
     const taskId = 'at_60606060';
     expect((await createTask(TEST_UID, { id: taskId, content: 'weekly digest', schedule: daily })).ok).toBe(true);
 
+    admitsInto('run_first');
     expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
     const first = await getTask(TEST_UID, taskId);
     expect(first?.run_count).toBe(1);
@@ -989,31 +1101,33 @@ describe('run facts and handoff', () => {
     expect(fs.existsSync(handoffDir)).toBe(true);
     expect((await readState(TEST_UID, 'cid_auto')).tool_extra_roots).toEqual([handoffDir]);
 
-    // Terminals from another account or conversation cannot settle this run.
-    emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_other', status: 'failed', finished_at_ms: Date.now() });
-    emitTerminal({ user_id: 'another-account', conversation_id: 'cid_auto', status: 'failed', finished_at_ms: Date.now() });
+    // Terminals of other conversations or of later chat in this one are not this run's.
+    emitTerminal({ run_id: 'run_elsewhere', user_id: TEST_UID, conversation_id: 'cid_other',  status: 'failed', finished_at_ms: Date.now() });
+    emitTerminal({ run_id: 'run_later_chat', user_id: TEST_UID, conversation_id: 'cid_auto',  status: 'failed', finished_at_ms: Date.now() });
     await realDelay(20);
     expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('running');
     const endedAt = Date.UTC(2026, 4, 22, 9, 5, 0);
-    emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto', status: 'completed', finished_at_ms: endedAt });
+    emitTerminal({ run_id: 'run_first', user_id: TEST_UID, conversation_id: 'cid_auto',  status: 'completed', finished_at_ms: endedAt });
     await untilStatus(taskId, 'completed');
     const closed = await getTask(TEST_UID, taskId);
     expect(closed?.last_run).toEqual({
       cid: 'cid_auto', started_at: first!.last_run!.started_at, ended_at: new Date(endedAt).toISOString(), status: 'completed',
     });
     expect(autoRuntime.terminalListeners.size).toBe(0);
-    // A later chat in the same conversation has no remaining run listener.
-    emitTerminal({ user_id: TEST_UID, conversation_id: 'cid_auto', status: 'failed', finished_at_ms: Date.now() });
-    expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('completed');
 
-    autoRuntime.createConversation.mockResolvedValue({ conversation_id: 'cid_auto_2' });
-    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto_2' });
+    // The next run continues in the same conversation.
+    await realDelay(2);
+    admitsInto('run_second');
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
     const second = await getTask(TEST_UID, taskId);
     expect(second?.run_count).toBe(2);
     expect(second?.previous_run).toEqual(closed?.last_run);
-    expect(second?.last_run).toMatchObject({ cid: 'cid_auto_2', status: 'running' });
-    // A late terminal for a run no longer on record changes nothing.
-    await recordRunTerminal(TEST_UID, taskId, 'cid_auto', 'failed', new Date().toISOString());
+    expect(second?.last_run).toMatchObject({ cid: 'cid_auto', status: 'running' });
+    expect(second?.last_run?.started_at).not.toBe(closed?.last_run?.started_at);
+    // A late terminal for the earlier run changes nothing, even though it ran
+    // in the same conversation.
+    await recordRunTerminal(TEST_UID, taskId, 'cid_auto', 'failed', new Date().toISOString(), closed!.last_run!.started_at);
     expect((await getTask(TEST_UID, taskId))?.previous_run?.status).toBe('completed');
     expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('running');
   });
@@ -1038,14 +1152,217 @@ describe('run facts and handoff', () => {
       const raw = JSON.parse(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8'));
       fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify({
         ...raw, run_count: -1, last_run: 'yesterday', previous_run: { cid: '../x', status: 'completed', started_at: 'now' },
+        conversation_id: '../chats',
       }));
       const task = await getTask(TEST_UID, taskId);
       expect(task?.content).toBe('weekly digest');
+      expect(task).not.toHaveProperty('conversation_id');
       expect(task).not.toHaveProperty('run_count');
       expect(task).not.toHaveProperty('last_run');
       expect(task).not.toHaveProperty('previous_run');
     } finally {
-      }
+    }
+  });
+});
+
+describe('run conversation', () => {
+  const daily = { type: 'daily', hour: 9, minute: 0 } as const;
+  const emitTerminal = (event: Record<string, unknown>) => {
+    for (const listener of [...autoRuntime.terminalListeners]) listener(event);
+  };
+  const sentTo = () => autoRuntime.send.mock.calls.map(([input]) => input.cid);
+  const createdFrom = async (cid: string, updates: Record<string, unknown> = {}) => {
+    const result = await applyAutoTaskMutation(TEST_UID, {
+      action: 'create', updates: { content: 'check the overnight replies', schedule: daily, ...updates },
+    }, { conversationId: cid });
+    if (!result.ok || !result.taskId) throw new Error(result.error || 'automation was not created');
+    return result.taskId;
+  };
+
+  it('opens a conversation on the first run of a task made in Auto and keeps every later run in it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    const taskId = 'at_70707070';
+    expect((await createTask(TEST_UID, { id: taskId, title: 'Morning brief', content: 'summarize overnight mail', schedule: daily })).ok).toBe(true);
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 30, 0));
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation).toHaveBeenCalledWith(TEST_UID, {
+      kind: 'normal', title: 'Morning brief', originAutoTaskId: taskId,
+    });
+    expect(sentTo()).toEqual(['cid_auto', 'cid_auto', 'cid_auto']);
+    // The conversation it opened follows that conversation's reply target
+    // as before; later runs address the task's own recipient instead.
+    expect(autoRuntime.send.mock.calls[0][0]).not.toHaveProperty('forceTo');
+    expect(autoRuntime.send.mock.calls[1][0].forceTo).toEqual(['commander']);
+    expect(autoRuntime.send.mock.calls[2][0].forceTo).toEqual(['commander']);
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      run_count: 3, last_run: { cid: 'cid_auto' }, previous_run: { cid: 'cid_auto' },
+    });
+    expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
+  });
+
+  it('runs a task created from a conversation in that conversation, from its first run', async () => {
+    openConversation('cid_source');
+    const taskId = await createdFrom('cid_source');
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_source' });
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_source' });
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.send).toHaveBeenNthCalledWith(1, {
+      userId: TEST_UID, cid: 'cid_source', text: 'check the overnight replies', notificationKind: 'automation',
+      beforeDispatch: expect.any(Function), forceTo: ['commander'],
+    });
+    expect(sentTo()).toEqual(['cid_source', 'cid_source']);
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({ run_count: 2, last_run: { cid: 'cid_source' } });
+  });
+
+  it('continues a task saved before this change in the conversation of its latest run', async () => {
+    const taskId = 'at_71717171';
+    const created = await createTask(TEST_UID, { id: taskId, content: 'weekly digest', schedule: daily });
+    if (!created.ok) throw new Error(created.error);
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify({
+      ...created.task, run_count: 4,
+      last_run: { cid: 'cid_week_4', started_at: '2026-05-15T09:00:00.000Z', ended_at: '2026-05-15T09:04:00.000Z', status: 'completed' },
+    }));
+    openConversation('cid_week_4');
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_week_4' });
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      run_count: 5, previous_run: { cid: 'cid_week_4', status: 'completed' }, last_run: { cid: 'cid_week_4' },
+    });
+  });
+
+  it('opens a new conversation when the run conversation was deleted, then continues there', async () => {
+    openConversation('cid_source');
+    const taskId = await createdFrom('cid_source');
+    autoRuntime.conversations.delete('cid_source');
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ originAutoTaskId: taskId });
+    expect(sentTo()).toEqual(['cid_auto', 'cid_auto']);
+  });
+
+  it('opens a conversation in the task scope when its conversation is in another scope', async () => {
+    writeProject(TEST_UID, 'p_scope');
+    openConversation('cid_outside_project');
+    const taskId = await createdFrom('cid_outside_project', { project_id: 'p_scope' });
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto' });
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ projectId: 'p_scope', originAutoTaskId: taskId });
+    // A conversation later moved out of the task's project is left as well.
+    autoRuntime.conversations.set('cid_auto', { conversation_id: 'cid_auto', project_id: 'p_elsewhere' });
+    autoRuntime.createConversation.mockImplementationOnce(createsConversation('cid_auto_2'));
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_auto_2' });
+    expect(sentTo()).toEqual(['cid_auto', 'cid_auto_2']);
+  });
+
+  it('keeps a reused conversation when the run cannot be sent, and retries there next time', async () => {
+    openConversation('cid_source');
+    const taskId = await createdFrom('cid_source');
+    const events: AutoFireEvent[] = [];
+    const unsubscribe = subscribeFires((ev) => events.push(ev));
+    autoRuntime.send.mockImplementationOnce(async input => {
+      await input.beforeDispatch?.({ runId: 'run_refused' });
+      return { ok: false, error: 'dispatch unavailable' };
+    });
+    autoRuntime.send.mockImplementationOnce(async () => { throw new Error('bus unavailable'); });
+    try {
+      expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: false, error: 'send_not_ok' });
+      expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: false, error: 'send_threw' });
+    } finally { unsubscribe(); }
+
+    expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.conversations.has('cid_source')).toBe(true);
+    expect(events.map((ev) => [ev.type, ev.cid, (ev as { error_code?: string }).error_code])).toEqual([
+      ['fire_failed', 'cid_source', 'send_not_ok'],
+      ['fire_failed', 'cid_source', 'send_threw'],
+    ]);
+    // The refused run is not left marked as running in the conversation.
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_source' });
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+  });
+
+  it('addresses the task recipient in a reused conversation, and Commander once that Agent is gone', async () => {
+    autoRuntime.getAgent.mockResolvedValue({ agent_id: 'agent_codex', name: 'Codex' });
+    openConversation('cid_source');
+    const taskId = await createdFrom('cid_source', { recipient: { kind: 'agent', id: 'agent_codex', name: 'Codex' } });
+
+    await runTaskNow(TEST_UID, taskId);
+    autoRuntime.getAgent.mockResolvedValue(null);
+    await runTaskNow(TEST_UID, taskId);
+
+    expect(autoRuntime.send.mock.calls.map(([input]) => [input.text, input.forceTo])).toEqual([
+      ['@Codex check the overnight replies', ['agent_codex']],
+      ['@Codex check the overnight replies', ['commander']],
+    ]);
+  });
+
+  it('adds the handoff directory to the tool roots the conversation already had', async () => {
+    openConversation('cid_source');
+    const conflictRoot = path.join(userRoot(TEST_UID), 'conflict-review');
+    await setToolExtraRoots(TEST_UID, 'cid_source', [conflictRoot]);
+    const taskId = await createdFrom('cid_source');
+
+    await runTaskNow(TEST_UID, taskId);
+    await runTaskNow(TEST_UID, taskId);
+
+    const handoffDir = path.dirname(handoffNotePath(TEST_UID, (await getTask(TEST_UID, taskId))!));
+    expect((await readState(TEST_UID, 'cid_source')).tool_extra_roots).toEqual([conflictRoot, handoffDir]);
+  });
+
+  it('closes a run on the terminal of the bus run its message joined, not of an earlier run there', async () => {
+    openConversation('cid_source');
+    const taskId = await createdFrom('cid_source');
+    // The user is still working in the conversation: the scheduled message
+    // joins that run, which the user's send opened.
+    admitsInto('run_user_started');
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_source' });
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
+    emitTerminal({ run_id: 'run_before', user_id: TEST_UID, conversation_id: 'cid_source',
+       status: 'failed', finished_at_ms: Date.now() });
+    await realDelay(20);
+    expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('running');
+    emitTerminal({ run_id: 'run_user_started', user_id: TEST_UID, conversation_id: 'cid_source',
+       status: 'completed', finished_at_ms: Date.now() });
+    await vi.waitFor(async () => expect((await getTask(TEST_UID, taskId))?.last_run?.status).toBe('completed'));
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+    expect(autoRuntime.terminalListeners.size).toBe(0);
+  });
+
+  it('counts a run whose send never named a bus run, without leaving a watcher or an in-progress mark', async () => {
+    openConversation('cid_source');
+    const taskId = await createdFrom('cid_source');
+    autoRuntime.send.mockImplementationOnce(async () => ({ ok: true }));
+
+    expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid: 'cid_source' });
+    expect((await getTask(TEST_UID, taskId))?.run_count).toBe(1);
+    expect(autoRuntime.terminalListeners.size).toBe(0);
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+  });
+
+  it('marks a run as in progress in its conversation from its start until its own end', async () => {
+    const taskId = await createdFrom('cid_source');
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+    await recordRunStart(TEST_UID, taskId, 'cid_source', '2026-05-22T09:00:00.000Z');
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
+    expect(activeRunTaskId('another-account', 'cid_source')).toBe('');
+    // Another run's end leaves it in progress; its own end clears it.
+    await recordRunTerminal(TEST_UID, taskId, 'cid_source', 'completed', '2026-05-22T09:01:00.000Z', '2026-05-21T09:00:00.000Z');
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
+    await recordRunTerminal(TEST_UID, taskId, 'cid_source', 'completed', '2026-05-22T09:02:00.000Z', '2026-05-22T09:00:00.000Z');
+    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
   });
 });
 
@@ -1077,7 +1394,8 @@ describe('scheduler dispatch', () => {
 
     vi.setSystemTime(new Date(2026, 4, 22, 11, 0, 0));
     await _onTimerFireForTest(TEST_UID, taskId);
-    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(3);
+    // Three runs, all in the conversation the first one opened.
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
     expect(autoRuntime.send).toHaveBeenCalledTimes(3);
   });
 
@@ -1126,8 +1444,9 @@ describe('scheduler dispatch', () => {
     );
     unsubscribe();
 
-    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(2);
-    expect(autoRuntime.createConversation.mock.calls[1][1]).toMatchObject({ title: 'Reply check' });
+    // The on-time run continues in the conversation the late run opened.
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send.mock.calls.map(([input]) => input.cid)).toEqual(['cid_auto', 'cid_auto']);
     expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(nextBoundary.toISOString());
     expect(events.map((ev) => [ev.type, ev.catch_up === true])).toEqual([
       ['conv_created', true],
@@ -1750,8 +2069,8 @@ describe('scheduler dispatch', () => {
       userId: TEST_UID,
       cid: 'cid_auto',
       text: 'run on demand',
-
-      beforeDispatch: expect.any(Function), notificationKind: 'automation',
+      notificationKind: 'automation',
+      beforeDispatch: expect.any(Function),
     });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
@@ -1761,12 +2080,14 @@ describe('scheduler dispatch', () => {
       cid: 'cid_auto',
       task_id: taskId,
     });
-    // The admitted run is counted and remembered; everything else in the
-    // record, including the scheduled-occurrence stamp, is untouched.
-    const { run_count, last_run, ...untouched } = JSON.parse(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8'));
+    // The admitted run is counted and remembered, with the conversation later
+    // runs continue in; everything else in the record, including the
+    // scheduled-occurrence stamp, is untouched.
+    const { run_count, last_run, conversation_id, ...untouched } = JSON.parse(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8'));
     expect(untouched).toEqual(JSON.parse(configBefore));
     expect(run_count).toBe(1);
     expect(last_run).toMatchObject({ cid: 'cid_auto', status: 'running' });
+    expect(conversation_id).toBe('cid_auto');
     expect(await getTask(TEST_UID, taskId)).toMatchObject({
       enabled: false,
       device_id: '11:22:33:44:55:66',
@@ -1840,8 +2161,8 @@ describe('scheduler dispatch', () => {
         const saved = await getTask(TEST_UID, taskId);
         if (mutation === 'edit') {
           expect(autoRuntime.send).toHaveBeenCalledExactlyOnceWith({
-            userId: TEST_UID, cid: 'cid_auto', text: 'new report',
-            beforeDispatch: expect.any(Function), notificationKind: 'automation',
+            userId: TEST_UID, cid: 'cid_auto', text: 'new report', notificationKind: 'automation',
+            beforeDispatch: expect.any(Function),
           });
           expect(saved?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
         } else {
@@ -1894,8 +2215,8 @@ describe('scheduler dispatch', () => {
       userId: TEST_UID,
       cid: 'cid_auto',
       text: '@Codex send the morning report',
-
-      beforeDispatch: expect.any(Function), notificationKind: 'automation',
+      notificationKind: 'automation',
+      beforeDispatch: expect.any(Function),
       attachments: ['z-first.txt', 'brief.md', 'a-last.txt'],
     });
     expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
@@ -1939,8 +2260,8 @@ describe('scheduler dispatch', () => {
       userId: TEST_UID,
       cid: 'cid_auto',
       text: '@Codex Renamed send the renamed-agent report',
-
-      beforeDispatch: expect.any(Function), notificationKind: 'automation',
+      notificationKind: 'automation',
+      beforeDispatch: expect.any(Function),
     });
   });
 
@@ -2013,8 +2334,8 @@ describe('scheduler dispatch', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
     autoRuntime.createConversation
-      .mockResolvedValueOnce({ conversation_id: 'cid_auto_1' })
-      .mockResolvedValueOnce({ conversation_id: 'cid_auto_2' });
+      .mockImplementationOnce(createsConversation('cid_auto_1'))
+      .mockImplementationOnce(createsConversation('cid_auto_2'));
 
     const taskId = 'at_88888888';
     const created = await createTask(TEST_UID, {
@@ -2038,8 +2359,9 @@ describe('scheduler dispatch', () => {
     vi.setSystemTime(new Date(2026, 4, 23, 9, 0, 0));
     await _onTimerFireForTest(TEST_UID, taskId);
 
-    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(2);
-    expect(autoRuntime.send).toHaveBeenCalledTimes(2);
+    // The next day's run continues in the first day's conversation.
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send.mock.calls.map(([input]) => input.cid)).toEqual(['cid_auto_1', 'cid_auto_1']);
     task = await getTask(TEST_UID, taskId);
     expect(task?.last_run_at).toBe(new Date(2026, 4, 23, 9, 0, 0).toISOString());
   });
@@ -2530,6 +2852,7 @@ describe('fire-boundary claim retention', () => {
   });
 });
 
+
 describe('automation › failed enable recovery', () => {
   it('keeps a failed enable disabled and unarmed, then preserves concurrent edits on retry', async () => {
     const created = await createTask(TEST_UID, {
@@ -2637,7 +2960,7 @@ describe('automation › recovery discovery sequences', () => {
       // Only an admitted run adds run facts; the claimed occurrence and the
       // rest of the record survive restoration either way.
       const withoutRunFacts = (buffer: Buffer) => {
-        const { run_count, last_run, previous_run, ...rest } = JSON.parse(buffer.toString('utf8'));
+        const { run_count, last_run, previous_run, conversation_id, ...rest } = JSON.parse(buffer.toString('utf8'));
         return rest;
       };
       expect(withoutRunFacts(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId)))).toEqual(withoutRunFacts(persisted));
@@ -2905,6 +3228,87 @@ describe('multi-selection recovery and clock changes', () => {
     await waitForSchedulerOutcome(() => armedDueAtForTest(created.task.id) === new Date(2026, 11, 1, 9).getTime(), 'next selected month');
   });
 
+  it('does not re-arm after shutdown while an admission-failure read is pending', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 10, 2, 8));
+    activateUser(TEST_UID);
+    const created = await createTask(TEST_UID, { content: 'Stop during failure recovery', schedule: { type: 'daily', hour: 9, minute: 0 } });
+    if (!created.ok) throw new Error('Scheduler failure fixture rejected');
+    startScheduler();
+    await rescheduleAllForTest(TEST_UID);
+    vi.setSystemTime(new Date(2026, 10, 2, 9));
+    const events: any[] = [];
+    const unsubscribe = subscribeFiresForUser(TEST_UID, event => events.push(event));
+    let release!: () => void;
+    let paused = false;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const readJson = storage.readJson;
+    const spy = vi.spyOn(storage, 'readJson').mockImplementation(async (...args) => {
+      const value = await readJson(...args);
+      if (!paused && args[0] === autoTaskConfigFile(TEST_UID, created.task.id)
+        && events.some(event => event.type === 'fire_failed')) {
+        paused = true;
+        await pending;
+      }
+      return value;
+    });
+    _setMarkRanFailureForTest(new Error('injected admission failure'));
+    const firing = _onTimerFireForTest(TEST_UID, created.task.id);
+    try {
+      await waitForSchedulerOutcome(() => paused, 'the failure recovery read to pause');
+      stopScheduler();
+      release();
+      await firing;
+      expect(armedDueAtForTest(created.task.id)).toBeNull();
+      expect(autoRuntime.send).not.toHaveBeenCalled();
+      expect(events).toEqual([expect.objectContaining({ type: 'fire_failed', task_id: created.task.id, error_code: 'mark_ran_failed' })]);
+      expect((await getTask(TEST_UID, created.task.id))?.last_run_at).toBeUndefined();
+    } finally {
+      release();
+      await firing;
+      spy.mockRestore();
+      _setMarkRanFailureForTest(null);
+      unsubscribe();
+    }
+  });
+
+  it('does not re-arm a stopped scheduler after an admitted dispatch finishes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 10, 2, 8));
+    activateUser(TEST_UID);
+    const created = await createTask(TEST_UID, { content: 'Stop during dispatch', schedule: { type: 'daily', hour: 9, minute: 0 } });
+    if (!created.ok) throw new Error('Scheduler stop fixture rejected');
+    startScheduler();
+    await rescheduleAllForTest(TEST_UID);
+    vi.setSystemTime(new Date(2026, 10, 2, 9));
+    let release!: () => void;
+    let admitted = false;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const send = autoRuntime.send.getMockImplementation()!;
+    autoRuntime.send.mockImplementationOnce(async input => {
+      const result = await send(input);
+      admitted = true;
+      await pending;
+      return result;
+    });
+    const firing = _onTimerFireForTest(TEST_UID, created.task.id);
+    try {
+      await waitForSchedulerOutcome(() => admitted, 'the admitted dispatch to pause');
+      stopScheduler();
+      expect(armedDueAtForTest(created.task.id)).toBeNull();
+      release();
+      await firing;
+      expect(armedDueAtForTest(created.task.id)).toBeNull();
+      expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+      expect((await getTask(TEST_UID, created.task.id))?.last_run_at).toBe(new Date(2026, 10, 2, 9).toISOString());
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      await firing;
+    }
+  });
+
   it('detects a forward wall-clock correction, catches up once and stops monitoring on shutdown', async () => {
     vi.useFakeTimers();vi.setSystemTime(new Date(2026, 10, 2, 8));activateUser(TEST_UID);
     const created = await createTask(TEST_UID, { content: 'Clock correction', schedule: { type: 'daily', hour: 9, minute: 0 } });
@@ -2923,7 +3327,6 @@ describe('multi-selection recovery and clock changes', () => {
   });
 });
 
-
 describe('automation search projection freshness', () => {
   it('returns current scoped content after edits and drops a deleted automation', async () => {
     const created = await createTask(TEST_UID, { title: 'Original', content: 'Read-only search content', enabled: false,
@@ -2936,4 +3339,75 @@ describe('automation search projection freshness', () => {
     await deleteTask(TEST_UID, created.task.id);
     expect(await listTaskSearchRows(TEST_UID)).toEqual([]);
   });
+});
+
+it('ends the host in-progress marker when its run finishes after the automation was deleted', async () => {
+  const taskId = 'at_93939393', cid = 'cid-deleted-automation-terminal', runId = 'run-deleted-automation-terminal';
+  openConversation(cid);
+  const created = await createTask(TEST_UID, { id: taskId, content: 'Finish this admitted run', enabled: false,
+    schedule: { type: 'daily', hour: 9, minute: 0 },
+  }, { conversationId: cid });
+  expect(created.ok).toBe(true);
+  admitsInto(runId);
+  expect(await runTaskNow(TEST_UID, taskId)).toEqual({ ok: true, cid });
+  expect(activeRunTaskId(TEST_UID, cid)).toBe(taskId);
+  expect((await deleteTask(TEST_UID, taskId)).ok).toBe(true);
+  for (const listener of [...autoRuntime.terminalListeners]) listener({
+    run_id: runId, user_id: TEST_UID, conversation_id: cid, status: 'completed', finished_at_ms: Date.now(),
+  });
+  await vi.waitFor(() => expect(activeRunTaskId(TEST_UID, cid)).toBe(''), { timeout: 2000 });
+  expect(autoRuntime.terminalListeners.size).toBe(0);
+  expect(await getTask(TEST_UID, taskId)).toBeNull();
+  expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
+});
+
+it('keeps the newer in-progress run when the same task receives an earlier run terminal', async () => {
+  const taskId = 'at_94949494', cid = 'cid-late-same-task-terminal';
+  openConversation(cid);
+  expect((await createTask(TEST_UID, { id: taskId, content: 'Keep the admitted run', enabled: false,
+    schedule: { type: 'daily', hour: 9, minute: 0 },
+  }, { conversationId: cid })).ok).toBe(true);
+  admitsInto('run_old_identity'); await runTaskNow(TEST_UID, taskId);
+  const first = (await getTask(TEST_UID, taskId))!.last_run!;
+  await realDelay(2);
+  admitsInto('run_new_identity'); await runTaskNow(TEST_UID, taskId);
+  const latest = (await getTask(TEST_UID, taskId))!.last_run!;
+  expect(latest.started_at).not.toBe(first.started_at);
+  for (const listener of [...autoRuntime.terminalListeners]) listener({
+    run_id: 'run_old_identity', user_id: TEST_UID, conversation_id: cid, status: 'failed', finished_at_ms: Date.now(),
+  });
+  await realDelay(10);
+  expect(activeRunTaskId(TEST_UID, cid)).toBe(taskId);
+  expect((await getTask(TEST_UID, taskId))?.last_run).toEqual(latest);
+  for (const listener of [...autoRuntime.terminalListeners]) listener({
+    run_id: 'run_new_identity', user_id: TEST_UID, conversation_id: cid, status: 'completed', finished_at_ms: Date.now(),
+  });
+  await vi.waitFor(() => expect(activeRunTaskId(TEST_UID, cid)).toBe(''));
+  expect(autoRuntime.terminalListeners.size).toBe(0);
+});
+
+it('ends actual run ownership when terminal persistence fails while preserving the last durable record and diagnostics', async () => {
+  const taskId = 'at_95959595', cid = 'cid-terminal-disk-failure', runId = 'run-terminal-disk-failure';
+  openConversation(cid);
+  expect((await createTask(TEST_UID, { id: taskId, content: 'Keep durable evidence', enabled: false,
+    schedule: { type: 'daily', hour: 9, minute: 0 },
+  }, { conversationId: cid })).ok).toBe(true);
+  admitsInto(runId); await runTaskNow(TEST_UID, taskId);
+  const bytes = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId));
+  const actual = storage.writeJson;
+  const failedWrite = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, value) => {
+    if (file === autoTaskConfigFile(TEST_UID, taskId) && (value as any).last_run?.status === 'completed') {
+      throw Object.assign(new Error('Synthetic terminal persistence failure'), { code: 'EACCES' });
+    }
+    return actual(file, value);
+  });
+  try {
+    for (const listener of [...autoRuntime.terminalListeners]) listener({
+      run_id: runId, user_id: TEST_UID, conversation_id: cid, status: 'completed', finished_at_ms: Date.now(),
+    });
+    await vi.waitFor(() => expect(automationLogs.records.some(row => String(row[0]).startsWith('run terminal record failed'))).toBe(true));
+    expect(activeRunTaskId(TEST_UID, cid)).toBe('');
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId))).toEqual(bytes);
+    expect(autoRuntime.terminalListeners.size).toBe(0);
+  } finally { failedWrite.mockRestore(); }
 });

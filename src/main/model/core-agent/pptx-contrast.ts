@@ -162,7 +162,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     const format = formatOf(node);
     const nodePath = String(node.path ?? '').trim();
     const nodeType = String(node.type ?? '').trim().toLowerCase();
-    const isOwner = ['shape', 'placeholder', 'textbox', 'table-cell', 'cell'].includes(nodeType);
+    const isOwner = ['shape', 'title', 'placeholder', 'textbox', 'table-cell', 'cell'].includes(nodeType);
     const activeOwner = isOwner && nodePath ? nodePath : ownerPath;
     const background = resolvedBackground(format, inheritedBackground, theme);
     const backgroundDeclared = background !== inheritedBackground ? background !== null : inheritedBackgroundDeclared;

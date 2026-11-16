@@ -11,6 +11,15 @@ const indexSource = fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8
 const styleSource = fs.readFileSync(path.join(rendererRoot, 'style.css'), 'utf8');
 const preloadSource = fs.readFileSync(path.resolve(__dirname, '../../src/main/preload.js'), 'utf8');
 
+function visibilityLayers(context: any) {
+  context.host ||= { hidden: false };
+  context.window ||= {};
+  context.window.OverlayManager = {
+    setBrowserTarget: vi.fn(),
+    isBrowserOccluded: () => context.occluded === true,
+  };
+}
+
 describe('Web Assist renderer wiring', () => {
   it.each(['another task', 'settings', 'leave and return'])('ignores a late browser reveal after navigating to %s', async destination => {
     let resolve: (value: unknown) => void = () => {};
@@ -527,7 +536,7 @@ describe('Web Assist renderer wiring', () => {
       renderedTabId: '', addressDirty: false, addressInput: input,
       emptyEl: {}, host: {}, backBtn: {}, forwardBtn: {}, reloadBtn: {}, externalBtn: {}, statusEl: {},
       stateErrorText: () => '', assistantStatusText: () => '',
-      renderPermissionPrompt() {}, ensureMainActiveTab() {}, syncVisibility() {},
+      renderPermissionPrompt() {}, renderPageDialog() {}, ensureMainActiveTab() {}, syncVisibility() {},
     });
     vm.runInContext(webAssistSource.slice(start, end), context);
     context.renderState({});
@@ -564,9 +573,8 @@ describe('Web Assist renderer wiring', () => {
     expect(invoke).not.toHaveBeenCalled();
     context.panelTab = 'browser';
     context.modalIsOpen = () => true;
-    context.ensureMainActiveTab();
-    expect(invoke).not.toHaveBeenCalled();
-    context.modalIsOpen = () => false;
+    // Existing floating UI must not prevent selection from reaching the
+    // common geometry gate when the browser is subsequently requested.
     context.selectedTab = () => ({ tab_id: 'same-tab', suspended: true, error_code: 'page_load_failed' });
     context.ensureMainActiveTab();
     expect(invoke).not.toHaveBeenCalled();
@@ -713,7 +721,8 @@ describe('Web Assist renderer wiring', () => {
     const context = vm.createContext({ nativeVisible: true, layoutFrame: 0, layoutRevision: 0,
       host: { hidden: false, getBoundingClientRect: () => ({ left: 600, top: 100, width: 400, height: 500 }) },
       window: { requestAnimationFrame: (fn: any) => { frame = fn; return 1; },
-        OverlayManager: { settled: () => settled, version: () => 2, epoch: () => 1 }, orkas: { invoke } },
+        OverlayManager: { refresh: vi.fn(), settled: () => settled, version: () => 2, epoch: () => 1,
+          setPresentedBounds: vi.fn() }, orkas: { invoke } },
       log: { warn: vi.fn() }, renderState: vi.fn(),
     });
     vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function scheduleLayout()'),
@@ -744,6 +753,7 @@ describe('Web Assist renderer wiring', () => {
       shell, selectedTab: () => null, panelOpen: false, panelTab: 'files',
       activeView: 'new-chat', activeCid: '', nativeVisible: false, nativeTabId: '', currentState: null,
     });
+    visibilityLayers(context);
     vm.runInContext(webAssistSource.slice(start, end), context);
     context.syncVisibility();
     // Browsers enqueue an attribute mutation even when a setter repeats its
@@ -775,6 +785,7 @@ describe('Web Assist renderer wiring', () => {
       window: { orkas: { invoke: () => Promise.resolve({ ok: true }) } },
       log: { warn() {} },
     });
+    visibilityLayers(context);
     vm.runInContext(webAssistSource.slice(start, end), context);
     context.syncVisibility();
     expect(context.nativeVisible).toBe(true);
@@ -797,6 +808,7 @@ describe('Web Assist renderer wiring', () => {
       nativeVisible: true, nativeTabId: 'tab', currentState: { open: true, active_tab_id: 'tab' },
       modalIsOpen: () => false, scheduleLayout, window: { orkas: { invoke } },
     });
+    visibilityLayers(context);
     vm.runInContext(webAssistSource.slice(start, end) + webAssistSource.slice(resizeStart, resizeEnd), context);
     context.setResizing(true);
     expect(context.nativeVisible).toBe(true);
@@ -811,7 +823,7 @@ describe('Web Assist renderer wiring', () => {
     { reason: 'closed details', open: false, tab: 'browser', modal: false, resizing: false },
     { reason: 'Files selected', open: true, tab: 'files', modal: false, resizing: false },
     { reason: 'Attachments selected', open: true, tab: 'attachments', modal: false, resizing: false },
-    { reason: 'protected dialog open', open: true, tab: 'browser', modal: true, resizing: false },
+    { reason: 'overlapping layer open', open: true, tab: 'browser', modal: true, resizing: false },
   ])('hides native content for $reason and restores it without closing the browser session', async (scenario) => {
     const start = webAssistSource.indexOf('  function syncVisibility() {');
     const end = webAssistSource.indexOf('  function scheduleLayout()', start);
@@ -828,6 +840,8 @@ describe('Web Assist renderer wiring', () => {
       modalIsOpen: () => scenario.modal, scheduleLayout,
       window: { orkas: { invoke } }, log: { warn() {} },
     });
+    visibilityLayers(context);
+    context.occluded = scenario.modal;
     vm.runInContext(webAssistSource.slice(start, end), context);
     context.syncVisibility();
     context.syncVisibility(); // Repeated page/status events must settle.
@@ -839,7 +853,7 @@ describe('Web Assist renderer wiring', () => {
     context.panelOpen = true;
     context.panelTab = 'browser';
     context.panelResizing = false;
-    context.modalIsOpen = () => false;
+    context.occluded = false;
     context.syncVisibility();
     expect(context.shell.hidden).toBe(false);
     expect(context.nativeVisible).toBe(true);

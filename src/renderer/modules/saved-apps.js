@@ -16,6 +16,8 @@
   let _appsCache = null; // last fetched list (for the i18n-change re-render)
   let _appsLocalCache = null;
   let _appsLoadGeneration = 0;
+  let _appsBuiltinCache = [];
+  let _editRequest = null;
   let _appViewerEl = null;
   let _appViewerFrame = null;
   let _appViewerTitle = null;
@@ -262,12 +264,13 @@
     const app = (_appsCache || []).find(row => row.id === _rowMenuAppId);
     const defs = [
       ['rename', _t('apps.rename', 'Rename'), false],
-      ['edit', _t('apps.edit', 'Edit'), false],
+      ['edit', _t(_editRequest ? 'common.loading' : 'apps.edit', 'Edit'), false],
       ['publish', _t('apps.publish_action', 'Publish'), false],
       ['delete', _t('apps.delete', 'Delete'), true],
     ];
     for (const [action, label, danger] of defs) {
-      _appendRowMenuItem(el, action, label, danger, false, () => {
+      if (app?.source === 'builtin' && action !== 'edit') continue;
+      _appendRowMenuItem(el, action, app?.source === 'builtin' ? _t('apps.edit_copy', 'Edit a copy') : label, danger, action === 'edit' && !!_editRequest, () => {
         const id = _rowMenuAppId;
         _closeRowMenu(true);
         if (!id) return;
@@ -310,13 +313,12 @@
   window.AppActionMenu = { toggle: _toggleActionMenu, close: () => { if (_rowMenuCustom) _closeRowMenu(); } };
 
   // ── actions ─────────────────────────────────────────────────────────────
-  async function _openApp(appId, online = false) {
-    const selected = (_appsCache || []).find(row => row.id === appId);
+  async function _openApp(appId, online = false, selected = (_appsCache || []).find(row => row.id === appId)) {
     if (window.OrkasPreviewWindows) {
-      const app = (_appsCache || []).find(item => item.id === appId);
+      const app = selected;
       const result = await window.OrkasPreviewWindows.open({ kind: 'app', appId, title: app?.title || _t('artifact.title', 'Interactive app') });
       if (!result?.ok) _appsLogFailure('saved_app_open', { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
-      return;
+      return !!result?.ok;
     }
     let r;
     try {
@@ -324,42 +326,111 @@
     } catch (err) {
       _appsLogFailure('saved_app_open', _savedAppFailure(err, 'saved_app_open_failed', 'ipc'));
       _fail(_t('apps.open_failed', 'Could not open the app'), err);
-      return;
+      return false;
     }
     if (!r || r.ok === false || !r.url) {
         const failure = _savedAppFailure(r, r && r.ok === false ? 'saved_app_open_failed' : 'invalid_response');
       _appsLogFailure('saved_app_open', failure);
       _fail(_t('apps.open_failed', 'Could not open the app'), { message: (r && r.error) || 'open failed' });
-      return;
+      return false;
     }
     try {
-      const app = (_appsCache || []).find((a) => a && a.id === appId);
+      const app = selected;
       _openAppViewer(r, (app && app.title) || _t('artifact.title', 'Interactive app'));
     } catch (err) {
-      _fail(_t('apps.open_failed', 'Could not open the app'), err);
-      return;
+      _appsLogFailure('saved_app_open', _savedAppFailure(err, 'saved_app_viewer_failed', 'presentation'));
+      _fail(_t('apps.open_failed', 'Could not open the app'));
+      return false;
     }
 
+    return true;
   }
 
+
+  // Resolve from the active account on each interaction. Coalesce simultaneous
+  // footer labels only; retaining a completed list could reopen a deleted app.
+  let _navRead = null;
+  async function _appNavTarget(targetId) {
+    if (typeof targetId !== 'string' || !targetId.trim() || targetId.length > 160 || /[\u0000-\u001f\u007f]/.test(targetId)) return null;
+    const user = currentUserId;
+    if (!_navRead || _navRead.user !== user) {
+      const read = { user, promise: Promise.resolve(window.orkas.invoke('savedApps.list', { localOnly: true })) };
+      _navRead = read;
+      void read.promise.finally(() => { if (_navRead === read) _navRead = null; }).catch(() => {});
+    }
+    const result = await _navRead.promise;
+    if (user !== currentUserId || !result || result.ok === false || !Array.isArray(result.apps)) return null;
+    const apps = result.apps.concat(Array.isArray(result.builtinApps) ? result.builtinApps : []);
+    const target = targetId.trim();
+    const byId = apps.find(app => app.id === target);
+    if (byId) return byId;
+    const matches = apps.filter(app => app.title === target);
+    return matches.length === 1 ? matches[0] : null;
+  }
+  window.loadSavedAppNavTarget = async targetId => {
+    const app = await _appNavTarget(targetId);
+    return app ? { name: app.title } : null;
+  };
+  window.openSavedAppById = async targetId => {
+    const user = currentUserId;
+    const app = await _appNavTarget(targetId);
+    return user === currentUserId && app ? _openApp(app.id, false, app) : false;
+  };
+
   // "Edit" — backend creates a fresh conversation with the app's source bundled
-  // in as an `app-source.md` attachment; we navigate to it and pre-fill a draft
+  // in as an `app-source.md` attachment; we navigate with an empty draft
   // (mirrors `agents.js::useAgent`'s create-conv-and-go pattern, but doesn't
   // auto-send — the user completes the request and hits Send).
   window.openSavedAppPreview = _openAppViewer;
 
-  async function _editApp(appId, capabilities) {
+  function _syncEditState() {
+    for (const card of document.querySelectorAll('.app-card')) {
+      const busy = _editRequest?.appId === card.dataset.appId;
+      card.setAttribute('aria-busy', String(busy));
+      let status = card.querySelector('[data-app-edit-status]');
+      if (!busy) { status?.remove(); continue; }
+      if (!status) {
+        status = document.createElement('span');
+        status.className = 'app-card-time';
+        status.dataset.appEditStatus = '1';
+        status.setAttribute('role', 'status');
+        card.querySelector('.app-card-meta')?.appendChild(status);
+      }
+      status.textContent = _t('common.loading', 'Loading…');
+    }
+    if (_rowMenuAppId && _rowMenuEl) _renderRowMenuItems(_rowMenuEl);
+  }
+
+  async function _editApp(appId) {
+    if (_editRequest) return;
+    const request = { appId: String(appId) };
+    _editRequest = request;
+    _syncEditState();
+    const originView = typeof currentView === 'undefined' ? null : currentView;
+    const originCid = typeof currentCid === 'undefined' ? null : currentCid;
+    try { await _prepareEditApp(request, originView, originCid); }
+    finally {
+      if (_editRequest === request) { _editRequest = null; _syncEditState(); }
+    }
+  }
+
+  async function _prepareEditApp(request, originView, originCid) {
+    const appId = request.appId;
     let r;
     try {
-      r = await window.orkas.invoke('savedApps.openForEditing', { appId: String(appId) });
+      r = await window.orkas.invoke('savedApps.openForEditing', {
+        appId: String(appId),
+      });
     } catch (err) {
+      if (_editRequest !== request) return;
       _appsLogFailure('saved_app_manage', { action: 'edit', ..._savedAppFailure(err, 'saved_app_edit_failed', 'ipc') });
-      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), err);
+      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'));
       return;
     }
+    if (_editRequest !== request) return;
     if (!r || r.ok === false) {
-        _appsLogFailure('saved_app_manage', { action: 'edit', ..._savedAppFailure(r, 'saved_app_edit_failed') });
-      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), { message: (r && r.error) || 'open-for-editing failed' });
+      _appsLogFailure('saved_app_manage', { action: 'edit', ..._savedAppFailure(r, 'saved_app_edit_failed') });
+      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'));
       return;
     }
     const conv = r.conversation;
@@ -368,7 +439,6 @@
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'));
       return;
     }
-
     // Add to the sidebar list. Set last_active_at explicitly — backend
     // create response doesn't include the derived field, so timeBucket
     // would otherwise put this brand-new row in the 'older' bucket.
@@ -379,23 +449,25 @@
         if (typeof renderConversationList === 'function') renderConversationList();
       }
     } catch (_) {}
+    // Keep a task prepared after navigation in the sidebar, without stealing
+    // the user's current view or replacing a draft they have since opened.
+    if ((originView !== null && currentView !== originView) || (originCid !== null && currentCid !== originCid)) return;
     // Navigate (skipLoad — the conv is brand new, nothing to fetch).
+    _closeRowMenu();
     try { setView('conversation', conv.conversation_id, { skipLoad: true }); } catch (_) {}
-    // Pre-fill a draft + refresh the attachment chips so `app-source.md` shows
+    // Clear the draft + refresh the attachment chips so `app-source.md` shows
     // (setView with skipLoad doesn't restore drafts or re-sync attachments).
     try {
-      const file = r.sourceFileName || 'app-source.md';
-      const name = r.title || _t('artifact.title', 'Interactive app');
       const input = document.getElementById('chat-input');
       if (input) {
-        let seed = _t('apps.edit_seed',
-          'Modify the interactive app "{name}". Source: attached "{file}":',
-          { name, file });
-        if (capabilities?.length) seed += '\n' + _t('apps.publish_adapt_seed', '', { capabilities: capabilities.map(c => _t('apps.capability_' + c, c)).join(', ') });
-        composerSetText(input, String(seed || '').trimEnd());
+        composerSetText(input, '');
+        composerSetPlaceholder(input, _t('skills.chat_input_placeholder', 'Describe what to change...'));
         if (typeof autoGrow === 'function') autoGrow(input, 200);
         if (typeof _saveDraft === 'function') _saveDraft(conv.conversation_id);
-        setTimeout(() => { try { input.focus(); } catch (_) {} }, 60);
+        setTimeout(() => {
+          if (typeof currentCid !== 'undefined' && currentCid !== conv.conversation_id) return;
+          try { input.focus(); } catch (_) {}
+        }, 0);
       }
       if (typeof _chatAttachRefreshFromServer === 'function') _chatAttachRefreshFromServer(conv.conversation_id);
     } catch (_) {
@@ -675,16 +747,40 @@
     const focusedAppId = focusedCard?.dataset.appId;
     const focusedMore = !!focusedCard && focused.matches('[data-app-more]');
     const focusedDetails = !!focusedCard && focused.matches('[data-app-details]');
+    const focusedAction = focusedCard && focused.dataset.appAction;
     const focusedMenuAction = _rowMenuAppId && _rowMenuEl?.contains(focused) ? focused.dataset.action : null;
     let replacementFocus = null;
     let replacementAnchor = null;
     grid.innerHTML = '';
-    const list = (Array.isArray(apps) ? apps : []).filter(app => {
+    const validApps = (Array.isArray(apps) ? apps : []).filter(app => {
       if (!app || !app.id) return false;
       return true;
     });
+    const custom = validApps.filter(app => app.source !== 'builtin');
+    const platform = validApps.filter(app => app.source === 'builtin');
+    // Preserve each owning pool's existing order.
+    const list = custom.concat(platform);
     if (empty) empty.style.display = list.length ? 'none' : '';
     if (countEl) countEl.textContent = list.length ? String(list.length) : '';
+    grid.classList.add('is-sectioned');
+    const sections = new Map();
+    for (const [source, label, rows] of [
+      ['custom', _t('apps.custom_group', 'Custom'), custom],
+      ['builtin', _t('apps.platform_group', 'Platform'), platform],
+    ]) {
+      if (!rows.length) continue;
+      const section = document.createElement('section');
+      section.className = 'skills-source-section';
+      section.dataset.appSource = source;
+      section.setAttribute('aria-label',label);
+      const heading = document.createElement('div');
+      heading.className = 'skills-source-section-head';
+      const title = document.createElement('span'); title.textContent = label;
+      const count = document.createElement('span'); count.className = 'skills-source-section-count'; count.textContent = String(rows.length);
+      heading.append(title, count);
+      const cards = document.createElement('div'); cards.className = 'skills-source-section-grid';
+      section.append(heading, cards); grid.appendChild(section); sections.set(source, cards);
+    }
 
     const moreSvg = (typeof uiIconHtml === 'function')
       ? uiIconHtml('more-horizontal', 'ui-icon app-card-more-icon')
@@ -692,7 +788,7 @@
 
     for (const a of list) {
       if (!a || !a.id) continue;
-      const title = a.title || _t('artifact.title', 'Interactive app');
+      const title = (a.source === 'builtin' && a.titleKey ? _t(a.titleKey,a.title) : a.title) || _t('artifact.title', 'Interactive app');
       const card = document.createElement('div');
       card.className = 'app-card';
       card.dataset.appId = a.id;
@@ -708,7 +804,7 @@
       const icon = document.createElement('span');
       icon.className = `app-card-icon is-${tones[hash % tones.length]}`;
       icon.setAttribute('aria-hidden', 'true');
-      icon.innerHTML = uiIconHtml('layout-grid');
+      icon.innerHTML = uiIconHtml(a.source === 'builtin' ? a.icon || 'layout-grid' : 'layout-grid');
       const header = document.createElement('div');
       header.className = 'app-card-header';
       header.appendChild(icon);
@@ -721,6 +817,23 @@
       name.textContent = title;
       titleBlock.appendChild(name);
       let details = null;
+      let actions = null;
+      if (a.source !== 'builtin' && a.local !== false) {
+        actions = document.createElement('div');
+        actions.className = 'app-card-actions';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-sm app-card-action';
+        button.dataset.appAction = 'publish';
+        button.textContent = _t('apps.publish_action', 'Publish');
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          _closeRowMenu();
+          void window.OrkasCommercialEntry?.show();
+        });
+        actions.appendChild(button);
+      }
+
 
       const more = document.createElement('button');
       more.type = 'button';
@@ -738,6 +851,10 @@
 
       const meta = document.createElement('div');
       meta.className = 'app-card-meta';
+      if (a.source === 'builtin' && a.description) {
+        const description = document.createElement('span');
+        description.textContent = a.descriptionKey ? _t(a.descriptionKey,a.description) : a.description; meta.appendChild(description);
+      }
       const updated = _formatRelative(a.savedAt);
       if (updated) {
         const u = document.createElement('span');
@@ -745,7 +862,11 @@
         u.textContent = _t('apps.saved_at_hint', 'Saved {time}', { time: updated });
         meta.appendChild(u);
       }
-      card.appendChild(meta);
+      const footer = document.createElement('div');
+      footer.className = 'app-card-footer';
+      footer.appendChild(meta);
+      if (actions) footer.appendChild(actions);
+      card.appendChild(footer);
 
       card.addEventListener('click', (e) => {
         if (e.target && e.target.closest && e.target.closest('[data-app-more]')) {
@@ -763,10 +884,12 @@
           _openApp(a.id);
         }
       });
-      grid.appendChild(card);
-      if (a.id === focusedAppId) replacementFocus = focusedMore ? more : focusedDetails && details ? details : card;
+      sections.get(a.source === 'builtin' ? 'builtin' : 'custom').appendChild(card);
+      if (a.id === focusedAppId) replacementFocus = focusedMore ? more : focusedDetails && details ? details
+        : (focusedAction && card.querySelector(`[data-app-action="${focusedAction}"]`)) || card;
       if (a.id === _rowMenuAppId) replacementAnchor = more;
     }
+    _syncEditState();
     if (replacementFocus) _uiRestoreDialogFocus(replacementFocus, { preventScroll: true });
     if (_rowMenuAppId) {
       if (replacementAnchor) {
@@ -790,13 +913,15 @@
 
   function repaintSavedApps() {
     if (!_appsLocalCache) return;
-    _appsCache = _appsLocalCache;
+    _appsCache = _appsLocalCache.concat(_appsBuiltinCache);
     _renderApps(_appsCache);
   }
 
   async function loadSavedApps(_force, options) {
     const request=++_appsLoadGeneration;
     if (options?.reset) {
+      _editRequest = null;
+      _appsBuiltinCache = [];
       _createPanel?.close(false);
       _createDraft = null;
       _appsCache = null;
@@ -809,14 +934,14 @@
       if (_createPanel) return;
       _openCreatePanel(_createDraft?.idea ?? '', _createDraft?.template ?? 'custom');
     };
-    // List from disk before online revalidation. Legacy type recovery can need
-    // the service; it must not hold every app card behind a network request.
+    // Read local app inventory without publication revalidation.
     try {
       const r = await window.orkas.invoke('savedApps.list', { localOnly: true });
       if(request!==_appsLoadGeneration)return;
       if (!r || r.ok === false || !Array.isArray(r.apps)) throw new Error('saved_app_list_failed');
-      _appsCache = r.apps;
       _appsLocalCache = r.apps;
+      _appsBuiltinCache = Array.isArray(r.builtinApps) ? r.builtinApps : [];
+      _appsCache = r.apps.concat(_appsBuiltinCache);
     } catch (_) {
       if(request!==_appsLoadGeneration)return;
       _appsLog.warn('savedApps.list failed', { error_code: 'saved_app_list_failed' });

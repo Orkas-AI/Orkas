@@ -1,5 +1,21 @@
 # 对话、附件与 Artifact 模块人工回归 Case
 
+## Pending-project backlog scope
+
+`conversation_tasks_tool.ts` belongs to conversation filing: an unbound
+Commander may write to the project it just created before filing finishes.
+Omitting the project selects only that pending creation; explicit `__global__`
+continues to select personal work. Existing, foreign, shared, deleted or
+replaced projects must not inherit this exception. Cancellation and account
+changes must stop deferred writes, deletes and attachment preparation without
+falling back to the global backlog or losing already saved project work.
+
+`project-todos_e2e_scope.test.ts` exercises the real runner, direct/programmatic
+tools and durable stores across these success, rejection and asynchronous
+interruption boundaries. `conversation-filing.test.ts` independently owns
+filing and relocation recovery. These deterministic host checks neither
+grant a new tool scope nor certify live model behavior or a whole module review.
+
 ## 评测原则与证据矩阵
 
 对话是所有 Agent 与项目任务的持久化底座。Case 必须同时证明成功路径和失败恢复，

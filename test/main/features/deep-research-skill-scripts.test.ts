@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { webFetchTool } from '../../../src/core-agent/src/tools/web-fetch';
+import { captureDeepResearchWebFetchEvidence } from '../../../src/main/model/core-agent/deep-research-evidence';
 
 const PC_ROOT = path.resolve(__dirname, '../../..');
 const RUN_SKILL = path.join(PC_ROOT, 'bin', 'run-skill.cjs');
@@ -23,6 +25,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -48,6 +51,41 @@ function runScript(script: string, args: string[]) {
 }
 
 describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
+  it.each(['application/json', 'text/plain'])('verifies a quote from a successful %s fetch without changing its body', async (contentType) => {
+    const quote = 'Offline use requires an initial model download.';
+    const body = contentType === 'application/json' ? JSON.stringify({ fact: quote }) : quote;
+    const url = 'https://example.test/official-guide';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      headers: { 'content-type': contentType },
+    })));
+    const fetched = await webFetchTool.execute({ url }, { state: {} });
+    expect(fetched.isError).not.toBe(true);
+    expect(fetched.content).toBe(contentType === 'application/json'
+      ? JSON.stringify({ fact: quote }, null, 2) : body);
+    captureDeepResearchWebFetchEvidence(fetched, path.join(tmpDir, 'source-snapshots.jsonl'));
+    fs.writeFileSync(path.join(tmpDir, 'evidence_ledger.jsonl'), JSON.stringify({
+      id: 'E1', source_id: 'S1', candidate: 'Example app', field: 'local_offline',
+      claim: quote, quote, canonical_url: url,
+    }) + '\n');
+    writeJson('citations_input.json', { compact_landscape: {
+      title: 'Offline availability', boundary: 'Controlled official source.',
+      analysis_markdown: 'Offline availability is conditional on the initial download [E1].',
+      candidates: [{ candidate: 'Example app', best_for: 'Conditional offline use', ideal_user: 'Local user' }],
+    } });
+    const result = runScript('citations', [
+      '--op', 'verify', '--input', 'citations_input.json', '--out', 'citations_output.json',
+      '--report-out', 'RESEARCH-offline.md',
+    ]);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    const output = JSON.parse(fs.readFileSync(path.join(tmpDir, 'citations_output.json'), 'utf8')).data;
+    expect(output.summary).toMatchObject({ verified: 1, flagged: 0 });
+    expect(output.comparison_coverage[0].fields_with_citations).toEqual(['local_offline']);
+    const report = fs.readFileSync(path.join(tmpDir, 'RESEARCH-offline.md'), 'utf8');
+    expect(report).toContain(quote);
+    expect(report).toContain('E1');
+  });
+
   it('plans caps from workspace-relative input and writes workspace-relative output', () => {
     writeJson('caps_input.json', {
       depth: 1,
@@ -238,6 +276,7 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
       'utf8',
     );
     const sourceText = Object.values(claims).join('\n');
+    fs.appendFileSync(path.join(tmpDir, 'evidence_ledger.jsonl'), '{broken\nnull\n', 'utf8');
     fs.writeFileSync(
       path.join(tmpDir, 'source-snapshots.jsonl'),
       `${JSON.stringify({
@@ -276,6 +315,12 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
       enabled: true,
       selected_evidence_rows: 6,
       candidate_rows: 1,
+      ledger_diagnostics: {
+        nonempty_lines: 8,
+        reason_counts: { invalid_json: 1, non_object: 1 },
+        samples: [{ line: 7, reason: 'invalid_json' }, { line: 8, reason: 'non_object' }],
+        omitted_samples: 0,
+      },
     });
     expect(stdout.report).toMatchObject({ path: 'RESEARCH-REPORT.md' });
     expect(stdout).not.toHaveProperty('comparison_markdown');
@@ -288,6 +333,7 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
     expect(report).not.toContain('material limitation:');
     expect(report).toContain('| Candidate | Best for |');
     expect(report).toContain('## Evidence used');
+    expect(report).not.toContain('invalid_json');
   });
 
   it('loads the academic entrypoint and reports an unknown provider without making a network call', () => {

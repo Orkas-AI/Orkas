@@ -4,6 +4,8 @@ import path from 'node:path';
 
 import { expect, test } from './fixtures/orkas';
 
+declare const currentCid: string;
+
 const accountTest = test;
 
 async function sendNewChat(
@@ -662,7 +664,7 @@ test.describe('real chat pipeline with a local model', () => {
     expect(modelOrkas.modelRequests).toHaveLength(2);
   });
 
-  test('steers a text-reference composer update and reorders the live reply on its next update', async ({ modelOrkas }) => {
+  test('steers a text-reference composer update and preserves reply order across task switches', async ({ modelOrkas }, testInfo) => {
     modelOrkas.setModelMode('controlled-slow');
     const page = await sendNewChat(modelOrkas, 'E2E active turn accepts a send-now update.');
     await expect.poll(
@@ -709,6 +711,30 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
       .toHaveText('Hello from the local E2E model.');
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+
+    const conversationId = await page.locator('#conversation-list .conv-item.active').getAttribute('data-cid');
+    const roles = () => page.locator('#chat-history > .chat-message').evaluateAll(nodes =>
+      nodes.map(node => node.classList.contains('user') ? 'user' : 'assistant'));
+    await expect.poll(roles).toEqual(['user', 'user', 'assistant']);
+    // Hold the model at the same fragment: neither a new delta nor terminal
+    // persistence may repair an incorrectly restored position for this check.
+    for (const [language, width] of [['en', 1280], ['zh', 760]] as const) {
+      await page.setViewportSize({ width, height: 760 });
+      await page.evaluate(lang => (window as any).setLang(lang), language);
+      await page.locator('#new-chat-btn').click();
+      if (language === 'zh') await page.reload();
+      await page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
+      await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
+        .toHaveText('Hello from the local E2E model.');
+      expect(await roles()).toEqual(['user', 'user', 'assistant']);
+      await page.evaluate(async () => {
+        const runtime = window as any;
+        await runtime.loadConversationHistory(currentCid, { preserveScroll: true, refreshDisplay: true });
+      });
+      expect(await roles()).toEqual(['user', 'user', 'assistant']);
+      await page.screenshot({ path: testInfo.outputPath(`send-now-reopened-${language}.png`) });
+    }
+    expect(modelOrkas.modelRequests).toHaveLength(1);
 
     // The terminal boundary confirms the visible draft. Keep the next steered
     // round active so chronology is checked during the live turn.
@@ -915,6 +941,32 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog).toBeVisible({ timeout: 20_000 });
     await expect(dialog).toContainText('curl --data-binary');
     await expect(dialog).toContainText('upload-source.txt');
+    const modeTrigger = dialog.locator('.bash-permission-mode-trigger');
+    await expect(modeTrigger).toBeVisible();
+    await modeTrigger.click();
+    const modeMenu = page.locator('.bash-permission-mode-menu');
+    await expect(modeMenu).toBeVisible();
+    const modeOptions = modeMenu.locator('.bash-permission-mode-option');
+    await expect(modeOptions).toHaveCount(3);
+    expect(await modeOptions.evaluateAll((options) => options.map((option) => (
+      option.getAttribute('data-mode')
+    )))).toEqual([
+      'workspace_approval',
+      'all_files_approval',
+      'all_files_auto',
+    ]);
+    const standardMode = modeMenu.locator('[data-mode="all_files_approval"]');
+    const trustedMode = modeMenu.locator('[data-mode="all_files_auto"]');
+    await expect(standardMode).toHaveAttribute('aria-selected', 'true');
+    await expect(standardMode.locator('.bash-permission-mode-check')).toHaveText('✓');
+    await expect(trustedMode).toHaveAttribute('aria-selected', 'false');
+    await trustedMode.click();
+    await expect(modeMenu).toBeHidden();
+    await expect(modeTrigger).toHaveAttribute('aria-expanded', 'false');
+    await expect(standardMode).toHaveAttribute('aria-selected', 'false');
+    await expect(standardMode.locator('.bash-permission-mode-check')).toHaveText('');
+    await expect(trustedMode).toHaveAttribute('aria-selected', 'true');
+    await expect(trustedMode.locator('.bash-permission-mode-check')).toHaveText('✓');
     expect(existsSync(sentinelPath)).toBe(false);
 
     await dialog.locator('[data-act="cancel"]').click();

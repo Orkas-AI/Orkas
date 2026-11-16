@@ -1,3 +1,6 @@
+import { captureAppTaskEvent } from '../util/app-task-events';
+import { isRetiredVideoModel } from '../features/video_models';
+import * as builtinApps from '../features/builtin_apps';
 /**
  * IPC wiring — replaces `bridge/routes.py` for the Electron era.
  *
@@ -19,6 +22,7 @@ import { app, ipcMain, dialog, BrowserWindow, type WebContents } from 'electron'
 
 import * as users from '../features/users';
 import * as chats from '../features/chats';
+import { ConversationHistoryClosedError } from '../features/conversation-history-client';
 import * as taskCleanup from '../features/task_cleanup';
 import * as projects from '../features/projects';
 import * as projectFiles from '../features/project_files';
@@ -54,7 +58,8 @@ import * as auth from '../features/auth';
 import * as imageAuth from '../features/image_auth';
 import * as searchAuth from '../features/search_auth';
 import * as videoAuth from '../features/video_auth';
-import * as videoStudioReview from '../features/video_studio_review';
+import * as videoCanvas from '../features/video_canvas';
+import * as videoCanvasJobs from '../features/video_canvas_jobs';
 import * as ttsAuth from '../features/tts_auth';
 import * as voiceInput from '../features/voice_input';
 import * as permissions from '../features/permissions';
@@ -193,7 +198,33 @@ function logInvokeResultFailure(channel: string, result: Record<string, unknown>
   });
 }
 
-function markPreferencesDirty(): void {}
+/** What a canvas job needs to know about its conversation. */
+async function videoCanvasJobContext(uid: string, cid: string, dir: unknown): Promise<videoCanvasJobs.VideoCanvasJobContext> {
+  const conversation = await chats.getConversationMetadata(uid, cid);
+  return {
+    uid,
+    cid,
+    dir: String(dir ?? ''),
+    ...(conversation?.project_id ? { projectId: conversation.project_id } : {}),
+    ...(conversation?.title ? { conversationTitle: conversation.title } : {}),
+  };
+}
+
+async function conversationNavigationRows(uid: string, rows: chats.Conversation[]): Promise<chats.Conversation[]> {
+  try {
+    const { conversationTaskLinks } = await import('../features/chat_task_references');
+    const links = await conversationTaskLinks(uid, rows);
+    return rows.map(row => ({ ...row, task_links: links.get(row.conversation_id) || [] }));
+  } catch {
+    // Secondary navigation must never hide conversations or mutate their metadata.
+    log.warn('conversation task links unavailable');
+    return rows;
+  }
+}
+
+async function conversationNavigationPage<T extends { conversations: chats.Conversation[] }>(uid: string, page: T): Promise<T> {
+  return { ...page, conversations: await conversationNavigationRows(uid, page.conversations) };
+}
 
 function conversationProjectHint(args: Record<string, any>): string | null | undefined {
   if (!Object.prototype.hasOwnProperty.call(args, 'project_id')) return undefined;
@@ -351,6 +382,21 @@ async function _importLocalFileEntries(payload: any, ctx: IpcContext): Promise<{
     logAttachmentBatchFailures('orkas.importLocalFiles', results.filter(result => result.ok === false));
     return { files: results };
   }
+  if (scope === 'video_canvas') {
+    const cid = payload?.cid;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const imported = await videoCanvas.importVideoCanvasFiles({
+      uid: ctx.userId,
+      cid,
+      dir: payload?.targetDir,
+      busy: !groupChat.busIsQuiescent(ctx.userId, cid),
+      entries,
+    });
+    if (imported.ok === false) {
+      return { files: entries.map((entry: LocalFileImportEntry) => ({ name: path.basename(entry.name), ok: false, reason: imported.code })) };
+    }
+    return { files: imported.files };
+  }
   if (scope === 'contexts') {
     for (const entry of entries) {
       const name = path.basename(entry.name);
@@ -435,187 +481,6 @@ function _projectFileScopeForUser(userId: string, projectId: string | undefined)
   return path.resolve(projectFilesDir(userId, projectId));
 }
 
-function _escapePreviewHtml(s: string): string {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-type OfficePreviewKind = 'word' | 'spreadsheet' | 'presentation';
-
-function _officePreviewKindForExt(ext: string): OfficePreviewKind | null {
-  if (ext === '.docx' || ext === '.docm') return 'word';
-  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
-  if (ext === '.pptx' || ext === '.pptm') return 'presentation';
-  return null;
-}
-
-function _wrapOfficePreviewHtml(kind: OfficePreviewKind, title: string, body: string): string {
-  const safeTitle = _escapePreviewHtml(title || 'Office preview');
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${safeTitle}</title>
-  <style>
-    :root { color-scheme: light; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: #eef2f7;
-      color: #0f172a;
-      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .office-preview {
-      width: 100%;
-      min-height: 100vh;
-      margin: 0 auto;
-      padding: 24px;
-    }
-    .office-word {
-      max-width: 820px;
-      background: #fff;
-      min-height: calc(100vh - 48px);
-      margin: 20px auto 32px;
-      padding: 56px 64px;
-      border: 1px solid #e5e7eb;
-      box-shadow: 0 1px 8px rgba(15, 23, 42, 0.06);
-    }
-    .office-spreadsheet {
-      max-width: none;
-      padding: 18px;
-    }
-    .office-word h1, .office-word h2, .office-word h3 {
-      line-height: 1.3;
-      color: #111827;
-    }
-    .office-word h1 {
-      margin: 0 0 22px;
-      font-size: 28px;
-      font-weight: 700;
-    }
-    .office-word h2 {
-      margin: 26px 0 12px;
-      font-size: 21px;
-      font-weight: 650;
-    }
-    .office-word h3 {
-      margin: 22px 0 10px;
-      font-size: 17px;
-      font-weight: 650;
-    }
-    .office-word p,
-    .office-word li {
-      margin: 0 0 13px;
-      font-size: 15px;
-      line-height: 1.72;
-      color: #111827;
-    }
-    .office-word ul,
-    .office-word ol {
-      margin: 0 0 16px 24px;
-      padding: 0;
-    }
-    .office-word table {
-      border-collapse: collapse;
-      width: 100%;
-      margin: 16px 0;
-    }
-    .office-word th, .office-word td,
-    .office-table-wrap th, .office-table-wrap td {
-      border: 1px solid #cbd5e1;
-      padding: 7px 9px;
-      vertical-align: top;
-    }
-    .office-sheet {
-      margin: 0 0 22px;
-      padding: 18px;
-      background: #fff;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
-    }
-    .office-sheet h2 {
-      margin: 0 0 12px;
-      font-size: 15px;
-    }
-    .office-table-wrap {
-      overflow: auto;
-      max-height: 70vh;
-      border: 1px solid #e2e8f0;
-      border-radius: 6px;
-    }
-    .office-table-wrap table {
-      border-collapse: collapse;
-      min-width: 100%;
-      background: #fff;
-      font-size: 13px;
-    }
-    .office-table-wrap td {
-      min-width: 96px;
-      white-space: pre-wrap;
-    }
-    .office-empty-cell, .office-muted { color: #64748b; }
-    .office-presentation {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 24px;
-      padding: 24px;
-    }
-    .office-slide {
-      width: min(1120px, calc(100vw - 64px));
-      aspect-ratio: 16 / 9;
-      margin: 0 auto;
-      padding: clamp(32px, 5vw, 64px);
-      background: #fff;
-      border: 1px solid #e2e8f0;
-      border-radius: 6px;
-      box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-      display: flex;
-      align-items: center;
-    }
-    .office-slide-body p {
-      margin: 0 0 18px;
-      font-size: clamp(18px, 2vw, 30px);
-      line-height: 1.35;
-    }
-    .office-slide-body p:first-child {
-      font-size: clamp(26px, 3vw, 44px);
-      font-weight: 600;
-      line-height: 1.2;
-    }
-    @media (max-width: 720px) {
-      .office-preview { padding: 12px; }
-      .office-word {
-        margin: 0 auto;
-        min-height: calc(100vh - 24px);
-        padding: 32px 24px;
-      }
-      .office-word h1 { font-size: 24px; }
-      .office-word p,
-      .office-word li { font-size: 14px; }
-      .office-presentation { padding: 12px; gap: 14px; }
-      .office-slide {
-        width: calc(100vw - 24px);
-        padding: 24px;
-      }
-      .office-slide-body p { font-size: 16px; }
-      .office-slide-body p:first-child { font-size: 22px; }
-    }
-  </style>
-</head>
-<body>
-  <main class="office-preview office-${kind}">
-    ${body}
-  </main>
-</body>
-</html>`;
-}
-
 /** Build the allowed-roots list for the file-class IPC sandbox: workspace ∪
  *  current cid's attachment dir ∪ payload's project-file dir. The actual
  *  containment check happens via `util/path-sandbox.isPathAllowed`, which
@@ -682,15 +547,24 @@ async function _savedAppRecoverySource(userId:string,payload:any):Promise<{rootD
   return {rootDir:inspected.rootDir};
 }
 
-// Todo preview adds only an exact, existing attachment in the resolved scope.
-// Keep mutation/share authorization on the existing file-action boundary.
+// Trusted host previews may read local user files outside the workspace, as
+// chat-media already does. App-managed account data retains its owning scope;
+// preview permission never enters the mutation/share authorization boundary.
 async function _isAllowedPreviewFilePath(userId: string, payload: any, absPath: string): Promise<boolean> {
+  if (!isPathAllowed(absPath, [WS_ROOT])) return true;
   if (await _isAllowedFileActionPath(userId, payload, absPath)) return true;
   const projectId = await _resolveWorkspaceScope(userId, payload);
   const resolved = await projectTasks.resolveTaskAttachmentPath(
     userId, projectId || '', path.basename(path.dirname(absPath)), path.basename(absPath),
   );
   return resolved === absPath;
+}
+
+function _localPreviewPath(payload: any): string {
+  const target = payload?.path;
+  if (typeof target !== 'string' || !target) throw new Error('missing path');
+  if (!path.isAbsolute(target) || target.includes('\0')) throw new Error('invalid file path');
+  return path.resolve(target);
 }
 
 type HtmlPreviewLayout = {
@@ -904,6 +778,13 @@ async function _importProducedToLibrary(payload: any, ctx: IpcContext): Promise<
     return { ok: true, scope: 'project', projectId, info: result.info };
   }
 
+  if (!contexts.isSupportedContextFileName(targetName)) {
+    const ext = path.extname(targetName).toLowerCase();
+    return {
+      ok: false,
+      error: t('errors.unsupported_file_ext', { ext: ext || t('errors.unsupported_file_no_ext') }),
+    };
+  }
   const relPath = typeof payload?.targetPath === 'string' && payload.targetPath.trim()
     ? payload.targetPath.trim()
     : await _uniqueContextImportPath(targetName);
@@ -1071,25 +952,31 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         expandedProjectIds,
         ...(Number.isFinite(activeSinceMs) ? { activeSinceMs } : {}),
       });
-      return result;
+      return conversationNavigationPage(ctx.userId, result);
     }
     if (mode === 'project') {
       if (!safeId(project_id)) throw new Error('invalid project id');
-      return chats.listProjectConversationPage(ctx.userId, project_id, offset);
+      return conversationNavigationPage(ctx.userId, await chats.listProjectConversationPage(ctx.userId, project_id, offset));
     }
     if (mode === 'unprojected') {
-      return chats.listUnprojectedConversationPage(ctx.userId, offset);
+      return conversationNavigationPage(ctx.userId, await chats.listUnprojectedConversationPage(ctx.userId, offset));
     }
     if (mode === 'auto_task') {
       if (!safeId(task_id)) throw new Error('invalid auto task id');
-      return chats.listAutoTaskConversationPage(ctx.userId, task_id, offset);
+      const task = await autoTasks.getTask(ctx.userId, task_id);
+      return conversationNavigationPage(ctx.userId, await chats.listAutoTaskConversationPage(ctx.userId, task_id, offset, task?.conversation_id || ''));
     }
-    return { conversations: await chats.listConversations(ctx.userId) };
+    return conversationNavigationPage(ctx.userId, { conversations: await chats.listConversations(ctx.userId) });
   },
 
   'conversations.autoTaskCounts': async ({ task_ids } = {}, ctx) => {
     const ids = Array.isArray(task_ids) ? task_ids : [];
-    return { counts: await chats.countAutoTaskConversations(ctx.userId, ids) };
+    const runConversationIds = ids.length
+      ? Object.fromEntries((await autoTasks.listTasks(ctx.userId))
+        .filter((task) => task.conversation_id)
+        .map((task) => [task.id, task.conversation_id as string]))
+      : {};
+    return { counts: await chats.countAutoTaskConversations(ctx.userId, ids, runConversationIds) };
   },
 
   'conversations.get': async (args, ctx) => {
@@ -1097,7 +984,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(cid)) throw new Error('invalid cid');
     const conv = await chats.getConversation(ctx.userId, cid, conversationProjectHint(args));
     if (!conv) throw new Error('conversation not found');
-    return { conversation: conv };
+    return { conversation: (await conversationNavigationRows(ctx.userId, [conv]))[0] };
   },
 
   // Home page: titles and ownership for a handful of unread finished runs that
@@ -1515,9 +1402,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Home page: all unfinished to-dos for expansion, or a bounded preview.
-  'projects.tasks.listOpen': async ({ limit, all } = {}, ctx) => {
+  'projects.tasks.listOpen': async ({ limit, all, dueSummary } = {}, ctx) => {
     const count = Math.min(20, Math.max(1, Math.round(Number(limit) || 3)));
-    return projectTasks.listOpenTasks(ctx.userId, all === true ? undefined : count);
+    const result = await projectTasks.listOpenTasks(ctx.userId, all === true || dueSummary === true ? undefined : count);
+    if (dueSummary === true) {
+      // Attention needs one earliest day per local scope, not task
+      // bodies or a renderer copy of the complete backlog. Include future days
+      // so midnight can update locally without polling the filesystem.
+      const days = new Map<string, string>();
+      for (const task of result.tasks) {
+        if (!task.due_at) continue;
+        const previous = days.get(task.project_id);
+        if (!previous || task.due_at < previous) days.set(task.project_id, task.due_at);
+      }
+      return { tasks: [...days].map(([project_id, due_at]) => ({ project_id, due_at })) };
+    }
+    return result;
   },
 
   'projects.tasks.create': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, depends_on, attachment_order, due_at } = {}, ctx) => {
@@ -1557,9 +1457,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { task: r.task };
   },
 
-  'projects.tasks.delete': async ({ projectId, taskId } = {}, ctx) => {
+  'projects.tasks.delete': async ({ projectId, taskId, expectedTask, expectedUserId } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (expectedTask !== undefined) {
+      if (expectedUserId !== ctx.userId) throw new Error('cleanup_account_changed');
+      const r = await projectTasks.deleteTask(ctx.userId, scopeProjectId, taskId, { expectedTask });
+      if (!r.ok) {
+        if ('error' in r && ['task_changed', 'task_not_found'].includes(r.error)) return { ok: true, skipped: true };
+        throw new Error('delete_failed');
+      }
+      return { ok: true };
+    }
     const r = await projectTasks.deleteTask(ctx.userId, scopeProjectId, taskId);
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { ok: true };
@@ -2091,6 +2000,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'groupChat.send': async ({
     cid,
     content,
+    model_text,
     commander_mention_display,
     title_text,
     attachments,
@@ -2103,6 +2013,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     bindWebAssistConversation(ctx.userId, cid, ctx.sender);
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
+    const modelText = typeof model_text === 'string' ? model_text.trim() : '';
     const hasTitleText = typeof title_text === 'string';
     const titleText = hasTitleText ? title_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
@@ -2119,6 +2030,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     }
     return groupChat.send({
       userId: ctx.userId, cid, text,
+      ...(modelText ? { model_text: modelText } : {}),
       ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
         ? { commander_mention_display } : {}),
       ...(steer_active_turn === true ? { steerActiveTurn: true } : {}),
@@ -2280,9 +2192,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Chat attachments (per-cid file pool for main chat) ──
-  'conversations.attachments.list': async ({ cid }, ctx) => {
+  'conversations.attachments.list': async ({ cid, scope }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    return { items: chatAttachments.listPendingAttachments(ctx.userId, cid) };
+    return { items: scope === 'all'
+      ? chatAttachments.listAttachments(ctx.userId, cid)
+      : chatAttachments.listPendingAttachments(ctx.userId, cid) };
   },
 
   'conversations.attachments.upload': async ({ cid, name, data }, ctx) => {
@@ -2368,7 +2282,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // `⋯` → "保存".
   'conversations.artifacts.editTarget': async ({ cid, artifactId }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    return { target: artifactId ? await savedApps.getSaveTarget(ctx.userId,String(cid),{artifactId:String(artifactId)}) : await savedApps.getEditTarget(ctx.userId, String(cid)) };
+    return { target: await savedApps.getSaveTargetForDisplay(ctx.userId, String(cid), artifactId ? { artifactId: String(artifactId) } : {}) };
   },
   'conversations.artifacts.save': async ({ cid, artifactId, mode, recovery }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
@@ -2415,7 +2329,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const inspected = await savedApps.inspectBundleFromPath(norm, {
       fenceRoots: await _ipcFileSandboxAllowedRoots(ctx.userId, payload),
     });
-    return inspected.ok && inspected.canSave ? {...inspected,target:await savedApps.getSaveTarget(ctx.userId,String(payload?.cid || ''),{rootDir:inspected.rootDir})} : inspected;
+    return inspected.ok && inspected.canSave ? {...inspected,target:await savedApps.getSaveTargetForDisplay(ctx.userId,String(payload?.cid || ''),{rootDir:inspected.rootDir})} : inspected;
   },
 
   'savedApps.saveFromPath': async (payload, ctx) => {
@@ -2442,8 +2356,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Saved apps ("My Apps" — user-kept copies of create_artifact bundles) ──
   // First paint reads disk only. Presentation is not authority: opening, editing,
   // sharing and deletion still resolve the app type at their owning boundaries.
-  'savedApps.list': async (payload, ctx) => ({ apps: payload?.localOnly === true
-    ? savedApps.listSavedApps(ctx.userId) : await savedApps.listResolvedSavedApps(ctx.userId) }),
+  'savedApps.list': async (payload, ctx) => {
+    // A failed upgrade must not hide the last working local applications.
+    try { await builtinApps.syncBuiltinApps(ctx.userId, () => users.getActiveUserId() === ctx.userId); }
+    catch (error) { log.warn('built-in app refresh deferred', {error:logErrorSummary(error)}); }
+    if (users.getActiveUserId() !== ctx.userId) throw Object.assign(new Error('account_changed'), {code:'E_CLOSED'});
+    return { apps: payload?.localOnly === true ? savedApps.listSavedApps(ctx.userId)
+      : await savedApps.listResolvedSavedApps(ctx.userId), builtinApps: builtinApps.listBuiltinApps(ctx.userId) };
+  },
   'savedApps.openExternal': async ({ appId }, ctx) => {
     const r = savedApps.resolveSavedAppIndex(ctx.userId, String(appId || ''));
     if (!r.ok) throw new Error((r as { error?: string }).error || 'app not found');
@@ -2484,6 +2404,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, title: (r as { title: string }).title };
   },
   'savedApps.delete': async ({ appId }, ctx) => {
+    if (builtinApps.isBuiltinAppId(String(appId || ''))) throw Object.assign(new Error('app_builtin_readonly'), {code:'app_builtin_readonly'});
     const batch = await recycleBin.createAppRecycleBatchForCloudEntry(
       ctx.userId,
       `cloud/saved_apps/${String(appId || '')}`,
@@ -3116,10 +3037,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'config.setLanguage': async ({ language }) => {
     if (!isLang(language)) throw new Error(`unsupported language: ${String(language)}`);
     const next = appConfig.setLanguage(language);
-    markPreferencesDirty();
     return { language: next };
   },
   'config.getLocales': async () => ({ tables: getRendererTables() }),
+
+  'prefs.getTodoGrouping': async (_args, ctx) => ({ grouping: appConfig.getTodoGrouping(ctx.userId) }),
+  'prefs.setTodoGrouping': async ({ grouping }, ctx) => ({ grouping: appConfig.setTodoGrouping(ctx.userId, grouping) }),
 
   // Avatar catalog (icons + colors + commander default) — single source of
   // truth lives in src/main/data/avatars.json. The renderer fetches once at
@@ -3168,7 +3091,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'prefs.getCommanderAvatar': async () => ({ avatar: appConfig.getCommanderAvatar() }),
   'prefs.setCommanderAvatar': async ({ icon, color }) => {
     const avatar = appConfig.setCommanderAvatar({ icon, color });
-    markPreferencesDirty();
     return { avatar };
   },
 
@@ -3183,7 +3105,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   }),
   'prefs.setMetacognition': async ({ enabled }) => {
     const next = appConfig.setMetacognitionEnabled(!!enabled);
-    markPreferencesDirty();
     return { enabled: next };
   },
 
@@ -3197,7 +3118,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const previous = appConfig.getTaskNotificationsEnabled();
     const next = appConfig.setTaskNotificationsEnabled(!!enabled);
     taskUnreadTray.refreshTaskUnreadTray();
-    markPreferencesDirty();
     // Preference persistence must not wait for the platform permission probe.
     // On Windows that probe launches PowerShell and can take several seconds
     // under load. Settings already refreshes OS permission independently on
@@ -3300,11 +3220,95 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'imageAuth.reorder':  async ({ orderedIds }) => imageAuth.reorderImageProfiles(orderedIds || []),
   'imageAuth.test':     async ({ id }) => imageAuth.testImageProfile(id),
 
-  // ── VideoStudio host review panel (read-only production state view) ──
-  'videoStudio.reviewPanel': async ({ cid }, ctx) => {
+  // ── Video canvas: a conversation's productions as cards, changed without a model ──
+  'videoCanvas.read': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    const panel = await videoStudioReview.buildVideoStudioReviewPanel(ctx.userId, cid);
-    return { ok: true, panel };
+    const busy = !groupChat.busIsQuiescent(ctx.userId, cid);
+    const videoStudio = videoCanvasJobs.conversationUsesVideoStudio(await chats.getConversation(ctx.userId, cid));
+    return {
+      ok: true,
+      busy,
+      // Workspace folders are named lazily and can repeat between conversations that have
+      // produced nothing yet, so a chat that never used VideoStudio must not list what is in
+      // its folder. Nor should opening one take it a folder name.
+      productions: videoStudio ? await videoCanvas.readVideoCanvasProductions(ctx.userId, cid) : [],
+      jobs: videoCanvasJobs.videoCanvasJobs(ctx.userId, cid, { busy }),
+      video_studio: videoStudio,
+    };
+  },
+  'videoCanvas.layout': async ({ cid, dir, cards }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvas.saveVideoCanvasLayout({ uid: ctx.userId, cid, dir, cards });
+  },
+  'videoCanvas.edit': async ({ cid, dir, edit }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const result = await videoCanvas.applyVideoCanvasEdit({ uid: ctx.userId, cid, dir, busy: !groupChat.busIsQuiescent(ctx.userId, cid), edit });
+    // A change waits for the user's Update, and an update in progress no longer matches it.
+    if (result.ok === true && result.changed_videos.length) {
+      const job = await videoCanvasJobContext(ctx.userId, cid, dir);
+      for (const video of result.changed_videos) videoCanvasJobs.stopVideoCanvasRender(job, video);
+    }
+    return result;
+  },
+  'videoCanvas.render': async ({ cid, dir, video }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    if (!groupChat.busIsQuiescent(ctx.userId, cid)) return { ok: false, code: 'busy' };
+    return videoCanvasJobs.updateVideoCanvasVideo(await videoCanvasJobContext(ctx.userId, cid, dir), String(video));
+  },
+  'videoCanvas.voices': async ({ cid, dir, video }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvas.readVideoCanvasVoices(ctx.userId, cid, dir, video);
+  },
+  'videoCanvas.saveCopy': async ({ cid, dir, file, name }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const located = await videoCanvas.locateProduction(ctx.userId, cid, dir);
+    if (!located || typeof file !== 'string' || !isPathAllowed(file, [located.productionAbs])) return { ok: false, code: 'not_found' };
+    const stem = String(name ?? '').replace(/[\\/:*?"<>|]+/g, '-').trim() || path.parse(file).name;
+    const result = await dialog.showSaveDialog({ defaultPath: `${stem}${path.extname(file)}` });
+    if (result.canceled || !result.filePath) return { ok: false, cancelled: true };
+    await fs.promises.copyFile(file, result.filePath);
+    return { ok: true };
+  },
+  'videoCanvas.redoOptions': async ({ cid, dir, asset, inputs, settings }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvasJobs.videoCanvasRedoOptions(await videoCanvasJobContext(ctx.userId, cid, dir), asset, inputs, settings);
+  },
+  'videoCanvas.quoteRedo': async ({ cid, dir, asset, choice, inputs, settings }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvasJobs.quoteVideoCanvasRedo(await videoCanvasJobContext(ctx.userId, cid, dir), asset, choice, inputs, settings);
+  },
+  'videoCanvas.redo': async ({ cid, dir, asset, prompt, choice, inputs, settings }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvasJobs.startVideoCanvasRedo({
+      ctx: await videoCanvasJobContext(ctx.userId, cid, dir),
+      asset,
+      prompt,
+      choice,
+      inputs,
+      settings,
+      isBusy: () => !groupChat.busIsQuiescent(ctx.userId, cid),
+    });
+  },
+  // A new shot drawn from footage lives on the canvas until the user generates it (2026-11-10).
+  'videoCanvas.draft': async ({ cid, dir, change }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvas.applyVideoCanvasDraftChange({ uid: ctx.userId, cid, dir, change });
+  },
+  'videoCanvas.draftOptions': async ({ cid, dir, id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvasJobs.videoCanvasDraftOptions(await videoCanvasJobContext(ctx.userId, cid, dir), id);
+  },
+  'videoCanvas.quoteDraft': async ({ cid, dir, id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvasJobs.quoteVideoCanvasDraft(await videoCanvasJobContext(ctx.userId, cid, dir), id);
+  },
+  'videoCanvas.generateDraft': async ({ cid, dir, id }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return videoCanvasJobs.startVideoCanvasDraft({
+      ctx: await videoCanvasJobContext(ctx.userId, cid, dir),
+      id,
+      isBusy: () => !groupChat.busIsQuiescent(ctx.userId, cid),
+    });
   },
 
   // ── Video-generation API key (independent from chat/image entries) ──
@@ -3313,11 +3317,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     providers: videoAuth.flattenVideoProviderOptions(videoAuth.listVideoProviderOptions()),
     profiles: videoAuth.listVideoProfiles().map((p) => ({
       id: p.id, provider: p.provider, model: p.model, label: p.label, createdAt: p.createdAt,
-      available: videoAuth.isVideoProviderModelAllowed(p.provider, p.model),
-      apiKeyMasked: auth.maskKey(p.apiKey),
+      available: videoAuth.isVideoProviderModelAllowed(p.provider, p.model) && !isRetiredVideoModel(p.provider,p.model),
+      ...(isRetiredVideoModel(p.provider,p.model) ? {selectable:false,availability:'model_unavailable'} : {}),
+      apiKeyMasked: p.provider === 'google-cloud' ? '********' : auth.maskKey(p.apiKey),
     })),
   }),
-  'videoAuth.add':      async ({ provider, model, apiKey, label }) => videoAuth.addVideoProfile({ provider, model, apiKey, label }),
+  'videoAuth.add':      async ({ provider, model, apiKey, label, workspaceId, region }) => videoAuth.addVideoProfile({ provider, model, apiKey, label, workspaceId, region }),
   'videoAuth.remove':   async ({ id }) => videoAuth.removeVideoProfile(id),
   'videoAuth.reorder':  async ({ orderedIds }) => videoAuth.reorderVideoProfiles(orderedIds || []),
 
@@ -3327,24 +3332,27 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     presets: ttsAuth.listTtsProviderPresets(),
     profiles: ttsAuth.listTtsProfiles().map((p) => ({
       id: p.id, provider: p.provider, baseUrl: p.baseUrl, model: p.model,
-      resourceId: p.resourceId,
+      resourceId: p.resourceId, workspaceId: p.workspaceId,
       voice: p.voice, format: p.format, label: p.label, createdAt: p.createdAt,
       apiKeyMasked: auth.maskKey(p.apiKey),
     })),
   }),
-  'ttsAuth.add':        async ({ provider, baseUrl, model, apiKey, resourceId, voice, format, label }) =>
-    ttsAuth.addTtsProfile({ provider, baseUrl, model, apiKey, resourceId, voice, format, label }),
+  'ttsAuth.add':        async ({ provider, baseUrl, model, apiKey, resourceId, workspaceId, voice, format, label }) =>
+    ttsAuth.addTtsProfile({ provider, baseUrl, model, apiKey, resourceId, workspaceId, voice, format, label }),
   'ttsAuth.remove':     async ({ id }) => ttsAuth.removeTtsProfile(id),
   'ttsAuth.reorder':    async ({ orderedIds }) => ttsAuth.reorderTtsProfiles(orderedIds || []),
 
   // ── Search-tool API key (overrides built-in keyless web_search) ──
-  'searchAuth.list':    async () => ({
-    ok: true,
-    profiles: searchAuth.listSearchProfiles().map((p) => ({
-      id: p.id, provider: p.provider, label: p.label, createdAt: p.createdAt,
-      extras: p.extras, apiKeyMasked: auth.maskKey(p.apiKey),
-    })),
-  }),
+  'searchAuth.list':    async () => {
+    return {
+      ok: true,
+      providers: searchAuth.listSearchProviderOptions(),
+      profiles: searchAuth.listSearchProfiles().map((p) => ({
+        id: p.id, provider: p.provider, label: p.label, createdAt: p.createdAt,
+        extras: p.extras, apiKeyMasked: auth.maskKey(p.apiKey),
+      })),
+    };
+  },
   'searchAuth.add':     async ({ provider, apiKey, label, extras }) => searchAuth.addSearchProfile({ provider, apiKey, label, extras }),
   'searchAuth.remove':  async ({ id }) => searchAuth.removeSearchProfile(id),
   'searchAuth.reorder': async ({ orderedIds }) => searchAuth.reorderSearchProfiles(orderedIds || []),
@@ -3556,15 +3564,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { path: norm };
   },
 
-  // Lightweight existence check for renderer previews. Same scope as
-  // delete/read: workspace, current cid attachments, project library,
-  // or an exact produced path already recorded on the conversation.
+  // Preview reads do not grant writes. Return the existing write scope so
+  // external files reuse the viewer's read-only controls.
   'workspace.statPath': async (payload, ctx) => {
-    const target = payload?.path;
-    if (typeof target !== 'string' || !target) {
-      throw new Error('missing path');
-    }
-    const norm = path.resolve(target);
+    const norm = _localPreviewPath(payload);
     if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
@@ -3582,6 +3585,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       isDirectory: st.isDirectory(),
       size: st.size,
       mtimeMs: st.mtimeMs,
+      readOnly: !isPathAllowed(norm, await _ipcFileSandboxAllowedRoots(ctx.userId, payload)),
     };
   },
 
@@ -3684,17 +3688,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // Read a file's text content for the in-app preview overlay
   // (markdown / plain text — pdf and html are streamed via `chat-media://`
-  // instead). Same scope as the file actions above: active workspace ∪ the
-  // attachment dir of the current cid ∪ exact recorded produced files. Full
+  // instead). Local user files outside the workspace are also previewable;
+  // app-managed account data keeps its owning scope. Full
   // reads keep the 2 MB cap because their contents cross IPC. The HTML viewer
   // uses `htmlPreviewLayoutOnly` to scan files of any size while returning
   // only a normalized fixed-canvas layout; the HTML body never crosses IPC.
   'produced.readText': async (payload, ctx) => {
-    const target = payload?.path;
-    if (typeof target !== 'string' || !target) {
-      throw new Error('missing path');
-    }
-    const norm = path.resolve(target);
+    const norm = _localPreviewPath(payload);
     if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
@@ -3728,15 +3728,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // The file viewer calls this before it loads an HTML page, so the page can
   // use the stylesheets, scripts, data and fonts in its own folder. The page
-  // must pass the same scope as produced.readText; the grant itself is kept
+  // must pass the same read-only scope as produced.readText; the grant itself is kept
   // in main (see chatAttachments.grantLocalHtmlPreviewAssets).
   'produced.grantHtmlPreviewAssets': async (payload, ctx) => {
-    const target = payload?.path;
-    if (typeof target !== 'string' || !target) {
-      throw new Error('missing path');
-    }
-    const norm = path.resolve(target);
-    if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
+    const norm = _localPreviewPath(payload);
+    if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
     const granted = chatAttachments.grantLocalHtmlPreviewAssets(norm);
@@ -3753,11 +3749,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // renderer, with the lightweight content path retained as a failure fallback.
   // It shares the same path scope as produced.readText.
   'produced.officePreviewHtml': async (payload, ctx) => {
-    const target = payload?.path;
-    if (typeof target !== 'string' || !target) {
-      throw new Error('missing path');
-    }
-    const norm = path.resolve(target);
+    const norm = _localPreviewPath(payload);
     if (!await _isAllowedPreviewFilePath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
@@ -3782,7 +3774,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Write a UTF-8 text file into the workspace (or current cid's attachment
-  // dir). Sandbox parity with `produced.readText`: same scope, same 2MB cap on
+  // dir). Keep the original write scope and the same 2MB cap on
   // the resulting bytes — the chat-md drawer is the sole caller today, and
   // the file's job is "human edits the LLM's md output", so anything larger
   // belongs in the OS editor (open via reveal).
@@ -3831,13 +3823,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: false, code: 'E_DATA_ROOT_OPEN', error: 'Could not open the data folder. Try again.' };
   },
 
-  // Internal debug panel data is stripped from the open-source build. Keep stable
-  // handler shapes so stale renderer calls receive empty results.
-  'devtools.listArchives':  async () => ({ items: [] }),
-  'devtools.readArchive':   async () => ({ item: null }),
-  'devtools.clearArchives': async () => ({ ok: true }),
-  'devtools.getNativeSearchEnabled': async () => ({ enabled: true }),
-  'devtools.setNativeSearchEnabled': async () => ({ enabled: true }),
+  // Local Skill metrics remain available independently of internal debug archives.
   'devtools.skillMetricsReport': async ({ sinceDays } = {}, ctx) => {
     const { aggregateSkillMetrics } = await import('../features/skill_metrics');
     return aggregateSkillMetrics(ctx.userId, { sinceDays: Number(sinceDays) });
@@ -3888,6 +3874,7 @@ const streamHandlers: Record<string, StreamHandler> = {
   'conversations.sendStream': async function* ({
     cid,
     content,
+    model_text,
     commander_mention_display,
     title_text,
     attachments,
@@ -3906,6 +3893,7 @@ const streamHandlers: Record<string, StreamHandler> = {
       yield { type: 'error', text: 'empty message' };
       return;
     }
+    const modelText = typeof model_text === 'string' ? model_text.trim() : '';
     const hasTitleText = typeof title_text === 'string';
     const titleText = hasTitleText ? title_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
@@ -3969,6 +3957,7 @@ const streamHandlers: Record<string, StreamHandler> = {
             })
           : await groupChat.send({
               userId: ctx.userId, cid, text,
+              ...(modelText ? { model_text: modelText } : {}),
               ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
                 ? { commander_mention_display } : {}),
               ...(typeof client_msg_id === 'string' && client_msg_id.trim()
@@ -4266,7 +4255,19 @@ async function resolveContext(sender: WebContents): Promise<IpcContext> {
 /** Send a push-event to every open renderer. Channel name must match preload's
  *  `PUSH_EVENT_PREFIXES` allow-list. Used by main-initiated status broadcasts
  *  (boot-time reconcile / sync / updater state). */
+async function isPrivateAppConversationPayload(uid: string, payload: any): Promise<boolean> {
+  const ids = [payload?.cid, payload?.conversation_id, payload?.id, ...(Array.isArray(payload?.cids) ? payload.cids.slice(0, 100) : [])]
+    .filter((id): id is string => typeof id === 'string');
+  if (ids.some(id => id.startsWith('app_'))) return true;
+  // Legacy app_task records are still in the old index until safely finalized.
+  const legacy = [payload?.cid, payload?.conversation_id, ...(Array.isArray(payload?.cids) ? payload.cids.slice(0, 100) : [])];
+  for (const cid of legacy) if (typeof cid === 'string' && (await chats.getConversationMetadata(uid, cid))?.kind === 'app_task') return true;
+  return false;
+}
+
+
 export function broadcastToRenderer(channel: string, payload: unknown): boolean {
+  if (captureAppTaskEvent(users.hasActiveUser() ? users.getActiveUserId() : '', channel, payload)) return true;
   let delivered = false;
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
@@ -4298,11 +4299,12 @@ export function register(): void {
     if ((channel.startsWith('voice.') || channel.startsWith('voiceInput.')) && (event.senderFrame !== event.sender.mainFrame || previewWindows.isPreviewContents(event.sender))) {
       return { ok: false, code: 'E_IPC_SENDER' };
     }
-    if ((channel.startsWith('desktop.') || channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };
+    if ((channel.startsWith('desktop.') || channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || ['workspace.statPath', 'produced.readText', 'produced.officePreviewHtml', 'produced.grantHtmlPreviewAssets'].includes(channel) || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };
     const handler = invokeHandlers[channel];
     if (!handler) return { ok: false, error: `unknown channel: ${channel}` };
     try {
       const ctx = await resolveContext(event.sender);
+      if (await isPrivateAppConversationPayload(ctx.userId, payload)) return { ok: false, code: 'E_NOT_FOUND' };
       const result = await handler(payload || {}, ctx);
       if (result && typeof result === 'object' && result.ok === false) {
         logInvokeResultFailure(channel, result);
@@ -4317,7 +4319,11 @@ export function register(): void {
           ? Number(rawCode.trim())
           : (typeof rawCode === 'string' && rawCode ? rawCode : normalized.code));
       const attachment = attachmentAddChannels.has(channel) ? attachmentFailureDiagnostic({ code, failure_kind: fileFailureKind(err) }) : null;
+      if (err instanceof ConversationHistoryClosedError) {
+        log.warn('conversation history request cancelled on close', { channel, code });
+      } else {
       log.error(`invoke ${channel} failed`, attachment || { error: logErrorSummary(err), code });
+      }
       const out: {
         ok: false;
         error: string;
@@ -4413,6 +4419,7 @@ export function register(): void {
     if(logLifecycle)log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
     try {
       const ctx = await resolveContext(event.sender);
+      if (await isPrivateAppConversationPayload(ctx.userId, payload)) { out({ type: 'error', code: 'E_NOT_FOUND' }); return; }
       for await (const ev of handler(payload || {}, ctx, controller.signal)) {
         if (state.cancelled) break;
         if (ev && ev.type === 'done') continue; // normalize below

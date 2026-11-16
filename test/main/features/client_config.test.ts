@@ -2,6 +2,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const diagnosticLog = vi.hoisted(() => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() }));
+vi.mock('../../../src/main/logger', () => ({ createLogger: () => diagnosticLog }));
+
 const electronMock = vi.hoisted(() => ({
   app: {
     isPackaged: false,
@@ -24,11 +27,19 @@ import {
   ClientConfigManager,
   clientConfig,
   DEFAULT_PROVIDER_MODELS,
+  DEFAULT_QUICK_START_CONFIG,
+  getMinimumAppVersion,
+  getQuickStartConfig,
+  getQuickStartConfigState,
+  getRetryErrorPolicyConfig,
+  getServerConnectorCatalogConfig,
   clientConfigPlatform,
   refresh,
   start,
   stop,
 } from '../../../src/main/features/client_config';
+
+import { DEFAULT_RETRY_ERROR_POLICY } from '../../../src/core-agent/src/shared/errors';
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 
@@ -41,6 +52,7 @@ async function waitForCondition(predicate: () => boolean, attempts = 20): Promis
 
 describe('client_config', () => {
   beforeEach(() => {
+    diagnosticLog.warn.mockClear();
     electronMock.app.isPackaged = false;
     electronMock.app.getVersion.mockReturnValue('9.8.7');
     (electronMock.app as any).getAppPath = undefined;
@@ -64,6 +76,334 @@ describe('client_config', () => {
     delete process.env.ORKAS_CHANNEL;
   });
 
+  it('keeps private configuration rejection details out of logs while preserving failure and later refresh', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfiglogprivacy';
+    users.activateUser(uid);
+    const privateMessage = 'model_catalog sensitive-provider-config private-configuration';
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 1, msg: privateMessage })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0, immediate: {}, restart: {} }))));
+    try {
+      expect(await refresh('manual', { force: true })).toMatchObject({ updated: false, error: privateMessage });
+      expect(diagnosticLog.warn).toHaveBeenCalledWith('client config refresh failed', expect.objectContaining({
+        diagnostic_id: 'D301', reason: 'manual', error: expect.objectContaining({
+          error_type: 'Error', message_hash: expect.stringMatching(/^[a-f0-9]{12}$/), message_chars: privateMessage.length,
+        }),
+      }));
+      expect(JSON.stringify(diagnosticLog.warn.mock.calls)).not.toMatch(/model_catalog|sensitive-provider-config|private-configuration/i);
+      expect(await refresh('manual', { force: true })).not.toHaveProperty('error');
+    } finally {
+      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { type: 'SyntaxError', code: 'ENOENT' },
+    { type: 'TypeError', code: 'EACCES' },
+  ])('preserves $type/$code classification without configuration content', async ({ type, code }) => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigdiagnostic';
+    users.activateUser(uid);
+    const rejectedBody = new Response('{}');
+    vi.spyOn(rejectedBody, 'json').mockRejectedValueOnce(Object.assign(new Error('model_catalog private-configuration'), { name: type, code, status: 503 }));
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(rejectedBody)
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0, immediate: {}, restart: {} }))));
+    try {
+      expect(await refresh('manual', { force: true })).toMatchObject({ updated: false });
+      expect(diagnosticLog.warn).toHaveBeenCalledWith('client config refresh failed', expect.objectContaining({
+        diagnostic_id: 'D301', reason: 'manual', error: expect.objectContaining({ error_type: type, error_code: code, status: 503 }),
+      }));
+      expect(JSON.stringify(diagnosticLog.warn.mock.calls)).not.toMatch(/model_catalog|private-configuration/);
+      expect(await refresh('manual', { force: true })).not.toHaveProperty('error');
+    } finally { fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true }); }
+  });
+
+  it('isolates cached Server values from callers, payload owners, and mutating merge functions', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    users.activateUser('clientconfigisolation');
+    const file = paths.userRemoteConfigFile('clientconfigisolation');
+    const manager = new ClientConfigManager();
+    const value = { nested: { enabled: false } };
+    try {
+      manager.applyServerPayload({ immediate: { feature: value }, restart: {} }, 'same');
+      value.nested.enabled = true;
+      (manager.get('feature') as typeof value).nested.enabled = true;
+      (manager.getServerValue('feature') as typeof value).nested.enabled = true;
+      (manager.readCache().active.immediate.feature as typeof value).nested.enabled = true;
+      expect(manager.get('feature')).toEqual({ nested: { enabled: false } });
+      manager.registerDefault('feature', value, { merge: (_, raw) => {
+        (raw as typeof value).nested.enabled = true;
+        return raw as typeof value;
+      } });
+      expect(manager.get('feature')).toEqual({ nested: { enabled: true } });
+      expect(manager.getServerValue('feature')).toEqual({ nested: { enabled: false } });
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('observes file replacement, deletion, and recovery after warming the config cache', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    users.activateUser('clientconfigreplacement');
+    const file = paths.userRemoteConfigFile('clientconfigreplacement');
+    const manager = new ClientConfigManager();
+    const body = (value: string) => JSON.stringify({ active: { immediate: { feature: value } } });
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, body('first'));
+      expect(manager.get('feature')).toBe('first');
+      const before = fs.statSync(file);
+      fs.writeFileSync(`${file}.replacement`, body('other'));
+      fs.utimesSync(`${file}.replacement`, before.atime, before.mtime);
+      fs.renameSync(`${file}.replacement`, file);
+      expect(manager.get('feature')).toBe('other');
+      fs.rmSync(file);
+      expect(manager.hasServerValue('feature')).toBe(false);
+      expect(manager.get('feature', 'default')).toBe('default');
+      fs.writeFileSync(file, '{broken');
+      expect(manager.get('feature', 'default')).toBe('default');
+      fs.writeFileSync(file, body('fixed'));
+      expect(manager.get('feature')).toBe('fixed');
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('retries a transient config read failure without requiring the file to change', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    users.activateUser('clientconfigreadretry');
+    const file = paths.userRemoteConfigFile('clientconfigreadretry');
+    const manager = new ClientConfigManager();
+    try {
+      storage.writeJsonSync(file, { active: { immediate: { feature: 'available' } } });
+      vi.spyOn(storage, 'readJsonSync').mockReturnValueOnce({});
+      expect(manager.get('feature', 'default')).toBe('default');
+      expect(manager.get('feature', 'default')).toBe('available');
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('ships nine grouped Commander quick-start defaults including PptMaker', () => {
+    expect(DEFAULT_QUICK_START_CONFIG).toHaveLength(9);
+    expect(DEFAULT_QUICK_START_CONFIG.map((item) => item.id)).toEqual([
+      'data', 'ecommerce', 'ppt', 'office', 'image', 'video', 'ui_design', 'rnd', 'seo_geo',
+    ]);
+    expect(DEFAULT_QUICK_START_CONFIG.find((item) => item.id === 'ppt')).toEqual({
+      id: 'ppt',
+      agent_id: '7e91cb9ec9e9',
+    });
+    expect(DEFAULT_QUICK_START_CONFIG.find((item) => item.id === 'ecommerce')).toEqual({
+      id: 'ecommerce',
+      agent_id: '5a1d43c2f28a',
+    });
+    expect(DEFAULT_QUICK_START_CONFIG.find((item) => item.id === 'rnd')).toEqual({
+      id: 'rnd',
+      agent_id: 'a316881746f9',
+    });
+
+    const builtinRoot = path.resolve(process.cwd(), 'resources/builtin/marketplace/agents');
+    const builtinIds = new Set(fs.readdirSync(builtinRoot).filter((id) => (
+      fs.existsSync(path.join(builtinRoot, id, 'agent.json'))
+    )));
+    for (const item of DEFAULT_QUICK_START_CONFIG) {
+      expect(
+        builtinIds.has(item.agent_id),
+        `${item.id}:${item.agent_id} must be bundled`,
+      ).toBe(true);
+    }
+  });
+
+  it('uses a valid Server quick-start order and falls back on an invalid payload', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigquickstart';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const manager = new ClientConfigManager();
+
+    try {
+      manager.applyServerPayload({
+        immediate: {
+          'commander.quick_start': [
+            { id: 'creation', agent_id: '173d4235a431' },
+            { id: 'image', agent_id: '814b61b027f0' },
+          ],
+        },
+        restart: {},
+        config_hash: 'sha256:quick-start-valid',
+      }, '"sha256:quick-start-valid"');
+      expect(getQuickStartConfig()).toEqual([
+        { id: 'creation', agent_id: '173d4235a431' },
+        { id: 'image', agent_id: '814b61b027f0' },
+      ]);
+      expect(getQuickStartConfigState().source).toBe('server_config');
+
+      manager.applyServerPayload({
+        immediate: {
+          'commander.quick_start': [
+            { id: 'creation', agent_id: '' },
+          ],
+        },
+        restart: {},
+        config_hash: 'sha256:quick-start-invalid',
+      }, '"sha256:quick-start-invalid"');
+      expect(getQuickStartConfig()).toEqual(DEFAULT_QUICK_START_CONFIG);
+      expect(getQuickStartConfigState().source).toBe('pc_default');
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  // Remote-only connector cards must retain translated copy through both catalog
+  // protocols. Old or malformed optional translations must keep English fallback usable.
+  it.each([
+    ['legacy-dcr', 'connectors.dcr_catalog', 'mcp_dcr'],
+    ['unified-dcr', 'connectors.catalog', 'mcp_dcr'],
+    ['unified-composio', 'connectors.catalog', 'composio'],
+  ])('preserves ten-language connector descriptions and legacy fallback for %s', async (scenario, key, authMode) => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = `clientconfiglanguages-${scenario}`;
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const manager = new ClientConfigManager();
+    const base = {
+      display_name: 'Remote connector',
+      category: 'productivity',
+      auth_mode: authMode,
+      description_en: 'English fallback',
+      description_zh: '中文说明',
+      description_ja: '日本語の説明',
+      description_pt: 'Descrição em português',
+      ...(authMode === 'mcp_dcr'
+        ? { transport_template: { kind: 'streamable-http', url: 'https://example.com/mcp' } }
+        : { composio: { toolkit: 'remote', auth_config_id: 'ac_remote123' } }),
+    };
+    try {
+      manager.applyServerPayload({
+        immediate: {
+          [key]: [
+            {
+              ...base, id: 'translated',
+              description_es: '  Descripción en español  ',
+              description_fr: '  Description française  ',
+              description_ko: '  한국어 설명  ',
+              description_de: '  Deutsche Beschreibung  ',
+              description_ru: '  Описание на русском  ',
+              description_it: '  Descrizione italiana  ',
+            },
+            { ...base, id: 'legacy' },
+            {
+              ...base, id: 'malformed',
+              description_es: null, description_fr: 123, description_ko: {},
+              description_de: [], description_ru: false, description_it: '  ',
+            },
+          ],
+        },
+        restart: {},
+      }, `"connector-languages-${scenario}"`);
+      const entries = getServerConnectorCatalogConfig();
+      expect(entries.map((entry) => entry.id)).toEqual(['translated', 'legacy', 'malformed']);
+      expect(entries[0]).toMatchObject({
+        description_en: 'English fallback', description_zh: '中文说明',
+        description_ja: '日本語の説明', description_pt: 'Descrição em português',
+        description_es: 'Descripción en español', description_fr: 'Description française',
+        description_ko: '한국어 설명', description_de: 'Deutsche Beschreibung',
+        description_ru: 'Описание на русском', description_it: 'Descrizione italiana',
+      });
+      for (const entry of entries.slice(1)) {
+        expect(entry).toMatchObject({
+          description_en: 'English fallback', description_zh: '中文说明',
+          description_ja: '日本語の説明', description_pt: 'Descrição em português',
+          description_es: '', description_fr: '', description_ko: '',
+          description_de: '', description_ru: '', description_it: '',
+        });
+      }
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('reads the minimum app version from the canonical app update config', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigappupdate';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+
+    try {
+      const manager = new ClientConfigManager();
+      manager.applyServerPayload({
+        immediate: {
+          app_update: {
+            min_version: '1.2.0',
+            minimumVersion: '9.9.9',
+          },
+          'app_update.min_version': '8.8.8',
+        },
+        restart: {},
+        config_hash: 'sha256:app-update-object',
+      }, '"sha256:app-update-object"');
+      expect(getMinimumAppVersion()).toBe('1.2.0');
+
+      manager.applyServerPayload({
+        immediate: {
+          app_update: { minimum_version: '1.4.0' },
+          'app_update.min_version': '1.3.0',
+        },
+        restart: {},
+        config_hash: 'sha256:app-update-direct',
+      }, '"sha256:app-update-direct"');
+      expect(getMinimumAppVersion()).toBe('');
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('reads retry error policy from immediate Server config', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigretrypolicy';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+
+    try {
+      const manager = new ClientConfigManager();
+      manager.applyServerPayload({
+        immediate: {
+          'model.retry_error_policy': {
+            permanent_statuses: [400, '499', 700, 'bad', 499],
+            permanent_message_patterns: ['custom_hard_stop', '', 42],
+            status_blacklist: [418],
+            message_blacklist: ['ignored_hard_stop'],
+            transient_message_patterns: {
+              connection_dropped: ['ignored because server policy is blacklist-only'],
+            },
+          },
+        },
+        restart: {},
+        config_hash: 'sha256:retry-policy',
+      }, '"sha256:retry-policy"');
+
+      const policy = getRetryErrorPolicyConfig();
+      expect(policy.permanent_statuses).toEqual([400, 499]);
+      expect(policy.permanent_message_patterns).toEqual(['custom_hard_stop']);
+      expect(policy.permanent_code_patterns).toEqual(DEFAULT_RETRY_ERROR_POLICY.permanent_code_patterns);
+      expect('transient_message_patterns' in policy).toBe(false);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
   it('returns registered local defaults before any Server config is available', () => {
     const manager = new ClientConfigManager();
     manager.registerDefault('feature.local-default', true);
@@ -81,6 +421,54 @@ describe('client_config', () => {
     expect(DEFAULT_IMAGE_GEN_BY_PROVIDER.doubao.model).toBe('doubao-seedream-5-0-flash-260915');
     // The normalized camelCase form is read again through the same catalog path.
     expect(getConfiguredImageGenCapability('google')).toMatchObject({ supportsEdit: true });
+  });
+
+  it.each(['image-field', 'section-aliases'] as const)('keeps canonical catalog wire fields through cache and identity changes: %s', async mode => {
+    const config = await import('../../../src/main/features/client_config');
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = `catalog-wire-${mode}`;
+    const previous = users.hasActiveUser() ? users.getActiveUserId() : undefined;
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const canonical = {
+      providers: { 'wire-compatible': [{ id: 'wire-model', name: 'Wire Model' }] },
+      openai_compatible_providers: { 'wire-compatible': { label: 'Wire', baseUrl: 'https://wire.example/v1' } },
+      image_generation: { 'wire-image': { model: 'wire-image-model', api: 'openai', supports_edit: true } },
+    };
+    try {
+      config.clientConfig.applyServerPayload({ immediate: { model_catalog: canonical }, restart: {}, config_hash: 'wire' }, 'wire');
+      expect(config.getConfiguredImageGenCapability('wire-image')).toEqual({ model: 'wire-image-model', api: 'openai', supportsEdit: true });
+      expect(config.getConfiguredProviderModels('wire-compatible')?.models).toEqual([{ id: 'wire-model', name: 'Wire Model' }]);
+      expect(config.getConfiguredOpenAICompatibleProvider('wire-compatible')).toMatchObject({ id: 'wire-compatible', baseUrl: 'https://wire.example/v1' });
+      // Persistence retains the wire object; typed camelCase views are not cache data.
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      expect(saved.active.immediate.model_catalog).toEqual(canonical);
+      users.activateUser(`${uid}-other`);
+      expect(config.getConfiguredImageGenCapability('wire-image')).toBeNull();
+      users.activateUser(uid);
+      storage.writeJsonSync(file, saved);
+      expect(config.getConfiguredImageGenCapability('wire-image')).toEqual({ model: 'wire-image-model', api: 'openai', supportsEdit: true });
+      if (mode === 'image-field') {
+        config.clientConfig.applyServerPayload({ immediate: { model_catalog: { image_generation: {
+          'field-alias': { model: 'alias-image-model', api: 'openai', supportsEdit: true },
+        } } }, restart: {}, config_hash: 'field-alias' }, 'field-alias');
+        expect(config.getConfiguredImageGenCapability('field-alias')).toEqual({ model: 'alias-image-model', api: 'openai', supportsEdit: false });
+      } else {
+        config.clientConfig.applyServerPayload({ immediate: { model_catalog: {
+          curated_models: { 'catalog-alias': [{ id: 'alias-model', name: 'Alias Model' }] },
+          openAICompatibleProviders: { 'compatible-alias': { label: 'Alias', baseUrl: 'https://alias.example/v1' } },
+          imageGeneration: { 'image-alias': { model: 'alias-image-model', api: 'openai', supportsEdit: true } },
+        } }, restart: {}, config_hash: 'section-aliases' }, 'section-aliases');
+        expect(config.getConfiguredProviderModels('catalog-alias')).toBeNull();
+        expect(config.getConfiguredOpenAICompatibleProvider('compatible-alias')).toBeNull();
+        expect(config.getConfiguredImageGenCapability('image-alias')).toBeNull();
+      }
+    } finally {
+      if (previous) users.activateUser(previous);
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 
   it('ships the synchronized public model catalog with compatibility metadata', () => {
@@ -503,34 +891,6 @@ describe('client_config', () => {
 
 
 describe('client config response ownership and deadline', () => {
-  it('allows a fresh refresh after the attempt timestamp could not be persisted', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'clientconfigattemptrecovery';
-    users.activateUser(uid);
-    const manager = new ClientConfigManager();
-    manager.applyServerPayload({ immediate: { 'feature.recovery': 'cached' }, restart: {} }, 'cached-etag');
-    const failure = Object.assign(new Error('synthetic config write unavailable'), { code: 'EACCES' });
-    const write = vi.spyOn(storage, 'writeJsonSync').mockImplementationOnce(() => { throw failure; });
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
-      code: 0, immediate: { 'feature.recovery': 'fresh' }, restart: {}, config_hash: 'recovered-hash',
-    }), { headers: { etag: 'recovered-etag' } }));
-    vi.stubGlobal('fetch', fetchMock);
-    try {
-      await expect(refresh('manual', { force: true })).rejects.toBe(failure);
-      expect(fetchMock).not.toHaveBeenCalled();
-      expect(manager.get('feature.recovery')).toBe('cached');
-      write.mockRestore();
-      await expect(refresh('manual', { force: true })).resolves.toEqual({ updated: true });
-      expect(fetchMock).toHaveBeenCalledOnce();
-      expect(manager.get('feature.recovery')).toBe('fresh');
-      expect(manager.readCache().etag).toBe('recovered-etag');
-    } finally {
-      write.mockRestore();
-      fs.rmSync(path.dirname(paths.userRemoteConfigFile(uid)), { recursive: true, force: true });
-    }
-  });
 
 
   afterEach(() => {

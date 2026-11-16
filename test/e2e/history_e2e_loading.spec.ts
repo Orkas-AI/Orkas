@@ -70,6 +70,11 @@ test('updates settled message actions in place when the user changes language', 
     const answer = page.locator('[data-msg-id="locale-answer"]');
     const quote = answer.locator('.bubble-quote-btn');
     await expect(quote).toHaveText('Quote');
+    // Creating a conversation queues the normal task-link sidebar refresh.
+    // Capture DOM identity only after that setup event has finished; the
+    // language change itself must still preserve every action/status node.
+    await page.waitForFunction(() => (window as any).eval(
+      '_conversationTaskLinksRefreshTimer === null && _loadConversationsInFlight === null'));
     const statusLabels = page.locator(`.conv-item[data-cid="${cid}"] .conv-item-status-label`);
     await expect(statusLabels).not.toHaveCount(0);
     for (const label of await statusLabels.all()) await expect(label).toHaveText('Failed');
@@ -728,6 +733,7 @@ test('loads and projects history from ASAR with the shipped dependency layout', 
     cpSync(path.join(pcRoot, 'src/main'), path.join(source, 'src/main'), { recursive: true });
     mkdirSync(path.join(source, 'bin'), { recursive: true });
     cpSync(path.join(pcRoot, 'bin/tool-input-compat.cjs'), path.join(source, 'bin/tool-input-compat.cjs'));
+    cpSync(path.join(pcRoot, 'bin/tool-parameter-errors.cjs'), path.join(source, 'bin/tool-parameter-errors.cjs'));
     for (const file of ['package.json', 'tsconfig.json']) cpSync(path.join(pcRoot, file), path.join(source, file));
     for (const name of ['tsx', 'get-tsconfig', 'resolve-pkg-maps', 'esbuild', `@esbuild/${process.platform}-${process.arch}`,
       'electron-log', 'async-mutex', 'tslib']) {

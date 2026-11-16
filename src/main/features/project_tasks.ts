@@ -47,6 +47,7 @@ import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { taskContent } from '../util/project-task-content';
 import { clampStr, isCommanderTaskOwner, isDueDate, orderTaskAttachments, normaliseTask as _normaliseTask, sanitiseTaskAttachmentName as _sanitiseAttachmentName,
+  matchesTaskDeleteExpectation, type TaskDeleteExpectation,
   TASK_STATUSES as STATUSES } from './project_task_record';
 import { ALLOWED_EXTENSIONS } from './chat_attachments';
 import * as projects from './projects';
@@ -96,6 +97,7 @@ export type TaskError =
   | 'status_conflict'
   | 'owner_not_bound'
   | 'id_taken'
+  | 'task_changed'
   | 'delete_failed';
 
 const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
@@ -201,8 +203,6 @@ async function _writeTask(uid: string, pid: string, t: ProjectTask): Promise<voi
   _notifyTasksChanged(uid, pid);
 }
 
-// Public builds keep project tasks local. The hook remains for test parity.
-
 // Local, in-process change notification — index.ts wires it to a renderer
 // broadcast so an open project's to-do list refreshes live when a task is
 // created/updated/deleted from anywhere (the auto-advance driver, the model's
@@ -260,11 +260,10 @@ export async function listTasks(uid: string, pid: string): Promise<ProjectTask[]
   return listLocalTasksForMigration(uid, pid);
 }
 
-type TaskSearchRow = Pick<ProjectTask, 'id' | 'content' | 'status'>;
+type TaskSearchRow = Pick<ProjectTask, 'id' | 'content' | 'status' | 'origin_cid'>;
 const _searchSnapshots = new FileSnapshotCache<TaskSearchRow>(row => 128 + 2 * row.content.length);
 
-/** The caller already resolved the account's project catalog. Shared work
- * keeps using the same authoritative local outbox snapshot as its page. */
+/** A cached read-only projection within the resolved local task scope. */
 export async function listTaskSearchRows(
   uid: string, pid: string, _project?: { project_id: string; name: string },
 ): Promise<TaskSearchRow[]> {
@@ -276,7 +275,7 @@ export async function listTaskSearchRows(
     .map(entry => entry.name.slice(0, -5)).filter(id => TASK_ID_RE.test(id));
   const rows = await mapFileSnapshots(ids, id => _searchSnapshots.read(_taskFile(uid, pid, id), async () => {
     const task = await _readTask(uid, pid, id);
-    return task ? { id: task.id, content: task.content, status: task.status } : null;
+    return task ? { id: task.id, content: task.content, status: task.status, origin_cid: task.origin_cid } : null;
   }));
   return rows.filter((row): row is TaskSearchRow => row !== null);
 }
@@ -482,8 +481,10 @@ export interface CreateTaskInput extends TaskContentInput {
 
 export async function createTask(
   uid: string, pid: string, input: CreateTaskInput,
+  options: { beforeWrite?: () => void } = {},
 ): Promise<{ ok: true; task: ProjectTask; alreadyExists: boolean } | { ok: false; error: TaskError }> {
   if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
+  options.beforeWrite?.();
   const contentError = validateTaskContent(input);
   if (contentError) return { ok: false, error: contentError };
   const content = taskContent(input)!;
@@ -497,6 +498,7 @@ export async function createTask(
 
   const requestedStatus = input.status || 'todo';
   return withCreateLock(uid, pid, async () => {
+    options.beforeWrite?.();
     // A caller-supplied id lets the editor stage attachments before the task
     // JSON exists. Validate collisions under the same create lock that owns
     // content de-duplication so concurrent creates cannot steal a draft.
@@ -518,6 +520,7 @@ export async function createTask(
 
     const id = suppliedId || genTaskId();
     return withTaskUpdateLock(uid, pid, id, async () => {
+      options.beforeWrite?.();
       const attachments = suppliedId ? orderTaskAttachments(_scanAttachmentsDir(uid, pid, id), input.attachment_order) : [];
       const now = nowIso();
       const task: ProjectTask = {
@@ -555,7 +558,7 @@ export interface UpdateTaskPatch extends TaskContentInput {
 export async function updateTask(
   uid: string, pid: string, tid: string, patch: UpdateTaskPatch,
   // Host-only optimistic guard: compare and write under the same task lock.
-  options: { expectedStatus?: TaskStatus; expectedAssigneeUid?: string } = {},
+  options: { expectedStatus?: TaskStatus; beforeWrite?: () => void } = {},
 ): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'task_not_found' };
   return withTaskUpdateLock(uid, pid, tid, async () => {
@@ -616,6 +619,7 @@ export async function updateTask(
       else delete next.done_at;
     }
     next.updated_at = nowIso();
+    options.beforeWrite?.();
     await _writeTask(uid, pid, next);
     log.info('updated', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), status: next.status });
     return { ok: true, task: next };
@@ -667,11 +671,19 @@ export async function decideReview(
 
 export async function deleteTask(
   uid: string, pid: string, tid: string,
+  options: { expectedTask?: TaskDeleteExpectation; beforeWrite?: () => void } = {},
 ): Promise<{ ok: true } | { ok: false; error: TaskError }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'task_not_found' };
   return withTaskUpdateLock(uid, pid, tid, async () => {
+    if (options.expectedTask !== undefined) {
+      const project = pid ? await projects.getProject(uid, pid) : null;
+      if (getActiveUserId() !== uid || (pid && !project)
+          || !matchesTaskDeleteExpectation(await _readTask(uid, pid, tid), options.expectedTask)
+          || getActiveUserId() !== uid) return { ok: false, error: 'task_changed' };
+    }
     const f = _taskFile(uid, pid, tid);
     if (!fs.existsSync(f)) return { ok: false, error: 'task_not_found' };
+    options.beforeWrite?.();
     try { await fsp.unlink(f); }
     catch (err) {
       log.warn('delete task', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) });
@@ -753,7 +765,7 @@ export async function resolveTaskAttachmentPath(uid: string, pid: string, tid: s
  *  yet). Validates the name + type against the composer's whitelist. */
 export async function uploadTaskAttachment(
   uid: string, pid: string, tid: string, name: string, buf: Buffer,
-  options: { overwrite?: boolean; requireTask?: boolean } = {},
+  options: { overwrite?: boolean; requireTask?: boolean; beforeWrite?: () => void } = {},
 ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'invalid_task_id' };
   return withTaskUpdateLock(uid, pid, tid, async () => {
@@ -766,13 +778,14 @@ export async function uploadTaskAttachment(
 
 async function _uploadTaskAttachment(
   uid: string, pid: string, tid: string, name: string, buf: Buffer,
-  options: { overwrite?: boolean },
+  options: { overwrite?: boolean; beforeWrite?: () => void },
 ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
   if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
   const safe = _sanitiseAttachmentName(name);
   if (!safe) return { ok: false, error: 'invalid_name' };
   if (!_attachmentExtOk(safe)) return { ok: false, error: 'unsupported_type' };
   if (!Buffer.isBuffer(buf) || buf.length > TASK_ATTACHMENT_MAX_BYTES) return { ok: false, error: 'too_large' };
+  options.beforeWrite?.();
   const dir = _taskAttachmentsDir(uid, pid, tid);
   try {
     fs.mkdirSync(dir, { recursive: true });

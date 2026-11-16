@@ -50,7 +50,8 @@ export interface RunOfficeCliOpts {
   maxOutputBytes?: number;
 }
 
-const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+export const OFFICECLI_DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+export const OFFICECLI_DEFAULT_TIMEOUT_MS = 60_000;
 
 /**
  * OfficeCLI's HTML renderer discovers macOS browsers by probing executable
@@ -108,8 +109,8 @@ export function runOfficeCli(args: string[], opts: RunOfficeCliOpts): Promise<Of
       new OfficeCliError('E_OFFICE_ENGINE_MISSING', `no OfficeCLI binary for ${process.platform}-${process.arch}`),
     );
   }
-  const timeoutMs = opts.timeoutMs ?? 60_000;
-  const maxOutputBytes = Math.max(1, opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
+  const timeoutMs = opts.timeoutMs ?? OFFICECLI_DEFAULT_TIMEOUT_MS;
+  const maxOutputBytes = Math.max(1, opts.maxOutputBytes ?? OFFICECLI_DEFAULT_MAX_OUTPUT_BYTES);
   if (opts.signal?.aborted) {
     return Promise.reject(new OfficeCliError('E_OFFICE_ABORTED', `OfficeCLI aborted before start: ${args[0]}`));
   }

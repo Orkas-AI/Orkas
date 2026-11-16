@@ -10,6 +10,7 @@ Use analysis mode when the user provides social post data, campaign exports, ad 
   "campaign_name": "launch_week",
   "total_spend": 500,
   "revenue": 1200,
+  "non_marketing_costs": 700,
   "conversion_value": 1200,
   "posts": [
     {
@@ -36,12 +37,22 @@ Use analysis mode when the user provides social post data, campaign exports, ad 
 ## Validation
 
 - `posts` must be a non-empty array for script-based calculations.
-- `reach > 0` is required for reach-based engagement rate.
-- `impressions > 0` is required for CTR and CPM.
-- Interactions, clicks, spend, conversions, and revenue must not be negative.
+- Supplied counters and monetary fields must be finite, non-negative JSON numbers, not booleans or numeric strings. Missing or `null` fields remain unavailable; explicitly supply zero only for a known zero or an inapplicable counter.
+- A positive reach is required for reach-based engagement rate; positive impressions are required for CTR and CPM. Missing or zero denominators make only the affected metric unavailable, without blocking other supported calculations.
 - Dates should be parseable when time comparison is requested.
 - If `reach > impressions`, `clicks > impressions`, or conversions exceed clicks, flag the data risk.
-- If ROI is requested without spend or value, state the missing field or assumption.
+- For monetary comparisons, establish matching campaign/attribution window, currency and cost scope before preparing the input. Scripts calculate supplied records; they do not verify attribution or exchange rates.
+
+## Monetary Sources And Return Bases
+
+Campaign-level `total_spend`, `revenue` and `non_marketing_costs` take precedence, including explicit zero or `null`. If a field is absent, the scripts sum its post-level counterpart (`spend`, `revenue`, `non_marketing_costs`) only when every included post supplies it. Never add campaign totals to the same underlying post rows or treat a partial export as a complete total.
+
+- `revenue` is the attributed sales amount on the declared basis. Revenue and positive spend support ROAS, not profit ROI by themselves.
+- `non_marketing_costs` is the total cost attributable to that same revenue, excluding `total_spend`. Include applicable goods, fulfillment, fees and other costs in the stated scope once. An explicit zero is a supplied cost assumption; an omitted cost is unknown. The result is ROI on the declared cost scope, not automatically net company profit or incremental campaign lift.
+- `conversion_value` is a separately declared value. Its `conversion_value_return_percentage` uses that value and spend; `conversion_value_basis` identifies it as user-declared. Do not silently use it as observed revenue or profit.
+- Only an explicit `value_per_engagement` enables the optional interaction-value scenario. `estimated_value` and `estimated_roi_percentage` stay separate from measured-return fields and carry `estimate_basis: "user_supplied_value_per_engagement"`. No default unit value is supplied.
+
+The two commands share the same calculations. Existing `campaign_metrics` and `roi_metrics` containers remain, but unavailable numeric results now return JSON `null` with `unavailable_reasons`; downstream prose must preserve those states. `roi_basis` identifies a computable profit-return basis. Missing values and zero spend must not become 0% ROI, infinite return or a recommendation to increase a budget. The performance command does not grade ROI or generate budget-scaling advice from a return ratio.
 
 ## Core Formulas
 
@@ -56,8 +67,10 @@ Use analysis mode when the user provides social post data, campaign exports, ad 
 - CPE = spend / total engagements.
 - CPM = spend / impressions * 1000.
 - CPA = spend / conversions.
-- ROI = (value - spend) / spend * 100.
+- ROI on declared costs = (revenue - non-marketing costs - spend) / spend * 100; requires all three inputs and positive spend.
 - ROAS = revenue / spend.
+- Declared conversion-value return = (conversion value - spend) / spend * 100; not automatically profit ROI.
+- Explicit interaction-value estimate = engagements × user-supplied value per engagement. Its estimated return = (estimated value - spend) / spend * 100; always a scenario.
 
 ## Script Commands
 

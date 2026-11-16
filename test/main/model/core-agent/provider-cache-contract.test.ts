@@ -6,9 +6,10 @@ import type { Api, Model } from '@earendil-works/pi-ai';
 import { createPiProvider } from '../../../../src/core-agent/src/providers/pi-provider.js';
 import { PUBLIC_PROVIDER_MODELS } from '../../../../src/main/model/public_model_catalog';
 import { CATALOG } from '../../../../src/main/model/provider_catalog';
+import { providerUserCacheKey } from '../../../../src/main/model/core-agent/provider-cache-scope';
 import type { CompletionParams } from '../../../../src/core-agent/src/providers/base.js';
 
-import { buildCustomAnthropicModel, buildCustomOpenAICompatibleModel,
+import { buildCustomAnthropicModel, buildCustomOpenAICompatibleModel, buildCustomResponsesModel,
   buildDeepSeekModel, buildDoubaoModel, buildRuntimeMoonshotModel, buildOrkasApiModel,
 } from '../../../../src/main/model/core-agent/external-providers';
 
@@ -38,6 +39,7 @@ const scenarios: Array<[string, () => Model<Api> | Promise<Model<Api>>]> = [
   ['minimax-cn-oauth', () => ({ ...builtin('minimax-cn', 'MiniMax-M3'), provider: 'minimax-portal-cn' })],
   ['orkas-api', () => buildOrkasApiModel('orkas-llm-1.5-pro')],
   ['custom-chat', () => buildCustomOpenAICompatibleModel('fixture', config)],
+  ['custom-responses', () => buildCustomResponsesModel('fixture', config)],
   ['custom-claude', () => buildCustomAnthropicModel('fixture', config)],
 ];
 const report: unknown[] = [];
@@ -48,6 +50,14 @@ afterAll(() => {
 });
 
 describe('Provider cache and conversation isolation contracts', () => {
+  it('keeps opaque user mapping stable without manufacturing a shared anonymous identity', () => {
+    for (const absent of [undefined, null, '', 'anonymous']) expect(providerUserCacheKey(absent)).toBeUndefined();
+    const a = providerUserCacheKey('用户/opaque-A')!;
+    expect(a).toMatch(/^[a-f0-9]{64}$/);
+    expect(a).toBe(providerUserCacheKey('用户/opaque-A'));
+    expect(a).not.toBe(providerUserCacheKey('用户/opaque-B'));
+    expect(a).not.toContain('opaque-A');
+  });
   it('covers every built-in provider card and public custom routes', async () => {
     const models = await Promise.all(scenarios.map(([, build]) => build()));
     expect(new Set(models.map(model => model.provider))).toEqual(new Set([
@@ -95,9 +105,9 @@ describe('Provider cache and conversation isolation contracts', () => {
     expect(semantic(captures[0].payload)).toEqual(semantic(captures[1].payload));
     expect(JSON.stringify(semantic(captures[0].payload))).not.toContain('fixture-chat-');
     const a = captures[0].headers!, b = captures[1].headers!;
-    if (model.api === 'openai-codex-responses') {
-      expect(a.get('session-id')).toBe(b.get('session-id'));
-      expect(a.get('session-id')).not.toBe('fixture-chat-a');
+    if (model.api === 'openai-codex-responses' || model.api === 'openai-responses') {
+      expect(a.get('session-id')).toBe('opaque-user-fixture');
+      expect(b.get('session-id')).toBe('opaque-user-fixture');
       expect(a.get('x-client-request-id')).not.toBe(b.get('x-client-request-id'));
     } else expect(a.has('session-id') || b.has('session-id')).toBe(false);
     if (model.provider === 'openrouter') {

@@ -30,15 +30,17 @@ it('main and renderer records bypass direct file/console sinks and snapshot once
     initLogger();
     const logger = createLogger('business');
     const getter = vi.fn(() => { throw new Error('diagnostic accessor'); });
-    const data = { result: 'success', token: 'private-canary', get details() { return getter(); } };
+    const data = { result: 'success', token: 'private-canary',
+      'Proxy-Authorization': 'Basic incomplete', get details() { return getter(); } };
     logger.debug('disabled', data);
     expect(send).not.toHaveBeenCalled();
     logger.info('completed', data);
     data.result = 'later';
-    expect(send.mock.calls[0][0]).toMatchObject({ scope: 'business', data: ['completed', { result: 'success', token: '***REDACTED***', details: '[accessor]' }] });
-    const error = Object.assign(new Error('failed'), { code: 'ECONNRESET', token: 'private-canary' });
+    expect(send.mock.calls[0][0]).toMatchObject({ scope: 'business', data: ['completed', { result: 'success', token: '***REDACTED***',
+      'Proxy-Authorization': '***REDACTED***', details: '[accessor]' }] });
+    const error = Object.assign(new Error('failed Authorization: Basic incomplete'), { code: 'ECONNRESET', token: 'private-canary' });
     logger.error('request failed', error);
-    expect(structuredClone(send.mock.calls[1][0]).data[1]).toMatchObject({ message: 'failed', code: 'ECONNRESET', token: '***REDACTED***' });
+    expect(structuredClone(send.mock.calls[1][0]).data[1]).toMatchObject({ message: 'failed Authorization: Basic ***', code: 'ECONNRESET', token: '***REDACTED***' });
     logFromRenderer({ level: 'warn', module: 'ui', message: 'renderer result' });
     expect(send.mock.calls[2][0].scope).toBe('renderer/ui');
     canAccept.mockReturnValue(false);

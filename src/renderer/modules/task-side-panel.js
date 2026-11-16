@@ -1,22 +1,32 @@
-// Shared width preference and resize behavior for the task's side panels.
+// Width preference and resize behavior for the task's side panels. They share one preference
+// unless a panel names its own.
 (function () {
-  const storageKey = 'orkas.conversationInfo.width';
+  const SHARED_STORAGE_KEY = 'orkas.conversationInfo.width';
   const controllers = new Map();
-  let preferredWidth = null;
-  try {
-    const saved = Number(localStorage.getItem(storageKey));
-    if (Number.isFinite(saved) && saved >= 320) preferredWidth = saved;
-  } catch (_) { /* Storage may be unavailable. */ }
+  const preferences = new Map();
 
-  function save() {
-    try { localStorage.setItem(storageKey, String(preferredWidth)); } catch (_) {}
+  function preferenceFor(storageKey) {
+    if (preferences.has(storageKey)) return preferences.get(storageKey);
+    const preference = { storageKey, width: null };
+    try {
+      const saved = Number(localStorage.getItem(storageKey));
+      if (Number.isFinite(saved) && saved >= 320) preference.width = saved;
+    } catch (_) { /* Storage may be unavailable. */ }
+    preferences.set(storageKey, preference);
+    return preference;
   }
 
-  function bind(panelId, handleId, onResize) {
+  function save(preference) {
+    try { localStorage.setItem(preference.storageKey, String(preference.width)); } catch (_) {}
+  }
+
+  function bind(panelId, handleId, onResize, options = {}) {
     if (controllers.has(panelId)) return controllers.get(panelId);
     const panel = document.getElementById(panelId);
     const handle = document.getElementById(handleId);
     if (!panel || !handle) return null;
+    const preference = preferenceFor(options.storageKey || SHARED_STORAGE_KEY);
+    const defaultWidth = options.defaultWidth || (() => window.innerWidth * 0.3);
     let resizing = false;
     function apply() {
       const container = panel.parentElement;
@@ -25,8 +35,8 @@
       if (available <= 0) return;
       const minimum = Math.min(400, available);
       const maximum = Math.max(minimum, available - Math.min(420, available * 0.5));
-      const width = Math.round(Math.max(minimum, Math.min(preferredWidth ?? window.innerWidth * 0.3, maximum)));
-      if (preferredWidth !== null) preferredWidth = width;
+      const width = Math.round(Math.max(minimum, Math.min(preference.width ?? defaultWidth(available), maximum)));
+      if (preference.width !== null) preference.width = width;
       panel.style.width = `${width}px`;
       panel.style.flexBasis = `${width}px`;
       handle.setAttribute('aria-valuemin', String(Math.round(minimum)));
@@ -38,12 +48,12 @@
       resizing = false;
       document.body.classList.remove('is-task-side-panel-resizing');
       onResize?.(false);
-      save();
+      save(preference);
     }
     handle.addEventListener('pointerdown', (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
-      preferredWidth = panel.getBoundingClientRect().width;
+      preference.width = panel.getBoundingClientRect().width;
       resizing = true;
       handle.setPointerCapture(event.pointerId);
       document.body.classList.add('is-task-side-panel-resizing');
@@ -51,7 +61,7 @@
     });
     handle.addEventListener('pointermove', (event) => {
       if (!resizing) return;
-      preferredWidth = panel.parentElement.getBoundingClientRect().right - event.clientX;
+      preference.width = panel.parentElement.getBoundingClientRect().right - event.clientX;
       apply();
     });
     handle.addEventListener('pointerup', finish);
@@ -61,9 +71,9 @@
       if (event.isComposing || event.keyCode === 229) return;
       if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
       event.preventDefault();
-      preferredWidth = panel.getBoundingClientRect().width + (event.key === 'ArrowLeft' ? 24 : -24);
+      preference.width = panel.getBoundingClientRect().width + (event.key === 'ArrowLeft' ? 24 : -24);
       apply();
-      save();
+      save(preference);
     });
     const controller = { apply, finish };
     controllers.set(panelId, controller);
@@ -74,5 +84,15 @@
   window.addEventListener('resize', () => {
     for (const controller of controllers.values()) controller.apply();
   });
+  // Header metadata can wrap or change during title editing without a window resize.
+  const header = document.getElementById('chat-header');
+  if (header && typeof ResizeObserver === 'function') {
+    const syncHeaderHeight = () => {
+      const height = header.getBoundingClientRect().height;
+      if (height > 0) header.closest('.chat-container')?.style.setProperty('--task-side-panel-header-height', `${height}px`);
+    };
+    new ResizeObserver(() => requestAnimationFrame(syncHeaderHeight)).observe(header);
+    syncHeaderHeight();
+  }
   window.TaskSidePanel = { bind };
 }());

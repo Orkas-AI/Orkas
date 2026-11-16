@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   captionFontForText,
+  concatListBody,
   editVideo,
   ffmpegFailure,
   normalizeLoudnessAudioFilter,
@@ -427,4 +428,226 @@ describe.skipIf(!haveFfmpeg)('concat when only some parts carry sound', () => {
     expect(audioDuration(out) !== null).toBe(hasAudio);
     expect((result as any).audio_conform).toBeUndefined();
   }, 120_000);
+});
+
+// 2026-11-12: remove_fillers on a steady tone with ten cuts clicked at every
+// join (max sample step 0.053 against a source 0.007) and came out with the
+// audio 0.16s longer than the picture, because aselect kept samples the frame
+// select had dropped. Cuts now land on frames and each audio piece is faded.
+describe.skipIf(!haveFfmpeg)('jump cuts join cleanly and stay in sync', () => {
+  function decodeMono(file: string): Float32Array {
+    const r = spawnSync(bins.ffmpeg!, ['-v', 'error', '-i', file, '-ac', '1', '-ar', '48000', '-f', 'f32le', 'pipe:1'], { maxBuffer: 64 * 1024 * 1024 });
+    expect(r.status, String(r.stderr)).toBe(0);
+    const buf = Buffer.from(r.stdout);
+    return new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+  }
+  function streamDurations(file: string): Record<string, number> {
+    const r = spawnSync(bins.ffprobe!, ['-v', 'error', '-show_entries', 'stream=codec_type,duration', '-of', 'csv=p=0', file], { encoding: 'utf8' });
+    const out: Record<string, number> = {};
+    for (const line of String(r.stdout).trim().split('\n')) {
+      const [kind, dur] = line.split(',');
+      out[kind] = Number(dur);
+    }
+    return out;
+  }
+  function maxStep(samples: Float32Array, skip: number): number {
+    let max = 0;
+    for (let i = skip + 1; i < samples.length - skip; i += 1) max = Math.max(max, Math.abs(samples[i] - samples[i - 1]));
+    return max;
+  }
+
+  it('removes ten fillers without clicks or audio drift', async () => {
+    const dir = tmp();
+    const input = path.join(dir, 'talk.mp4');
+    const made = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=gray:s=320x180:r=30:d=12',
+      '-f', 'lavfi', '-i', 'sine=f=220:r=48000:d=12,volume=0.5', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '256k', input], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+    const words: Array<{ word: string; start: number; end: number }> = [];
+    let t = 0;
+    for (let i = 0; i < 10; i += 1) {
+      words.push({ word: `w${i}`, start: t, end: t + 0.7137 });
+      words.push({ word: 'um', start: t + 0.7137, end: t + 1.1348 });
+      t += 1.1348;
+    }
+    words.push({ word: 'end', start: t, end: 12 });
+    const transcript = path.join(dir, 'transcript.json');
+    fs.writeFileSync(transcript, JSON.stringify({ words }));
+    const out = path.join(dir, 'tight.mp4');
+    const result = await editVideo({ op: 'remove_fillers', inputAbsPath: input, transcriptAbsPath: transcript, fillers: ['um'], padSec: 0, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+
+    const d = streamDurations(out);
+    expect(d.video).toBeLessThan(9);
+    expect(Math.abs(d.audio - d.video)).toBeLessThan(1 / 30 + 0.025);
+
+    const source = maxStep(decodeMono(input), 4800);
+    const cut = maxStep(decodeMono(out), 4800);
+    expect(cut).toBeLessThan(source * 2);
+  }, 120_000);
+});
+
+describe.skipIf(!haveFfmpeg)('burned captions on a vertical frame', () => {
+  function captionBottomGap(file: string, w: number, h: number): number {
+    const r = spawnSync(bins.ffmpeg!, ['-v', 'error', '-ss', '0.5', '-i', file, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'], { maxBuffer: 16 * 1024 * 1024 });
+    expect(r.status, String(r.stderr)).toBe(0);
+    const px = Buffer.from(r.stdout);
+    expect(px.length).toBe(w * h);
+    for (let y = h - 1; y >= 0; y -= 1) {
+      for (let x = 0; x < w; x += 1) if (px[y * w + x] > 100) return h - 1 - y;
+    }
+    return -1;
+  }
+  it.each([
+    ['vertical', 360, 640, (gap: number, h: number) => expect(gap / h).toBeGreaterThan(0.15)],
+    ['landscape', 640, 360, (gap: number, h: number) => expect(gap / h).toBeLessThan(0.1)],
+  ])('places %s captions for the frame shape', async (_label, w, h, check) => {
+    const dir = tmp();
+    const input = path.join(dir, 'clip.mp4');
+    const made = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=c=black:s=${w}x${h}:r=30:d=1`, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', input], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+    const subtitles = path.join(dir, 'captions.srt');
+    fs.writeFileSync(subtitles, '1\n00:00:00,000 --> 00:00:01,000\nCaption visible\n');
+    const out = path.join(dir, 'captioned.mp4');
+    const result = await editVideo({ op: 'burnsubs', inputAbsPath: input, subtitlesAbsPath: subtitles, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    const gap = captionBottomGap(out, w, h);
+    expect(gap).toBeGreaterThan(0);
+    (check as (gap: number, h: number) => void)(gap, h);
+  }, 60_000);
+});
+
+// 2026-11-14: an English version went out with the Chinese captions still burned in under
+// the new ones. `cover` lays an opaque bar over the old band and puts the new captions on it.
+describe.skipIf(!haveFfmpeg)('captions over captions already in the picture', () => {
+  function rgbFrame(file: string, w: number, h: number, at: number): Buffer {
+    const r = spawnSync(bins.ffmpeg!, ['-v', 'error', '-ss', String(at), '-i', file, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], { maxBuffer: 1 << 26 });
+    expect(r.status).toBe(0);
+    return r.stdout as Buffer;
+  }
+  const count = (px: Buffer, w: number, rows: [number, number], test: (r: number, g: number, b: number) => boolean) => {
+    let n = 0;
+    for (let y = rows[0]; y < rows[1]; y += 1) for (let x = 0; x < w; x += 1) {
+      const i = (y * w + x) * 3;
+      if (test(px[i], px[i + 1], px[i + 2])) n += 1;
+    }
+    return n;
+  };
+  const red = (r: number, g: number, b: number) => r > 150 && g < 90 && b < 90;
+  const white = (r: number, g: number, b: number) => r > 200 && g > 200 && b > 200;
+
+  it('covers the old band, sets the new captions in it, and leaves the rest of the picture', async () => {
+    const dir = tmp();
+    const [w, h] = [360, 640];
+    const input = path.join(dir, 'clip.mp4');
+    // A grey picture with a red caption bar burned in at 80-87% of the height.
+    const made = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=c=0x506070:s=${w}x${h}:r=30:d=2`,
+      '-vf', 'drawbox=x=40:y=ih*0.80:w=280:h=ih*0.07:color=red@1:t=fill', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', input], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+    const subtitles = path.join(dir, 'english.srt');
+    fs.writeFileSync(subtitles, '1\n00:00:00,000 --> 00:00:02,000\nEasy on your eyes\n');
+    const out = path.join(dir, 'english.mp4');
+    const result = await editVideo({ op: 'burnsubs', inputAbsPath: input, subtitlesAbsPath: subtitles, cover: { top: 0.78, bottom: 0.89 }, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    const band: [number, number] = [Math.floor(h * 0.78), Math.ceil(h * 0.89)];
+    const before = rgbFrame(input, w, h, 1);
+    const after = rgbFrame(out, w, h, 1);
+    expect(count(before, w, band, red)).toBeGreaterThan(5000);
+    expect(count(after, w, band, red)).toBe(0);
+    expect(count(after, w, band, white)).toBeGreaterThan(50);
+    // Above the band the picture is untouched: no bar, no caption.
+    expect(count(after, w, [0, band[0] - 2], white)).toBe(0);
+    expect(count(after, w, [0, band[0] - 2], (r, g, b) => r + g + b < 60)).toBe(0);
+
+    const wide = await editVideo({ op: 'burnsubs', inputAbsPath: input, subtitlesAbsPath: subtitles, cover: { top: 0.2, bottom: 0.9 }, outputAbsPath: path.join(dir, 'wide.mp4') });
+    expect(wide).toMatchObject({ ok: false, errorCode: 'E_EDIT_ARG' });
+  }, 60_000);
+});
+
+describe.skipIf(!haveFfmpeg)('mix lowers the original sound only under the added line', () => {
+  function bandLevelDb(samples: Float32Array, sr: number, freq: number, fromSec: number, toSec: number): number {
+    // Goertzel power at one frequency over the window.
+    const start = Math.floor(fromSec * sr);
+    const end = Math.floor(toSec * sr);
+    const k = (2 * Math.PI * freq) / sr;
+    const coeff = 2 * Math.cos(k);
+    let s1 = 0; let s2 = 0;
+    for (let i = start; i < end; i += 1) { const s0 = samples[i] + coeff * s1 - s2; s2 = s1; s1 = s0; }
+    const power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+    return 10 * Math.log10(power / ((end - start) ** 2) + 1e-20);
+  }
+  it('ducks the base during the line and restores it after', async () => {
+    const dir = tmp();
+    const base = path.join(dir, 'scene.mp4');
+    const made = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=30:d=6',
+      '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=6,volume=0.3', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', base], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+    const line = path.join(dir, 'line.wav');
+    const tone = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=f=1000:r=48000:d=2,volume=0.5', line], { encoding: 'utf8' });
+    expect(tone.status, tone.stderr).toBe(0);
+    const out = path.join(dir, 'narrated.mp4');
+    const result = await editVideo({ op: 'mix', inputAbsPath: base, audioSegments: [{ audioAbsPath: line, startSec: 2 }], onExistingAudio: 'mix', duck: true, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+
+    const r = spawnSync(bins.ffmpeg!, ['-v', 'error', '-i', out, '-ac', '1', '-ar', '48000', '-f', 'f32le', 'pipe:1'], { maxBuffer: 64 * 1024 * 1024 });
+    expect(r.status, String(r.stderr)).toBe(0);
+    const buf = Buffer.from(r.stdout);
+    const pcm = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+    const before = bandLevelDb(pcm, 48000, 440, 0.3, 1.7);
+    const during = bandLevelDb(pcm, 48000, 440, 2.3, 3.7);
+    const after = bandLevelDb(pcm, 48000, 440, 4.6, 5.6);
+    expect(before - during).toBeGreaterThan(5);
+    expect(Math.abs(after - before)).toBeLessThan(2);
+  }, 120_000);
+});
+
+// 2026-11-13: sixteen 128 BPM beats cut at 30 fps joined to 8.03 s instead of 7.5 s:
+// each trim kept a frame too many and the join added one more where timestamps did
+// not land on its constant-rate grid, so the last cut fell more than a beat late.
+describe.skipIf(!haveFfmpeg)('cuts to a beat grid add up to the grid', () => {
+  function frames(file: string): number {
+    const r = spawnSync(bins.ffprobe!, ['-v', 'error', '-count_frames', '-select_streams', 'v', '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', file], { encoding: 'utf8' });
+    return Number(String(r.stdout).trim());
+  }
+
+  it('trims to the nearest whole frame and joins sixteen beat cuts to exactly 7.5 s', async () => {
+    const dir = tmp();
+    const source = path.join(dir, 'source.mp4');
+    const made = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=12',
+      '-f', 'lavfi', '-i', 'sine=f=300:r=48000:d=12', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', source], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+
+    const one = path.join(dir, 'one-beat.mp4');
+    expect((await editVideo({ op: 'trim', inputAbsPath: source, start: 1.03, duration: 0.46875, outputAbsPath: one })).ok).toBe(true);
+    expect(frames(one)).toBe(14);
+
+    const beat = 60 / 128;
+    const parts: string[] = [];
+    for (let i = 0; i < 16; i += 1) {
+      const from = Math.round(i * beat * 30);
+      const to = Math.round((i + 1) * beat * 30);
+      const part = path.join(dir, `beat-${i}.mp4`);
+      const cut = await editVideo({ op: 'trim', inputAbsPath: source, start: from / 30, duration: (to - from) / 30, outputAbsPath: part });
+      expect(cut.ok, JSON.stringify(cut)).toBe(true);
+      parts.push(part);
+    }
+    const joined = path.join(dir, 'joined.mp4');
+    const result = await editVideo({ op: 'concat', inputAbsPaths: parts, outputAbsPath: joined });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(frames(joined)).toBe(225);
+    // The picture starts with the sound, so each cut sits on its frame against the music
+    // (2026-11-14: it started one frame late, and a montage's cuts with it).
+    const starts = spawnSync(bins.ffprobe!, ['-v', 'error', '-show_entries', 'stream=codec_type,start_time', '-of', 'csv=p=0', joined], { encoding: 'utf8' });
+    const start = Object.fromEntries(String(starts.stdout).trim().split('\n').map((row) => { const [kind, at] = row.split(','); return [kind, Number(at)]; }));
+    expect(start.video).toBeCloseTo(start.audio, 3);
+    const times = spawnSync(bins.ffprobe!, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'csv=p=0', joined], { encoding: 'utf8' });
+    const at = String(times.stdout).split('\n').map((row) => row.trim()).filter(Boolean).map((row) => Number(row.split(',')[0]));
+    expect(at[0]).toBeCloseTo(0, 3);
+    expect(at[Math.round(beat * 30)]).toBeCloseTo(Math.round(beat * 30) / 30, 3);
+  }, 180_000);
+
+  it('gives each file in the join its picture\'s length', () => {
+    expect(concatListBody(['/a/x.mp4', "/a/it's.mp4", '/a/y.mp4'], [0.466667, 0.5, null])).toBe(
+      "file '/a/x.mp4'\nduration 0.466667\nfile '/a/it'\\''s.mp4'\nduration 0.500000\nfile '/a/y.mp4'",
+    );
+  });
 });

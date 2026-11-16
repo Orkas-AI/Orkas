@@ -322,6 +322,7 @@ vi.mock('electron', () => {
 
 import {
   answerWebAssistPermission,
+  answerWebAssistDialog,
   actOnControlledWebAssist,
   actOnModelWebAssist,
   activateWebAssistTab,
@@ -1250,7 +1251,7 @@ describe('Web Assist controlled connector lifecycle', () => {
       expect(logWebAssistFailure).toHaveBeenCalledTimes(2);
       page.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
       expect(logWebAssistFailure).toHaveBeenLastCalledWith(electronMock.renderer, 'renderer_gone',
-        undefined, undefined, { reason: 'crashed', exitCode: 1 });
+        undefined, { reason: 'crashed', exitCode: 1 });
     });
   });
 
@@ -3076,11 +3077,13 @@ describe('host-started task browser binding', () => {
       .find((view: any) => view.webContents === page);
     const original = { x: 0, y: 0, width: 600, height: 500 };
     const moved = { x: 0, y: 28, width: 600, height: 472 };
-    layoutWebAssist(electronMock.renderer, original);
+    expect(layoutWebAssist(electronMock.renderer, original)).toMatchObject({ bounds: original });
     page.emit('before-mouse-event', {}, { type: 'mouseDown', x: 100, y: 100, button: 'left' });
     expect(listModelWebAssistTabs('u1', cid).tabs.find((tab: any) => tab.tab_id === opened.active_tab_id))
       .toMatchObject({ user_controlled: true });
-    layoutWebAssist(electronMock.renderer, moved);
+    // The renderer must protect the applied rectangle, including while a
+    // physical gesture defers its requested replacement.
+    expect(layoutWebAssist(electronMock.renderer, moved)).toMatchObject({ bounds: original });
     expect(view.getBounds()).toEqual(original);
     if (ending === 'hide') layoutWebAssist(electronMock.renderer, { visible: false });
     page.emit('before-mouse-event', {}, { type: 'mouseUp', x: 100, y: 100, button: 'left' });
@@ -3726,7 +3729,7 @@ describe('AI task browser native dialogs', () => {
     finishBrowserTaskRun('u1', cid, 'replacement');
   });
 
-  it('reclaims connector dialog control after observing in a new turn and revokes it for manual history navigation', async () => {
+  it('reclaims connector AI control in a new turn and keeps manual history dialogs tab-local', async () => {
     await openControlledWebAssist('u1', cid, { scope: 'connector_setup', scopeId: 'shop', url: 'https://example.com/dialogs' });
     finishBrowserTaskRun('u1', cid, 'dialog-run');
     beginBrowserTaskRun('u1', cid, 'replacement');
@@ -3735,7 +3738,8 @@ describe('AI task browser native dialogs', () => {
     expect(callback).toHaveBeenCalledExactlyOnceWith(true, '');
     electronMock.page.reload = () => { show('alert'); };
     expect(navigateWebAssist(electronMock.renderer, 'reload')).toMatchObject({ ok: true });
-    expect(electronMock.page.nativeDialogs).toHaveBeenCalledTimes(1);
+    expect(electronMock.page.nativeDialogs).not.toHaveBeenCalled();
+    expect(webAssistState(electronMock.renderer).state.tabs.find(tab => tab.page_dialog)?.page_dialog).toMatchObject({ type: 'alert' });
     finishBrowserTaskRun('u1', cid, 'replacement');
   });
 
@@ -3791,28 +3795,100 @@ describe('AI task browser native dialogs', () => {
     execute.mockRestore();
   });
 
-  it('returns a pending dialog to the native handler on human takeover and invalidates AI input', async () => {
+  it('keeps a pending dialog inside its tab during human takeover and invalidates AI input', async () => {
     const callback = show('confirm');
     const snapshot = await observe();
     electronMock.page.emit('before-mouse-event', {}, { type: 'mouseDown', button: 'left', x: 1, y: 1 });
-    expect(electronMock.page.nativeDialogs).toHaveBeenCalledTimes(1);
-    expect(callback).toHaveBeenCalledExactlyOnceWith(false, '');
+    expect(electronMock.page.nativeDialogs).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
     expect(await click(snapshot, 'OK')).toMatchObject({ ok: false, code: 'user_controlled' });
-    const humanAlert = show('alert');
-    expect(humanAlert).toHaveBeenCalledExactlyOnceWith(false, '');
-    expect(electronMock.page.nativeDialogs).toHaveBeenCalledTimes(2);
+    expect(webAssistState(electronMock.renderer).state.tabs[0].page_dialog).toMatchObject({ type: 'confirm', message: 'Continue?' });
   });
 
-  it('cancels pending input on task end and never inherits control in a replacement run', async () => {
+  it('preserves the page decision across task turns without inheriting old input authority', async () => {
     const callback = show('prompt');
     const snapshot = await observe();
     finishBrowserTaskRun('u1', cid, 'dialog-run');
-    expect(callback).toHaveBeenCalledExactlyOnceWith(false, '');
+    expect(callback).not.toHaveBeenCalled();
     beginBrowserTaskRun('u1', cid, 'replacement');
-    const human = show('confirm');
-    expect(human).toHaveBeenCalledExactlyOnceWith(false, '');
-    expect(electronMock.page.nativeDialogs).toHaveBeenCalledTimes(1);
+    expect(electronMock.page.nativeDialogs).not.toHaveBeenCalled();
     expect(await click(snapshot, 'OK')).toMatchObject({ ok: false, code: 'stale_page' });
+    const fresh = await observe();
+    expect(fresh).toMatchObject({ dialog_type: 'prompt' });
+    expect(await click(fresh, 'Cancel')).toMatchObject({ ok: true });
+    expect(callback).toHaveBeenCalledExactlyOnceWith(false, '');
     finishBrowserTaskRun('u1', cid, 'replacement');
   });
+
+  it('retains a delayed submission alert after the model turn for a fresh observation and acknowledgement', async () => {
+    finishBrowserTaskRun('u1', cid, 'dialog-run');
+    const callback = show('alert', 'Something went wrong. Please try again.');
+    expect(electronMock.page.nativeDialogs).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    expect(webAssistState(electronMock.renderer).state.tabs[0].page_dialog).toMatchObject({ type: 'alert', message: 'Something went wrong. Please try again.' });
+    beginBrowserTaskRun('u1', cid, 'replacement');
+    const fresh: any = await observe();
+    expect(fresh).toMatchObject({ dialog_type: 'alert', untrusted_content: true });
+    expect(fresh.elements.map((e: any) => e.label)).toEqual(['OK']);
+    expect(await click(fresh, 'OK')).toMatchObject({ ok: true });
+    expect(callback).toHaveBeenCalledExactlyOnceWith(true, '');
+    finishBrowserTaskRun('u1', cid, 'replacement');
+  });
+
+  it('accepts one human answer only from the owning selected tab, and keeps prompt values out of model output', async () => {
+    setActiveWebAssistConversation(electronMock.renderer, cid);
+    const reply = show('prompt', '<untrusted> Name?', 'private-default');
+    const state = webAssistState(electronMock.renderer).state;
+    const request = state.tabs.find(tab => tab.page_dialog)!.page_dialog!;
+    const input = { tabId: state.active_tab_id, requestId: request.id, accepted: true, value: '  人类回答😀  ' };
+    expect(answerWebAssistDialog(electronMock.page, input)).toEqual({ handled: false });
+    setActiveWebAssistConversation(electronMock.renderer, 'other');
+    expect(answerWebAssistDialog(electronMock.renderer, input)).toEqual({ handled: false });
+    setActiveWebAssistConversation(electronMock.renderer, cid);
+    expect(answerWebAssistDialog(electronMock.renderer, { ...input, requestId: 'stale' })).toEqual({ handled: false });
+    expect(reply).not.toHaveBeenCalled();
+    const snapshot = await observe();
+    expect(JSON.stringify(snapshot)).not.toContain('private-default');
+    expect(answerWebAssistDialog(electronMock.renderer, input)).toEqual({ handled: true });
+    expect(reply).toHaveBeenCalledExactlyOnceWith(true, input.value);
+    expect(answerWebAssistDialog(electronMock.renderer, input)).toEqual({ handled: false });
+    expect(electronMock.page.nativeDialogs).not.toHaveBeenCalled();
+  });
+});
+
+
+
+describe('task browser observation failure causes', () => {
+  beforeEach(() => { electronMock.createWindow?.(); });
+  afterEach(() => { closeWebAssist(electronMock.renderer); vi.restoreAllMocks(); });
+  it.each(['owned timeout', 'other owned timeout', 'unknown error', 'untrusted code'] as const)(
+    'preserves only a known owned timeout: %s', async kind => {
+      const { OperationTimeoutError } = await import('../../../src/main/util/operation-timeout');
+      const error = kind === 'owned timeout'
+        ? new OperationTimeoutError('observation_timeout', 'browser observation', 5000)
+        : kind === 'other owned timeout' ? new OperationTimeoutError('other_timeout', 'other operation', 5000)
+        : Object.assign(new Error('PRIVATE_DOCUMENT_ERROR'), kind === 'untrusted code' ? { code: 'observation_timeout' } : {});
+      const cid = 'failure-causes';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      const opened = await openModelWebAssist('u1', cid, { url: 'https://example.com/diagnostic' });
+      const previous = await observeModelWebAssist('u1', cid, opened.active_tab_id);
+      expect(previous.ok).toBe(true);
+      let injected = 0;
+      const original = electronMock.page.executeJavaScriptInIsolatedWorld.bind(electronMock.page);
+      vi.spyOn(electronMock.page, 'executeJavaScriptInIsolatedWorld').mockImplementation(async (...args: any[]) => {
+        if (String(args[1]?.[0]?.code).includes('elements_truncated:')) { injected++; throw error; }
+        return original(...args);
+      });
+      const result = await observeModelWebAssist('u1', cid, opened.active_tab_id);
+      expect(injected).toBe(1);
+      expect(result).toMatchObject({ ok: false, code: kind === 'owned timeout' ? 'observation_timeout' : 'observation_failed' });
+      expect(JSON.stringify(result)).not.toContain('PRIVATE');
+      // A failed read never leaves the previous page's action refs valid.
+      expect(await actOnModelWebAssist('u1', cid, {
+        tabId: opened.active_tab_id, action: 'click', pageId: previous.page_id, elementRef: 'e1',
+      } as any)).toMatchObject({ ok: false });
+      vi.restoreAllMocks();
+      expect(await observeModelWebAssist('u1', cid, opened.active_tab_id)).toMatchObject({ ok: true });
+    },
+  );
 });

@@ -139,6 +139,13 @@ export class TestLogAnalysisReporter implements Reporter {
     const summary = summarizeTestLogs(modules, this.root);
     process.stdout.write(formatTestLogSummary(summary));
     if (summary.status === 'FAIL') process.exitCode = 1;
+    if (process.env.ORKAS_TEST_PROCESS_REPORT) {
+      // Only the bounded receipt crosses this launcher boundary, never raw text.
+      writeFileSync(process.env.ORKAS_TEST_PROCESS_REPORT, JSON.stringify({ schema: 1,
+        stderr: combineStderrReceipts(modules.filter(module => module.state() !== 'skipped')
+          .map(module => (module.meta() as Record<string, unknown>).orkasStderrReceipt)),
+      }), { mode: 0o600 });
+    }
     if (process.env.ORKAS_TEST_BATCH_REPORT) {
       const files = modules.map(module => {
         const counts = { passed: 0, failed: 0, skipped: 0 };

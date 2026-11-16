@@ -50,6 +50,7 @@ let _settingsState = {
   ttsPresets: [],
   ttsProfiles: [],
   ttsProviderSel: null,
+  ttsModelSel: null,
   dragState: null,
   taskNotifications: {
     enabled: true,
@@ -138,14 +139,7 @@ async function loadSettings() {
   await _settingsSafeCall('settings task notifications render', _settingsRenderTaskNotifications);
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
-  // Account card + subscription card (views/login/account_settings.js — absent in
-  // the open-source build, so these are no-ops there). renderSubscriptionSettings rebinds the
-  // action button's click handler with the current subscription state on every
-  // render — opening the panel is the canonical "guarantee fresh button binding"
-  // moment, so call it explicitly here (not just from the account.onChange listener
-  // which only fires on state changes — for a Free user with no transitions the
-  // listener never fires after boot, leaving the button bound to whatever its
-  // first render captured).
+
 }
 
 // ── Native task notifications ──
@@ -713,6 +707,11 @@ function _settingsBindRecycleBinOnce() {
           _settingsSafeCall('restored Skills refresh', typeof loadSkills === 'function' ? () => loadSkills(true) : null),
           _settingsSafeCall('restored projects refresh', typeof loadProjects === 'function' ? () => loadProjects(true) : null),
           _settingsSafeCall('restored conversations refresh', typeof loadConversations === 'function' ? () => loadConversations() : null),
+          _settingsSafeCall('restored resources refresh', typeof loadContexts === 'function' ? () => loadContexts() : null),
+          _settingsSafeCall('restored apps refresh', typeof window.loadSavedApps === 'function' ? () => window.loadSavedApps(true, { localOnly: true }) : null),
+          _settingsSafeCall('restored automation refresh', typeof window.loadAutoList === 'function' ? () => window.loadAutoList(true) : null),
+          _settingsSafeCall('restored project automation refresh', typeof _projectDetailPid !== 'undefined' && _projectDetailPid && typeof window.loadProjectAutoList === 'function' ? () => window.loadProjectAutoList(_projectDetailPid) : null),
+          _settingsSafeCall('restored project detail refresh', typeof _projectDetailPid !== 'undefined' && _projectDetailPid && typeof loadProjectDetail === 'function' ? () => loadProjectDetail(_projectDetailPid) : null),
         ]);
       }
     } catch (err) {
@@ -848,7 +847,6 @@ function _settingsBindMetacognitionOnce() {
   cb.addEventListener('change', async () => {
     if (cb.disabled) return;
     const epoch = ++_settingsState.metacognitionToggleEpoch;
-    const startedAt = Date.now();
     const next = !!cb.checked;
     const previous = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
     _settingsState.metacognition = {
@@ -868,13 +866,11 @@ function _settingsBindMetacognitionOnce() {
         // changes, so a rejected write must fetch the persisted truth again
         // instead of rolling back to a possibly uninitialized placeholder.
         await _settingsRefreshMetacognition({ failureFallbackEnabled: previous });
-        const actualEnabled = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
         _settingsLog.warn('setMetacognition rejected', { error_code: 'update_rejected' });
       }
     } catch (err) {
       if (epoch !== _settingsState.metacognitionToggleEpoch) return;
       await _settingsRefreshMetacognition({ failureFallbackEnabled: previous });
-      const actualEnabled = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
       _settingsLog.warn('setMetacognition failed', {
         error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
       });
@@ -920,7 +916,6 @@ function _settingsRenderDataRoot() {
   span.textContent = _settingsState.dataRoot || '';
   if (!btn.dataset.bound) {
     btn.addEventListener('click', async () => {
-      const startedAt = Date.now();
       let res;
       try {
         res = await window.orkas.invoke('app.openDataRoot');
@@ -1047,10 +1042,6 @@ function _settingsBindModelTabsOnce() {
 
 function _settingsActivateModelTab(kind, opts = {}) {
   const target = _SETTINGS_MODEL_KINDS.includes(kind) ? kind : 'chat';
-  // `click_settings_model_tab` — explicit user selection of a Models purpose
-  // sub-tab (mouse or arrow keys). Bounded payload: the purpose id only.
-  if (opts.explicit) {
-  }
   _settingsState.modelTab = target;
   _settingsQueryAll('[data-settings-model-tab]').forEach((btn) => {
     const active = btn.dataset.settingsModelTab === target;
@@ -1556,7 +1547,6 @@ function _settingsShowApiKeyForm(provider, modelId) {
   saveBtn.textContent = t('settings.save');
   const save = async () => {
     if (saveBtn.disabled || overlay._onKey !== formOwner) return;
-    const startedAt = Date.now();
     const resolvedModelId = _settingsResolveApiKeyModelId(provider.id, modelId, modelInput?.value);
     const label  = (labelInput.value || '').trim();
     const apiKey = (keyInput.value || '').trim();
@@ -1633,17 +1623,6 @@ function _settingsCustomModelError(code, fallback) {
     CUSTOM_TOKEN_LIMIT_INVALID: 'settings.custom.error_token_limits',
   })[String(code || '')];
   return key ? t(key) : (fallback || t('settings.save_failed'));
-}
-
-function _settingsModelConfigValidationCode(code) {
-  return ({
-    CUSTOM_BASE_URL_REQUIRED: 'base_url_required',
-    CUSTOM_BASE_URL_INVALID: 'base_url_invalid',
-    CUSTOM_MODEL_REQUIRED: 'model_required',
-    CUSTOM_API_KEY_REQUIRED: 'api_key_required',
-    CUSTOM_API_KEY_INVALID: 'api_key_invalid',
-    CUSTOM_TOKEN_LIMIT_INVALID: 'token_limit_invalid',
-  })[String(code || '')] || 'validation_failed';
 }
 
 function _settingsValidateCustomBaseUrl(value) {
@@ -1763,7 +1742,6 @@ function _settingsShowCustomModelForm(provider) {
   saveBtn.textContent = t('settings.save');
   const save = async () => {
     if (saveBtn.disabled || overlay._onKey !== formOwner) return;
-    const startedAt = Date.now();
     const payload = _settingsBuildCustomModelPayload({
       label: labelInput.value,
       protocol: protocolSelect.getValue(),
@@ -2176,7 +2154,6 @@ async function _settingsUpdateEntryModel(entry, model, modelSel) {
     || !requestedModel
     || requestedModel === String(entry.model || '').trim()
   ) return false;
-  const startedAt = Date.now();
   let res = null;
   try {
     res = await window.orkas.invoke('auth.updateEntryModel', {
@@ -2479,7 +2456,6 @@ async function _settingsRemoveEntry(entry) {
   const providerName = entry.providerLabelKey ? t(entry.providerLabelKey) : (entry.providerLabel || entry.provider);
   const title = `${providerName} · ${entry.modelName || entry.model} · ${entry.profileLabel}`;
   if (!(await uiConfirm(t('settings.entries.delete_confirm', { title })))) return;
-  const startedAt = Date.now();
   _settingsLog.info('remove entry', {
     entry_id: entry.entryId,
     provider: entry.provider,
@@ -2545,6 +2521,19 @@ function _settingsVisibleApiProfiles(profiles) {
   ));
 }
 
+function _settingsApiProfileIsUnavailable(profile) {
+  return profile?.available === false
+    || (profile?.availability === 'model_unavailable' && profile.selectable === false);
+}
+
+function _settingsSortApiProfiles(profiles) {
+  const list = _settingsVisibleApiProfiles(profiles);
+  return [
+    ...list.filter(profile => !_settingsApiProfileIsUnavailable(profile)),
+    ...list.filter(profile => _settingsApiProfileIsUnavailable(profile)),
+  ];
+}
+
 function _settingsOrkasServiceLabel(service) {
   return `Orkas · ${service}`;
 }
@@ -2581,6 +2570,9 @@ function _settingsRenderSearchPicker() {
   if (!_settingsState.searchProviderSel) {
     _settingsState.searchProviderSel = _aiSelectMount(el, {
       placeholder: t('settings.search.pick_provider'),
+    });
+    _settingsState.searchProviderSel.onChange(() => {
+      _settingsSetStatus('settings-search-status', '', '');
     });
   }
   // setOptions on every call — the second arg refreshes the placeholder so a
@@ -2732,6 +2724,9 @@ function _settingsRenderImagePicker() {
     _settingsState.imageProviderSel = _aiSelectMount(el, {
       placeholder: t('settings.image.pick_provider'),
     });
+    _settingsState.imageProviderSel.onChange(() => {
+      _settingsSetStatus('settings-image-status', '', '');
+    });
   }
   const prev = _settingsState.imageProviderSel.getValue();
   _settingsState.imageProviderSel.setOptions(
@@ -2850,15 +2845,27 @@ function _settingsRenderImageEntries() {
 // User-owned provider keys only; account-managed providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', provider: 'orkas-api', model: 'orkas-video', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
-  {"id": "doubao:doubao-seedance-2-0-260128", "label": "DouBao · Seedance 2.0", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedance-2-0-260128"},
-  {"id": "doubao:doubao-seedance-2-0-fast-260128", "label": "DouBao · Seedance 2.0 Fast", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedance-2-0-fast-260128"},
-  {"id": "doubao:doubao-seedance-2-0-mini", "label": "DouBao · Seedance 2.0 Mini", "docs": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", "provider": "doubao", "model": "doubao-seedance-2-0-mini"},
-  {"id": "minimax", "label": "MiniMax · Hailuo 2.3", "docs": "https://platform.minimax.io/user-center/basic-information/interface-key", "provider": "minimax", "model": "MiniMax-Hailuo-2.3"},
-  {"id": "vidu", "label": "Vidu · Q3 Pro", "docs": "https://platform.vidu.com/", "provider": "vidu", "model": "viduq3-pro"},
-  {"id": "kling", "label": "Kling · 3.0 Turbo", "docs": "https://kling.ai/global/dev", "provider": "kling", "model": "kling-v3-0-turbo"},
-  {"id": "google", "label": "Google · Veo 3.1", "docs": "https://aistudio.google.com/app/apikey", "provider": "google", "model": "veo-3.1-generate-preview"},
-  {"id": "runway", "label": "Runway · Gen-4.5", "docs": "https://dev.runwayml.com/", "provider": "runway", "model": "gen4.5"},
+  {id:'orkas-api',provider:'orkas-api',model:'orkas-video',label:_settingsOrkasServiceLabel('Video'),docs:_ORKAS_API_KEYS_URL},
+  { id: 'doubao:doubao-seedance-2-5-260628', provider: 'doubao', model: 'doubao-seedance-2-5-260628', label: 'Doubao Seedance 2.5' },
+  { id: 'doubao:doubao-seedance-2-5-flash', provider: 'doubao', model: 'doubao-seedance-2-5-flash', label: 'Doubao Seedance 2.5 Flash' },
+  { id: 'doubao:doubao-seedance-2-0-260128', provider: 'doubao', model: 'doubao-seedance-2-0-260128', label: 'Doubao Seedance 2.0' },
+  { id: 'doubao:doubao-seedance-2-0-fast-260128', provider: 'doubao', model: 'doubao-seedance-2-0-fast-260128', label: 'Doubao Seedance 2.0 Fast' },
+  { id: 'doubao:doubao-seedance-2-0-mini', provider: 'doubao', model: 'doubao-seedance-2-0-mini', label: 'Doubao Seedance 2.0 Mini' },
+  { id: 'minimax:MiniMax-H3', provider: 'minimax', model: 'MiniMax-H3', label: 'MiniMax H3' },
+  { id: 'minimax:MiniMax-H3-Highspeed', provider: 'minimax', model: 'MiniMax-H3-Highspeed', label: 'MiniMax H3 Highspeed' },
+  { id: 'minimax:MiniMax-H3-Lite', provider: 'minimax', model: 'MiniMax-H3-Lite', label: 'MiniMax H3 Lite' },
+  { id: 'minimax:MiniMax-H3-Max', provider: 'minimax', model: 'MiniMax-H3-Max', label: 'MiniMax H3 Max' },
+  { id: 'vidu:viduq3-pro', provider: 'vidu', model: 'viduq3-pro', label: 'Vidu Q3 Pro' },
+  { id: 'vidu:viduq3-turbo', provider: 'vidu', model: 'viduq3-turbo', label: 'Vidu Q3 Turbo' },
+  { id: 'kling:kling-v4-0', provider: 'kling', model: 'kling-v4-0', label: 'Kling 4.0' },
+  { id: 'kling:kling-v4-0-flash', provider: 'kling', model: 'kling-v4-0-flash', label: 'Kling 4.0 Flash' },
+  { id: 'google', provider: 'google', model: 'gemini-omni-1.1-flash', label: 'Google Gemini Omni 1.1 Flash' },
+  { id: 'google-cloud:veo-3.1-generate-001', provider: 'google-cloud', model: 'veo-3.1-generate-001', label: 'Google Cloud Veo 3.1' },
+  { id: 'google-cloud:veo-3.1-fast-generate-001', provider: 'google-cloud', model: 'veo-3.1-fast-generate-001', label: 'Google Cloud Veo 3.1 Fast' },
+  { id: 'google-cloud:veo-3.1-lite-generate-001', provider: 'google-cloud', model: 'veo-3.1-lite-generate-001', label: 'Google Cloud Veo 3.1 Lite' },
+  { id: 'aliyun:wan3.0-video', provider: 'aliyun', model: 'wan3.0-video', label: 'Alibaba Cloud Wan 3.0' },
+  { id: 'aliyun:wan3.0-video-prime', provider: 'aliyun', model: 'wan3.0-video-prime', label: 'Alibaba Cloud Wan 3.0 Prime' },
+  { id: 'runway', provider: 'runway', model: 'gen4.5', label: 'Runway Gen-4.5' },
 ];
 
 function _settingsVideoProviderOptions() {
@@ -2868,11 +2875,19 @@ function _settingsVideoProviderOptions() {
 }
 
 function _videoProviderLabel(provider, model) {
+  if (provider === _ORKAS_API_PROVIDER_ID) return _settingsOrkasServiceLabel('Video');
   const hit = _settingsVideoProviderOptions().find((option) => (
     (option.provider || option.id) === provider
     && (!model || !option.model || option.model === model)
   ));
-  return hit ? hit.label : provider;
+  if (hit) return hit.label;
+  const legacy = {
+    'MiniMax-Hailuo-2.3': 'MiniMax · Hailuo 2.3',
+    'kling-v3-0-turbo': 'Kling · 3.0 Turbo',
+    'veo-3.1-generate-preview': 'Google · Veo 3.1 Preview',
+    'doubao-seedance-2-0-mini-260615': 'DouBao · Seedance 2.0 Mini',
+  };
+  return legacy[model] || `${provider}${model ? ` · ${model}` : ''}`;
 }
 
 function _videoProviderOption(id) {
@@ -2902,23 +2917,34 @@ function _settingsRenderVideoSection() {
 function _settingsRenderVideoPicker() {
   const providerEl = document.getElementById('settings-video-provider');
   if (!providerEl) return;
+  const regionEl = document.getElementById('settings-video-region');
+  if (regionEl && !_settingsState.videoRegionSel) {
+    _settingsState.videoRegionSel = _aiSelectMount(regionEl, {
+      options: ['cn-beijing', 'ap-southeast-1', 'ap-northeast-1', 'eu-central-1', 'us-east-1', 'cn-hongkong'].map(value => ({ value, label: value })),
+      value: 'cn-beijing',
+    });
+  }
   if (!_settingsState.videoProviderSel) {
     _settingsState.videoProviderSel = _aiSelectMount(providerEl, {
       placeholder: t('settings.video.pick_provider'),
     });
-    _settingsState.videoProviderSel.onChange((provider) => {
+    _settingsState.videoProviderSel.onChange((optionId) => {
+      _settingsToggleVideoKeyInput();
       _settingsSetStatus('settings-video-status', '', '');
     });
   }
   const prevProvider = _settingsState.videoProviderSel.getValue();
+  const providers = _settingsVideoProviderOptions();
   _settingsState.videoProviderSel.setOptions(
-    _settingsVideoProviderOptions().map((p) => ({
+    providers.map((p) => ({
       value: p.id,
-      label: p.label || p.id,
+      label: p.label,
       hint: p.docs,
     })),
     { value: prevProvider || '', placeholder: t('settings.video.pick_provider') },
   );
+  _settingsToggleVideoKeyInput();
+  requestAnimationFrame(() => _settingsToggleVideoKeyInput());
   const addBtn = document.getElementById('settings-video-add-btn');
   if (addBtn && !addBtn.dataset.bound) {
     addBtn.dataset.bound = '1';
@@ -2937,12 +2963,14 @@ async function _settingsClickAddVideoKey() {
   if (!apiKey) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_key_needed')); return; }
   _settingsSetStatus('settings-video-status', 'busy', t('settings.video.adding'));
   try {
-    const res = await window.orkas.invoke('videoAuth.add', { provider, model, apiKey, label: 'default' });
+    const res = await window.orkas.invoke('videoAuth.add', { provider, model, apiKey, label: 'default', ...(provider === 'aliyun' ? { workspaceId: document.getElementById('settings-video-workspace-input')?.value?.trim() || '', region: _settingsState.videoRegionSel?.getValue() || 'cn-beijing' } : {}) });
     if (!res || !res.ok) {
-      _settingsSetStatus('settings-video-status', 'error', (res && res.error) || t('settings.video.add_failed'));
+      _settingsSetStatus('settings-video-status', 'error', res?.errorKey ? t(res.errorKey) : (res && res.error) || t('settings.video.add_failed'));
       return;
     }
     if (input) input.value = '';
+    const workspaceInput = document.getElementById('settings-video-workspace-input');
+    if (workspaceInput) workspaceInput.value = '';
     _settingsSetStatus('settings-video-status', 'ok', t('settings.video.add_ok'));
     _settingsCloseAddModal();
     await _settingsRefreshVideoProfiles();
@@ -2956,15 +2984,17 @@ function _settingsRenderVideoEntries() {
   const container = document.getElementById('settings-video-entries');
   if (!container) return;
   container.innerHTML = '';
-  const list = _settingsVisibleApiProfiles(_settingsState.videoProfiles);
+  const list = _settingsSortApiProfiles(_settingsState.videoProfiles);
   if (!list.length) {
     container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.video.empty'))}</div>`;
     return;
   }
-  list.forEach((p, idx) => {
+  let priorityIdx = 0;
+  list.forEach((p) => {
+    const available = !_settingsApiProfileIsUnavailable(p);
+    const idx = available ? priorityIdx++ : null;
     const row = document.createElement('div');
-    const available = p.available !== false;
-    const isDefault = available && list.find((profile) => profile.available !== false)?.id === p.id;
+    const isDefault = idx === 0;
     row.className = 'entry-row' + (isDefault ? ' is-default' : '');
     row.dataset.profileId = p.id;
 
@@ -3020,10 +3050,11 @@ function _settingsRenderVideoEntries() {
     actions.appendChild(delBtn);
     row.appendChild(actions);
 
-    _settingsAttachReorderDnd(row, {
+    if (available) _settingsAttachReorderDnd(row, {
       kind: 'video',
       id: p.id,
-      getIds: () => _settingsVisibleApiProfiles(_settingsState.videoProfiles).map((x) => x.id),
+      getIds: () => _settingsVisibleApiProfiles(_settingsState.videoProfiles)
+        .filter(profile => !_settingsApiProfileIsUnavailable(profile)).map((x) => x.id),
       ipcName: 'videoAuth.reorder',
       onSuccess: async () => {
         await _settingsRefreshVideoProfiles();
@@ -3086,10 +3117,25 @@ function _settingsTtsPrefillProvider(providerId) {
   const resInput = document.getElementById('settings-tts-doubao-resource');
   if (baseInput) baseInput.value = preset?.baseUrl || '';
   if (modelInput) modelInput.value = preset?.defaultModel || '';
+  const modelEl = document.getElementById('settings-tts-model-select');
+  if (modelEl && !_settingsState.ttsModelSel) {
+    _settingsState.ttsModelSel = _aiSelectMount(modelEl, { placeholder: t('settings.tts.model') });
+    _settingsState.ttsModelSel.onChange((model) => {
+      if (modelInput) modelInput.value = model;
+      const current = _settingsTtsPreset(_settingsState.ttsProviderSel?.getValue());
+      const entry = current?.models?.find((item) => item.id === model);
+      const voice = document.getElementById('settings-tts-voice-input');
+      if (voice) { voice.value = ''; voice.placeholder = entry?.defaultVoice || t('settings.tts.voice'); }
+    });
+  }
+  _settingsState.ttsModelSel?.setOptions((preset?.models || []).map((entry) => ({ value: entry.id, label: entry.name })),
+    { value: preset?.defaultModel || '', placeholder: t('settings.tts.model') });
   if (voiceInput) {
     voiceInput.value = '';
-    voiceInput.placeholder = preset?.defaultVoice || 'alloy';
+    voiceInput.placeholder = preset?.defaultVoice || t('settings.tts.voice');
   }
+  const workspaceInput = document.getElementById('settings-tts-workspace-input');
+  if (workspaceInput) workspaceInput.value = '';
   if (resInput) resInput.value = preset?.defaultResourceId || '';
 }
 
@@ -3104,9 +3150,11 @@ function _settingsTtsSetRowHidden(selector, hidden) {
 function _settingsTtsApplyProviderFields(providerId) {
   const preset = _settingsTtsPreset(providerId);
   const isCustom = providerId === 'custom';
-  const needsVoice = !!providerId && !preset?.defaultVoice;
+  const needsVoice = !!providerId;
   _settingsTtsSetRowHidden('#settings-tts-key-row', false);
   _settingsTtsSetRowHidden('.tts-row-base, .tts-row-model', !isCustom);
+  _settingsTtsSetRowHidden('.tts-row-model-select', !preset?.models?.length);
+  _settingsTtsSetRowHidden('#settings-tts-workspace-row', providerId !== 'aliyun');
   _settingsTtsSetRowHidden('.tts-row-voice', !needsVoice);
   _settingsTtsSetRowHidden('.tts-row-doubao-res', true);
 }
@@ -3131,16 +3179,24 @@ async function _settingsClickAddTts() {
 
   let payload;
   if (provider === 'doubao') {
+    // Doubao V3: only the API key is required; voice (speaker) + resource id
+    // default server-side (the user overrides them for their activated voice).
     const resourceId = (document.getElementById('settings-tts-doubao-resource')?.value || '').trim();
     payload = { provider, apiKey, voice: voice || (preset?.defaultVoice || ''), resourceId };
   } else {
+    // Model-specific defaults also cover clone-only models without a public voice.
     const baseUrl = (document.getElementById('settings-tts-base-input')?.value || '').trim() || (preset?.baseUrl || '');
-    const model = (document.getElementById('settings-tts-model-input')?.value || '').trim() || (preset?.defaultModel || '');
-    const finalVoice = voice || (preset?.defaultVoice || '');
-    if (!baseUrl) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_base_needed')); return; }
+    const model = (preset?.models?.length ? _settingsState.ttsModelSel?.getValue() : '')
+      || (document.getElementById('settings-tts-model-input')?.value || '').trim() || (preset?.defaultModel || '');
+    const modelPreset = preset?.models?.find((entry) => entry.id === model);
+    const finalVoice = voice || (modelPreset ? modelPreset.defaultVoice || '' : preset?.defaultVoice || '');
+    if (!baseUrl && provider !== 'aliyun') { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_base_needed')); return; }
     if (!model) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_model_needed')); return; }
+    // Voice is required when the provider has no default to fall back on
+    // (ElevenLabs / custom have none; OpenAI defaults to alloy).
     if (!finalVoice) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_voice_needed')); return; }
-    payload = { provider, baseUrl, model, apiKey, voice: finalVoice };
+    payload = { provider, baseUrl, model, apiKey, voice: finalVoice,
+      ...(provider === 'aliyun' ? { workspaceId: document.getElementById('settings-tts-workspace-input')?.value?.trim() || '' } : {}) };
   }
 
   _settingsSetStatus('settings-tts-status', 'busy', t('settings.tts.adding'));
@@ -3284,4 +3340,19 @@ async function _settingsRefreshOperatorPolicy() {
   }
   try { render(await window.orkas.invoke('quality.operatorStatus')); }
   catch (_) { status.textContent = t('quality.operator.invalid'); }
+}
+
+function _settingsToggleVideoKeyInput() {
+  const input = document.getElementById('settings-video-key-input');
+  const option = _videoProviderOption(_settingsSelectedVideoProvider());
+  const provider = option?.provider || option?.id;
+  const cloud = provider === 'google-cloud';
+  const label = document.getElementById('settings-video-key-label');
+  const labelKey = cloud ? 'settings.video.service_account' : 'settings.video.api_key';
+  if (label) { label.dataset.i18n = labelKey; label.textContent = t(labelKey); }
+  if (input) input.placeholder = cloud ? '{"type":"service_account",…}' : '';
+  for (const id of ['settings-video-workspace-row', 'settings-video-region-row']) {
+    const field = document.getElementById(id);
+    if (field) { field.hidden = provider !== 'aliyun'; field.style.display = provider === 'aliyun' ? '' : 'none'; }
+  }
 }

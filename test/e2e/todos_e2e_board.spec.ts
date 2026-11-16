@@ -964,8 +964,11 @@ test('manages the same backlog from global and project boards without a duplicat
   // Reopening the app reads persisted tasks and restores default disclosure states.
   const reloaded = await orkas.relaunch();
   await openSidebarEntry(reloaded, '#todos-btn');
-  // A fresh launch focuses the first scope; the rest stay one chip away.
+  await expect(reloaded.locator('[data-todo-group="status"]')).toHaveAttribute('aria-pressed', 'true');
+  // Grouping is remembered; choose Project before using its scope chips.
   await expect(reloaded.locator('#todos-content').getByText('全局跟进发票', { exact: true })).toBeVisible();
+  await reloaded.locator('[data-todo-group="project"]').click();
+  await expect(reloaded.locator('[data-todo-group="project"]')).toHaveAttribute('aria-pressed', 'true');
   await reloaded.locator(`#todos-content .todo-scope-chip[data-pid="${b}"]`).click();
   await expect(reloaded.locator('#todos-content').getByText('完善价格页与导航', { exact: true })).toBeVisible();
   await expect(reloaded.locator('#todos-content .todo-column.is-done .todo-collapse').first()).toHaveAttribute('aria-expanded', 'false');

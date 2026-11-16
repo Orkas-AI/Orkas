@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { profileSyncCosts } from "../../../test/helpers/sync-cost.cjs";
+import { profileContextSaves } from "../../../test/helpers/context-save-profile.cjs";
+import { measureWorkload } from "../../../test/helpers/workload-metrics.cjs";
+import { checkLatencyBudget, BULK_MAIN_GAP_LIMIT_MS } from "../../../test/helpers/latency-budget";
 import { PersistentSession } from "../src/agent/persistent-session.js";
 import { contextBudget } from "../src/agent/session.js";
 import type { Message, MessageContent } from "../src/shared/types.js";
@@ -50,6 +53,26 @@ describe("PersistentSession", () => {
     restored.beginUserTurn([{ type: "text", text: "Another task" }]);
     expect(JSON.stringify(restored.getMessagesForModel())).not.toContain("SOURCE_PIXELS");
     expect(fs.readFileSync(file, "utf8")).toContain("SOURCE_PIXELS");
+  });
+
+  it("restores every retained authoring set after checkpoint/restart", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Remake the reference with my clip" }]);
+    for (const id of ["reference", "clip"]) {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, `${id} frames`, [{ data: `${id.toUpperCase()}_PIXELS`, mediaType: "image/png" }], false, undefined, "active_turn");
+    }
+    for (const id of ["read", "list", "notes"]) {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, "done");
+    }
+    session.applyActiveCheckpointSummary("Both inspected; write the notes", 8);
+    const expected = session.getMessagesForModel();
+    expect(JSON.stringify(expected)).toContain("REFERENCE_PIXELS");
+    expect(JSON.stringify(expected)).toContain("CLIP_PIXELS");
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getMessagesForModel()).toEqual(expected);
+    expect(restored.estimateModelTokens()).toEqual(session.estimateModelTokens());
   });
 
   it("persists the turn-start history allowance across restart without losing original evidence", () => {
@@ -1815,7 +1838,8 @@ it.each([
   { mode: 'sequential', tasks: 8, operations: 40, snapshotBytes: 0 },
   { mode: 'parallel', tasks: 8, operations: 40, snapshotBytes: 0 },
   { mode: 'sequential', tasks: 1, operations: 16, snapshotBytes: 65536 },
-] as const)('PF-01 retains every receipt and ledger through $mode tasks with $snapshotBytes-byte file observations', async ({ mode, tasks, operations, snapshotBytes }) => {
+  { mode: 'sequential', tasks: 8, operations: 16, snapshotBytes: 65536 },
+] as const)('PF-01 retains every receipt and ledger through $tasks $mode tasks with $snapshotBytes-byte file observations', async ({ mode, tasks, operations, snapshotBytes }) => {
   const { AgentRunner } = await import('../src/agent/runner.js');
   const { ProviderRegistry } = await import('../src/providers/registry.js');
   const { createConfig } = await import('../src/config/loader.js');
@@ -1827,7 +1851,7 @@ it.each([
   const sourceText = (step: number) => `${String(step).padStart(4, '0')}\n` + 'x'.repeat(Math.max(0, snapshotBytes - 5));
   if (snapshotBytes) for (let task = 0; task < tasks; task++) fs.writeFileSync(path.join(workspace, `source-${task}.txt`), sourceText(-1));
   const attribution = process.env.ORKAS_PERFORMANCE_ATTRIBUTION === '1';
-  const previousBodies = new Map<string, string>();
+  const previousBodies = new Map<string, string | Buffer>();
   const context = { writes: 0, first: 0, identical: 0, changed: 0, unclassified: 0 };
   const sessions = Array.from({ length: tasks }, (_, n) => new PersistentSession({ sessionFile: path.join(root, `task-${n}.jsonl`) }));
   const callCounts = Array(tasks).fill(0);
@@ -1877,6 +1901,8 @@ it.each([
     });
   });
   const costs = attribution ? profileSyncCosts(file => typeof file === 'string' && file.startsWith(root + path.sep) && !file.startsWith(workspace + path.sep)) : null;
+  const contextProfile = process.env.ORKAS_CONTEXT_SAVE_PROFILE === '1' ? profileContextSaves(PersistentSession) : null;
+  let contextSaveProfile: ReturnType<ReturnType<typeof profileContextSaves>['stop']> | undefined;
   const originalWrite = fs.writeFileSync;
   const spy = attribution ? vi.spyOn(fs, 'writeFileSync').mockImplementation(((target: fs.PathOrFileDescriptor, body: unknown, ...args: unknown[]) => {
     const result = (originalWrite as Function)(target, body, ...args);
@@ -1885,24 +1911,30 @@ it.each([
       // Diagnostic storage is bounded to the fixture paths and4M UTF-16
       // units each, including the declared16x64KiB before/after snapshots.
       // Saturation is unknown, never an assumed cache hit.
-      if (typeof body !== 'string' || body.length > 4194304 || (!previousBodies.has(target) && previousBodies.size >= tasks)) {
+      if ((typeof body !== 'string' && !Buffer.isBuffer(body)) || body.length > 4194304 || (!previousBodies.has(target) && previousBodies.size >= tasks)) {
         context.unclassified++; previousBodies.delete(target);
       } else {
         if (!previousBodies.has(target)) context.first++;
-        else if (previousBodies.get(target) === body) context.identical++;
+        else if (typeof body === 'string' ? previousBodies.get(target) === body
+          : Buffer.isBuffer(previousBodies.get(target)) && body.equals(previousBodies.get(target) as Buffer)) context.identical++;
         else context.changed++;
         previousBodies.set(target, body);
       }
     }
     return result;
   }) as typeof fs.writeFileSync) : null;
-  const start = performance.now();
+  let measurementStopped = false;
+  const stopMeasurement = () => {
+    if (measurementStopped) return;
+    measurementStopped = true;
+    spy?.mockRestore(); contextSaveProfile = contextProfile?.stop(); costs?.stop(); previousBodies.clear();
+  };
   try {
-    let results;
-    try { results = await Promise.all(runners.map((runner, task) => runner.run({ message: `Run task-${task}`, workingDir: root,
-      historyResources: [{ kind: 'attachment', path: `/fixture-${task}`, name: `input-${task}` }] }))); }
-    finally { spy?.mockRestore(); costs?.stop(); previousBodies.clear(); }
-    const elapsedMs = performance.now() - start;
+    let measured;
+    try { measured = await measureWorkload(() => Promise.all(runners.map((runner, task) => runner.run({ message: `Run task-${task}`, workingDir: root,
+      historyResources: [{ kind: 'attachment', path: `/fixture-${task}`, name: `input-${task}` }] })))); }
+    finally { stopMeasurement(); }
+    const results = measured.value, elapsedMs = measured.metrics.elapsedMs;
     expect(results.map(result => result.text)).toEqual(Array.from({ length: tasks }, (_, task) => `DONE-${task}`));
     expect(callCounts).toEqual(Array(tasks).fill(operations));
     expect(sessions.every(session => !session.hasPendingPersistence())).toBe(true);
@@ -1951,10 +1983,19 @@ it.each([
       expect(context.writes).toBeGreaterThan(0); // tap validity, not an inefficient-count contract
       expect(context.unclassified).toBe(0);
     }
-    console.log('[PF-01 actual Runner persistence]', JSON.stringify({ mode, tasks, operationsPerTask: operations, snapshotBytes, elapsedMs,
+    if (contextSaveProfile) {
+      expect(contextSaveProfile.saves).toBeGreaterThan(0);
+      expect(contextSaveProfile.contextWriteBytes).toBeGreaterThan(0);
+      expect(contextSaveProfile.omitted).toBe(0);
+      if (costs) expect(contextSaveProfile.contextWriteBytes).toBe(costs.report.fs.writeFileSync.bytes);
+    }
+    console.log('[PF-01 actual Runner persistence]', JSON.stringify({ mode, tasks, operationsPerTask: operations, snapshotBytes, elapsedMs, callerMetrics: measured.metrics,
+      ...(contextSaveProfile ? { contextSaveProfile } : {}),
       ...(costs ? { callerCosts: costs.report, contextWritePayloads: context } : {}),
       scope: 'real Runner/Session/files/reopen; synthetic provider, no network/UI; FS attribution excludes fixture source-file I/O; SHA counters cover intercepted calls only; equal payloads compare successful submissions, not an external-change-safe write cache' }));
-  } finally { spy?.mockRestore(); costs?.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+    checkLatencyBudget(`Runner ${tasks}x${operations} snapshot${snapshotBytes} caller delay`,
+      { elapsedMs: measured.metrics.eventLoopDelayMs }, BULK_MAIN_GAP_LIMIT_MS);
+  } finally { stopMeasurement(); fs.rmSync(root, { recursive: true, force: true }); }
 }, 30000);
 
 // A remembered last payload is not proof that the backing file still has it.
@@ -1984,4 +2025,291 @@ it.each(['deleted', 'replaced'] as const)('PF-01 restores unchanged in-memory co
       [{ type: 'text', text: 'Progress committed' }],
     ]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+
+// Recovery must remain exact while ordinary transcript growth avoids rebuilding
+// and rewriting an unchanged recovery snapshot. Spies measure the avoidable work;
+// independent disk/reopen checks protect the actual durability contract.
+describe("context save integrity and efficiency", () => {
+  let root: string, file: string, sidecar: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "orkas-context-save-"));
+    file = path.join(root, "task.jsonl");
+    sidecar = file + ".context.json";
+  });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); });
+  function started() {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Keep all progress 界🙂" }]);
+    session.addHistoryResource({ kind: "attachment", path: "/kept", name: "source" });
+    return session;
+  }
+  function assertSaved(session: PersistentSession) {
+    expect(session.hasPendingPersistence()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(sidecar, "utf8"))).toEqual(JSON.parse(JSON.stringify(session.getSerializedContextState())));
+    return new PersistentSession({ sessionFile: file });
+  }
+
+  it("saves every ordinary message for immediate reopen without re-encoding or overwriting unchanged context", () => {
+    const session = started(), original = fs.readFileSync(sidecar);
+    const encode = vi.spyOn(session, "getSerializedContextState"), write = vi.spyOn(fs, "writeFileSync");
+    for (const text of ["first 界🙂", "second\r\nline", "final"]) {
+      session.addAssistantMessage([{ type: "text", text }]);
+      expect(fs.readFileSync(sidecar)).toEqual(original);
+      expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+    }
+    expect(encode).not.toHaveBeenCalled();
+    expect(write.mock.calls.filter(([p]) => p === sidecar + ".tmp")).toHaveLength(0);
+    expect(session.hasPendingPersistence()).toBe(false);
+  });
+
+  it("also avoids unchanged snapshots for tool receipts and ordinary user rows without losing protocol", () => {
+    const session = started();
+    session.addAssistantMessage([{ type: "tool_use", id: "read", name: "fixture", input: {} }]);
+    const original = fs.readFileSync(sidecar), encode = vi.spyOn(session, "getSerializedContextState");
+    session.addToolResult("read", "complete receipt 界🙂");
+    session.addUserMessage("additional input");
+    expect(encode).not.toHaveBeenCalled();
+    expect(fs.readFileSync(sidecar)).toEqual(original);
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+  });
+
+  it.each(["short", "long", "same-size", "deleted"])("repairs %s external snapshots before acknowledging the next message", change => {
+    const session = started(), original = fs.readFileSync(sidecar);
+    if (change === "deleted") fs.unlinkSync(sidecar);
+    else if (change === "same-size") fs.writeFileSync(sidecar, original.toString().replace("/kept", "/evil"));
+    else fs.writeFileSync(sidecar, change === "short" ? "{}" : Buffer.concat([original, Buffer.from("extra")]));
+    session.addAssistantMessage([{ type: "text", text: "durable" }]);
+    expect(fs.readFileSync(sidecar)).toEqual(original);
+    expect(assertSaved(session).getSerializedContextState()?.resources?.[0].path).toBe("/kept");
+  });
+
+  it("does not read an externally enlarged snapshot into unbounded memory", () => {
+    const session = started(), original = fs.readFileSync(sidecar);
+    fs.truncateSync(sidecar, 256 * 1024 * 1024);
+    const read = vi.spyOn(fs, "readFileSync"), boundedRead = vi.spyOn(fs, "readSync");
+    session.addAssistantMessage([{ type: "text", text: "restore boundedly" }]);
+    expect(read.mock.calls.filter(([p]) => p === sidecar)).toHaveLength(0);
+    expect(boundedRead).not.toHaveBeenCalled();
+    expect(fs.readFileSync(sidecar)).toEqual(original);
+  });
+
+  it.each(["read", "partial-read"])("recovers a verification %s failure by restoring the authoritative snapshot", fault => {
+    const session = started(), original = fs.readFileSync(sidecar);
+    const read = fs.readSync;
+    const faultSpy = vi.spyOn(fs, "readSync").mockImplementationOnce(((...args: Parameters<typeof fs.readSync>) => {
+      if (fault === "read") throw Object.assign(new Error("injected verification failure"), { code: "EIO" });
+      return Reflect.apply(read, fs, [args[0], args[1], args[2], Math.min(7, Number(args[3])), args[4]]);
+    }) as typeof fs.readSync);
+    session.addAssistantMessage([{ type: "text", text: "keep the receipt" }]);
+    faultSpy.mockRestore();
+    expect(fs.readFileSync(sidecar)).toEqual(original);
+    expect(assertSaved(session).getMessages()).toEqual(session.getMessages());
+  });
+
+  it.each(["write", "rename"])("keeps newer changes pending after a warm-cache %s failure, then retries only storage", async fault => {
+    vi.useFakeTimers();
+    const session = started(), original = fs.readFileSync(sidecar);
+    fs.writeFileSync(sidecar, "{}");
+    if (fault === "write") vi.spyOn(fs, "writeFileSync").mockImplementationOnce(() => { throw Object.assign(new Error("injected write failure"), { code: "ENOSPC" }); });
+    else vi.spyOn(fs, "renameSync").mockImplementationOnce(() => { throw Object.assign(new Error("injected rename failure"), { code: "EACCES" }); });
+    session.addAssistantMessage([{ type: "text", text: "first saved transcript" }]);
+    expect(session.hasPendingPersistence()).toBe(true);
+    session.addHistoryResource({ kind: "final_output", path: "/new-result" });
+    session.addAssistantMessage([{ type: "text", text: "later saved transcript" }]);
+    const flush = session.flushPending();
+    await vi.advanceTimersByTimeAsync(200); await flush;
+    expect(fs.readFileSync(sidecar)).not.toEqual(original);
+    const restored = assertSaved(session);
+    expect(restored.getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept", "/new-result"]);
+    expect(restored.getMessages()).toEqual(session.getMessages());
+  });
+
+  it("saves nested mutations even when an enclosing batch throws", () => {
+    const session = started();
+    expect(() => session.withContextMutationBatch(() => {
+      session.addHistoryResource({ kind: "explicit", path: "/new" });
+      session.withContextMutationBatch(() => session.updateExecutionPlan({ steps: [{ step: "verify all files", status: "in_progress" }] }));
+      session.recordCompletedWork({ tool: "fixture", toolCallId: "completed", inputDigest: "one", inputSummary: "one", status: "succeeded" });
+      throw new Error("injected interruption");
+    })).toThrow("injected interruption");
+    const restored = assertSaved(session);
+    expect(restored.getExecutionPlan()?.steps[0].step).toBe("verify all files");
+    expect(restored.getCompletedWorkLedger().map(r => r.toolCallId)).toEqual(["completed"]);
+    expect(restored.getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept", "/new"]);
+  });
+
+  it("persists restored state instead of reusing a prior recovery snapshot", () => {
+    const session = started();
+    const state = session.getSerializedContextState()!;
+    state.resources = [{ kind: "attachment", path: "/restored" }];
+    session.restoreContextState(state);
+    session.addAssistantMessage([{ type: "text", text: "after restore" }]);
+    expect(assertSaved(session).getSerializedContextState()?.resources?.[0].path).toBe("/restored");
+    session.clear();
+    session.addAssistantMessage([{ type: "text", text: "legacy reset" }]);
+    expect(fs.existsSync(sidecar)).toBe(false);
+    expect(new PersistentSession({ sessionFile: file }).getMessages()).toEqual(session.getMessages());
+  });
+
+  it("persists a new steer anchor instead of treating all appends as context no-ops", () => {
+    const session = started();
+    session.updateExecutionPlan({ steps: [{ step: "verify", status: "pending" }] });
+    const before = fs.readFileSync(sidecar, "utf8");
+    session.addUserMessage("[User interrupt]\nKeep the corrected requirement");
+    const state = JSON.parse(fs.readFileSync(sidecar, "utf8"));
+    expect(state.activeTurn.steerPlanAnchors).toHaveLength(1);
+    expect(fs.readFileSync(sidecar, "utf8")).not.toBe(before);
+    session.addAssistantMessage([{ type: "text", text: "correction received" }]);
+    expect(new PersistentSession({ sessionFile: file }).getMessagesForModel()).toEqual(session.getMessagesForModel());
+  });
+
+  it("saves shifted turn indexes when an assistant append trims older memory", () => {
+    const session = new PersistentSession({ sessionFile: file, maxHistoryTurns: 8 });
+    for (let i = 0; i < 8; i++) {
+      session.beginUserTurn([{ type: "text", text: `input-${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `reply-${i}` }]);
+      session.completeActiveTurn();
+    }
+    session.beginUserTurn([{ type: "text", text: "current" }]);
+    const previous = JSON.parse(fs.readFileSync(sidecar, "utf8")).activeTurn.userMessageIndex;
+    session.addAssistantMessage([{ type: "text", text: "after trim" }]);
+    const saved = JSON.parse(fs.readFileSync(sidecar, "utf8"));
+    expect(saved.activeTurn.userMessageIndex).toBeLessThan(previous);
+    expect(fs.readFileSync(file, "utf8")).toContain("input-0");
+    expect(new PersistentSession({ sessionFile: file }).getMessagesForModel()).toEqual(session.getMessagesForModel());
+  });
+
+  it("isolates nested context snapshots from callers before and after restore", () => {
+    const session = started();
+    session.configureHistoryBudget(24_000, 19_680, 5000);
+    session.updateExecutionPlan({ steps: [{ step: "verify", status: "pending" }] });
+    session.addUserMessage("corrected instruction");
+    session.addAssistantMessage([{ type: "text", text: "acknowledged" }]);
+    const expected = fs.readFileSync(sidecar, "utf8");
+    const snapshot = session.getSerializedContextState()!;
+    snapshot.activeTurn!.historyBudget!.maxTokens = 0;
+    snapshot.activeTurn!.steerPlanAnchors![0].text = "foreign mutation";
+    expect(JSON.stringify(session.getSerializedContextState()) + "\n").toBe(expected);
+    session.restoreContextState(JSON.parse(expected));
+    const incoming = session.getSerializedContextState()!;
+    session.restoreContextState(incoming);
+    incoming.activeTurn!.historyBudget!.maxTokens = 0;
+    incoming.activeTurn!.steerPlanAnchors![0].text = "late input mutation";
+    session.addAssistantMessage([{ type: "text", text: "still correct" }]);
+    expect(fs.readFileSync(sidecar, "utf8")).toBe(expected);
+    expect(assertSaved(session).getMessagesForModel()).toEqual(session.getMessagesForModel());
+  });
+
+  it("evicts by retained bytes before reaching the entry-count ceiling", () => {
+    const session = started();
+    session.addHistoryResource({ kind: "attachment", path: "/" + "x".repeat(3 * 1024 * 1024) });
+    for (let i = 0; i < 11; i++) {
+      const other = new PersistentSession({ sessionFile: path.join(root, `large-${i}.jsonl`) });
+      other.beginUserTurn([{ type: "text", text: "separate task" }]);
+      other.addHistoryResource({ kind: "attachment", path: "/" + "y".repeat(3 * 1024 * 1024) });
+    }
+    const encode = vi.spyOn(session, "getSerializedContextState");
+    session.addAssistantMessage([{ type: "text", text: "after byte eviction" }]);
+    expect(encode).toHaveBeenCalled();
+    expect(assertSaved(session).getSerializedContextState()?.resources?.[0].path).toBe("/kept");
+  });
+
+  it("rebuilds snapshots after cache eviction without losing session isolation", () => {
+    const session = started();
+    for (let i = 0; i < 65; i++) {
+      const other = new PersistentSession({ sessionFile: path.join(root, `other-${i}.jsonl`) });
+      other.beginUserTurn([{ type: "text", text: `unrelated-${i}` }]);
+    }
+    const encode = vi.spyOn(session, "getSerializedContextState");
+    session.addAssistantMessage([{ type: "text", text: "after eviction" }]);
+    expect(encode).toHaveBeenCalled();
+    expect(assertSaved(session).getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept"]);
+  });
+
+  it("reuses one UTF-8 encoding for synchronous save and cache without changing recovery bytes", () => {
+    const session = started(), from = Buffer.from;
+    const encoded: Buffer[] = [];
+    const allocation = vi.spyOn(Buffer, "from").mockImplementation(((...args: unknown[]) => {
+      const bytes = Reflect.apply(from, Buffer, args) as Buffer;
+      if (typeof args[0] === "string" && args[0].startsWith('{"version":1')) encoded.push(bytes);
+      return bytes;
+    }) as typeof Buffer.from);
+    const write = vi.spyOn(fs, "writeFileSync");
+    const resource = '/exact-界🙂\r\n"\\' + String.fromCharCode(0xd800);
+    session.addHistoryResource({ kind: "final_output", path: resource });
+    allocation.mockRestore();
+    const writes = write.mock.calls.filter(([p]) => p === sidecar + ".tmp");
+    expect(encoded).toHaveLength(1);
+    expect(writes).toHaveLength(1);
+    expect(writes[0][1]).toBe(encoded[0]);
+    const disk = fs.readFileSync(sidecar);
+    expect(disk.toString("utf8")).toBe(JSON.stringify(session.getSerializedContextState()) + "\n");
+    expect(assertSaved(session).getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept", resource]);
+    write.mockClear();
+    session.addAssistantMessage([{ type: "text", text: "reuses the saved snapshot" }]);
+    expect(write.mock.calls.filter(([p]) => p === sidecar + ".tmp")).toHaveLength(0);
+    expect(fs.readFileSync(sidecar)).toEqual(disk);
+    expect(assertSaved(session).getMessages()).toEqual(session.getMessages());
+  });
+
+  it("keeps synchronous saves durable when optional UTF-8 allocation fails", () => {
+    const session = started(), from = Buffer.from;
+    let failures = 0;
+    const allocation = vi.spyOn(Buffer, "from").mockImplementation(((...args: unknown[]) => {
+      if (typeof args[0] === "string" && args[0].startsWith('{"version":1')) {
+        failures++;
+        throw new Error("injected optional encoding allocation failure");
+      }
+      return Reflect.apply(from, Buffer, args);
+    }) as typeof Buffer.from);
+    session.addHistoryResource({ kind: "final_output", path: "/new-result" });
+    allocation.mockRestore();
+    expect(failures).toBe(1);
+    expect(session.hasPendingPersistence()).toBe(false);
+    expect(assertSaved(session).getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept", "/new-result"]);
+    session.addAssistantMessage([{ type: "text", text: "encoding failure did not fail the task" }]);
+    expect(assertSaved(session).getMessages()).toEqual(session.getMessages());
+  });
+
+  it("keeps committed data when publishing the disposable encoded cache fails", () => {
+    const session = started(), from = Buffer.from, rename = fs.renameSync, set = Map.prototype.set;
+    let encoded: Buffer | undefined, committed = false, failures = 0;
+    vi.spyOn(Buffer, "from").mockImplementation(((...args: unknown[]) => {
+      const bytes = Reflect.apply(from, Buffer, args) as Buffer;
+      if (typeof args[0] === "string" && args[0].startsWith('{"version":1')) encoded = bytes;
+      return bytes;
+    }) as typeof Buffer.from);
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      rename(source, destination);
+      if (destination === sidecar) committed = true;
+    });
+    const publish = vi.spyOn(Map.prototype, "set").mockImplementation(function (this: Map<unknown, unknown>, key, value) {
+      if (committed && encoded && value?.bytes === encoded) {
+        failures++;
+        throw new Error("injected optional cache publication failure");
+      }
+      return set.call(this, key, value);
+    });
+    session.addHistoryResource({ kind: "final_output", path: "/new-result" });
+    publish.mockRestore();
+    expect(failures).toBe(1);
+    expect(session.hasPendingPersistence()).toBe(false);
+    expect(assertSaved(session).getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept", "/new-result"]);
+    const write = vi.spyOn(fs, "writeFileSync");
+    session.addAssistantMessage([{ type: "text", text: "cache publication failure did not fail the task" }]);
+    expect(write.mock.calls.filter(([p]) => p === sidecar + ".tmp")).toHaveLength(1);
+    expect(assertSaved(session).getMessages()).toEqual(session.getMessages());
+  });
+
+  it("falls back to full saves for oversized snapshots instead of retaining unbounded cache entries", () => {
+    const session = started();
+    const resource = "/" + "x".repeat(4 * 1024 * 1024);
+    session.addHistoryResource({ kind: "attachment", path: resource });
+    const encode = vi.spyOn(session, "getSerializedContextState");
+    session.addAssistantMessage([{ type: "text", text: "after large state" }]);
+    expect(encode).toHaveBeenCalled();
+    expect(assertSaved(session).getSerializedContextState()?.resources?.map(r => r.path)).toEqual(["/kept", resource]);
+  });
 });

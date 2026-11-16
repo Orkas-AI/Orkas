@@ -1,6 +1,10 @@
-import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { appendFileSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
+import { makeMinimalDocx } from '../fixtures/make-minimal-docx';
+import { makeMinimalPdf } from '../fixtures/make-minimal-pdf';
 
 test('a descriptive file-link label does not hide the CSV format', async ({ orkas }) => {
   const file = orkas.createWorkspaceFile('report.csv', 'name,value\nOrkas,12\n');
@@ -35,7 +39,7 @@ test('CSV opens from task attachments and the Library without changing cell cont
   await orkas.closePreview(preview);
 
   expect((await orkas.invoke<any>('contexts.upload', { path: 'sample.csv', data: bytes.toString('base64') })).ok).toBe(true);
-  await page.locator('#contexts-btn').click();
+  await openSidebarEntry(page, '#contexts-btn');
   await page.locator('.ctx-tree-wrap[data-path="sample.csv"] > .skill-tree-node').click();
   await expect(page.locator('#contexts-viewer-body .delimited-preview td').filter({ hasText: '中文样本' })).toHaveCount(1);
   await page.screenshot({ path: info.outputPath('csv-library.png') });
@@ -85,7 +89,7 @@ test('CSV and TSV use the available preview height after resizing and switching 
     await orkas.closePreview(preview);
 
     expect((await orkas.invoke<any>('contexts.upload', { path: name, data: Buffer.from(content).toString('base64') })).ok).toBe(true);
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     await page.locator(`.ctx-tree-wrap[data-path="${name}"] > .skill-tree-node`).click();
     const libraryBody = page.locator('#contexts-viewer-body');
     await expect(libraryBody.locator('.delimited-preview tr')).toHaveCount(80);
@@ -131,7 +135,7 @@ test('HTML attachments render offline interactions while the Library preserves e
 
   expect(await orkas.invoke('contexts.upload', { path: 'sample.html', data: Buffer.from(source).toString('base64') }))
     .toMatchObject({ ok: true });
-  await page.locator('#contexts-btn').click();
+  await openSidebarEntry(page, '#contexts-btn');
   await page.locator('.ctx-tree-wrap[data-path="sample.html"] > .skill-tree-node').click();
   await expect(page.locator('#contexts-viewer-body pre')).toContainText('<!doctype html>');
   await expect(page.locator('#contexts-viewer-body #increment')).toHaveCount(0);
@@ -159,7 +163,7 @@ test('large CSV previews remain bounded and cannot overwrite the original with a
   expect(readFileSync(file, 'utf8')).toBe(content);
   await orkas.closePreview(preview);
   expect((await orkas.invoke<any>('contexts.upload', { path: 'large.csv', data: Buffer.from(content).toString('base64') })).ok).toBe(true);
-  await orkas.page!.locator('#contexts-btn').click();
+  await openSidebarEntry(orkas.page!, '#contexts-btn');
   await orkas.page!.locator('.ctx-tree-wrap[data-path="large.csv"] > .skill-tree-node').click();
   await expect(orkas.page!.locator('#contexts-viewer-body .delimited-preview tr')).toHaveCount(200);
   await expect(orkas.page!.locator('#contexts-viewer-actions [data-mve-action="edit"]')).toHaveCount(0);
@@ -186,7 +190,7 @@ test('Library source files remain literal and keep unsaved drafts across file sw
   for (const name of ['config.jsonl', 'sample.py']) {
     expect((await orkas.invoke<any>('contexts.write', { path: name, content: name === 'config.jsonl' ? '# literal\n<b>source</b>\n- [ ] text' : '# different source' })).ok).toBe(true);
   }
-  await page.locator('#contexts-btn').click();
+  await openSidebarEntry(page, '#contexts-btn');
   await page.locator('.ctx-tree-wrap[data-path="config.jsonl"] > .skill-tree-node').click();
   await expect(page.locator('#contexts-viewer-body pre')).toHaveText('# literal\n<b>source</b>\n- [ ] text');
   await expect(page.locator('#contexts-viewer-body input[type="checkbox"]')).toHaveCount(0);
@@ -219,3 +223,112 @@ test('native local image previews decode common raster formats and aliases', asy
     await orkas.closePreview(preview);
   }
 });
+
+test('unregistered external bubble files preview read-only with existing unsupported and missing feedback', async ({ orkas }, info) => {
+  const outside = mkdtempSync(path.join(tmpdir(), 'orkas-bubble-external-'));
+  const marker = 'External preview 完整内容';
+  const files = [
+    ['交接 100% #1.md', `# ${marker}\n\n- [ ] Preserve this checkbox\n`],
+    ['report.csv', `name,value\n${marker},12\n`],
+    ['page.html', `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="style.css"><p>${marker}</p>`],
+    ['brief.docx', makeMinimalDocx({ paragraphs: [marker] })],
+    ['document.pdf', makeMinimalPdf(['External PDF preview'])],
+    ['archive.zip', 'unsupported'],
+  ] as const;
+  try {
+    const page = orkas.page!;
+    await page.evaluate(() => (window as any).setLang('en'));
+    for (const [name, body] of files) writeFileSync(path.join(outside, name), body);
+    writeFileSync(path.join(outside, 'style.css'), 'p { color: rgb(12, 34, 56); }');
+    const created: any = await orkas.invoke('conversations.create', { title: 'External file previews' });
+    const cid = created.conversation.conversation_id;
+    appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`), JSON.stringify({
+      id: 'external-preview', from: 'commander', to: ['user'], ts: new Date().toISOString(),
+      text: [...files.map(([name]) => `[${name}](<${path.join(outside, name)}>)`), `[missing](<${path.join(outside, 'missing.md')}>)`].join('\n\n'),
+    }) + '\n');
+    await page.evaluate(async cid => {
+      await (window as any).loadConversations();
+      await (window as any).setView('conversation', cid);
+    }, cid);
+    const chips = page.locator('#chat-history [data-chat-md-file-open="1"]');
+    await expect(chips).toHaveCount(7);
+    for (let i = 0; i < 5; i++) {
+      const preview = await orkas.openPreview(() => chips.nth(i).click());
+      const ext = path.extname(files[i][0]);
+      if (ext === '.html') {
+        await expect(preview.frameLocator('.chat-file-viewer-html').locator('p')).toHaveText(marker);
+        await expect(preview.frameLocator('.chat-file-viewer-html').locator('p')).toHaveCSS('color', 'rgb(12, 34, 56)');
+      } else if (ext === '.docx') {
+        await expect(preview.frameLocator('.chat-file-viewer-office').locator('body')).toContainText(marker);
+      } else if (ext === '.pdf') {
+        await expect(preview.locator('.chat-file-viewer-pdf')).toBeVisible();
+        const loaded = await preview.evaluate(async () => {
+          const response = await fetch((document.querySelector('.chat-file-viewer-pdf') as HTMLIFrameElement).src);
+          return { status: response.status, magic: (await response.text()).slice(0, 4) };
+        });
+        expect(loaded).toEqual({ status: 200, magic: '%PDF' });
+      } else {
+        await expect(preview.locator('.chat-file-viewer-body')).toContainText(marker);
+        await expect(preview.locator('[data-mve-action="edit"], [data-tve-action="edit"]')).toHaveCount(0);
+        if (ext === '.md') {
+          for (const [width, height] of [[1280, 800], [960, 640]]) {
+            await preview.setViewportSize({ width, height });
+            await expect(preview.getByRole('heading', { name: marker })).toBeInViewport();
+            await expect(preview.getByRole('checkbox')).toBeDisabled();
+            await preview.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+            await preview.screenshot({ path: info.outputPath(`external-readonly-${width}.png`) });
+          }
+        }
+      }
+      await orkas.closePreview(preview);
+      expect(readFileSync(path.join(outside, files[i][0]))).toEqual(Buffer.from(files[i][1]));
+    }
+    await chips.nth(5).click();
+    const dialog = page.locator('.ui-dialog-overlay.open');
+    await expect(dialog).toContainText('Cannot preview .zip files in app.');
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await chips.nth(6).click();
+    await expect(page.locator('.ui-toast')).toContainText('The file “missing.md” no longer exists.');
+  } finally { rmSync(outside, { recursive: true, force: true }); }
+});
+
+for (const language of ['en', 'zh'] as const) {
+  test.describe(`unsupported bubble files (${language})`, () => {
+    test('shows only the owner dialog and restores bubble focus when dismissed', async ({ orkas }, info) => {
+      const page = orkas.page!;
+      await page.evaluate(language => (window as any).setLang(language), language);
+      const name = `${'release-package-'.repeat(8)}2.5.0.zip`;
+      const file = orkas.createWorkspaceFile(name, 'unsupported preview fixture');
+      const created: any = await orkas.invoke('conversations.create', { title: 'Unsupported file preview' });
+      const cid = created.conversation.conversation_id;
+      appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`), JSON.stringify({
+        id: 'unsupported-file', from: 'commander', to: ['user'], ts: new Date().toISOString(),
+        text: `[${name}](${pathToFileURL(file).href})`,
+      }) + '\n');
+      await page.evaluate(async cid => {
+        await (window as any).loadConversations();
+        await (window as any).setView('conversation', cid);
+      }, cid);
+      const chip = page.locator('#chat-history [data-chat-md-file-open="1"]');
+      await expect(chip).toBeVisible();
+      const countWindows = () => orkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length);
+      const windows = await countWindows();
+      for (const [width, height] of [[1280, 800], [960, 640]]) {
+        await page.setViewportSize({ width, height });
+        await chip.click();
+        const dialog = page.locator('.ui-dialog-overlay.open');
+        await expect(dialog).toContainText(language === 'zh' ? '无法在应用内预览 .zip 文件' : 'Cannot preview .zip files in app.');
+        await expect(dialog.getByRole('button', { name: language === 'zh' ? '打开文件夹' : 'Open Folder', exact: true })).toBeFocused();
+        expect(await countWindows()).toBe(windows);
+        await expect(page.locator('.chat-file-viewer.is-open')).toHaveCount(0);
+        await page.screenshot({ path: info.outputPath(`unsupported-${language}-${width}.png`) });
+        if (width === 1280) await dialog.getByRole('button', { name: language === 'zh' ? '关闭' : 'Close', exact: true }).click();
+        else await page.keyboard.press('Escape');
+        await expect(dialog).toHaveCount(0);
+        await expect(chip).toBeFocused();
+        expect(await countWindows()).toBe(windows);
+      }
+    });
+  });
+}

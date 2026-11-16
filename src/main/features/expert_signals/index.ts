@@ -21,6 +21,7 @@ import {
   querySignalsForUser as _querySignalsForUser,
 } from './storage';
 import type { Signal, SignalFilter, SignalInput } from './types';
+import { appConversationOwner } from '../../paths';
 
 export type {
   Signal, SignalFilter, SignalInput,
@@ -33,6 +34,7 @@ export { EXTRACTOR_VERSION } from './types';
  *  here) so a turn-end hook fired during user-switch doesn't accidentally
  *  cross-write. */
 export function emitSignal(uid: string, input: SignalInput): void {
+  if (appConversationOwner(input.cid)) return;
   appendSignal(uid, input);
 }
 

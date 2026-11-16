@@ -111,6 +111,8 @@ const PACKAGED_BIN_ENTRYPOINTS = Object.freeze([
 // surfaces themselves. App-owned connector entrypoints load this proxy
 // bootstrap so their fetch can follow the route selected by Electron main.
 const PACKAGED_BIN_HELPERS = Object.freeze([
+  'psd-preview.cjs',
+  'tool-parameter-errors.cjs',
   'local-cli-lark-permission-contract.json',
   // Shared automation schema loaded by both the packaged Orkas bridge and
   // the in-process auto_tasks tool.
@@ -218,6 +220,7 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
 const DORMANT_BIN_FILES = Object.freeze([]);
 
 const BUILD_ONLY_BIN_FILES = Object.freeze([
+  'tool-parameter-errors.d.cts',
   'project-instructions-contract.d.cts',
   'tool-input-compat.d.cts',
   'builtin-resource-gate.cjs',

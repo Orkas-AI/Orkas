@@ -51,10 +51,13 @@ jobs:
 
       - name: Install the Linux test desktop when the runner image does not provide it
         run: |
-          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v openbox >/dev/null 2>&1 || ! command -v xprop >/dev/null 2>&1; then
+          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v openbox >/dev/null 2>&1 || ! command -v xprop >/dev/null 2>&1 || ! command -v dbus-run-session >/dev/null 2>&1 || ! command -v dbus-send >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install --yes xvfb openbox x11-utils
+            sudo apt-get install --yes xvfb openbox x11-utils dbus
           fi
+
+      - name: Prepare the native repository search backend
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
 
       - name: Restore standard read-only system font permissions
         run: |
@@ -67,7 +70,7 @@ jobs:
 
       - name: Run Linux platform-native test lane
         run: |
-          xvfb-run --auto-servernum bash -eu -c '
+          dbus-run-session -- xvfb-run --auto-servernum bash -eu -c '
             openbox --sm-disable &
             window_manager_pid=$!
             trap "kill $window_manager_pid 2>/dev/null || true" EXIT
@@ -88,10 +91,57 @@ jobs:
 
       - name: Launch the real Orkas application and renderer
         run: >-
-          ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum
+          dbus-run-session -- xvfb-run --auto-servernum
           npm run test:e2e --
           test/e2e/app_e2e_smoke.spec.ts
           --grep "launches the hidden real renderer and preload bridge"
+
+
+      - name: Verify task pagination labels and navigation
+        run: >-
+          dbus-run-session -- xvfb-run --auto-servernum npm run test:e2e --
+          test/e2e/sidebar_e2e_pagination_spacing.spec.ts
+          --output=test-results/pagination
+
+      - name: Retain content-free Electron journey log findings
+        if: always()
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          for (const root of ['test-results/e2e', 'test-results/pagination']) {
+          const entries = fs.existsSync(root) ? fs.readdirSync(root).sort().slice(0, 64) : [];
+          for (const [index, entry] of entries.entries()) {
+            const dir = path.join(root, entry);
+            const report = path.join(dir, 'electron-log-analysis.json');
+            if (!fs.existsSync(report)) continue;
+            if (fs.statSync(report).size > 1024 * 1024) throw new Error('Startup log summary exceeds its bound');
+            const value = JSON.parse(fs.readFileSync(report, 'utf8'));
+            const { passed, coveragePassed, capturedLineCount, analyzedLineCount, droppedLineCount, levelCounts, findings } = value;
+            console.log(JSON.stringify({ suite: path.basename(root), startupLogSummary: index, passed, coveragePassed, capturedLineCount, analyzedLineCount, droppedLineCount, levelCounts, findings }));
+            const log = path.join(dir, 'electron-main.log');
+            if (!fs.existsSync(log)) continue;
+            if (fs.statSync(log).size > 8 * 1024 * 1024) throw new Error('Startup log exceeds its diagnostic bound');
+            const body = fs.readFileSync(log, 'utf8');
+            if (!passed || levelCounts.warn) {
+              require('tsx/cjs');
+              const { sanitizeLogText } = require('./src/main/util/log-redact.ts');
+              let stderr = false;
+              const diagnostic = [];
+              for (const line of body.split(/\r?\n/)) {
+                const stream = /^\[(main|renderer):(stdout|stderr|info|warn|error)\]/.exec(line);
+                if (stream) stderr = stream[1] === 'main' && stream[2] === 'stderr';
+                if (line.startsWith('[fixture-cleanup]')) stderr = false;
+                if (stderr && !/\[\d\d:\d\d:\d\d\.\d+\] \[(?:info|warn|error|debug)\]/.test(line)) diagnostic.push(sanitizeLogText(line));
+              }
+              const warnings = body.split(/\r?\n/).filter(line => /\[warn(?:ing)?\]/i.test(line)).map(sanitizeLogText);
+              console.log(JSON.stringify({ suite: path.basename(root), journeyProcessDiagnostics: index, count: diagnostic.length, lines: diagnostic.slice(0, 64), warningCount: warnings.length, warnings: warnings.slice(0, 16) }));
+            }
+            const identities = [...body.matchAll(/message_hash:\s*'([a-f0-9]{12})',\s*message_chars:\s*(\d+)/g)];
+            console.log(JSON.stringify({ suite: path.basename(root), startupErrorIdentities: index, retained: identities.length, errors: identities.slice(0, 32).map(match => ({ hash: match[1], chars: Number(match[2]) })) }));
+          }
+          }
+          NODE
 
       - name: Run native inference and Electron GUI smoke
         run: xvfb-run --auto-servernum npm run test:linux-source

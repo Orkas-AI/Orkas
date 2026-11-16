@@ -70,7 +70,7 @@ describe('recovered error log classification', () => {
     expect(report.recoveredRendererErrorCount).toBe(1);
   });
   it('classifies CRLF debugger lifecycle logs while retaining fatal unknown stderr', () => {
-    const lifecycle = '[main:stderr] Debugger listening on ws://127.0.0.1:9229/abcd-1234\r\n'
+    const lifecycle = '[main:stderr] Debugger listening on ws://127.0.0.1:9229/12345678-1234-1234-1234-123456789abc\r\n'
       + 'For help, see: https://nodejs.org/learn/getting-started/debugging\r\n'
       + '[main:stderr] Waiting for the debugger to disconnect...\r\n'
       + '[fixture-cleanup] {"phase":"application-close","outcome":"completed"}\r\n';
@@ -78,6 +78,7 @@ describe('recovered error log classification', () => {
     expect(report.passed).toBe(true);
     expect(report.coveragePassed).toBe(true);
     expect(report.capturedLineCount).toBe(report.analyzedLineCount);
+    expect(analyzeWebAppLogs(lifecycle.replace('12345678-1234-1234-1234-123456789abc', 'abcd-1234')).passed).toBe(false);
     expect(analyzeWebAppLogs(lifecycle + 'unknown process error\r\n').passed).toBe(false);
   });
   it('rejects a claimed recovery on a main-process line', () => {

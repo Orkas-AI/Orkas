@@ -53,7 +53,7 @@ export const APP_NAV_SURFACES: readonly AppNavSurface[] = [
     actions: ['open', 'create', 'configure'],
     targetRequiredFor: ['configure'],
   },
-  { id: 'apps', summary: 'My Apps: saved interactive results that can be launched again.', actions: ['open'] },
+  { id: 'apps', summary: 'My Apps: open the list or launch one saved or bundled app.', actions: ['open', 'configure'], targetRequiredFor: ['configure'] },
   { id: 'marketplace', summary: 'Marketplace: installable Agents and Skills.', actions: ['open'] },
 ];
 

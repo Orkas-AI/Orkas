@@ -32,7 +32,12 @@ function _taskUnreadStorageKey(userId) {
 
 function _taskUnreadSafeCid(value) {
   const cid = typeof value === 'string' ? value.trim() : '';
-  return cid && /^[A-Za-z0-9_-]+$/.test(cid) ? cid : '';
+  return cid && /^[A-Za-z0-9_-]+$/.test(cid) && !_taskUnreadAppCid(cid) ? cid : '';
+}
+
+function _taskUnreadAppCid(cid) {
+  // Mirror paths.appConversationOwner's host-reserved identity, not task text.
+  return typeof cid === 'string' && /^app_[a-f0-9]{64}_(once|retain)_[a-f0-9]{32}$/.test(cid);
 }
 
 function _taskUnreadTimestamp(value, fallback = Date.now()) {
@@ -101,6 +106,11 @@ function _taskUnreadLoadOwner(userId) {
         _taskUnreadByCid.delete(cid);
       }
     }
+    // Older hosts leaked app terminals into ordinary attention storage. Their
+    // execution context may already be gone; purge reminders without looking it
+    // up or touching the app's durable outputs, receipts or retained session.
+    if (unreadRows.some(row => _taskUnreadAppCid(row?.cid))
+        || readRows.some(row => _taskUnreadAppCid(row?.cid))) _taskUnreadSave();
   } catch (_) {
     _taskUnreadByCid.clear();
     _taskReadAtByCid.clear();
@@ -360,7 +370,7 @@ function _refreshUnreadTaskIndicators(projectIdOverride) {
     else if (record.projectId) projectsCount += 1;
   }
   _taskUnreadSetDot(document.getElementById?.('tasks-unread-dot'), globalCount > 0);
-  _taskUnreadSetDot(document.getElementById?.('projects-unread-dot'), projectsCount > 0);
+  _taskUnreadSetDot(document.getElementById?.('projects-unread-dot'), projectsCount > 0 || !!window.TodoDue?.hasProjects());
   // The Today section mirrors rows that also live under Tasks or a Project, so
   // its header follows the rows it currently shows rather than an ownership
   // count; the loop above has just settled each row's `has-unread` class.
@@ -372,7 +382,7 @@ function _refreshUnreadTaskIndicators(projectIdOverride) {
 
   for (const dot of document.querySelectorAll?.('[data-project-unread-dot]') || []) {
     const projectId = dot.dataset?.projectUnreadDot;
-    _taskUnreadSetDot(dot, _taskUnreadProjectCount(projectId) > 0);
+    _taskUnreadSetDot(dot, _taskUnreadProjectCount(projectId) > 0 || !!window.TodoDue?.hasScope(projectId));
   }
 }
 

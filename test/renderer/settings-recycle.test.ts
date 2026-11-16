@@ -90,6 +90,45 @@ describe('Settings recycle bin', () => {
     expect(sandbox.uiAlert).not.toHaveBeenCalled();
   });
 
+  it.each(['', 'fixture-project'])('refreshes every restored local surface without publication discovery (project=%s)', async projectId => {
+    const { sandbox, getClickListener, recycleBin } = loadHarness([]);
+    sandbox.uiConfirm = vi.fn(async () => true);
+    sandbox.uiAlert = vi.fn();
+    sandbox.uiToast = vi.fn();
+    sandbox._projectDetailPid = projectId;
+    sandbox.loadAgents = vi.fn(async () => {});
+    sandbox.loadSkills = vi.fn(async () => {});
+    sandbox.loadProjects = vi.fn(async () => {});
+    sandbox.loadConversations = vi.fn(async () => { throw new Error('fixture refresh failure'); });
+    sandbox.loadContexts = vi.fn(async () => {});
+    sandbox.loadProjectDetail = vi.fn(async () => {});
+    sandbox.window.loadSavedApps = vi.fn(async () => {});
+    sandbox.window.loadAutoList = vi.fn(async () => {});
+    sandbox.window.loadProjectAutoList = vi.fn(async () => {});
+    sandbox._settingsBindRecycleBinOnce();
+    const button = { disabled: false, getAttribute: () => 'fixture-batch', hasAttribute: () => false };
+    await getClickListener()!({ target: { closest: (selector: string) => selector === '[data-recycle-restore], [data-recycle-delete]' ? button : null } });
+    expect(recycleBin.restore).toHaveBeenCalledExactlyOnceWith('fixture-batch');
+    expect(sandbox.loadAgents).toHaveBeenCalledExactlyOnceWith(true);
+    expect(sandbox.loadSkills).toHaveBeenCalledExactlyOnceWith(true);
+    expect(sandbox.loadProjects).toHaveBeenCalledExactlyOnceWith(true);
+    expect(sandbox.loadConversations).toHaveBeenCalledExactlyOnceWith();
+    expect(sandbox.loadContexts).toHaveBeenCalledExactlyOnceWith();
+    expect(sandbox.window.loadSavedApps).toHaveBeenCalledExactlyOnceWith(true, { localOnly: true });
+    expect(sandbox.window.loadAutoList).toHaveBeenCalledExactlyOnceWith(true);
+    if (projectId) {
+      expect(sandbox.window.loadProjectAutoList).toHaveBeenCalledExactlyOnceWith(projectId);
+      expect(sandbox.loadProjectDetail).toHaveBeenCalledExactlyOnceWith(projectId);
+    } else {
+      expect(sandbox.window.loadProjectAutoList).not.toHaveBeenCalled();
+      expect(sandbox.loadProjectDetail).not.toHaveBeenCalled();
+    }
+    expect(sandbox.uiToast).toHaveBeenCalledExactlyOnceWith('settings.recycle.restored', { variant: 'success' });
+    expect(sandbox.uiAlert).not.toHaveBeenCalled();
+    expect(button.disabled).toBe(false);
+    expect(recycleBin.list).toHaveBeenCalledOnce();
+  });
+
   const repeatedTitle = '@ContentWriter 最近关于模型即应用';
   const batch = {
     id: 'batch-1',

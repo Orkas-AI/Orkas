@@ -94,6 +94,15 @@ describe('buildReframeFilter', () => {
       .toContain('crop=1080:1920:(iw-ow)*1:(ih-oh)*0');
   });
 
+  it('moves the crop to keep the point of each stretch centred, inside the frame', () => {
+    const { filter, complex } = buildReframeFilter({
+      mode: 'crop', width: 1080, height: 1920,
+      plan: [{ startSec: 0, centreX: 0.28 }, { startSec: 3, centreX: 0.78, centreY: 0.4 }],
+    });
+    expect(complex).toBe(false);
+    expect(filter).toContain("crop=1080:1920:x='clip(iw*if(lt(t,3.000),0.2800,0.7800)-ow/2,0,iw-ow)':y='clip(ih*if(lt(t,3.000),0.5000,0.4000)-oh/2,0,ih-oh)'");
+  });
+
   it('fills the bars with a blurred copy through a labelled filter_complex', () => {
     const { filter, complex } = buildReframeFilter({ mode: 'blur', width: 1080, height: 1920 });
     expect(complex).toBe(true);
@@ -184,6 +193,19 @@ describe.skipIf(!haveFfmpeg)('reframe on real footage', () => {
     expect([probe(output).width, probe(output).height]).toEqual([90, 160]);
     const [r] = pixel(output, 90, 160, 45, 5);
     expect(r).toBeGreaterThan(150);
+  });
+
+  it('refuses a plan with a mode that cannot move, or a malformed plan, before encoding', async () => {
+    const dir = tmp();
+    const input = path.join(dir, 'in.mp4');
+    fs.writeFileSync(input, 'not decoded');
+    const plan = [{ start: 0, centre_x: 0.3 }];
+    const padded = await editVideo({ op: 'reframe', inputAbsPath: input, outputAbsPath: path.join(dir, 'a.mp4'), aspect: '9:16', mode: 'pad', focusPlan: plan });
+    expect(padded).toMatchObject({ ok: false, errorCode: 'E_EDIT_ARG' });
+    expect((padded as any).message).toMatch(/needs mode crop/);
+    const late = await editVideo({ op: 'reframe', inputAbsPath: input, outputAbsPath: path.join(dir, 'b.mp4'), aspect: '9:16', focusPlan: [{ start: 2, centre_x: 0.3 }] });
+    expect(late).toMatchObject({ ok: false, errorCode: 'E_EDIT_ARG' });
+    expect(fs.existsSync(path.join(dir, 'a.mp4')) || fs.existsSync(path.join(dir, 'b.mp4'))).toBe(false);
   });
 
   it('refuses to write over its own input', async () => {

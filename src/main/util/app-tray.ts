@@ -1,4 +1,5 @@
 import { Menu, nativeImage, Tray } from 'electron';
+import path from 'node:path';
 
 type TrayOptions = {
   platform: NodeJS.Platform;
@@ -26,13 +27,30 @@ export function createOptionalTray({ platform, iconPath, displayName, labels, on
     if (platform === 'darwin') image.setTemplateImage(true);
     tray = new Tray(image);
     tray.setToolTip(displayName);
+    // Native menus accept raster icons; these are exports of the shared
+    // renderer's monitor/log-out glyphs, with 2x representations for Retina.
+    const menuIcon = (name: string) => {
+      try {
+        const icon = nativeImage.createFromPath(path.join(path.dirname(iconPath), `tray-${name}.png`));
+        if (icon.isEmpty()) throw new Error('empty icon');
+        if (platform === 'darwin') icon.setTemplateImage(true);
+        return icon;
+      } catch {
+        warnSafely('tray menu icon unavailable');
+        return undefined;
+      }
+    };
+    const openIcon = menuIcon('open'), quitIcon = menuIcon('quit');
     // Build on each opening so account/language changes cannot leave stale copy.
     // Own both mouse buttons; no second automatic context menu is registered.
     const openMenu = action(() => {
       const text = labels();
+      // Electron exposes no native menu minimum width. Trailing em spaces
+      // leave breathing room after short translations without changing copy.
+      const padding = '\u2003'.repeat(4);
       tray!.popUpContextMenu(Menu.buildFromTemplate([
-        { label: text.open, click: action(onActivate, 'tray activation unavailable') },
-        { label: text.quit, click: action(onQuit, 'tray quit unavailable') },
+        { label: text.open + padding, icon: openIcon, click: action(onActivate, 'tray activation unavailable') },
+        { label: text.quit + padding, icon: quitIcon, click: action(onQuit, 'tray quit unavailable') },
       ]));
     }, 'tray menu unavailable');
     tray.on('click', openMenu);

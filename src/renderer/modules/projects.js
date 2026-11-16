@@ -133,6 +133,7 @@ async function loadProjects(forceRefresh, requireFresh = false) {
     _projectsCache = previousProjects;
   }
   renderProjectsSection();
+  if (refreshed && forceRefresh) void window.TodoDue?.refresh();
   if (typeof window.refreshAutoProjectGroups === 'function') window.refreshAutoProjectGroups();
   return requireFresh && !refreshed ? null : _projectsCache;
 }
@@ -294,7 +295,9 @@ function _renderProjectRow(p, convs) {
   const expanded = !!_projectsExpanded[p.project_id];
   const selected = _isProjectSelected(p.project_id);
   const editing = _projectsInlineRenamePid === p.project_id;
-  const folderIcon = _projectUiIconHtml('folder', 'project-folder-icon');
+  const folderIcon = expanded
+    ? _projectUiIconHtml('folder-open', 'project-folder-icon')
+    : _projectUiIconHtml('folder', 'project-folder-icon');
   const moreTitle = escapeHtml(t('project.menu.more_actions'));
   const safeName = escapeHtml(p.name || '');
   const renameErrorClass = editing && _projectsInlineRenameError ? ' is-error' : '';
@@ -346,7 +349,7 @@ function _renderProjectRow(p, convs) {
       }
     }
     if (typeof _projectConversationHasMore === 'function' && _projectConversationHasMore(p.project_id)) {
-      html += `<button type="button" class="conversation-list-load-more" data-project-conv-more="${escapeHtml(p.project_id)}">
+      html += `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-project-conv-more="${escapeHtml(p.project_id)}">
         ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
     }
     html += '</div>';
@@ -522,7 +525,6 @@ function _bindInlineCreateInput(input) {
     input.disabled = true;
     _projectsInlineCreateError = '';
     const requestId = ++_projectsInlineCreateRequestId;
-    const startedAt = performance.now();
     try {
       const res = await window.orkas.invoke('projects.create', { name });
       if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
@@ -634,7 +636,6 @@ function _bindInlineRenameInput(input) {
     input.disabled = true;
     _projectsInlineRenameError = '';
     const requestId = ++_projectsInlineRenameRequestId;
-    const startedAt = performance.now();
     try {
       const res = await window.orkas.invoke('projects.rename', { projectId: pid, name: next });
       if (
@@ -878,7 +879,6 @@ async function _confirmDeleteProject(pid, source = 'sidebar') {
   });
   if (!ok) return;
 
-  const startedAt = performance.now();
   let deleted = false;
   try {
     const res = await window.orkas.invoke('projects.delete', { projectId: pid });
@@ -926,8 +926,8 @@ async function _confirmDeleteProject(pid, source = 'sidebar') {
       ));
     }
   } catch (err) {
-    // The delete already committed and its terminal success was emitted. A presentation refresh
-    // failure is local diagnostics only and must not turn the mutation into a second failure row.
+    // Deletion already committed. A presentation refresh failure must not
+    // turn the successful mutation into a user-visible failure.
     _projectsLog.warn('refresh after project delete failed', err);
   }
 }
@@ -969,7 +969,9 @@ window.openProjectsSurface = async function openProjectsSurface(request) {
   if (action === 'configure') {
     const projectId = String(request.target_id || '').trim();
     if (!projectId) return false;
+    const account = typeof currentUserId === 'string' ? currentUserId : '';
     const projects = await loadProjects(true, true);
+    if (account !== (typeof currentUserId === 'string' ? currentUserId : '')) return false;
     const exists = Array.isArray(projects)
       && projects.some((project) => project && project.project_id === projectId);
     if (!exists || typeof setView !== 'function') return false;
@@ -995,19 +997,6 @@ function _applyProjectRename(projectId, name) {
 
 // ── Init ────────────────────────────────────────────────────────────────
 
-function _applyProjectRename(projectId, name) {
-  const cached = Array.isArray(_projectsCache)
-    ? _projectsCache.find((project) => project?.project_id === projectId) : null;
-  if (cached) cached.name = name;
-  // Update only the title; reloading the detail would replace active editors.
-  if (typeof _projectDetailPid !== 'undefined' && _projectDetailPid === projectId
-      && typeof _projectDetailMeta !== 'undefined' && _projectDetailMeta?.project) {
-    _projectDetailMeta.project.name = name;
-    const title = document.getElementById('project-detail-title');
-    if (title) title.textContent = name;
-  }
-  renderProjectsSection();
-}
 
 async function _applyHostProjectRename(payload) {
   if (!payload || typeof currentUserId === 'undefined' || payload.userId !== currentUserId

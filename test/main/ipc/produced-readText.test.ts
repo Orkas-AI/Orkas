@@ -2,151 +2,99 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { expectTestLog } from '../../helpers/test-log-analysis';
+import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
+import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
-
-vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
-}));
 
 // Mock electron — the IPC router imports `shell` / `dialog` / `ipcMain` at
 // module load, none of which are exercised by the readText handler.
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   ipcMain: { handle: vi.fn(), on: vi.fn() },
   dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] })) },
-  BrowserWindow: { getFocusedWindow: vi.fn(() => null) },
+  BrowserWindow: { getAllWindows: vi.fn(() => []), getFocusedWindow: vi.fn(() => null) },
   shell: { showItemInFolder: vi.fn(), openPath: vi.fn(async () => '') },
 }));
 
 let tmpDir: string;
+let sourceDir: string;
+let closeLogWorkers: () => Promise<void>;
 let prevWs: string | undefined;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-readText-'));
+  sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-readText-external-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  vi.clearAllMocks();
+  closeLogWorkers = await captureMainLogWorkers();
 });
 
 afterEach(async () => {
   await drainMainRuntimeForTest();
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  await closeLogWorkers();
+  if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+  else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  fs.rmSync(sourceDir, { recursive: true, force: true });
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-// The IPC table in ipc/index.ts isn't exported per-handler, so — same
-// pattern as workspace-reveal.test.ts — reproduce the handler body
-// inline using the same modules the real handler imports. If the source
-// drifts the test must drift with it; the unit-test triage explicitly
-// covers this kind of multi-branch decision function (CLAUDE.md §9).
-async function callReadText(
-  userId: string,
-  input: { path?: unknown; cid?: unknown; htmlPreviewLayoutOnly?: unknown },
-): Promise<{
-  ok: boolean;
-  error?: string;
-  size?: number;
-  cap?: number;
-  text?: string;
-  layout?: { kind: 'fixed-canvas'; width: number; height: number } | null;
-}> {
-  const userWorkspace = await import('../../../src/main/features/user_workspace');
-  const { chatAttachmentDir } = await import('../../../src/main/paths');
-  const { safeId } = await import('../../../src/main/storage');
-  const { isPathAllowed } = await import('../../../src/main/util/path-sandbox');
-
-  const target = input?.path;
-  if (typeof target !== 'string' || !target) return { ok: false, error: 'missing path' };
-  const ws = userWorkspace.getWorkspacePath(userId);
-  const norm = path.resolve(target);
-  const cidRaw = input?.cid;
-  const attachmentScope = (typeof cidRaw === 'string' && cidRaw && safeId(cidRaw))
-    ? path.resolve(chatAttachmentDir(userId, cidRaw))
-    : null;
-  // Mirrors `ipc/index.ts::produced.readText`: delegate the symlink-safe
-  // sandbox check to `util/path-sandbox.isPathAllowed`. Drift here = drift
-  // from the real handler.
-  const allowedRoots: string[] = [path.resolve(ws)];
-  if (attachmentScope) allowedRoots.push(attachmentScope);
-  if (!isPathAllowed(norm, allowedRoots)) {
-    return { ok: false, error: 'path is outside the user workspace' };
-  }
-  let st: fs.Stats;
-  try { st = fs.statSync(norm); }
-  catch { return { ok: false, error: 'not_found' }; }
-  if (!st.isFile()) return { ok: false, error: 'not_found' };
-  const MAX_TEXT_BYTES = 2 * 1024 * 1024;
-  const htmlPreviewLayoutOnly = input?.htmlPreviewLayoutOnly === true;
-  if (!htmlPreviewLayoutOnly && st.size > MAX_TEXT_BYTES) {
-    return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
-  }
-  if (htmlPreviewLayoutOnly) {
-    const stream = fs.createReadStream(norm, { encoding: 'utf8', highWaterMark: 64 * 1024 });
-    const rootPattern = /<[^>]*\b(?:data-preview-layout\s*=\s*["']fixed-canvas["']|data-composition-id\s*=\s*["'][^"']+["'])[^>]*>/i;
-    let carry = '';
-    let layout: { kind: 'fixed-canvas'; width: number; height: number } | null = null;
-    const validLayout = (widthValue: unknown, heightValue: unknown) => {
-      const width = Number(widthValue);
-      const height = Number(heightValue);
-      if (!Number.isInteger(width) || !Number.isInteger(height)
-          || width < 16 || width > 7680 || height < 16 || height > 7680
-          || width * height > 16_777_216) return null;
-      return { kind: 'fixed-canvas' as const, width, height };
-    };
-    try {
-      for await (const chunk of stream) {
-        const combined = carry + String(chunk);
-        const match = combined.match(rootPattern);
-        if (match) {
-          const attrNumber = (name: string) => {
-            const attr = match[0].match(new RegExp(`\\b${name}\\s*=\\s*["'](\\d+(?:\\.\\d+)?)["']`, 'i'));
-            return attr ? Number(attr[1]) : 0;
-          };
-          layout = validLayout(
-            attrNumber('data-preview-width') || attrNumber('data-width'),
-            attrNumber('data-preview-height') || attrNumber('data-height'),
-          );
-          break;
-        }
-        const lastOpen = combined.lastIndexOf('<');
-        carry = lastOpen >= 0 ? combined.slice(lastOpen) : '';
-        if (carry.length > 64 * 1024) carry = '';
-      }
-    } finally {
-      if (!stream.closed) {
-        await new Promise<void>((resolve) => {
-          stream.once('close', resolve);
-          stream.destroy();
-        });
-      }
-    }
-    if (!layout) {
-      const projectDir = path.dirname(norm);
-      const manifestPath = path.join(projectDir, 'image-manifest.json');
-      try {
-        const manifestStat = fs.lstatSync(manifestPath);
-        if (manifestStat.isFile() && !manifestStat.isSymbolicLink() && manifestStat.size <= 256 * 1024) {
-          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-          const entry = typeof manifest.entry === 'string' && manifest.entry.trim()
-            ? manifest.entry.trim()
-            : 'index.html';
-          const entryAbs = path.resolve(projectDir, entry);
-          const width = Number(manifest.canvas?.width);
-          const height = Number(manifest.canvas?.height);
-          if (isPathAllowed(entryAbs, [projectDir])
-              && entryAbs === norm) {
-            layout = validLayout(width, height);
-          }
-        }
-      } catch { /* no valid ImageStudio manifest */ }
-    }
-    return { ok: true, layout, size: st.size };
-  }
-  let text = fs.readFileSync(norm, 'utf8');
-  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-  return { ok: true, text, size: st.size };
+// Dispatch through the registered production IPC route so scope and content
+// checks cannot silently diverge from the handler the renderer actually uses.
+async function callPreviewIpc(userId: string, channel: string, input: Record<string, unknown>, sender = trustedIpcSender()): Promise<any> {
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(userId);
+  const electron = await import('electron') as any;
+  const { register } = await import('../../../src/main/ipc/index');
+  register();
+  const entry = electron.ipcMain.handle.mock.calls.find(([name]: [string]) => name === 'orkas.invoke');
+  expect(entry).toBeTruthy();
+  return entry[1]({ sender }, { channel, payload: input });
+}
+function callReadText(userId: string, input: { path?: unknown; cid?: unknown; htmlPreviewLayoutOnly?: unknown }) {
+  return callPreviewIpc(userId, 'produced.readText', input);
 }
 
 describe('produced.readText › scope', () => {
+  it('previews an external file without importing it and keeps mutation denied', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.writeText failed \{$/ });
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.deletePath failed \{$/ });
+    const file = path.join(sourceDir, 'outside.md');
+    fs.writeFileSync(file, '# External reference');
+    await expect(callReadText('reader', { path: file }))
+      .resolves.toMatchObject({ ok: true, text: '# External reference' });
+    await expect(callPreviewIpc('reader', 'workspace.statPath', { path: file }))
+      .resolves.toMatchObject({ ok: true, exists: true, readOnly: true });
+    for (const channel of ['produced.writeText', 'workspace.deletePath']) {
+      await expect(callPreviewIpc('reader', channel, { path: file, content: 'replacement' }))
+        .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    }
+    expect(fs.readFileSync(file, 'utf8')).toBe('# External reference');
+  });
+
+  it('rejects another account attachment even with a matching conversation id', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{$/ });
+    const { chatAttachmentDir } = await import('../../../src/main/paths');
+    const cid = 'foreign-conversation';
+    const directory = chatAttachmentDir('foreign-user', cid);
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, 'private.txt');
+    fs.writeFileSync(file, 'private foreign attachment');
+    await expect(callReadText('reader', { path: file, cid }))
+      .resolves.toMatchObject({ ok: false, error: 'path is outside the user workspace' });
+    expect(fs.readFileSync(file, 'utf8')).toBe('private foreign attachment');
+  });
+
+  it('rejects external reads from an untrusted renderer', async () => {
+    const file = path.join(sourceDir, 'outside.md');
+    fs.writeFileSync(file, 'retained source');
+    await expect(callPreviewIpc('reader', 'produced.readText', { path: file }, { getURL: () => 'https://example.com' }))
+      .resolves.toMatchObject({ ok: false, code: 'E_IPC_SENDER' });
+    expect(fs.readFileSync(file, 'utf8')).toBe('retained source');
+  });
+
   it('reads a markdown file inside the user workspace', async () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const dir = path.join(tmpDir, 'ws');
@@ -179,6 +127,7 @@ describe('produced.readText › scope', () => {
   });
 
   it('rejects an attachment-dir path when cid is omitted', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{$/ });
     // Without cid the scope unions to workspace only. Files in
     // chat_attachments/<cid>/ are not visible — even though the user owns them.
     const ws = await import('../../../src/main/features/user_workspace');
@@ -197,7 +146,8 @@ describe('produced.readText › scope', () => {
     expect(res.error).toMatch(/outside/);
   });
 
-  it('rejects a path outside the workspace AND outside the attachment dir', async () => {
+  it('keeps unscoped app-managed files private', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{$/ });
     const ws = await import('../../../src/main/features/user_workspace');
     const dir = path.join(tmpDir, 'ws');
     fs.mkdirSync(dir, { recursive: true });
@@ -211,6 +161,7 @@ describe('produced.readText › scope', () => {
   });
 
   it('rejects a missing path argument', async () => {
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{$/ });
     const res = await callReadText('u5', {});
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/missing path/);

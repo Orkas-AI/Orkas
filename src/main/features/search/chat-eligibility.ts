@@ -17,7 +17,7 @@ export async function chatEligibility(
   const excluded = new Set<string>();
   const live = new Set<string>();
   for (const row of rows) {
-    if (row.deleted || (row.project_id && !projectIds.has(row.project_id))) excluded.add(row.conversation_id);
+    if (row.hidden || row.deleted || (row.project_id && !projectIds.has(row.project_id))) excluded.add(row.conversation_id);
     else live.add(row.conversation_id);
   }
   try {

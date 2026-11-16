@@ -3,13 +3,13 @@ import type { WebContents } from 'electron';
 import { describe, expect, it, vi } from 'vitest';
 import { attachWebAssistDialogs, interruptOnWebAssistDialog, WebAssistDialogOpenedError, webAssistDialogs } from '../../../src/main/features/web_assist_dialogs';
 
-function browser() {
+function browser(autoDismissAlerts = () => true) {
   let owner: string | undefined = 'run-one';
   const page = Object.assign(new EventEmitter(), { ipc: new EventEmitter(), mainFrame: {} });
   const native = vi.fn((_info, callback) => callback(false, ''));
   page.on('-run-dialog', native);
   const changed = vi.fn();
-  const controller = attachWebAssistDialogs(page as WebContents, () => owner, changed)!;
+  const controller = attachWebAssistDialogs(page as WebContents, () => owner, changed, autoDismissAlerts)!;
   const show = (type = 'confirm', message = 'Continue?', value = '') => {
     const reply = vi.fn();
     page.emit('-run-dialog', { dialogType: type, messageText: message, defaultPromptText: value,
@@ -20,6 +20,19 @@ function browser() {
 }
 
 describe('task-scoped native dialog decisions and recovery', () => {
+  it('holds an alert outside AI control until one explicit acknowledgement, without opening native UI', () => {
+    const b = browser(() => false);
+    const reply = b.show('alert', 'Submission failed');
+    const pending = b.controller.pending()!;
+    expect(pending.info.messageText).toBe('Submission failed');
+    expect(reply).not.toHaveBeenCalled();
+    expect(b.controller.act(pending.id, 'click', 'e2')).toMatchObject({ ok: false });
+    expect(b.controller.act(pending.id, 'press', undefined, undefined, 'Escape')).toMatchObject({ ok: true });
+    expect(reply).toHaveBeenCalledExactlyOnceWith(true, '');
+    expect(b.controller.act(pending.id, 'click', 'e1')).toMatchObject({ code: 'stale_page' });
+    expect(b.native).not.toHaveBeenCalled();
+    b.controller.dispose();
+  });
   it('does not replace an unknown or absent native handler layout', () => {
     const page = new EventEmitter();
     expect(attachWebAssistDialogs(page as WebContents, () => 'run', vi.fn())).toBeUndefined();

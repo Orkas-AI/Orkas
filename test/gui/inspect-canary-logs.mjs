@@ -1,3 +1,5 @@
+import { ELECTRON_MACOS_TASK_POLICY_WARNING_RE } from '../../scripts/model-eval-log-policy.mjs';
+
 // Linux source builds retain these diagnostics in the successful main baseline
 // (GitHub Actions run 34550610580). They are warnings, not clean-runtime evidence.
 // Application sharp operations now run outside Electron; GLib collisions fail.
@@ -13,7 +15,9 @@ export function reviewInspectStderr(stderr, platform = process.platform) {
   let unexpected = 0;
   for (const line of stderr.split(/\r?\n/)) {
     if (!line.trim()) continue;
-    const match = platform === 'linux' && knownLinux.find(([, pattern]) => pattern.test(line));
+    const known = platform === 'linux' ? knownLinux : platform === 'darwin'
+      ? [['macos-task-policy', ELECTRON_MACOS_TASK_POLICY_WARNING_RE, 4]] : [];
+    const match = known.find(([, pattern]) => pattern.test(line));
     if (!match) { unexpected++; continue; }
     const [name, , limit] = match;
     warnings[name] = (warnings[name] || 0) + 1;

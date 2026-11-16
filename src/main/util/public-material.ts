@@ -1,4 +1,4 @@
-import * as fs from 'node:fs';
+import { fileSystemForPath } from './user-file-fs';
 import * as path from 'node:path';
 import { createPublicKey, X509Certificate } from 'node:crypto';
 
@@ -43,6 +43,7 @@ export function isVerifiedPublicMaterial(file: string): boolean {
   const template = /^\.env\.(?:example|sample|template)$/i.test(path.basename(file));
   if (!/\.(?:pub|pem)$/i.test(file) && !template) return false;
   try {
+    const fs = fileSystemForPath(file);
     const st = fs.lstatSync(file);
     if (!st.isFile() || st.nlink !== 1 || st.size > 64 * 1024) return false;
     if (st.size === 0) return template;

@@ -15,6 +15,31 @@ import {
 } from '../../../src/main/util/log-redact';
 
 describe('log-redact', () => {
+  it('retains actionable closed diagnostics without changing legacy summaries', () => {
+    const error = Object.assign(new SyntaxError('sampling private-configuration'), { code: 'EACCES', statusCode: 503 });
+    const legacy = logErrorSummary(error);
+    const closed = logErrorSummary(error, { closed: true });
+    expect(closed).toEqual({ error_type: 'SyntaxError', error_code: 'EACCES', status: 503,
+      message_hash: legacy.message_hash, message_chars: legacy.message_chars });
+    expect(legacy).toMatchObject({ name: 'SyntaxError', code: 'EACCES', status: 503 });
+    expect(logErrorSummary(Object.assign(new Error(error.message), { code: 'ENOENT' }), { closed: true }))
+      .toMatchObject({ error_type: 'Error', error_code: 'ENOENT', message_hash: closed.message_hash });
+    expect(JSON.stringify(closed)).not.toMatch(/sampling|private-configuration/);
+  });
+
+  it.each([0, 99, 600, '503'])('rejects non-HTTP status %s and arbitrary exception identifiers', status => {
+    const error = { name: 'TaskTurnError', code: 'sampling_failed', status, message: 'private payload' };
+    expect(logErrorSummary(error, { closed: true })).toEqual({ error_type: 'exception', error_code: 'operation_failed',
+      message_hash: expect.stringMatching(/^[a-f0-9]{12}$/), message_chars: 15 });
+  });
+
+  it('tolerates throwing getters without invoking arbitrary exception coercion in closed diagnostics', () => {
+    const error = { get name() { throw new Error('private'); }, code: { toString() { throw new Error('private'); } },
+      get message() { throw new Error('private'); }, status: 599 };
+    expect(logErrorSummary(error, { closed: true })).toMatchObject({ error_type: 'exception', error_code: 'operation_failed', status: 599, message_chars: 0 });
+  });
+
+
   it('summarizes local and legacy cloud paths without exposing filenames or ids', () => {
     const ref = logPathRef('cloud/chats/private-conversation-title.jsonl');
     expect(ref).toMatchObject({ domain: 'chats', depth: 3, ext: '.jsonl' });
@@ -96,6 +121,21 @@ describe('log-redact', () => {
     expect(serialized).not.toContain('/Users/test');
     expect(serialized).not.toContain('Private Clips');
     expect(serialized).not.toContain('not-a-directory');
+  });
+
+  it('keeps malformed Basic authentication private in failed-request diagnostics', () => {
+    const value = Buffer.from('synthetic-only').toString('base64');
+    const ref = logErrorRef(new Error(`request rejected Authorization: Basic ${value}`));
+    expect(ref.message).toBe('request rejected Authorization: Basic ***');
+    expect(JSON.stringify(ref)).not.toContain(value);
+    expect(sanitizeLogText('falling back to basic retrieval')).toBe('falling back to basic retrieval');
+  });
+
+  it('keeps escaped and truncated quoted credentials out of error references', () => {
+    const ref = logErrorRef(new Error(String.raw`request failed password="private\" tail" status=401`));
+    expect(ref.message).toBe('request failed password=*** status=401');
+    expect(sanitizeLogText('request token="unfinished private value\nstatus=401'))
+      .toBe('request token=***\nstatus=401');
   });
 
   it('preserves safe URLs adjacent to cloud paths while redacting secrets', () => {

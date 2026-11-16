@@ -1,23 +1,20 @@
 ---
 name: product-dev
-description_zh: "在现有仓库中按明确需求实现功能、修复缺陷、重构或形成技术决策，并交付验证证据；不用于模糊需求探索、一次性演示或仓库运营。"
-description_en: "Deliver verified features, bug fixes, refactors and technical decisions in an existing repository from clear requirements; not vague discovery, disposable demos or repository operations."
+description_zh: "在工作区或仓库中按明确需求实现功能、原型、Demo、小工具，修复缺陷、重构或形成技术决策，并交付验证证据；不用于模糊需求探索或仓库运营。"
+description_en: "Deliver verified features, prototypes, demos, small tools, bug fixes, refactors and technical decisions in a workspace or repository from clear requirements; not vague discovery or repository operations."
 ---
 
 # Product development
 
-Deliver scoped repository changes or technical decisions with verification evidence.
-Product discovery, disposable prototypes, product acceptance design, and repository
-operations belong to their respective capabilities.
+Deliver scoped implementations or technical decisions with verification evidence.
+Product discovery, product acceptance design, and repository operations belong to
+their respective capabilities.
 
 ## Scope
 
 - If the user, problem, outcome, or success criteria still require a product
   decision, identify the missing choice and route to requirements discovery;
   do not invent an MVP, PRD, scope, architecture, or code.
-- For a disposable demo, hand off to prototyping with the time box, clickability,
-  disposable nature, and validation question intact; do not produce implementation
-  artifacts through the production-development workflow.
 - Review or diagnosis alone does not authorize edits. This Skill grants no
   commit, push, publication, or external-action authority.
 

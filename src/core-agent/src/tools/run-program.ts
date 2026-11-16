@@ -9,6 +9,7 @@ import {
   type ToolContext,
   type ToolObservations,
   type ToolResult,
+  type ToolResultImage,
 } from "./base.js";
 
 export const RUN_PROGRAM_TOOL_NAME = "run_program";
@@ -294,6 +295,9 @@ async function runProgram(
   const failedChildTools = new Map<string, number>();
   let lastChildFailure: ProgramChildFailure | undefined;
   let aggregateToolResultBytes = 0;
+  // Previews stay in the Host. Only the final ordinary ToolResult carries
+  // them to Session; neither the Worker nor QuickJS receives their bytes.
+  const previewImages = new Map<number, ToolResultImage[]>();
   let disposed = false;
 
   const observeChildFailure = (name: string): void => {
@@ -309,7 +313,10 @@ async function runProgram(
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([name, count]) => ({ name, count })),
     };
-    return { ...result, observations };
+    const images = [...previewImages.entries()]
+      .sort(([left], [right]) => left - right)
+      .flatMap(([, images]) => images);
+    return { ...result, ...(images.length ? { images } : {}), observations };
   };
 
   const executionReceipt = (error?: ProgramErrorDiagnostic): ProgramExecutionReceipt => ({
@@ -522,6 +529,9 @@ async function runProgram(
         throw setFatal({ code: outcome.code, reason: outcome.reason, directCallAllowed: true });
       }
       completedToolCalls += 1;
+      // The executor already committed these effects, even if its preview
+      // exceeds the transport limit. Preserve the receipt without replay.
+      mergeObservations(observations, outcome.result.observations);
       if (outcome.result.isError) {
         failedToolCalls += 1;
         observeChildFailure(name);
@@ -540,8 +550,16 @@ async function runProgram(
         ...(outcome.result.displayName ? { displayName: outcome.result.displayName } : {}),
         ...programArtifactIdentities(outcome.result.observations, parentCtx.workingDir),
       };
+      if (outcome.result.imageRetention === "active_turn") {
+        if (!outcome.result.isError) failedToolCalls += 1;
+        lastChildFailure = { tool: name, call: callNumber, code: "E_PROGRAM_IMAGE_RETENTION",
+          message: "Active-turn reference images require a direct tool call." };
+        throw setFatal({ code: "E_PROGRAM_IMAGE_RETENTION", reason: lastChildFailure.message, directCallAllowed: true });
+      }
       const contentBytes = Buffer.byteLength(outcome.result.content, "utf8");
-      if (contentBytes > limits.maxToolResultBytes) {
+      const images = outcome.result.images ?? [];
+      const imageBytes = previewImageBytes(images, limits.maxToolResultBytes);
+      if (contentBytes + imageBytes > limits.maxToolResultBytes) {
         if (!outcome.result.isError) failedToolCalls += 1;
         lastChildFailure = {
           tool: name,
@@ -558,7 +576,7 @@ async function runProgram(
       const artifactBytes = childResult.artifacts
         ? Buffer.byteLength(JSON.stringify(childResult.artifacts), "utf8")
         : 0;
-      aggregateToolResultBytes += contentBytes + artifactBytes;
+      aggregateToolResultBytes += contentBytes + imageBytes + artifactBytes;
       if (aggregateToolResultBytes > limits.maxAggregateToolResultBytes) {
         if (!outcome.result.isError) failedToolCalls += 1;
         lastChildFailure = {
@@ -573,12 +591,31 @@ async function runProgram(
           directCallAllowed: true,
         });
       }
-      mergeObservations(observations, outcome.result.observations);
+      if (images.length) previewImages.set(callNumber, images.map(image => ({
+        data: image.data, mediaType: image.mediaType,
+        ...(image.analysisMode ? { analysisMode: image.analysisMode } : {}),
+      })));
       return childResult;
     } finally {
       release();
     }
   }
+}
+
+/** Count the encoded image envelope without copying Base64 payloads into
+ * another JSON string. Base64 bytes need no JSON escaping. Stop as soon as
+ * the existing per-result limit is exceeded. */
+function previewImageBytes(images: ToolResultImage[], limit: number): number {
+  let bytes = images.length ? 2 : 0;
+  for (let index = 0; index < images.length; index++) {
+    const image = images[index];
+    bytes += (index ? 1 : 0) + Buffer.byteLength(image.data, "utf8")
+      + Buffer.byteLength(JSON.stringify({ data: "", mediaType: image.mediaType,
+        ...(image.analysisMode ? { analysisMode: image.analysisMode } : {}),
+      }), "utf8");
+    if (bytes > limit) break;
+  }
+  return bytes;
 }
 
 function programmaticToolNames(listToolNames: () => string[]): string[] {

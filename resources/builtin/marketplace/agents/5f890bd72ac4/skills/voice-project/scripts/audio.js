@@ -7,6 +7,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { createReadStream } = require('node:fs');
+const processing = require('./processing.js');
+const transfer = require('./transfer.js');
+const composition = require('./composition.js');
+const wordEdits = require('./word-edits.js');
 
 function fail(code, message) { throw Object.assign(new Error(message), { code }); }
 function num(value, fallback, min, max) {
@@ -35,18 +39,24 @@ async function local(root, name, output = false) {
     }
   }
 }
-async function json(file) {
-  if ((await fs.stat(file)).size > 4 * 1024 * 1024) fail('E_SIZE', 'Project metadata exceeds 4 MB.');
-  return JSON.parse(await fs.readFile(file, 'utf8'));
+async function json(file, withIdentity = false) {
+  const maxBytes = 4 * 1024 * 1024;
+  if ((await fs.stat(file)).size > maxBytes) fail('E_SIZE', 'Project metadata exceeds 4 MB.');
+  const bytes = await fs.readFile(file);
+  if (bytes.length > maxBytes) fail('E_SIZE', 'Project metadata exceeds 4 MB.');
+  const data = JSON.parse(bytes.toString('utf8'));
+  // Parse and attest one revision, including when a legal replacement arrives
+  // after the read. Word editing rechecks this identity before publication.
+  return withIdentity ? { data, sha256: crypto.createHash('sha256').update(bytes).digest('hex') } : data;
 }
 async function atomic(file, value) {
   const temp = `${file}.${crypto.randomUUID()}.tmp`;
   try { await fs.writeFile(temp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' }); await fs.rename(temp, file); }
   finally { await fs.rm(temp, { force: true }); }
 }
-async function digest(file) {
+async function digest(file, signal) {
   const hash = crypto.createHash('sha256');
-  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  for await (const chunk of createReadStream(file)) { signal?.throwIfAborted(); hash.update(chunk); }
   return hash.digest('hex');
 }
 async function declareAudioText(dir, files) {
@@ -88,16 +98,24 @@ function run(executable, args, signal, timeout = 30 * 60 * 1000) {
     });
   });
 }
-async function probe(file, signal) {
-  const result = await run(await binary('ORKAS_BUNDLED_FFPROBE'), ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,sample_rate,channels', '-of', 'json', file], signal, 60000);
+async function probe(file, signal, restricted = false) {
+  const result = await run(await binary('ORKAS_BUNDLED_FFPROBE'), ['-v', 'error', ...(restricted ? composition.MEDIA_INPUT : []), '-show_entries', 'format=duration:stream=index,codec_type,codec_name,sample_rate,channels,duration:stream_tags=language', '-of', 'json', file], signal, 60000);
   const data = JSON.parse(result.stdout);
   const audio = data.streams?.find(stream => stream.codec_type === 'audio');
   const duration = Number(data.format?.duration);
   if (!audio || !(duration > 0) || !Number.isFinite(duration)) fail('E_NO_AUDIO', 'The file has no readable audio with a finite duration.');
-  return { duration_sec: duration, sample_rate: Number(audio.sample_rate), channels: Number(audio.channels) };
+  return { duration_sec: duration, sample_rate: Number(audio.sample_rate), channels: Number(audio.channels),
+    audio_streams: data.streams.filter(stream => stream.codec_type === 'audio').map((stream, audio_stream) => ({
+      audio_stream, codec: stream.codec_name, sample_rate: Number(stream.sample_rate), channels: Number(stream.channels), ...(stream.tags?.language ? { language: stream.tags.language } : {}),
+    })) };
 }
 function validate(plan) {
-  if (plan.schema_version !== 1 || !Array.isArray(plan.segments) || plan.segments.length > 200) fail('E_PLAN', 'Use schema_version 1 and at most 200 segments; split longer work into chapters.');
+  if (![1, 2, 3].includes(plan.schema_version) || !Array.isArray(plan.segments) || plan.segments.length > 200) fail('E_PLAN', 'Use schema_version 1, 2 or 3 and at most 200 segments; split longer work into chapters.');
+  if (plan.processing !== undefined) {
+    if (plan.schema_version < 2) fail('E_PLAN', 'Processing steps require schema_version 2 or 3; preserve the original project when upgrading.');
+    processing.settings(plan.processing);
+  }
+  if (plan.export !== undefined) transfer.settings(plan.export);
   const ids = new Set();
   for (const s of plan.segments) {
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(s.id || '') || ids.has(s.id)) fail('E_PLAN', 'Each segment needs a unique alphanumeric id.');
@@ -115,8 +133,13 @@ function validate(plan) {
     if (s.end_sec !== undefined && num(s.end_sec, 0, 0, 14400) <= (s.start_sec ?? 0)) fail('E_PLAN', 'end_sec must be after start_sec.');
     num(s.fade_in_sec, 0, 0, 60); num(s.fade_out_sec, 0, 0, 60);
     if (s.denoise !== undefined && typeof s.denoise !== 'boolean') fail('E_PLAN', 'denoise must be boolean.');
+    if (s.word_edit !== undefined) {
+      if (plan.schema_version !== 3 || typeof s.path !== 'string') fail('E_WORD_EDIT', 'Word edits require schema 3 and a recorded source segment.');
+      wordEdits.settings(s.word_edit);
+    }
   }
-  if (plan.music) { if (typeof plan.music.path !== 'string') fail('E_PLAN', 'Music needs a local path.'); num(plan.music.volume, 0.15, 0, 2); }
+  if (plan.music) { if (typeof plan.music.path !== 'string') fail('E_PLAN', 'Music needs a local path.'); num(plan.music.volume, 0.15, 0, 2); transfer.duck(plan.music.duck); }
+  composition.validate(plan);
   return plan;
 }
 function speechIdentity(plan, s) {
@@ -136,7 +159,7 @@ async function rowsFor(root, plan, state, signal) {
   const rows = [];
   const probes = new Map(), digests = new Map();
   const measured = async file => {
-    if (!probes.has(file)) probes.set(file, await probe(file, signal));
+    if (!probes.has(file)) probes.set(file, await probe(file, signal, plan.schema_version === 3));
     return probes.get(file);
   };
   for (const s of plan.segments) {
@@ -167,28 +190,73 @@ function stamp(seconds) {
 }
 function subtitles(segments) { return segments.map((s, i) => `${i + 1}\n${stamp(s.start_sec)} --> ${stamp(s.end_sec)}\n${s.text.trim()}\n`).join('\n'); }
 function whisperSegments(data) {
-  if (!Array.isArray(data.transcription)) fail('E_TRANSCRIPT', 'Whisper returned no segment array.');
+  if (!data || !Array.isArray(data.transcription)) fail('E_TRANSCRIPT', 'Whisper returned no segment array.');
+  if (data.transcription.some(s => !s || typeof s !== 'object' || typeof s.text !== 'string')) fail('E_TRANSCRIPT', 'Whisper returned invalid segment timing.');
+  const seconds = value => typeof value === 'number' || typeof value === 'string' && value.trim() ? Number(value) / 1000 : NaN;
   return data.transcription.filter(s => typeof s.text === 'string' && s.text.trim()).map(s => {
-    const start = Number(s.offsets?.from) / 1000, end = Number(s.offsets?.to) / 1000;
+    const start = seconds(s.offsets?.from), end = seconds(s.offsets?.to);
     if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) fail('E_TRANSCRIPT', 'Whisper returned invalid segment timing.');
     return { start_sec: start, end_sec: end, text: s.text.trim() };
   });
 }
+function segmentTiming(segments, duration) {
+  let previous = 0;
+  for (const s of segments) {
+    // Match the existing word-timing millisecond precision allowance.
+    if (s.start_sec < previous || s.end_sec <= s.start_sec || s.end_sec > duration + .001) fail('E_TRANSCRIPT', 'Whisper returned invalid segment timing.');
+    previous = s.end_sec;
+  }
+  return segments;
+}
 async function transcribe(root, input, signal) {
+  if (input.granularity !== undefined && !['segment', 'word'].includes(input.granularity)) fail('E_INPUT', 'Choose segment or word transcription granularity.');
   const source = await local(root, input.input_path);
-  await probe(source, signal);
+  if (input.granularity === 'word') {
+    const info = await fs.stat(source);
+    if (!info.isFile() || info.size > 8 * 1024 ** 3) fail('E_SIZE', 'Use a regular recording up to 8 GiB for word transcription.');
+  }
+  const meta = await probe(source, signal, input.granularity === 'word');
+  if (input.granularity === 'word' && meta.audio_streams.length !== 1) fail('E_AUDIO_TRACK', 'Extract the desired audio stream before word transcription.');
+  if (input.granularity === 'word' && meta.duration_sec > 14400) fail('E_DURATION', 'Split word transcription into chapters up to four hours.');
+  const sourceHash = await digest(source, signal);
   const ffmpeg = await binary('ORKAS_BUNDLED_FFMPEG'), whisper = await binary('ORKAS_WHISPER_CPP'), model = await binary('ORKAS_WHISPER_MODEL');
   const dir = await fs.mkdtemp(path.join(root, 'transcript-'));
   try {
-    await run(ffmpeg, ['-v', 'error', '-nostdin', '-i', source, '-vn', '-ac', '1', '-ar', '16000', path.join(dir, 'input.wav')], signal);
+    await run(ffmpeg, ['-v', 'error', '-nostdin', ...(input.granularity === 'word' ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-ac', '1', '-ar', '16000', path.join(dir, 'input.wav')], signal);
+    // Bind the decoded input before recognition. Later source edits belong to
+    // another version and must neither relabel nor discard this attempt.
+    if (await digest(source, signal) !== sourceHash) fail('E_TRANSCRIPT_STALE', 'The recording changed during transcription; transcribe the preserved current source.');
+    // Container duration can follow a longer video track. Validate against the
+    // exact decoded audio sent to recognition, not the container's end time.
+    const decoded = await probe(path.join(dir, 'input.wav'), signal);
     await run(whisper, ['-m', model, '-f', path.join(dir, 'input.wav'), '-l', input.language || 'auto', '-oj', '-of', path.join(dir, 'raw'), '-np',
+      ...(input.granularity === 'word' ? ['-ml', '1'] : []),
       // The bundled Intel macOS Metal backend can return corrupt recognition.
       ...(process.platform === 'darwin' && process.arch === 'x64' ? ['-ng'] : [])], signal);
-    const segments = whisperSegments(await json(path.join(dir, 'raw.json')));
+    const raw = await json(path.join(dir, 'raw.json'));
+    let segments;
+    try {
+      segments = whisperSegments(raw);
+      segments = input.granularity === 'word'
+        ? wordEdits.fromSegments(segments, decoded.duration_sec)
+        : segmentTiming(segments, decoded.duration_sec);
+    } catch (err) {
+      if (!['E_TRANSCRIPT', 'E_WORD_EDIT'].includes(err.code) || !Array.isArray(raw.transcription)) throw err;
+      const text = raw.transcription.filter(s => s && typeof s.text === 'string' && s.text.trim()).map(s => s.text.trim()).join('\n');
+      if (!text) throw err;
+      // Preserve wording without publishing an invalid timed JSON/SRT or
+      // silently trimming words, reordering cues, or replaying recognition.
+      await fs.writeFile(path.join(dir, 'transcript.txt'), text + '\n');
+      await declareAudioText(dir, ['transcript.txt']);
+      await fs.rm(path.join(dir, 'input.wav')); await fs.rm(path.join(dir, 'raw.json'));
+      signal?.throwIfAborted();
+      return { ok: false, code: err.code, message: err.message, files: [path.relative(root, path.join(dir, 'transcript.txt'))] };
+    }
     const text = segments.map(s => s.text).join('\n');
     await fs.writeFile(path.join(dir, 'transcript.txt'), text + '\n');
     await fs.writeFile(path.join(dir, 'transcript.srt'), subtitles(segments));
-    await atomic(path.join(dir, 'transcript.json'), { schema_version: 1, segments, text, source_sha256: await digest(source) });
+    await atomic(path.join(dir, 'transcript.json'), { schema_version: 1, segments, text, source_sha256: sourceHash,
+      ...(input.granularity === 'word' ? { granularity: 'word', timing: 'estimated', unit: 'word-or-subword' } : {}) });
     await declareAudioText(dir, ['transcript.txt']);
     await fs.rm(path.join(dir, 'input.wav')); await fs.rm(path.join(dir, 'raw.json'));
     return { ok: true, segments: segments.length, files: ['transcript.txt', 'transcript.srt', 'transcript.json'].map(f => path.relative(root, path.join(dir, f))), empty: segments.length === 0 };
@@ -196,53 +264,74 @@ async function transcribe(root, input, signal) {
 }
 async function render(root, plan, state, input, signal) {
   if (!plan.segments.length) fail('E_PLAN', 'Add at least one segment before rendering.');
+  if (input.export !== undefined && (!input.export || typeof input.export !== 'object' || Array.isArray(input.export))) fail('E_FORMAT', 'Export settings must be an object.');
   const rows = await rowsFor(root, plan, state, signal);
   if (rows.some(r => r.status !== 'ready')) fail('E_NOT_READY', 'Some speech segments are pending, uncertain or stale. Inspect status and preserve completed recordings.');
-  const format = input.format ?? 'mp3';
-  if (!['mp3', 'wav'].includes(format)) fail('E_FORMAT', 'Export format must be mp3 or wav.');
+  const options = transfer.settings({ ...plan.export, ...input.export }, true, input.format ?? input.export?.format ?? plan.export?.format);
+  const format = options.format;
+  // Keep one channel layout throughout the render. An implicit mono -> stereo
+  // -> mono round trip attenuates the retained samples even at unity gain.
+  const channels = options.channels ?? 2;
   const ffmpeg = await binary('ORKAS_BUNDLED_FFMPEG');
-  const music = plan.music ? await local(root, plan.music.path) : undefined;
+  const newMix = composition.enabled(plan);
+  const music = plan.music && !newMix ? await local(root, plan.music.path) : undefined;
   if (music) await probe(music, signal);
   const temp = await fs.mkdtemp(path.join(root, '.voice-render-'));
-  const cues = []; let cursor = 0;
+  const cues = [], generated = [], wordReceipts = []; let cursor = 0;
   try {
     for (let i = 0; i < rows.length; i++) {
-      const s = plan.segments[i], source = await local(root, rows[i].path);
+      const s = plan.segments[i]; let source = await local(root, rows[i].path);
       const meta = rows[i];
-      const start = s.start_sec ?? 0, end = s.end_sec ?? meta.duration_sec;
+      let start = s.start_sec ?? 0, end = s.end_sec ?? meta.duration_sec;
       if (start >= meta.duration_sec || end > meta.duration_sec + 0.05) fail('E_TRIM', 'A trim lies outside its source audio.');
+      if (s.word_edit) {
+        if (meta.audio_streams.length !== 1) fail('E_AUDIO_TRACK', 'Extract the desired audio stream before word editing.');
+        const cut = await wordEdits.cut(root, temp, i, source, s, meta.duration_sec, signal, { local, json, digest, run, binary, channels });
+        source = cut.path; start = 0; end = cut.duration; generated.push(cut.name); wordReceipts.push(cut.receipt);
+      }
       const speed = s.speed ?? 1, duration = (end - start) / speed;
       if (duration <= 0 || cursor + duration + (s.gap_after_sec ?? 0) > 14400) fail('E_DURATION', 'Use positive segments and at most four hours per chapter.');
-      const filters = [`atrim=start=${start}:end=${end}`, 'asetpts=PTS-STARTPTS', `atempo=${speed}`, `volume=${s.volume ?? 1}`];
+      const filters = [`atrim=start=${start}:end=${end}`, 'asetpts=PTS-STARTPTS'];
+      // Even at unity, atempo can discard a final partial analysis window.
+      // Preserve unretimed recordings sample-for-sample through this stage.
+      if (speed !== 1) filters.push(`atempo=${speed}`);
+      filters.push(`volume=${s.volume ?? 1}`);
       if (s.denoise) filters.push('afftdn');
       if (s.fade_in_sec) filters.push(`afade=t=in:d=${Math.min(duration, s.fade_in_sec)}`);
       if (s.fade_out_sec) { const fade = Math.min(duration, s.fade_out_sec); filters.push(`afade=t=out:st=${Math.max(0, duration - fade)}:d=${fade}`); }
       if (s.gap_after_sec) filters.push(`apad=pad_dur=${s.gap_after_sec}`);
       const clip = path.join(temp, `${i}.wav`);
-      await run(ffmpeg, ['-v', 'error', '-nostdin', '-i', source, '-vn', '-af', filters.join(','), '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', clip], signal);
+      await run(ffmpeg, ['-v', 'error', '-nostdin', ...(plan.schema_version === 3 ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-af', filters.join(','), '-ar', '48000', '-ac', String(channels), '-c:a', 'pcm_s16le', clip], signal);
       const measured = await probe(clip, signal);
       if (s.text) cues.push({ start_sec: cursor, end_sec: cursor + duration, text: s.text });
       cursor += measured.duration_sec;
     }
     await fs.writeFile(path.join(temp, 'concat.txt'), rows.map((_, i) => `file '${i}.wav'`).join('\n'));
     await run(ffmpeg, ['-v', 'error', '-nostdin', '-f', 'concat', '-safe', '1', '-i', path.join(temp, 'concat.txt'), '-c:a', 'copy', path.join(temp, 'joined.wav')], signal);
-    const args = ['-v', 'error', '-nostdin', '-i', path.join(temp, 'joined.wav')];
+    const processed = plan.processing?.length ? await processing.processAudio(root, path.join(temp, 'joined.wav'), plan.processing, signal, { run, binary, digest, probe, local, json, atomic }) : undefined;
+    if (processed) cursor = (await probe(processed.path, signal)).duration_sec;
+    const mixed = newMix ? await composition.compose(root, temp, processed?.path || path.join(temp, 'joined.wav'), cursor, plan, signal, { local, probe, binary, run, digest, channels }) : undefined;
+    if (mixed) { cursor = mixed.duration; generated.push(...mixed.generated); }
+    const args = ['-v', 'error', '-nostdin', '-i', mixed?.path || processed?.path || path.join(temp, 'joined.wav')];
     if (music) {
       // Drain the looping source separately. Mixing a looping mono input with
       // stereo narration can stall FFmpeg's filter graph even with input -t.
       const musicClip = path.join(temp, 'music.wav');
       await run(ffmpeg, ['-v', 'error', '-nostdin', '-stream_loop', '-1', '-i', music,
-        '-t', String(cursor), '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', musicClip], signal);
-      args.push('-i', musicClip, '-filter_complex', `[1:a]volume=${plan.music.volume ?? 0.15}[music];[0:a][music]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[out]`, '-map', '[out]');
-    } else args.push('-af', 'loudnorm=I=-16:TP=-1.5:LRA=11');
-    args.push('-ar', '48000', '-ac', '2', '-c:a', format === 'wav' ? 'pcm_s16le' : 'libmp3lame');
-    if (format === 'mp3') args.push('-b:a', '192k');
+        '-t', String(cursor), '-ar', '48000', '-ac', String(channels), '-c:a', 'pcm_s16le', musicClip], signal);
+      const duck = transfer.duck(plan.music.duck);
+      const graph = duck
+        ? `[0:a]asplit=2[voice][key];[1:a]volume=${plan.music.volume ?? 0.15}[music];[music][key]sidechaincompress=threshold=${10 ** (duck.threshold_db / 20)}:ratio=${duck.ratio}:attack=${duck.attack_ms}:release=${duck.release_ms}[background];[voice][background]amix=inputs=2:duration=first:normalize=0`
+        : `[1:a]volume=${plan.music.volume ?? 0.15}[music];[0:a][music]amix=inputs=2:duration=first:normalize=0`;
+      args.push('-i', musicClip, '-filter_complex', `${graph},${transfer.loudness(options)}[out]`, '-map', '[out]');
+    } else args.push('-af', transfer.loudness(options));
+    args.push(...transfer.encoding(options));
     args.push(path.join(temp, `audio.${format}`));
     await run(ffmpeg, args, signal);
     const meta = await probe(path.join(temp, `audio.${format}`), signal);
     if (Math.abs(meta.duration_sec - cursor) > 0.15) fail('E_EXPORT', 'Export duration does not match the assembled segments.');
     await run(ffmpeg, ['-v', 'error', '-nostdin', '-i', path.join(temp, `audio.${format}`), '-f', 'null', '-'], signal);
-    const completeCaptions = plan.segments.every(s => s.text && !s.start_sec && s.end_sec === undefined);
+    const completeCaptions = !processed?.timingChanged && plan.segments.every(s => s.text && !s.start_sec && s.end_sec === undefined);
     if (cues.length) {
       await fs.writeFile(path.join(temp, 'script.txt'), cues.map(c => c.text).join('\n') + '\n');
     }
@@ -250,14 +339,31 @@ async function render(root, plan, state, input, signal) {
       await fs.writeFile(path.join(temp, 'captions.srt'), subtitles(cues));
     }
     await atomic(path.join(temp, 'plan-snapshot.json'), plan);
-    await atomic(path.join(temp, 'receipt.json'), { schema_version: 1, ...meta, cues, captions_complete: completeCaptions, sha256: await digest(path.join(temp, `audio.${format}`)), verification: 'decoded; segment duration checked; perceptual quality not verified' });
+    await atomic(path.join(temp, 'receipt.json'), { schema_version: 1, ...meta, cues, captions_complete: completeCaptions, export: options,
+      ...(mixed ? { tracks: mixed.tracks } : {}), ...(wordReceipts.length ? { word_edits: wordReceipts } : {}),
+      ...(processed ? { processing: processed.processing } : {}), sha256: await digest(path.join(temp, `audio.${format}`)), verification: 'decoded; segment duration checked; perceptual quality not verified' });
     if (cues.length) await declareAudioText(temp, ['script.txt']);
     const output = path.join(root, `export-${crypto.randomUUID()}`);
     // Publish the complete candidate directory atomically, preserving every prior export.
-    for (const name of ['joined.wav', 'concat.txt', ...(music ? ['music.wav'] : []), ...rows.map((_, i) => `${i}.wav`)]) await fs.rm(path.join(temp, name));
+    for (const name of ['joined.wav', 'concat.txt', ...generated, ...(music ? ['music.wav'] : []), ...rows.map((_, i) => `${i}.wav`)]) await fs.rm(path.join(temp, name));
+    signal?.throwIfAborted();
     await fs.rename(temp, output);
     return { ok: true, ...meta, captions_complete: completeCaptions, files: [`audio.${format}`, ...(cues.length ? ['script.txt'] : []), ...(completeCaptions ? ['captions.srt'] : []), 'receipt.json', 'plan-snapshot.json'].map(f => path.relative(root, path.join(output, f))) };
   } finally { await fs.rm(temp, { recursive: true, force: true }); }
+}
+async function withAudioDeadline(parent, work, message) {
+  const controller = new AbortController(); let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 30 * 60 * 1000);
+  timer.unref?.();
+  const abort = () => controller.abort();
+  parent?.addEventListener('abort', abort, { once: true });
+  if (parent?.aborted) abort();
+  try { return await work(controller.signal); }
+  catch (err) {
+    if (parent?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.');
+    if (timedOut) fail('E_TIMEOUT', message);
+    throw err;
+  } finally { clearTimeout(timer); parent?.removeEventListener('abort', abort); }
 }
 async function execute(operation, request, signal) {
   if (operation === 'preflight') {
@@ -265,7 +371,8 @@ async function execute(operation, request, signal) {
     for (const env of ['ORKAS_BUNDLED_FFMPEG', 'ORKAS_BUNDLED_FFPROBE', 'ORKAS_WHISPER_CPP', 'ORKAS_WHISPER_MODEL']) {
       try { await binary(env); ready[env] = true; } catch { ready[env] = false; }
     }
-    return { ok: Object.values(ready).every(Boolean), ready };
+    const codecs = ready.ORKAS_BUNDLED_FFMPEG && ready.ORKAS_BUNDLED_FFPROBE;
+    return { ok: codecs, ready, capabilities: { editing: codecs, processing: codecs, transcription: codecs && ready.ORKAS_WHISPER_CPP && ready.ORKAS_WHISPER_MODEL } };
   }
   if (!request || typeof request !== 'object' || Array.isArray(request)
     || typeof request.project !== 'string' || !request.project.trim()) {
@@ -275,14 +382,23 @@ async function execute(operation, request, signal) {
   const root = await fs.realpath(path.dirname(projectFile));
   const plan = validate(await json(await local(root, path.basename(projectFile))));
   if (operation === 'probe') return { ok: true, ...await probe(await local(root, request.input_path), signal) };
-  if (operation === 'transcribe') return transcribe(root, request, signal);
+  if (operation === 'transcribe') return request.granularity === 'word'
+    ? withAudioDeadline(signal, current => transcribe(root, request, current), 'Word transcription timed out; the original recording was preserved.')
+    : transcribe(root, request, signal);
   const lockPath = await local(root, '.voice-lock', true);
   let lock;
   try { lock = await fs.open(lockPath, 'wx'); } catch (err) { if (err.code === 'EEXIST') fail('E_BUSY', 'Audio project is busy. After a crash, verify no task is active before removing .voice-lock.'); throw err; }
   try {
+    if (operation === 'extract' || operation === 'convert') {
+      if (signal?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.');
+      try { return await transfer.transfer(root, request, operation, signal, { local, run, binary, digest, atomic }); }
+      catch (err) { if (signal?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.'); throw err; }
+    }
     const state = await stateFor(root);
     if (operation === 'status') return { ok: true, segments: await rowsFor(root, plan, state, signal) };
-    if (operation === 'render') return await render(root, plan, state, request, signal);
+    if (operation === 'render') return await (plan.schema_version === 3
+      ? withAudioDeadline(signal, current => render(root, plan, state, request, current), 'Audio rendering timed out; sources and completed exports were preserved.')
+      : render(root, plan, state, request, signal));
     const s = plan.segments.find(segment => segment.id === request.segment_id && segment.text !== undefined);
     if (!s) fail('E_SEGMENT', 'Choose a speech segment id from this project.');
     const key = keyFor(plan, s);
@@ -302,7 +418,7 @@ async function execute(operation, request, signal) {
       await atomic(await local(root, '.voice-state.json', true), state);
       return { ok: true, key, ...meta };
     }
-    fail('E_OPERATION', 'Use preflight, probe, transcribe, status, begin, record or render.');
+    fail('E_OPERATION', 'Use preflight, probe, transcribe, status, begin, record, render, extract or convert.');
   } finally { await lock.close(); await fs.rm(lockPath, { force: true }); }
 }
 async function entry(args) {

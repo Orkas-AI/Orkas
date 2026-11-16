@@ -73,7 +73,7 @@ describe('logger › redact', () => {
     expect(out.note).toBe('contact a***@example.com phone 138****8000');
     expect(out.absPath).toBe('***REDACTED_PATH***');
     expect(out.relPath).toBe('***REDACTED_PATH***');
-    expect(JSON.stringify(out)).not.toContain('/Users/alice');
+    expect(JSON.stringify(out)).not.toContain('/Users/test');
     expect(JSON.stringify(out)).not.toContain('customer-plan.md');
     expect(out.user_id).toBe('ABCD...7890');
     expect(out.session_id).toBe('***REDACTED***');
@@ -149,6 +149,39 @@ describe('logger › redact', () => {
     expect(out.name).toBe('root');
     // The self-reference is replaced, not traversed forever.
     expect(out.self).toBe('[circular]');
+  });
+
+  it('keeps incomplete Basic headers private in Error messages and stacks', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const value = Buffer.from('synthetic-only').toString('base64');
+    const error = new Error(`request rejected Proxy-Authorization: Basic ${value}`);
+    error.stack = `Error: ${error.message}\n    at request`;
+    const out = redact(error) as Error;
+    expect(out.message).toBe('request rejected Proxy-Authorization: Basic ***');
+    expect(out.stack).toBe('Error: request rejected Proxy-Authorization: Basic ***\n    at request');
+    expect(error.message).toContain(value);
+    expect(redact('falling back to basic retrieval')).toBe('falling back to basic retrieval');
+    expect(redact({ authorization: `Basic ${value}` })).toEqual({ authorization: '***REDACTED***' });
+  });
+
+  it('keeps escaped quoted credentials out of nested strings and Error snapshots', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const message = String.raw`request failed password="private\" tail" status=401`;
+    const error = new Error(message);
+    error.stack = `Error: ${message}\n    at request`;
+    const out = redact({ errors: [error], detail: 'token="unfinished private value' }) as any;
+    expect(out.errors[0].message).toBe('request failed password=*** status=401');
+    expect(out.errors[0].stack).toBe('Error: request failed password=*** status=401\n    at request');
+    expect(out.detail).toBe('token=***');
+    expect(error.message).toBe(message);
+  });
+
+  it('masks proxy authorization fields before serializing structured log records', async () => {
+    const { redact } = await import('../../src/main/logger');
+    for (const field of ['Proxy-Authorization', 'proxy_authorization', 'proxyAuthorization']) {
+      expect(redact({ [field]: 'Basic incomplete', status: 401 }))
+        .toEqual({ [field]: '***REDACTED***', status: 401 });
+    }
   });
 });
 

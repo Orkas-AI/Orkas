@@ -12,12 +12,63 @@ const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
 const mathConfig = index.slice(index.indexOf('window.MathJax = {'), index.indexOf('</script>', index.indexOf('window.MathJax = {')));
 const capturedLogs = new WeakMap<Page, Array<{ level: string; message: string }>>();
 
+for (const [locale, width, height] of [['zh', 1280, 800], ['en', 760, 560]] as const) {
+  test(`message reading keeps actions and history navigation reachable (${locale})`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height });
+    await setup(page);
+    const dictionary = JSON.parse(fs.readFileSync(path.join(renderer, 'locales', `${locale}.json`), 'utf8'));
+    await page.evaluate(({ dictionary, locale }) => {
+      const w = window as any;
+      w.t = (key: string) => dictionary[key] || key;
+      document.documentElement.lang = locale;
+      document.querySelector('#composer')?.remove();
+      const history = document.querySelector('#chat-history') as HTMLElement;
+      history.style.width = '100%';
+      history.style.height = '100vh';
+      history.style.marginBottom = '0';
+      history.replaceChildren();
+      const content = locale === 'zh'
+        ? '**品牌核对完成。这个名称已有相近业务使用，建议继续筛选。**\n\n- **公司**：现有品牌已在多个市场开展业务。\n- **业务**：内容生成、搜索优化及营销自动化。\n- **来源**：[查看官网](https://example.com)\n\n已确认实际使用；商标注册范围仍需进一步核实。'
+        : '**Brand review complete. A business in the same category already uses this name.**\n\n- **Company**: An existing brand operates across several markets.\n- **Business**: Content generation, search optimization and marketing automation.\n- **Source**: [Company website](https://example.com)\n\nActual use is confirmed; trademark coverage still needs verification.';
+      w.appendChatMessage({ role: 'assistant', content, _from: 'commander', _msg_id: 'review', time: 1794489000000 }, false);
+      w.appendChatMessage({ role: 'user', content: locale === 'zh' ? '继续筛选新名称' : 'Continue with new names', _msg_id: 'follow-up', time: 1794489060000 }, false);
+      w._setLoadNewerHistory(history, 'fixture', 20);
+    }, { dictionary, locale });
+    const message = page.locator('.chat-message.assistant');
+    const copy = message.locator('.bubble-copy-btn');
+    await copy.focus();
+    await expect(copy).toBeFocused();
+    await expect(message.locator('.chat-bubble-actions')).toHaveCSS('opacity', '1');
+    await expect(message.locator('.bubble-archive-btn')).toBeInViewport();
+    await expect(page.locator('.chat-history-load-newer')).toBeInViewport();
+    expect(await page.locator('#chat-history').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    expect(await message.locator('.bubble-action-btn').evaluateAll(buttons => buttons.every(button => {
+      const bounds = button.getBoundingClientRect();
+      const bubble = button.closest('.chat-message')!.getBoundingClientRect();
+      return bounds.left >= bubble.left && bounds.right <= bubble.right + 1 && bounds.height >= 24;
+    }))).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`message-reading-${locale}.png`) });
+  });
+}
+
 test('resolves scoped task previews after delayed final math and preserves complete visible characters', async ({ page }) => {
   await setup(page);
   await page.evaluate(() => {
     const w = window as any;
     w.currentUserId = 'fixture-user';
     w.taskReferenceReads = [];
+    // Saved task links also refresh the sidebar through the real list loader.
+    // Supply its local transport and DOM boundary in this renderer-only fixture.
+    document.body.insertAdjacentHTML('beforeend', '<div id="conversation-list"></div>');
+    w.sidebarRequests = [];
+    w.apiFetch = async (url: string) => {
+      const request = new URL(url, 'http://fixture.invalid');
+      if (request.pathname !== '/api/conversations/list' || request.searchParams.get('mode') !== 'startup') {
+        throw new Error(`Unexpected fixture request: ${request.pathname}`);
+      }
+      w.sidebarRequests.push(url);
+      return { json: async () => ({ ok: true, conversations: [] }) };
+    };
     w.orkas.invoke = async (_channel: string, payload: any) => {
       w.taskReferenceReads.push(payload.references);
       return { ok: true, references: [{ kind: 'todo', task_id: 't_123456789abc', project_id: 'p_source',
@@ -43,6 +94,8 @@ test('resolves scoped task previews after delayed final math and preserves compl
   await preview.focus();
   await page.keyboard.press('Enter');
   expect(await page.evaluate(() => (window as any).openedTask)).toEqual(['p_source', 't_123456789abc']);
+  await expect(page.locator('#conversation-list')).toHaveText('sidebar.conv_empty');
+  expect(await page.evaluate(() => (window as any).sidebarRequests.length)).toBe(1);
 });
 
 test('keeps unresolved task IDs literal and resolves fresh content when the reply reopens', async ({ page }) => {

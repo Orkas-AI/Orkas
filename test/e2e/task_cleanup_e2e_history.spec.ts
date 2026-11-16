@@ -520,21 +520,23 @@ test.describe('inline historical task cleanup', () => {
     const geometry = await section.evaluate(el => ({ width: el.clientWidth, scroll: el.scrollWidth }));
     expect(geometry.scroll).toBeLessThanOrEqual(geometry.width);
     await section.screenshot({ path: testInfo.outputPath('cleanup-zh-narrow.png') });
-    // Cleanup is maintenance, not task activity. Observe the real old history
-    // throughout deletion so a transient promotion into Recent is not missed.
-    await page.evaluate(async ({ ids, pid }) => {
+    // Old pinned tasks already belong to Recent regardless of age. Cleanup
+    // must not promote any unpinned old history, or remove a pin before its
+    // own conversation is deleted.
+    await page.evaluate(async ({ ids, pid, pinnedCid }) => {
       if (pid) await (window as any).loadConversationProject(pid, { reset: true });
       const recent = document.getElementById('today-list')!;
       const promoted = new Set<string>();
       const observer = new MutationObserver(() => {
         for (const row of recent.querySelectorAll<HTMLElement>('[data-cid]')) {
-          if (ids.includes(row.dataset.cid!)) promoted.add(row.dataset.cid!);
+          if (ids.includes(row.dataset.cid!) && row.dataset.cid !== pinnedCid) promoted.add(row.dataset.cid!);
         }
       });
       observer.observe(recent, { childList: true, subtree: true });
       (window as any).__cleanupRecentObservation = { promoted, observer };
-    }, { ids: cids, pid: projectId });
-    await expect(page.locator('#today-list [data-cid]')).toHaveCount(0);
+    }, { ids: cids, pid: projectId, pinnedCid: cids[3] });
+    await expect(page.locator('#today-list [data-cid]')).toHaveCount(1);
+    await expect(page.locator('#today-list [data-cid]')).toHaveAttribute('data-cid', cids[3]);
     // Hold the second real deletion at IPC to inspect the first completed one.
     await orkas.electronApp!.evaluate(({ ipcMain }) => {
       const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
@@ -561,7 +563,12 @@ test.describe('inline historical task cleanup', () => {
       expect(cids).toContain(removed);
       await expect(page.locator(`.conv-item[data-cid="${removed}"]`)).toHaveCount(0);
       expect(await page.evaluate(cid => window.eval('conversations').some((row: any) => row.conversation_id === cid), removed)).toBe(false);
-      await expect(page.locator('#today-list [data-cid]')).toHaveCount(0);
+      const remainingRecent = page.locator('#today-list [data-cid]');
+      if (removed === cids[3]) await expect(remainingRecent).toHaveCount(0);
+      else {
+        await expect(remainingRecent).toHaveCount(1);
+        await expect(remainingRecent).toHaveAttribute('data-cid', cids[3]);
+      }
       await expect(section.locator('[data-cleanup-action="stop"]')).toBeEnabled();
       await section.screenshot({ path: testInfo.outputPath('cleanup-progress-zh.png') });
     } finally {
@@ -573,6 +580,7 @@ test.describe('inline historical task cleanup', () => {
       observer.disconnect();
       return Array.from(promoted);
     })).toEqual([]);
+    await expect(page.locator('#today-list [data-cid]')).toHaveCount(0);
     expect(existsSync(path.join(root, `${cids[0]}.jsonl`))).toBe(false);
     expect(existsSync(attachment(cids[0]))).toBe(false);
     expect(existsSync(attachment(cids[6]))).toBe(false);

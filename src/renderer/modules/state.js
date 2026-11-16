@@ -25,6 +25,7 @@ function setGroupConversationBusy(cid, busy) {
   if (!cid) return;
   if (busy) groupBusyConvs.set(cid, true);
   else groupBusyConvs.delete(cid);
+  try { window.VideoCanvas?.notifyBusy?.(cid, !!busy); } catch (_) { /* optional surface */ }
 }
 
 function isConvPending(cid) {
@@ -348,7 +349,38 @@ document.addEventListener('DOMContentLoaded', () => {
   initAuth();
 });
 
+async function _openBuiltinModelSettings(payload) {
+  if (payload?.user_id !== currentUserId || !['image','video','tts'].includes(payload?.kind)) return;
+  await window.loadRendererFeature('settings');
+  if (payload.user_id !== currentUserId) return;
+  setView('settings');
+  window.activateSettingsTab('credentials');
+  _settingsActivateModelTab(payload.kind);
+}
+
 function bindStaticHandlers() {
+  window.orkas.onPushEvent('settings:open-models-from-app', payload => {
+    void _openBuiltinModelSettings(payload).catch(() => {
+      createLogger('builtin-model-navigation').warn('model settings navigation failed', {code:'E_UNAVAILABLE'});
+      uiToast(t('web_apps.error_E_FAILED'));
+    });
+  });
+  let connectorAppUser = null;
+  const connectorAppReturn = document.getElementById('connectors-return-app');
+  window.orkas.onPushEvent('connectors:open-from-app', payload => {
+    if (payload?.user_id !== currentUserId) return;
+    connectorAppUser = currentUserId;
+    connectorAppReturn.hidden = false;
+    setView('connectors');
+  });
+  connectorAppReturn.addEventListener('click', async () => {
+    if (connectorAppUser !== currentUserId) { connectorAppReturn.hidden = true;return; }
+    connectorAppReturn.disabled = true;
+    try {
+      // The normal app owner refocuses its existing native window without reloading it.
+      if (await window.openSavedAppById('builtin-product-listing')) connectorAppReturn.hidden = true;
+    } finally { connectorAppReturn.disabled = false; }
+  });
   window.orkas.onPushEvent('conversations:open-from-notification', (payload) => {
     _openTaskNotificationConversation(payload);
   });

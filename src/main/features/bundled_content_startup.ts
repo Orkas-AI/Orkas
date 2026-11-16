@@ -1,6 +1,7 @@
 import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from '../util/log-redact';
 import * as systemSkills from './system_skills';
+import { syncBuiltinApps } from './builtin_apps';
 import * as builtinMarketplaceStartup from './builtin_marketplace_startup';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import type { BuiltinMarketplaceSeedResult } from './builtin_marketplace';
@@ -27,7 +28,7 @@ export interface SyncBundledContentOptions {
 export interface SyncBundledContentResult {
   system_skills: SystemSkillReconcileResult[];
   marketplace: BuiltinMarketplaceSeedResult | null;
-  failed: Array<'system_skills' | 'marketplace'>;
+  failed: Array<'system_skills' | 'marketplace' | 'builtin_apps'>;
 }
 
 const inFlightByUid = new Map<string, Promise<SyncBundledContentResult>>();
@@ -103,6 +104,14 @@ async function _syncBundledContentForUser(
   }
 
   const systemMs = Date.now() - systemStartedAt;
+  if (!_canContinue(opts)) return result;
+  try {
+    const apps = await syncBuiltinApps(uid, () => _canContinue(opts));
+    if (apps.deferred) result.failed.push('builtin_apps');
+  } catch (err) {
+    result.failed.push('builtin_apps');
+    log.warn('bundled app sync failed', { error: logErrorSummary(err) });
+  }
   if (!_canContinue(opts)) return result;
   const marketplaceStartedAt = Date.now();
   try {

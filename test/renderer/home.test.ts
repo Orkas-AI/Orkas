@@ -139,6 +139,30 @@ function run(cid: string, status: string, minutesAgo: number, entryPoint?: strin
 }
 
 describe('Commander home states', () => {
+  it('removes old private app reminders before home lookups even when their cleaned contexts cannot be read', async () => {
+    const cid = `app_${'a'.repeat(64)}_once_${'b'.repeat(32)}`;
+    const persisted = new Map([['task_unread_v1_u1', JSON.stringify({
+      unread: [run(cid, 'completed', 60), run('ordinary', 'completed', 30)], read: [],
+    })]]);
+    const h = loadHome({
+      conversations: [{ conversation_id: 'ordinary', title: 'Ordinary result', project_id: '' }],
+      lookup: () => { throw new Error('cleaned context unavailable'); },
+    });
+    h.context.currentUserId = 'u1';
+    h.context.localStorage = {
+      getItem: (key: string) => persisted.get(key) ?? null,
+      setItem: (key: string, value: string) => persisted.set(key, value),
+    };
+    vm.runInContext(fs.readFileSync(path.join(R, 'modules/task-unread.js'), 'utf8'), h.context);
+    h.context._restoreUnreadTaskState();
+    h.context.homeOnEnter();
+    await h.settle();
+    expect(h.data().tasks.map((task: any) => task.cid)).toEqual(['ordinary']);
+    expect(h.html()).toContain('Ordinary result');
+    expect(h.html()).not.toContain('未命名任务');
+    expect(h.invokes.some(([channel]) => channel === 'conversations.getMany')).toBe(false);
+    expect(JSON.parse(persisted.get('task_unread_v1_u1')!).unread.map((task: any) => task.cid)).toEqual(['ordinary']);
+  });
   it('shows the empty state when nothing is open or unopened', async () => {
     const h = loadHome();
     h.context.homeOnEnter();

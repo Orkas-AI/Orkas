@@ -63,7 +63,7 @@ const REDACT_KEYS = new Set([
   'cid', 'conversationid', 'conversation_id',
   'secret', 'clientsecret', 'client_secret',
   'password', 'passwd', 'pwd',
-  'authorization',
+  'authorization', 'proxyauthorization', 'proxy_authorization', 'proxy-authorization',
   'cookie', 'setcookie', 'set-cookie',
   // PII (defense-in-depth — no current call site logs these unmasked, but
   // the rule shields against future regressions).

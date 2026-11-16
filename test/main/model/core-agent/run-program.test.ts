@@ -35,13 +35,23 @@ const EXPECTED_PROGRAMMATIC_TOOL_NAMES = [
   'grep_files',
   'write_file',
   'append_file',
+  'publish_outputs',
+  'library_save',
   'apply_patch',
   'edit_file',
   'delete_file',
   'workspace_diff',
   'bash',
+  'create_artifact',
+  'html_preview',
+  'create_pdf',
+  'edit_pdf',
   'pdf_render',
+  'create_docx',
+  'create_xlsx',
+  'create_pptx',
   'office_read',
+  'edit_office',
   'office_review',
   'library',
   'research_verify_citations',
@@ -55,6 +65,7 @@ const EXPECTED_PROGRAMMATIC_TOOL_NAMES = [
   'skill_search',
   'marketplace_search',
   'app_health',
+  'open_app_view',
   'tool_result',
 ] as const;
 
@@ -67,13 +78,23 @@ const VALID_PROGRAMMATIC_INPUTS: Record<ProgrammaticToolName, Record<string, unk
   grep_files: {},
   write_file: {},
   append_file: {},
+  publish_outputs: { paths: ['report.pdf'] },
+  library_save: { source_path: 'report.pdf' },
   apply_patch: {},
   edit_file: {},
   delete_file: {},
   workspace_diff: {},
   bash: {},
+  create_artifact: { files: [{ path: 'index.html', content: '<button>Try</button>' }] },
+  html_preview: { path: 'index.html' },
+  create_pdf: { path: 'report.pdf', source_type: 'markdown', content: '# Report' },
+  edit_pdf: { action: 'rotate_pages', input_path: 'report.pdf', output_path: 'rotated.pdf', degrees: 90 },
   pdf_render: { path: 'report.pdf' },
+  create_docx: { path: 'report.docx', paragraphs: [{ text: 'Report' }] },
+  create_xlsx: { path: 'report.xlsx', sheets: [{ name: 'Report', rows: [['Report']] }] },
+  create_pptx: { path: 'report.pptx', slides: [{ title: 'Report' }] },
   office_read: { path: 'report.docx' },
+  edit_office: { path: 'report.docx', operations: [{ action: 'set', path: '/body/p[1]', props: { text: 'Updated' } }] },
   office_review: { path: 'report.docx' },
   library: {},
   research_verify_citations: {},
@@ -87,6 +108,7 @@ const VALID_PROGRAMMATIC_INPUTS: Record<ProgrammaticToolName, Record<string, unk
   skill_search: { query: 'pdf' },
   marketplace_search: { query: 'pdf' },
   app_health: {},
+  open_app_view: { surface_id: 'apps' },
   tool_result: {},
 };
 
@@ -279,19 +301,24 @@ describe('run_program Host policy', () => {
     expect(summary.keys).toEqual(callable);
     expect(summary.seen).toEqual(callable);
     expect(calls).toEqual(callable);
-    expect(summary.keys).not.toEqual(expect.arrayContaining([
-      'publish_outputs',
-      'library_save',
+    for (const name of [
       'process_session',
       'interactive_cli',
+      'generate_image',
+      'image_studio',
+      'generate_video',
+      'video_studio',
+      'generate_speech',
+      'dispatch_to',
+      'cross_session_memory',
       'tool_load',
       'run_program',
-    ]));
+    ]) expect(summary.keys).not.toContain(name);
   });
 
-  it('completes one deterministic write-execute-validate stage without exposing publication', async () => {
+  it('completes one deterministic write-execute-validate stage', async () => {
     const policy = createProgrammaticToolPolicy({ userId: 'u1' });
-    const candidates = ['write_file', 'bash', 'read_files', 'publish_outputs'];
+    const candidates = ['write_file', 'bash', 'read_files'];
     const callable = candidates.filter((name) => policy.isEligible(name));
     const calls: string[] = [];
     const runProgram = createRunProgramTool({

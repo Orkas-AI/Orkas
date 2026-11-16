@@ -269,7 +269,7 @@ describe("Session", () => {
     expect(changed[0].content[0]).toMatchObject({ type: "tool_result", toolUseId: "shot-2" });
   });
 
-  it("keeps only the latest authoring references through intervening tools and checkpoints, then releases them", () => {
+  it("keeps authoring references through intervening tools and checkpoints, clears them on an empty set, then releases them", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Build from this reference" }]);
     const capture = (id: string, retention?: "active_turn", count = 1) => {
@@ -299,6 +299,53 @@ describe("Session", () => {
     session.completeActiveTurn();
     session.beginUserTurn([{ type: "text", text: "New task" }]);
     expect(images()).toEqual([]);
+  });
+
+  it("shows every parallel authoring set, keeps earlier sets beside later ones, and drops the oldest whole set past six images", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Remake this reference with my clips" }]);
+    const sets = (ids: string[], count = 1) => {
+      session.addAssistantMessage(ids.map(id => ({ type: "tool_use" as const, id, name: "fixture", input: {} })));
+      for (const id of ids) {
+        session.addToolResult(id, id, Array.from({ length: count }, (_, i) => ({ data: `${id}-${i}`, mediaType: "image/png" })), false, undefined, "active_turn");
+      }
+    };
+    const read = (id: string) => {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, "Read.");
+    };
+    const images = () => session.getMessagesForModel().flatMap(m => m.content).flatMap(c =>
+      c.type === "tool_result" ? (c.images ?? []).map(i => i.data) : []);
+    // One assistant message inspects the reference and two clips at once.
+    sets(["reference", "clip-1", "clip-2"]);
+    expect(images()).toEqual(["reference-0", "clip-1-0", "clip-2-0"]);
+    for (const id of ["read-1", "read-2", "read-3"]) read(id);
+    expect(images()).toEqual(["reference-0", "clip-1-0", "clip-2-0"]);
+    sets(["sheet"], 3);
+    expect(images()).toEqual(["reference-0", "clip-1-0", "clip-2-0", "sheet-0", "sheet-1", "sheet-2"]);
+    // A newer set that does not fit beside the reference drops it whole.
+    sets(["delivered"], 2);
+    expect(images()).toEqual(["clip-2-0", "sheet-0", "sheet-1", "sheet-2", "delivered-0", "delivered-1"]);
+    session.completeActiveTurn();
+    session.beginUserTurn([{ type: "text", text: "Next" }]);
+    expect(images()).toEqual([]);
+  });
+
+  it("carries every retained set into a checkpoint, oldest first, and counts each of them", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Remake this reference" }]);
+    const step = (id: string, retention?: "active_turn") => {
+      session.addAssistantMessage([{ type: "tool_use", id, name: "fixture", input: {} }]);
+      session.addToolResult(id, retention ? id : "Read source metadata. ".repeat(500), retention ? [{ data: `${id}-0`, mediaType: "image/png" }] : [], false, undefined, retention);
+    };
+    step("reference", "active_turn");
+    step("clip", "active_turn");
+    for (const id of ["read", "list", "write"]) step(id);
+    session.applyActiveCheckpointSummary("Reference and clip inspected", 8);
+    const view = session.getMessagesForModel();
+    const checkpoint = view.find(m => m.content.some(c => c.type === "text" && c.text.includes("[Current turn checkpoint]")));
+    expect(checkpoint?.content.flatMap(c => c.type === "image" ? [c.data] : [])).toEqual(["reference-0", "clip-0"]);
+    expect(session.estimateActiveProcessTokens()).toBeGreaterThan(2 * IMAGE_BLOCK_ESTIMATE_TOKENS);
   });
 
   it("marks elided JSON receipts structurally and keeps tagged user images as input", () => {

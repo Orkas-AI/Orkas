@@ -51,7 +51,7 @@ const {
   _mediaDedupKey: (src: string) => string;
   _localMediaReferenceBasename: (src: string) => string;
   _parseOrkasMediaTitle: (title: string) => { kind: 'image' | 'video'; remoteSrc: string } | null;
-  _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
+  _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number, clientX?: number, rectRight?: number) => boolean;
   renderMarkdown: (md: string) => string;
 };
 
@@ -389,12 +389,24 @@ describe('markdown media links', () => {
     expect(_localMediaReferenceBasename('data:audio/wav;base64,AAAA')).toBe('');
   });
 
+  it('names a local link whose folder encoding was copied wrong by its intact file name', () => {
+    // 2026-11-07: Luna copied a delivery link and broke a Chinese folder name's encoding mid-character.
+    const broken = 'chat-media://local/var/T/userWorkSpace/%E8%BF%99%E6%98%AF%E护眼台灯/lamp/versions/main-v1.mp4?v=1-1-3502446';
+    expect(_chatMediaLocalPathFromUrl(broken)).toBe('');
+    expect(_localMediaReferenceBasename(broken)).toBe('main-v1.mp4');
+    // A file name that is itself broken names nothing to compare.
+    expect(_localMediaReferenceBasename('chat-media://local/Users/test/%E8%BF%E护.mp4')).toBe('');
+  });
+
   it('reserves native video controls while allowing the rest of the surface to toggle playback', () => {
     expect(_chatVideoNativeControlsHit(351, 100, 360)).toBe(true);
-    expect(_chatVideoNativeControlsHit(312, 100, 360)).toBe(true);
-    expect(_chatVideoNativeControlsHit(311, 100, 360)).toBe(false);
+    expect(_chatVideoNativeControlsHit(304, 100, 360)).toBe(true);
+    expect(_chatVideoNativeControlsHit(303, 100, 360)).toBe(false);
     expect(_chatVideoNativeControlsHit(200, 100, 360)).toBe(false);
     expect(_chatVideoNativeControlsHit(361, 100, 360)).toBe(false);
+    expect(_chatVideoNativeControlsHit(296, 100, 360, 540, 664)).toBe(true);
+    expect(_chatVideoNativeControlsHit(296, 100, 360, 220, 344)).toBe(true);
+    expect(_chatVideoNativeControlsHit(296, 100, 360, 200, 664)).toBe(false);
   });
 
   it('renders a normal markdown link to chat-media mp3 as an inline audio player', () => {

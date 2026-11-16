@@ -26,7 +26,7 @@ describe('native browser upload authorization', () => {
     const read = vi.spyOn(fs.promises, 'readFile');
     try {
       const files = await loadWebAssistUploadFiles('u1', 'c1', paths);
-      expect(files.map(file => file.path)).toEqual(paths.map(p => fs.realpathSync(p)));
+      expect(files.map(file => file.path)).toEqual(paths.map(p => fs.realpathSync.native(p)));
       expect(files.map(file => file.name)).toEqual(['work.txt', 'attached.txt', 'code.txt']);
       expect(files.every(file => !('data' in file) && !file.directory)).toBe(true);
       expect(read).not.toHaveBeenCalled();
@@ -41,7 +41,7 @@ describe('native browser upload authorization', () => {
   it('supports directories and rejects symlinks escaping the authorized task', async () => {
     const file = write('attachments/u1/c1/tree/sub/file.txt');
     const dir = path.dirname(path.dirname(file));
-    expect(await loadWebAssistUploadFiles('u1', 'c1', [dir])).toEqual([{ path: fs.realpathSync(dir), name: 'tree', directory: true }]);
+    expect(await loadWebAssistUploadFiles('u1', 'c1', [dir])).toEqual([{ path: fs.realpathSync.native(dir), name: 'tree', directory: true }]);
     fs.symlinkSync(write('foreign/private.txt'), path.join(dir, 'escape'));
     await expect(loadWebAssistUploadFiles('u1', 'c1', [dir])).rejects.toThrow('upload_outside_task');
   });

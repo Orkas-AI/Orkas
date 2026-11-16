@@ -233,6 +233,30 @@ describe('conversation send control styles', () => {
 });
 
 describe('queued message composer editing', () => {
+  it.each([false, true])('rebuilds hidden app source framing when the user revises a queued edit request (publish: %s)', async publishForWeb => {
+    const h = loadQueueDraft();
+    const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+    vm.runInContext(source.slice(source.indexOf('function _appEditingSource('), source.indexOf('async function handleChatSubmit()')), h.context);
+    Object.assign(h.context, { currentCid: 'c1', window: {}, conversations: [{ conversation_id: 'c1', assistance: {
+      kind: 'app_editing', title: 'Budget', sourceFileName: 'app-source.md', publishForWeb,
+    } }], _chatAttachTryBeginSend: () => () => {},
+      _chatAttachSnapshotForSend: async () => ({ ok: true, names: ['app-source.md'] }),
+      transformWithChatUse: (text: string) => text,
+      t: () => '界面文案',
+    });
+    let sent: any;
+    h.context.apiFetch = async (url: string, options: any) => ({ json: async () => {
+      if (url.endsWith('/begin-edit')) return { ok: true, message: { text: 'Original change', attachments: ['app-source.md'] } };
+      sent = JSON.parse(options.body); return { ok: true };
+    } });
+    await h.context._startQueueItemEdit('c1', 'q1');
+    h.input.value = 'Updated change';
+    expect(await h.context._finishQueueItemEdit('c1')).toBe(true);
+    expect(sent.instruction).toBe('Updated change');
+    expect(sent.resources.model_text).toContain('Modify the interactive app "Budget". Source: attached "app-source.md":');
+    expect(sent.resources.model_text.endsWith('\nUpdated change')).toBe(true);
+  });
+
   it.each(['ready', 'error'])('keeps displaced draft files out of an edit with a %s upload', async (uploadStatus) => {
     const { context, input, attachmentsByCid, stored } = loadQueueDraft();
     // Run the real snapshot producer with the real queued-edit consumer.

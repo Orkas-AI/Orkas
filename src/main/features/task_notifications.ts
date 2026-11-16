@@ -1,4 +1,5 @@
 import { t, type Lang } from '../i18n';
+import { appConversationOwner } from '../paths';
 import { createLogger } from '../logger';
 import {
   subscribeTaskTerminals,
@@ -127,6 +128,7 @@ export function startTaskNotifications(
   updateBadge(0);
   const stopFocusListener = runtime.onDidFocus(markNotificationsRead);
   const deliver = (event: TaskNotificationEvent, intervention = false): void => {
+    if (appConversationOwner(event.conversation_id)) return;
     const key = eventKey(event);
     const group = groupKey(event);
     let badgeOwned = false;

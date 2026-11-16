@@ -96,7 +96,9 @@ describe('new chat home surface', () => {
   it('exposes Library-aware picker copy and accessible skill chip removal', () => {
     const html = read('src/renderer/index.html');
 
-    expect(html).toContain('placeholder="Type @ to choose agents, skills, connectors, Library files."');
+    const composer = html.match(/<div\b[^>]*id="chat-input"[^>]*>/)?.[0];
+    expect(composer).toContain('data-i18n-placeholder="chat.input_placeholder"');
+    expect(composer).toContain('placeholder="Type @ to choose agents, skills, connectors, Library files. Agents support parallel execution: @A @B analyze data; sequential execution: @A analyze data @B write a report."');
     expect(html).toContain('data-i18n-title="chat.recipient_picker_title_with_library"');
     expect(html).toContain('data-i18n-aria-label="chat.chip_remove_title"');
     expect(html).toContain('data-ui-icon="x"');

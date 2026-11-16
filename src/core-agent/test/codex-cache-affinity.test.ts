@@ -232,7 +232,24 @@ describe('Codex cache affinity without shared conversation state', () => {
     }
     expect(payloads.map(p => p.prompt_cache_key)).toEqual(['opaque-user-a', 'opaque-user-a']);
     expect(headers.map(h => h.get('session_id'))).toEqual(['login-credential', 'login-credential']);
+    expect(headers.map(h => h.get('session-id'))).toEqual(['opaque-user-a', 'opaque-user-a']);
     expect(headers.map(h => h.get('x-client-request-id'))).toEqual(['chat-a', 'chat-b']);
+  });
+
+  it.each(['complete', 'stream'] as const)('preserves explicit Responses affinity headers while keeping the user body key (%s)', async method => {
+    const headers: Headers[] = [], bodies: any[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+      headers.push(new Headers(init?.headers)); bodies.push(await wirePayload(input, init)); return response();
+    }));
+    const p = createPiProvider({ provider: 'openai', model: 'gpt-6.1-sol', apiKey: 'fixture',
+      userCacheKey: 'opaque-user-a', headers: { 'SeSsIoN-Id': 'caller-owned', 'session_id': 'login-credential' },
+    });
+    const params = request('chat-a');
+    if (method === 'complete') await p.complete(params);
+    else for await (const event of p.stream(params)) if (event.type === 'error') throw event.error;
+    expect(headers[0].get('session-id')).toBe('caller-owned');
+    expect(headers[0].get('session_id')).toBe('login-credential');
+    expect(bodies[0].prompt_cache_key).toBe('opaque-user-a');
   });
 
   it('preserves other protocols and their caller-supplied headers', async () => {

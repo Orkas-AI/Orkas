@@ -34,6 +34,7 @@ import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
 import { t } from '../../i18n';
 import { createLogger } from '../../logger';
+import { missingRequiredOAuthScopes } from './oauth-scopes';
 import { fetchWithTimeout } from '../../util/abort';
 import { safeExternalHttpUrl } from '../../util/window-security';
 import { broadcastOAuthConnectProgress } from './oauth-events';
@@ -124,9 +125,7 @@ function _cancelPending(reason: string, code?: string): void {
 }
 
 function _missingRequiredScopes(requiredScopes: string[] | undefined, grantedScopes: string[]): string[] {
-  if (!Array.isArray(requiredScopes) || !requiredScopes.length) return [];
-  const granted = new Set((grantedScopes || []).filter(Boolean));
-  return requiredScopes.filter((scope) => !granted.has(scope));
+  return missingRequiredOAuthScopes(requiredScopes, grantedScopes);
 }
 
 function _refreshErrorFromBody(body: ConnectorRefreshErrorBody, fallback: string): Error {

@@ -10,6 +10,8 @@ test('native saved-app consumer retains the submitted check-in count after app-l
   ], access: { read: ['value'], insert: ['value'] } }] };
   const reference = '<!doctype html><html><meta charset="utf-8"><script src="/__orkas/sdk.js"></script><h1>Check-in</h1><label for="count">Count</label><input id="count" type="number"><button id="save">Save</button><output id="value"></output><script>const refresh=async()=>{const r=await orkasApp.data.query({table:"counts"});document.getElementById("value").textContent=String(r.records.reduce((n,r)=>n+r.value,0));};document.getElementById("save").onclick=async()=>{await orkasApp.data.insert({table:"counts",values:{value:Number(document.getElementById("count").value)}});await refresh();};refresh();</script></html>';
   const source = process.env.ORKAS_EVAL_NATIVE_APP_BUNDLE;
+  const loan = process.env.ORKAS_EVAL_NATIVE_APP_PROFILE === 'loan-preference';
+  if (loan && !source) throw new Error('Loan preference consumer requires a delivered bundle');
   const files = new Map<string, Buffer>();
   if (source) {
     if (!path.isAbsolute(source)) throw new Error('Native app consumer needs an absolute bundle directory');
@@ -55,17 +57,33 @@ test('native saved-app consumer retains the submitted check-in count after app-l
   await frame.locator('#count').fill('7');
   await frame.locator('#save').click();
   await expect(frame.locator('#value')).toHaveText('7');
+  if (loan) {
+    await frame.locator('#days').fill('3');
+    await expect(frame.locator('#fee')).toHaveText('21');
+    // Saving the same preference twice must replace it, not accumulate it.
+    await frame.locator('#save').click();
+    await expect(frame.locator('#value')).toHaveText('7');
+  }
   await orkas.closePreview(preview);
   expect((await orkas.invoke<any>('savedApps.list')).apps.map((a: any) => a.id)).toEqual([id]);
   preview = await orkas.openPreview(() => card.click());
   frame = preview.locator('.saved-app-viewer-frame').contentFrame();
   await expect(frame.locator('#value')).toHaveText('7');
+  if (loan) {
+    await frame.locator('#days').fill('3');
+    await expect(frame.locator('#fee')).toHaveText('21');
+    await frame.locator('#days').fill('0');
+    await expect(frame.locator('#fee')).toHaveText('0');
+    await frame.locator('#days').fill('3');
+    await expect(frame.locator('#fee')).toHaveText('21');
+  }
   await preview.screenshot({ path: info.outputPath('native-count-reopened.png') });
   await orkas.closePreview(preview);
   expect(orkas.modelRequests).toHaveLength(0);
   writeFileSync(info.outputPath('native-app-consumer.json'), JSON.stringify({ owner: 'production-evaluation-runner',
     sourceFiles: hashes, savedAppCount: 1, savedAppId: id, enteredCount: 7, reopenedCount: 7,
-    saveEntry: 'savedApps.saveFromPath IPC', reopenEntry: 'native-app-list-card', modelRequests: 0 }));
+    saveEntry: 'savedApps.saveFromPath IPC', reopenEntry: 'native-app-list-card', modelRequests: 0,
+    profile: loan ? 'loan-preference' : 'checkin', ...(loan ? { reopenedFee: 21 } : {}) }));
 });
 
 test('web app common data survives closing and reopening while host inference remains unavailable',async({orkas},testInfo)=>{

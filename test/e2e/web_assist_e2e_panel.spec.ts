@@ -1617,8 +1617,8 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
     const resizedWidth = (await browser.boundingBox())!.width;
     await expect.poll(async () => (await native())?.visible).toBe(true);
-    // Every application overlay suppresses the browser, including a surface
-    // outside its rectangle. No geometry-specific browser exception remains.
+    // All floating families use the same geometry rule, including a modal
+    // surface whose actual bounds do not cover the browser.
     await page.evaluate(() => {
       const overlay = document.createElement('div');
       overlay.id = 'browser-occlusion-fixture';
@@ -1627,7 +1627,7 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       document.body.appendChild(overlay);
       return new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     });
-    await expect.poll(async () => (await native())?.visible).toBe(false);
+    expect((await native())?.visible).toBe(true);
     await page.evaluate(() => {
       const overlay = document.getElementById('browser-occlusion-fixture')!;
       const rect = document.querySelector('.web-assist-native-host')!.getBoundingClientRect();

@@ -55,6 +55,7 @@ describe('complete bridge resource retrieval', () => {
     buildSync({
       entryPoints: [path.resolve(__dirname, '../../../../src/main/features/local_agents/bridge-files.ts')],
       outfile: module, bundle: true, platform: 'node', format: 'cjs',
+      external: ['original-fs'],
     });
     // Run the actual reader in a bounded child: a regression must not hang
     // the test runner (or Electron's main thread) before fstat can reject it.

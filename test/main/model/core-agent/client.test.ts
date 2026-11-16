@@ -217,7 +217,7 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('private system rules');
     expect(serialized).not.toContain('private skill catalog');
     expect(serialized).not.toContain('private live task board');
-    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('/Users/test');
     expect(serialized).not.toContain('Secret Project');
     expect(serialized).not.toContain('secret-session-id');
     expect(serialized).not.toContain('conversation-private');
@@ -754,6 +754,21 @@ describe('core-agent client skill sandbox env', () => {
       providerEmptyOutputTokens: 2,
       lastFallbackCandidateIndex: 2,
     });
+    expect(stats.providerRounds).toEqual([
+      {
+        index: 1, durationMs: 70_000, outcome: 'completed',
+        usage: { inputTokens: 100, outputTokens: 4, cacheReadTokens: 1_000,
+          cacheWriteTokens: 5, totalTokens: 1_109 },
+        toolNames: [],
+      },
+      {
+        index: 2, durationMs: 500, outcome: 'completed', stopReason: 'tool_use', textChars: 37,
+        usage: { inputTokens: 120, outputTokens: 5, cacheReadTokens: 1_000,
+          cacheWriteTokens: 6, totalTokens: 1_131 },
+        toolNames: ['read_file'],
+      },
+    ]);
+    expect(JSON.stringify(stats.providerRounds)).not.toContain('private');
     expect(JSON.stringify(summary)).not.toContain('private-provider-id');
     expect(JSON.stringify(summary)).not.toContain('another-private-provider');
     expect(JSON.stringify(summary)).not.toContain('private-call-id');
@@ -848,6 +863,18 @@ describe('core-agent client skill sandbox env', () => {
       isError: true,
     }, 1_920);
 
+    expect(stats.providerRounds[0]?.planMutations).toEqual([{
+      action: 'update',
+      initialExplicitPlan: true,
+      stepCount: 3,
+      changedStepCount: 3,
+      noOp: false,
+    }]);
+    expect(stats.providerRounds[1]).not.toHaveProperty('planMutations');
+    const serialized = JSON.stringify({ rounds: stats.providerRounds,
+      summary: client.summarizeModelRunForLog(stats, 2_000) });
+    expect(serialized).not.toContain('private milestone');
+    expect(serialized).not.toContain('private-plan-call');
   });
 
   it('does not misclassify a revision-one no-op replay as initial Plan creation', async () => {

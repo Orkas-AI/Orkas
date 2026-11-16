@@ -23,6 +23,15 @@ export type ToolDefinition = {
   constrainedSampling?: Extract<NonNullable<PiTool["constrainedSampling"]>, { type: "grammar" }>;
 };
 
+/** Read-only, provider-owned candidate limits. The opaque key survives request
+ * cloning and distinguishes equal model names on different connections. */
+export type ProviderContextBudget = Readonly<{
+  key: string;
+  model: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+}>;
+
 /** Parameters for an LLM completion request. */
 export type CompletionParams = {
   /** Request-local measurement from core preparation. `model` is the configured
@@ -36,6 +45,7 @@ export type CompletionParams = {
     tools?: ToolDefinition[];
     tokens: number;
     source: "anchored" | "estimated";
+    budget?: ProviderContextBudget;
   };
   /** Best-effort metadata observer, including attempts recovered by wrappers. Never sent to the API. */
   onRequestFailure?: (failure: import("./request-diagnostics.js").ProviderRequestFailure) => void;
@@ -95,6 +105,8 @@ export type CompletionParams = {
 export type CompletionResult = {
   content: Message["content"];
   stopReason: StopReason;
+  /** Known output truncation with discarded tool proposals; not replay state. */
+  incompleteToolCall?: true;
   usage: Usage;
   model: string;
 };
@@ -123,6 +135,10 @@ export interface LLMProvider {
    * model's catalog window and labels its measurement with it. Absent means
    * the last model the provider reported serving. */
   contextBudgetModel?(): string | undefined;
+
+  /** Actual limits for the next candidate or the candidate that last served
+   * a call. Providers without this hook retain catalog-based accounting. */
+  contextBudget?(phase?: "next" | "served"): ProviderContextBudget | undefined;
 }
 
 /** Provider factory function. */

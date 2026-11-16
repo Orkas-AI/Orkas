@@ -67,3 +67,7 @@ parentPort!.on('message', (request: { id: number; file: string; indexes: number[
     parentPort!.postMessage({ id: request.id, rows });
   });
 });
+
+// This application-level receipt follows Electron/TypeScript initialization;
+// Worker.online alone does not prove that terminating bootstrap is safe.
+parentPort!.postMessage({ ready: true });

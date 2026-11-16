@@ -39,6 +39,61 @@ test.afterEach(async ({}, info) => {
   if (analysis.requiresReview) console.info(formatProcessLogSummary(analysis));
 });
 
+test('hides app-private history in real search and after restart while preserving the source archive', async ({}, info) => {
+  const app = new OrkasTestApp(info, { configuredModel: false, marketplaceStub: true, seedLanguage: 'en' });
+  try {
+    await app.launch();
+    await installEmptyLibrarySearch(app, pcRoot);
+    const identity = await app.electronApp!.evaluate(async (_, root) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      const fs = req('node:fs');
+      const chats = req(`${root}/src/main/features/chats.ts`);
+      const paths = req(`${root}/src/main/util/project-layout.ts`);
+      const store = req(`${root}/src/main/features/search/chat_store.ts`);
+      const hidden = await chats.createConversation('account-e2e', { kind: 'app_task', title: 'Internal application archive' });
+      const visible = await chats.createConversation('account-e2e', { title: 'My archive notes' });
+      const text = 'archivevisibilitymarker';
+      for (const row of [hidden, visible]) {
+        fs.writeFileSync(paths.conversationMessageFile('account-e2e', row.conversation_id), JSON.stringify({ role: 'user', content: text, time: 't' }) + '\n');
+        store.replaceConversation('account-e2e', row.conversation_id,
+          [{ cid: row.conversation_id, msgIndex: 0, role: 'user', time: 't', text }], { mtime: 1, size: 1, next: 1 });
+      }
+      return { hidden: hidden.conversation_id, visible: visible.conversation_id,
+        file: paths.conversationMessageFile('account-e2e', hidden.conversation_id) };
+    }, pcRoot);
+    const source = readFileSync(identity.file);
+    const check = async () => {
+      for (const includeChatSnippets of [false, true]) {
+        const page = await app.invoke<any>('search.global', { query: 'archivevisibilitymarker', scope: 'chat', includeChatSnippets });
+        expect(page.results.map((row: any) => row.cid)).toEqual([identity.visible]);
+      }
+      const page = app.page!;
+      await page.locator('#sidebar-search-btn').click();
+      await page.locator('#search-input').fill('archivevisibilitymarker');
+      await page.locator('#search-input').press('Enter');
+      await page.locator('.search-tab[data-tab="chat"]').click();
+      await expect(page.locator('#search-body .search-result-title')).toHaveText(['My archive notes']);
+      await expect(page.locator('#search-body .search-result-snippet')).toContainText('archivevisibilitymarker');
+      expect(readFileSync(identity.file)).toEqual(source);
+      await page.locator('#search-input').press('Escape');
+    };
+    await check();
+    expect(await app.electronApp!.evaluate(async (_, root) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      await req(`${root}/src/main/features/search/indexer.ts`).reconcileChatsIndex('account-e2e');
+      return [...req(`${root}/src/main/features/search/chat_store.ts`).indexedConversationIds('account-e2e')];
+    }, pcRoot)).toEqual([identity.visible]);
+    await app.relaunch();
+    await installEmptyLibrarySearch(app, pcRoot);
+    await check();
+    await app.page!.locator('#sidebar-search-btn').click();
+    await app.page!.locator('#search-input').fill('archivevisibilitymarker');
+    await app.page!.locator('#search-input').press('Enter');
+    await expect(app.page!.locator('#search-body .search-result-title')).toHaveText(['My archive notes']);
+    await app.page!.screenshot({ path: info.outputPath('search-app-private-restart.png') });
+  } finally { await app.dispose(); }
+});
+
 test('searches automations and to-dos in distinct categories and reveals their current entries', async ({}, info) => {
   const app = new OrkasTestApp(info, { configuredModel: false, seedLanguage: 'zh' });
   try {
@@ -601,6 +656,73 @@ test('shows cold chat matches within the input latency budget while snippet read
   }
 });
 
+for (const [language, width, height] of [['zh', 1280, 800], ['en', 900, 640]] as const) {
+  test(`keeps the start of search results visible when earlier categories arrive later (${language})`, async ({}, info) => {
+    const app = new OrkasTestApp(info, { configuredModel: false, seedLanguage: language });
+    try {
+      await app.launch();
+      await installEmptyLibrarySearch(app, pcRoot);
+      const ids: string[] = [];
+      for (let index = 0; index < 10; index++) {
+        const { task } = await app.invoke<any>('autoTasks.create', {
+          title: `Scrollmarker automation ${index}`, content: 'Scrollmarker ' + 'long summary '.repeat(30),
+          enabled: false, schedule: { type: 'daily', hour: 9, minute: 0 },
+        });
+        ids.push(task.id);
+      }
+      await app.electronApp!.evaluate(async (_, root) => {
+        const req = (process as any).mainModule.require.bind((process as any).mainModule);
+        const uid = req(`${root}/src/main/features/users.ts`).getActiveUserId();
+        const now = new Date().toISOString();
+        await req(`${root}/src/main/features/connectors/registry.ts`).upsert(uid, {
+          id: 'custom-scrollmarker', origin: 'custom', display_name: 'Scrollmarker connector',
+          transport: { kind: 'streamable-http', url: 'https://example.test/mcp' },
+          enabled_subtools: null, tools_cache: [], tools_cached_at: 0,
+          status: { kind: 'disconnected' }, created_at: now, updated_at: now,
+        });
+      }, pcRoot);
+      const page = app.page!;
+      await page.setViewportSize({ width, height });
+      // Hold only the automation files, leaving the real connector search,
+      // stream/preload/IPC and renderer free to publish the first category.
+      await app.electronApp!.evaluate((_, input) => {
+        const req = (process as any).mainModule.require.bind((process as any).mainModule);
+        const uid = req(`${input.root}/src/main/features/users.ts`).getActiveUserId();
+        const layout = req(`${input.root}/src/main/util/project-layout.ts`);
+        const files = new Set(input.ids.map(id => layout.findAutoTaskLocation(uid, id).configFile));
+        const fsp = req('node:fs/promises'), originalRead = fsp.readFile;
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        fsp.readFile = async function(target: any, ...args: any[]) {
+          if (files.has(String(target))) await gate;
+          return originalRead.call(this, target, ...args);
+        };
+        req('node:module').syncBuiltinESMExports();
+        (globalThis as any).__releaseScrollmarker = () => {
+          release(); fsp.readFile = originalRead; req('node:module').syncBuiltinESMExports();
+        };
+      }, { root: pcRoot, ids });
+      await page.locator('#sidebar-search-btn').click();
+      await page.locator('#search-input').fill('Scrollmarker');
+      await page.locator('#search-input').press('Enter');
+      const results = page.locator('#search-body .search-result');
+      await expect(results).toHaveCount(1);
+      await expect(results).toContainText('Scrollmarker connector');
+      expect(await page.locator('#search-body').evaluate(body => body.scrollTop)).toBe(0);
+      await app.electronApp!.evaluate(() => (globalThis as any).__releaseScrollmarker());
+      await expect(results).toHaveCount(11);
+      await expect(page.locator('#search-body .search-loading-spinner')).toHaveCount(0);
+      expect(await page.locator('#search-body').evaluate(body => body.scrollHeight > body.clientHeight)).toBe(true);
+      expect(await page.locator('#search-body').evaluate(body => body.scrollTop)).toBe(0);
+      await expect(results.first()).toBeInViewport();
+      await expect(results.first()).toContainText('Scrollmarker automation 0');
+      await expect(page.locator('#search-input')).toBeFocused();
+      await page.screenshot({ path: info.outputPath(`search-top-${language}-${width}.png`) });
+      await page.locator('#search-input').press('Escape');
+    } finally { await app.dispose(); }
+  });
+}
+
 test('paints local hits before held semantic retrieval and preserves selection when body results arrive', async ({}, info) => {
   const app = new OrkasTestApp(info, { configuredModel: false, seedLanguage: 'en' });
   try {
@@ -827,7 +949,7 @@ test('shows preparation before full results, searches partial history, and resum
 });
 
 test('runs rebuild, live indexing and snippet workers from an ASAR with the shipped dependency layout', async ({}, testInfo) => {
-  const app = new OrkasTestApp(testInfo, { configuredModel: false });
+  const app = new OrkasTestApp(testInfo, { configuredModel: false, marketplaceStub: true });
   try {
     const source = path.join(app.root, 'package-source');
     const archive = path.join(app.root, 'fixture.asar');
@@ -882,8 +1004,16 @@ test('runs rebuild, live indexing and snippet workers from an ASAR with the ship
         const snippet = await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => reject(new Error('Packaged snippet worker did not respond')), 10_000);
           snippetWorker.once('error', (error: Error) => { clearTimeout(timeout); reject(error); });
-          snippetWorker.once('message', (message: any) => { clearTimeout(timeout); resolve(message.rows[0]?.[1]?.snippet); });
-          snippetWorker.postMessage({ id: 1, file, indexes: [0], tokens: ['packagedmarker'], source: { userId: 'packaged-fixture', cid: 'source' } });
+          snippetWorker.on('message', (message: any) => {
+            // The application-ready receipt precedes the correlated reply.
+            if (message.ready === true) {
+              snippetWorker!.postMessage({ id: 1, file, indexes: [0], tokens: ['packagedmarker'], source: { userId: 'packaged-fixture', cid: 'source' } });
+              return;
+            }
+            if (message.id !== 1) return;
+            clearTimeout(timeout);
+            resolve(message.rows[0]?.[1]?.snippet);
+          });
         });
         return { complete: batch.complete, liveComplete, liveMatches: store.postingsFor('packaged-fixture', 'packagedlivemarker').length, count: store.docCount('packaged-fixture'),
           matches: store.postingsFor('packaged-fixture', 'packagedmarker').length, snippet };

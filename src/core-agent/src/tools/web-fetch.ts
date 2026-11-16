@@ -6,6 +6,7 @@
  * HTML tag stripping.
  */
 import { defineTool, type AgentTool, type ToolResult } from "./base.js";
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 import { createLogger } from "../shared/logger.js";
 import {
   compactGitHubSnapshotReplay,
@@ -712,13 +713,13 @@ async function httpFetchPage(url: string, signal?: AbortSignal): Promise<DirectF
 
     if (body.contentType.includes("json")) {
       try {
-        return { result: { content: JSON.stringify(JSON.parse(body.raw), null, 2) }, browserRecoverable: false };
+        return { result: { content: JSON.stringify(JSON.parse(body.raw), null, 2), webSourceUrl: response.url || url }, browserRecoverable: false };
       } catch {
-        return { result: { content: body.raw }, browserRecoverable: false };
+        return { result: { content: body.raw, webSourceUrl: response.url || url }, browserRecoverable: false };
       }
     }
     if (body.contentType.includes("text/plain")) {
-      return { result: { content: body.raw }, browserRecoverable: false };
+      return { result: { content: body.raw, webSourceUrl: response.url || url }, browserRecoverable: false };
     }
 
     const title = extractTitle(body.raw);
@@ -740,7 +741,7 @@ async function httpFetchPage(url: string, signal?: AbortSignal): Promise<DirectF
         browserRecoverable: issue.code !== "PAGE_NOT_FOUND",
       };
     }
-    return { result: { content: header + text }, browserRecoverable: false };
+    return { result: { content: header + text, webSourceUrl: response.url || url }, browserRecoverable: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (signal?.aborted) {
@@ -793,6 +794,7 @@ async function renderPage(url: string, signal?: AbortSignal): Promise<ToolResult
 
   log.info("browser render retry recovered the page body", { text_chars: text.length });
   return {
+    webSourceUrl: page?.url || url,
     content: pageHeader({
       title,
       url: page?.url || url,
@@ -830,6 +832,8 @@ export const webFetchTool: AgentTool = defineTool({
     required: ["url"],
   },
   async execute(input, ctx) {
+    if (input.url == null) return parameterError('Error: url is required', ['url'], 'required');
+    if (typeof input.url !== 'string') return parameterError('Error: url must be a string', ['url'], 'invalid_type');
     const url = (input.url as string).trim();
     const requestedMaxChars = Number(input.maxChars);
     const maxChars = Number.isFinite(requestedMaxChars) && requestedMaxChars > 0
@@ -837,13 +841,13 @@ export const webFetchTool: AgentTool = defineTool({
       : null;
 
     if (!url) {
-      return { content: "Error: url is required", isError: true };
+      return parameterError("Error: url is required", ['url'], 'required');
     }
     if (!/^https?:\/\//i.test(url)) {
-      return { content: "Error: only http:// and https:// URLs are supported", isError: true };
+      return parameterError("Error: only http:// and https:// URLs are supported", ['url'], 'invalid_value');
     }
     const offset = parseOffset(input.offset);
-    if (typeof offset === "string") return { content: offset, isError: true };
+    if (typeof offset === "string") return parameterError(offset, ['offset'], 'invalid_value');
     if (ctx.signal?.aborted) return { content: `Fetch of ${url} was cancelled`, isError: true };
 
     const fetchCache = fetchCacheForState(ctx.state);

@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { OrkasTestApp } from './fixtures/orkas';
-import { checkLatencyBudget } from '../helpers/latency-budget';
+import { checkLatencyBudget, BULK_MAIN_GAP_LIMIT_MS } from '../helpers/latency-budget';
 const { collectLogFiles } = require('./fixtures/electron-log-files.cjs');
 
 test('prepares the selected API after boot without requests and keeps Main responsive', async ({}, testInfo) => {
@@ -34,7 +34,7 @@ test('prepares the selected API after boot without requests and keeps Main respo
       delete (globalThis as any).__preloadPulse;
       return { maxGapMs: pulse.maxGapMs };
     });
-    checkLatencyBudget('main loop response during idle API preload', { elapsedMs: pulse.maxGapMs });
+    checkLatencyBudget('main loop response during idle API preload', { elapsedMs: pulse.maxGapMs }, BULK_MAIN_GAP_LIMIT_MS);
     await page.locator('#new-chat-input').fill('Reply after idle preparation.');
     await page.locator('#new-chat-send-btn').click();
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))

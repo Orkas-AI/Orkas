@@ -437,7 +437,7 @@ describe('group_chat failed-turn smart retry', () => {
     expect(resolved.value.enqueue.retrySourceMessageId).toBe(`${cid}-source`);
   });
 
-  it('uses an explicitly linked internal dispatch instead of guessing a nearby user task', async () => {
+  it.each([undefined, 'Original bounded goal; final answer in Arabic.', 'x'.repeat(4001)])('uses an explicitly linked internal dispatch and its trusted goal after reload (%s)', async (goal) => {
     const cid = 'dispatch-source-retry-cid';
     const layout = await import('../../../../src/main/util/project-layout');
     const file = layout.conversationMessageFile(UID, cid);
@@ -458,6 +458,7 @@ describe('group_chat failed-turn smart retry', () => {
         text: 'Internal continuation',
         model_text: 'Exact internal continuation payload',
         dispatch: true,
+        ...(goal !== undefined ? { orchestration_goal: goal } : {}),
       },
       {
         id: `${cid}-failed`,
@@ -486,6 +487,8 @@ describe('group_chat failed-turn smart retry', () => {
     expect(resolved.value.mode).toBe('restart');
     expect(resolved.value.enqueue.model_text).toBe('Exact internal continuation payload');
     expect(resolved.value.enqueue.retrySourceMessageId).toBe(`${cid}-dispatch`);
+    if (goal === undefined) expect(resolved.value.enqueue).not.toHaveProperty('orchestrationGoal');
+    else expect(resolved.value.enqueue.orchestrationGoal).toBe(goal.slice(0, 4000));
   });
 
   it('restarts an older failed bubble instead of attaching it to a newer actor turn', async () => {

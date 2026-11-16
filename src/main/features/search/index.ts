@@ -109,7 +109,7 @@ async function _getChatDisplayCatalog(userId: string): Promise<ChatDisplayCatalo
       import('../projects'),
     ]);
     const [conversationRows, projectRows] = await Promise.all([
-      chats.listConversationDisplayRows(userId, { includeDeleted: true }),
+      chats.listConversationDisplayRows(userId, { includeDeleted: true, includeHidden: true }),
       projects.listProjectNameRows(userId),
     ]);
     const eligibility = await chatEligibility(userId, conversationRows);

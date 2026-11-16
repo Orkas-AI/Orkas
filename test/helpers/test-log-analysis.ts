@@ -256,7 +256,7 @@ export function installTestLogAnalysis(): void {
     installStreamTaps(state);
   }
   const fileState = state;
-  fileState.stderrReceipt = process.env.ORKAS_TEST_BATCH_REPORT ? createStderrReceipt() : undefined;
+  fileState.stderrReceipt = (process.env.ORKAS_TEST_BATCH_REPORT || process.env.ORKAS_TEST_PROCESS_REPORT) ? createStderrReceipt() : undefined;
 
   beforeEach(() => {
     fileState.current = newScope('case', []);

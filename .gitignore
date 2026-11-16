@@ -11,6 +11,7 @@
 /resources/runtime/uv
 /resources/runtime/ffmpeg
 /resources/runtime/whisper
+/resources/runtime/libraw/
 /resources/runtime/vc
 /resources/runtime/phone-passkey/
 /src/main/native/build/

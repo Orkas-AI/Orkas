@@ -31,6 +31,7 @@ afterEach(() => {
   if (previousStateDir === undefined) delete process.env.CORE_AGENT_STATE_DIR;
   else process.env.CORE_AGENT_STATE_DIR = previousStateDir;
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -416,6 +417,11 @@ describe("web-search tool execution", () => {
   });
 
   it("handles a Brave 429 inside one tool call by falling back to DuckDuckGo once", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const rejected = new Response("private response body", {
+      status: 429, statusText: "private-status-text", headers: { "content-type": "text/html; charset=utf-8" },
+    });
+    const readRejectedBody = vi.spyOn(rejected, "text");
     fs.writeFileSync(path.join(stateDir, "web-search-cache.json"), JSON.stringify({
       preferred: "brave",
       probedAt: new Date().toISOString(),
@@ -423,7 +429,7 @@ describe("web-search tool execution", () => {
     const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
       const href = String(url);
       return href.includes("brave.com")
-        ? new Response("rate limited", { status: 429, statusText: "Too Many Requests" })
+        ? rejected
         : new Response(DUCKDUCKGO_FIXTURE, { status: 200 });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -437,6 +443,13 @@ describe("web-search tool execution", () => {
     const cache = JSON.parse(fs.readFileSync(path.join(stateDir, "web-search-cache.json"), "utf8"));
     expect(cache.preferred).toBe("duckduckgo");
     expect(cache.reason).toContain("HTTP 429");
+    expect(readRejectedBody).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledExactlyOnceWith("[web-search]", "provider request failed", {
+      provider: "brave", next_provider: "duckduckgo", failure_stage: "http", attempts: 1,
+      http_status: 429, content_type: "text/html", decoded_body_bytes: null,
+      parsed_results: null, elapsed_ms: expect.any(Number),
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private-");
   });
 
   it("uses Bing RSS after both Brave and DuckDuckGo fail", async () => {
@@ -467,14 +480,15 @@ describe("web-search tool execution", () => {
     expect(String(fetchMock.mock.calls[5][0])).toContain("format=rss");
   });
 
-  it("recovers through Yahoo when DuckDuckGo returns an anti-bot page", async () => {
+  it.each([200, 202])("records empty-result response facts (%i) and recovers through Yahoo", async (status) => {
+    const warn = vi.spyOn(console, "warn");
     const fetchMock = vi.fn(async (url: string) => {
       const href = String(url);
       if (href.includes("brave.com")) {
         return new Response("rate limited", { status: 429, statusText: "Too Many Requests" });
       }
       if (href.includes("duckduckgo.com")) {
-        return new Response("<html>challenge</html>", { status: 202 });
+        return new Response("<html>challenge</html>", { status, headers: { "content-type": "text/html" } });
       }
       return new Response(YAHOO_FIXTURE, { status: 200 });
     });
@@ -486,9 +500,17 @@ describe("web-search tool execution", () => {
     expect(result.content).toContain("via Yahoo");
     expect(result.content).toContain("https://official.example.com/report?id=1");
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    // The fixture has no result markup; its HTTP status does not prove a CAPTCHA or a parser defect.
+    expect(warn).toHaveBeenLastCalledWith("[web-search]", "provider request failed", {
+      provider: "duckduckgo", next_provider: "yahoo", failure_stage: "empty_results", attempts: 1,
+      http_status: status, content_type: "text/html", decoded_body_bytes: 22,
+      parsed_results: 0, elapsed_ms: expect.any(Number),
+    });
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 
   it("recovers through Sogou when Brave and DuckDuckGo are unavailable", async () => {
+    const warn = vi.spyOn(console, "warn");
     const fetchMock = vi.fn(async (url: string) => {
       const href = String(url);
       if (href.includes("brave.com")) {
@@ -510,12 +532,23 @@ describe("web-search tool execution", () => {
     expect(result.content).toContain("via Sogou");
     expect(result.content).toContain("https://report.example.cn/ai-hiring?id=2026");
     expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(warn).toHaveBeenCalledWith("[web-search]", "provider request retry", {
+      provider: "yahoo", next_provider: "yahoo", failure_stage: "http", attempts: 1,
+      http_status: 500, content_type: "text/plain", decoded_body_bytes: null,
+      parsed_results: null, elapsed_ms: expect.any(Number),
+    });
+    expect(warn).toHaveBeenLastCalledWith("[web-search]", "provider request failed", {
+      provider: "yahoo", next_provider: "sogou", failure_stage: "http", attempts: 2,
+      http_status: 500, content_type: "text/plain", decoded_body_bytes: null,
+      parsed_results: null, elapsed_ms: expect.any(Number),
+    });
   });
 
   it("falls back when the preferred provider returns an unparseable empty page", async () => {
+    const warn = vi.spyOn(console, "warn");
     const fetchMock = vi.fn(async (url: string) => (
       String(url).includes("brave.com")
-        ? new Response("<html><body>layout changed</body></html>", { status: 200 })
+        ? new Response("<html>🌏</html>", { status: 200 })
         : new Response(DUCKDUCKGO_FIXTURE, { status: 200 })
     ));
     vi.stubGlobal("fetch", fetchMock);
@@ -525,6 +558,76 @@ describe("web-search tool execution", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content).toContain("via DuckDuckGo");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("[web-search]", "provider request failed", {
+      provider: "brave", next_provider: "duckduckgo", failure_stage: "empty_results", attempts: 1,
+      http_status: 200, content_type: "text/plain", decoded_body_bytes: 17,
+      parsed_results: 0, elapsed_ms: expect.any(Number),
+    });
+  });
+
+  it.each(["transport", "body_read", "parse"] as const)("keeps %s failure diagnostics content-free and still recovers", async (stage) => {
+    const warn = vi.spyOn(console, "warn");
+    const privateText = "private-query https://private.example/?token=secret";
+    const originalMatch = String.prototype.match;
+    if (stage === "parse") {
+      // Inject a parser fault after a real response body is read; no fake result is injected.
+      vi.spyOn(String.prototype, "match").mockImplementation(function (pattern) {
+        if (String(this).includes("parser-fault-marker")) throw new Error(privateText);
+        return originalMatch.call(this, pattern);
+      });
+    }
+    const fetchMock = vi.fn(async (url: string) => {
+      if (!String(url).includes("brave.com")) return new Response(DUCKDUCKGO_FIXTURE);
+      if (stage === "transport") throw new Error(privateText);
+      const response = new Response(stage === "parse"
+        ? '<div class="snippet" data-type="web">parser-fault-marker</div>'
+        : privateText, { headers: { "content-type": "text/html" } });
+      if (stage === "body_read") vi.spyOn(response, "text").mockRejectedValue(new Error(privateText));
+      return response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await runBuiltinWebSearch(privateText);
+
+    expect(result.isError).not.toBe(true);
+    expect(result.displayName).toBe("DuckDuckGo");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("[web-search]", "provider request failed", {
+      provider: "brave", next_provider: "duckduckgo", failure_stage: stage, attempts: 1,
+      http_status: stage === "transport" ? null : 200,
+      content_type: stage === "transport" ? "unknown" : "text/html",
+      decoded_body_bytes: stage === "parse" ? 62 : null,
+      parsed_results: null, elapsed_ms: expect.any(Number),
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private|secret|parser-fault-marker/);
+  });
+
+  it("logs every exhausted provider, including the terminal failure, without reading error bodies or echoing headers", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const readBody = vi.fn();
+    const fetchMock = vi.fn(async () => {
+      const response = new Response("private response body", {
+        status: 503, headers: { "content-type": `private/${"x".repeat(10000)}` },
+      });
+      vi.spyOn(response, "text").mockImplementation(readBody);
+      return response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await runBuiltinWebSearch("private query");
+
+    expect(result.isError).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(readBody).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(6);
+    expect(warn.mock.calls.map(call => call[2].provider)).toEqual(["brave", "duckduckgo", "yahoo", "sogou", "so", "bing"]);
+    expect(warn).toHaveBeenLastCalledWith("[web-search]", "provider request failed", {
+      provider: "bing", next_provider: null, failure_stage: "http", attempts: 1,
+      http_status: 503, content_type: "other", decoded_body_bytes: null,
+      parsed_results: null, elapsed_ms: expect.any(Number),
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private");
+    expect(JSON.stringify(warn.mock.calls).length).toBeLessThan(2500);
   });
 
   it("serializes sibling keyless searches and reuses the recovered provider", async () => {

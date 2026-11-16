@@ -25,7 +25,8 @@ export const MIN_VERSIONS: Readonly<Record<LocalCliType, string>> = {
   // compatibility.
   codex: '0.145.0',
   // OpenCode's run --auto --format json transport, session continuation and
-  // per-run MCP configuration are validated from this release line.
+  // per-run MCP configuration are validated from this release line. 2.x
+  // (checked against 2.2.6) differs in `run` flags, adapted from its help.
   opencode: '1.18.0',
   // The native configuration/MCP overlay is verified against 2026.4.11;
   // see openclaw.ts and the zero-model canaries recorded in 92a3944ff.

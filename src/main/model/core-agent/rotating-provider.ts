@@ -54,15 +54,16 @@
  * callers can clear any prior cooldown + bump lastUsed.
  */
 
+import { createHash } from 'node:crypto';
 import type { CustomModelImageSupport } from './custom-model-image-support';
-import type { LLMProvider, CompletionParams, CompletionResult, Message } from '#core-agent';
+import type { LLMProvider, ProviderContextBudget, CompletionParams, CompletionResult, Message } from '#core-agent';
 import type { ProviderEmptyKind, ProviderTerminationCategory, StreamEvent, Usage } from '#core-agent';
 import { classifyKeyFailure, formatKeyFailure, type KeyFailureKind } from './auth-error';
 import { markCooldown } from './profile-cooldown';
 import { createLogger } from '../../logger';
 import { getRetryErrorPolicyConfig } from '../../features/client_config';
-import { isProviderRateLimitError, isTerminalRecoveryError, classifyTransientNetworkError, classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
-import { providerErrorFacts, providerRequestWasRejected } from '../../../core-agent/src/shared/provider-error-facts';
+import { COMMITTED_STREAM_RATE_LIMIT_CODE, isProviderRateLimitError, isTerminalRecoveryError, classifyTransientNetworkError, classifyRetryableErrorWithPolicy, type RetryableErrorKind } from '../../../core-agent/src/shared/errors';
+import { providerErrorFacts, providerRequestWasRejected, providerRetryAfterMs } from '../../../core-agent/src/shared/provider-error-facts';
 import { maskId } from '../../util/log-redact';
 
 import { MIN_NATIVE_MODEL_CONTEXT_WINDOW, modelContextWindowBelowMinimum } from '../../util/model-context-window';
@@ -246,9 +247,8 @@ export interface CreateRotatingProviderConfig {
    *  rotating-provider's primary label. Fires at most once per `complete`
    *  / `stream` invocation. */
   onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
-  /** Reports configured and currently usable candidates even when no fallback
-   * occurs. This keeps `candidate_count=0` from ambiguously meaning either
-   * "one candidate" or "not observed" in sampled diagnostics. */
+  /** Reports bounded configured/available counts to local runtime diagnostics,
+   * including calls that never need a fallback. */
   onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void;
   /** Provider id surfaced as `LLMProvider.id` — should match the group's
    *  shared provider id, e.g. "anthropic" / "moonshot". */
@@ -314,9 +314,31 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     || unavailableProfiles.has(cooldownIdFor(candidate))
     || rateLimitedCandidates.has(rateLimitIdFor(candidate))
   );
+  // Pin a committed model through its bounded recovery.
+  let recoveryCandidate: RotatingCandidate | undefined;
   const budgetCandidate = (): RotatingCandidate | undefined => {
-    const first = candidates.find(candidate => !isUnavailable(candidate));
+    const first = recoveryCandidate ?? candidates.find(candidate => !isUnavailable(candidate));
     return typeof first?.contextWindow === 'number' ? first : undefined;
+  };
+  let servedCandidate: RotatingCandidate | undefined;
+  const candidateBudgets = new WeakMap<RotatingCandidate, ProviderContextBudget>();
+  const budgetFor = (candidate?: RotatingCandidate): ProviderContextBudget | undefined => {
+    if (!candidate || typeof candidate.contextWindow !== 'number') return undefined;
+    const output = candidate.maxTokens ?? 8_192;
+    if (!Number.isSafeInteger(candidate.contextWindow) || candidate.contextWindow <= 0
+      || !Number.isSafeInteger(output) || output <= 0 || output >= candidate.contextWindow) return undefined;
+    const cached = candidateBudgets.get(candidate);
+    if (cached && cached.model === candidate.modelId && cached.contextWindow === candidate.contextWindow
+      && cached.maxOutputTokens === output) return cached;
+    const budget = Object.freeze({
+      // Host-private matching only: never expose profile ids to payloads/logs.
+      key: createHash('sha256').update(JSON.stringify([
+        candidate.profileId, candidate.providerId, candidate.modelId, candidate.contextWindow, output,
+      ])).digest('hex'),
+      model: candidate.modelId, contextWindow: candidate.contextWindow, maxOutputTokens: output,
+    });
+    candidateBudgets.set(candidate, budget);
+    return budget;
   };
   const allConfiguredRateLimited = (): boolean => candidates.length > 0 && candidates.every(isUnavailable)
     && candidates.every(candidate => rateLimitedCandidates.has(rateLimitIdFor(candidate)));
@@ -363,7 +385,17 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     if (cand.providerId === 'custom' && params.messages.some(message => messageImageCount(message) > 0)) {
       cand.imageSupport?.observeRejection(error);
     }
+    if (isTerminalRecoveryError(error)) return;
     if (committed && (classifyKeyFailure(error) === 'rate_limit' || isProviderRateLimitError(error))) {
+      if (params.requestMetadata?.outputLimitSource !== 'provider_default') {
+        // Keep the candidate pinned until this model round completes. Runner
+        // owns the bounded wait and uses the already committed tool receipts.
+        recoveryCandidate = cand;
+        config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+        throw Object.assign(new Error('Model stream was rate limited'), {
+          code: COMMITTED_STREAM_RATE_LIMIT_CODE, cause: error, retryAfterMs: providerRetryAfterMs(error),
+        });
+      }
       terminalRateLimit = exhaustedCredentialError(error, { kind: 'rate_limit', cooldownKind: null });
       config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
       throw terminalRateLimit;
@@ -454,7 +486,9 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // lowering admission. Other providers/models and projected inputs use
       // the ordinary raw estimate.
       const measured = params.requestTokenEstimate;
-      const validMeasurement = measured && (cand.providerId === providerId || cand === priced)
+      const validMeasurement = measured && (measured.budget
+        ? measured.budget.key === budgetFor(cand)?.key
+        : cand.providerId === providerId || cand === priced)
         && measured.model === next.model && measured.messages === next.messages
         && measured.systemPrompt === next.systemPrompt && measured.tools === next.tools
         && Number.isSafeInteger(measured.tokens) && measured.tokens >= 0
@@ -857,7 +891,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           if (item.type === 'text') return !!String(item.text ?? '').trim();
           return item.type === 'tool_use';
         });
-        if (!hasUsableContent) {
+        if (!hasUsableContent && (ev as Extract<StreamEvent, { type: 'message_end' }>).stopReason !== 'max_tokens') {
           disposeStream();
           const category = (ev as Extract<StreamEvent, { type: 'message_end' }>)
             .providerTermination?.category;
@@ -889,6 +923,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
 
     contextBudgetModel: () => budgetCandidate()?.modelId,
+    contextBudget: (phase = 'next') => budgetFor(phase === 'served' ? servedCandidate : budgetCandidate()),
 
     async complete(params: CompletionParams): Promise<CompletionResult> {
       if (config.requireImageInput && !params.messages.some(message => messageImageCount(message) > 0)) {
@@ -914,7 +949,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       const { admitted } = await admitCandidates(params);
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if (isUnavailable(cand) || !admitted.has(cand)) continue;
+        if ((recoveryCandidate && cand !== recoveryCandidate) || isUnavailable(cand) || !admitted.has(cand)) continue;
         lastCand = cand;
 
         let networkRetry = 0;
@@ -942,6 +977,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               throw new ProviderEmptyResponseError(cand.providerId, 'normal_end_empty');
             }
             config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+            servedCandidate = cand;
             config.onSuccess?.(cand.profileId, cand);
             for (const id of networkFailedThisCall) unavailableProfiles.add(id);
             return result;
@@ -1034,7 +1070,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
 
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if (isUnavailable(cand) || !admitted.has(cand)) continue;
+        if ((recoveryCandidate && cand !== recoveryCandidate) || isUnavailable(cand) || !admitted.has(cand)) continue;
         lastCand = cand;
         let attempt: Awaited<ReturnType<typeof streamOne>> | null = null;
         let networkRetry = 0;
@@ -1046,6 +1082,12 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             requestMetadata: admitted.get(cand)!.requestMetadata });
 
           if (!('rotatable' in attempt)) break;
+          if (recoveryCandidate === cand) {
+            // A recovery that fails before its first delta still belongs to
+            // the same committed call, never the normal fallback sweep.
+            observeFailure(cand, params, attempt.err, true);
+            throw attempt.err;
+          }
           if (config.requireImageInput) {
             observeFailure(cand, params, attempt.err);
             if (lacksRequiredImages(cand)) break;
@@ -1144,13 +1186,13 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           const hasFallback = !!fallbackCandidate;
           if (failure.cooldownKind && failure.cooldownKind !== 'network') {
             markUnavailable(cand, failure.cooldownKind, reason);
-            if (failure.kind === 'auth' && hasFallback) {
+            if ((failure.kind === 'auth' || failure.kind === 'balance') && hasFallback) {
               yield {
                 type: 'provider_fallback',
-              reason: 'auth',
-              providerId: cand.providerId,
-              candidateIndex: i + 1,
-              candidateCount: candidates.length,
+                reason: failure.kind,
+                providerId: cand.providerId,
+                candidateIndex: i + 1,
+                candidateCount: candidates.length,
               };
             }
           } else if (isProviderNoFirstEventTimeout(attempt.err) && hasFallback) {
@@ -1184,6 +1226,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         let streamFinished = false;
         try {
           config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+          servedCandidate = cand;
           config.onSuccess?.(cand.profileId, cand);
           // This candidate works, so the network failures collected above were
           // candidate-specific: keep those candidates out of the remaining
@@ -1212,6 +1255,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             const { value, done } = await iterator.next();
             if (done) {
               streamFinished = true;
+              recoveryCandidate = undefined;
               return;
             }
             if (value?.type === 'error') observeFailure(cand, params, value.error, true);

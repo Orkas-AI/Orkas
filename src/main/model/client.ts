@@ -241,9 +241,6 @@ export interface ChatOptions {
    *  and attaches a `artifacts[]` list to the assistant message so the
    *  renderer embeds each interactive web-app artifact in the bubble. */
   onArtifactCreated?: (a: { id: string; title: string; revision?: number }) => void;
-  /** Host diagnostic delivery is independent of chat completion. The host
-   * pins this promise to the originating task before the stream ends. */
-  onDiagnosticsPending?: (result: Promise<StreamEvent | null>) => void;
   /** Fired only after the custom-connector manager has durably accepted a
    * user-confirmed server. Group chat uses the stable id to offer a review
    * shortcut; the callback is not part of installation authorization. */
@@ -285,6 +282,8 @@ export interface ChatOptions {
    *  (the nested session is fresh/unique, so it's uncontended). Default false =
    *  top-level turn = current behavior. */
   nested?: boolean;
+  /** Host-owned approval source, refreshed only after a real user steer is durably applied. */
+  currentUserMessage?: { text: string };
   /** interrupt-steer (G9). Called at each safe model/tool-loop boundary. The
    * group-chat host may asynchronously hydrate rich queued content before it
    * is atomically folded into this run. */

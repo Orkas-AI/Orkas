@@ -231,6 +231,7 @@ function loadRenderer(cid: string) {
     _bumpConvToTop = function() {};
     _repaintConvRowStatus = function() {};
     _scheduleConversationInfoFileRefresh = function() {};
+    _scheduleConversationTaskLinksRefresh = function() {};
     _evaluateAutoRecipient = function() {};
     _renderOrClaimPersistedUserMessage = function() { return true; };
     _isRoutingOnlyEventNames = function() { return false; };

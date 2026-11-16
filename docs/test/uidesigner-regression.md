@@ -1,5 +1,17 @@
 # UIDesigner 测试规范与回归 Case
 
+## Capability display and handoff criteria
+
+Capability summaries describe interface creation, source reconstruction,
+reusable visual systems, accessible prototypes and design review. They are not
+runtime instructions. Resident standards retain usable artifact delivery,
+complete required assets, traceable revisions and recorded visual-review
+evidence; manifest fields and the exact revision transition remain owned by
+`ui-artifact-workspace` and `ui-design-executor`. The benchmark contract checks
+the resident workflow/standards and routed Skills, while `agent-standards-budget`
+verifies that display copy stays absent and standards appear once in real
+English and Chinese prompts. These checks do not establish live design quality.
+
 ## 范围与准入规则
 
 本文件覆盖内置 UIDesigner（agent id `bcfcb4921dce`）的输出格式与技能路由、仓库源码写入边界、已有产品扩展与多来源权责、设计来源保真、独立产物目录、原位修订、HTML 运行安全、响应式与可访问性、live data 安全及能力交接。

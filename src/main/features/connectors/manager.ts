@@ -28,6 +28,7 @@ import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './avai
 import { startComposioConnect, startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
 import { startMcpDcrOAuth, startCustomMcpOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
+import { missingRequiredOAuthScopes } from './oauth-scopes';
 import { isConnectorActionBlocked } from './action_policy';
 import { logErrorSummary } from '../../util/log-redact';
 import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
@@ -333,8 +334,7 @@ function _missingRequiredScopes(entry: CatalogEntry, grant: OAuthGrant | undefin
   const required = Array.isArray(entry.required_oauth_scopes) ? entry.required_oauth_scopes : [];
   if (!required.length || !grant) return [];
   if (!Array.isArray(grant.scopes)) return required.slice();
-  const granted = new Set(grant.scopes.filter(Boolean));
-  return required.filter((scope) => !granted.has(scope));
+  return missingRequiredOAuthScopes(required, grant.scopes);
 }
 
 function _storedAuthorizationProblem(inst: ConnectorInstance): { message: string; reason: string } | null {

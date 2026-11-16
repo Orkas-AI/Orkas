@@ -1,0 +1,618 @@
+--- a/codex-rs/codex-api/src/error.rs
++++ b/codex-rs/codex-api/src/error.rs
+@@ -12,6 +12,8 @@
+     Transport(#[from] TransportError),
+     #[error("api error {status}: {message}")]
+     Api { status: StatusCode, message: String },
++    #[error("WebSocket request rejected as too large (close 1009)")]
++    WebSocketRequestTooLarge,
+     #[error("stream error: {0}")]
+     Stream(String),
+     #[error("stream error: Incomplete response returned, reason: content_filter")]
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -671,6 +671,7 @@
+     timing_log_context: &ResponsesWebsocketTimingLogContext,
+     interrupt: oneshot::Receiver<()>,
+ ) -> Result<(), ApiError> {
++    let mut received_server_message = false;
+     let mut last_server_model: Option<String> = None;
+     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
+     send_websocket_request(
+@@ -727,6 +728,7 @@
+
+         match message {
+             Message::Text(text) => {
++                received_server_message = true;
+                 if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
+                     && let Some(error) =
+                         map_wrapped_websocket_error_event(wrapped_error, text.to_string())
+@@ -833,6 +835,15 @@
+             }
+             Message::Binary(_) => {
+                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
++            }
++            Message::Close(Some(frame))
++                if frame.code
++                    == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Size
++                    && !received_server_message =>
++            {
++                // Only an explicit rejection before any server event can switch transport
++                // without replaying a response that may already have produced output.
++                return Err(ApiError::WebSocketRequestTooLarge);
+             }
+             Message::Close(_) => {
+                 return Err(ApiError::Stream(
+@@ -1277,4 +1288,125 @@
+             }
+         );
+     }
+-}
++
++    #[tokio::test]
++    async fn oversized_websocket_close_is_not_retried_as_a_transient_stream() {
++        use crate::RetryConfig;
++        use crate::auth::AuthProvider;
++        use codex_http_client::HttpClientFactory;
++        use codex_http_client::OutboundProxyPolicy;
++        use tokio::net::TcpListener;
++        use tokio_tungstenite::accept_async_with_config;
++        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
++
++        struct NoAuth;
++        impl AuthProvider for NoAuth {
++            fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
++        }
++
++        for (code, prefix, should_retry) in [
++            (CloseCode::Size, None, false),
++            (
++                CloseCode::Size,
++                Some(json!({"type":"response.created","response":{"id":"accepted"}})),
++                true,
++            ),
++            (CloseCode::Normal, None, true),
++            (CloseCode::Error, None, true),
++        ] {
++            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++            let address = listener.local_addr().expect("address");
++            let server = tokio::spawn(async move {
++                let (socket, _) = listener.accept().await.expect("accept");
++                let mut socket = accept_async_with_config(socket, Some(websocket_config()))
++                    .await
++                    .expect("upgrade");
++                socket
++                    .next()
++                    .await
++                    .expect("request")
++                    .expect("request frame");
++                if let Some(prefix) = prefix {
++                    socket
++                        .send(Message::Text(prefix.to_string().into()))
++                        .await
++                        .expect("prefix");
++                }
++                socket
++                    .close(Some(CloseFrame {
++                        code,
++                        reason: "opaque peer reason".into(),
++                    }))
++                    .await
++                    .expect("close");
++            });
++            let provider = Provider {
++                name: "size-test".to_string(),
++                base_url: format!("http://{address}"),
++                query_params: None,
++                headers: HeaderMap::new(),
++                retry: RetryConfig {
++                    max_attempts: 1,
++                    base_delay: Duration::ZERO,
++                    retry_429: false,
++                    retry_5xx: false,
++                    retry_transport: false,
++                },
++                stream_idle_timeout: Duration::from_secs(2),
++            };
++            let client = ResponsesWebsocketClient::new(provider, Arc::new(NoAuth));
++            let connection = client
++                .connect(
++                    &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++                    HeaderMap::new(),
++                    HeaderMap::new(),
++                    /*turn_state*/ None,
++                    /*telemetry*/ None,
++                )
++                .await
++                .expect("connect");
++            let request = ResponseCreateWsRequest {
++                model: "test",
++                instructions: "",
++                previous_response_id: None,
++                input: &[],
++                tools: None,
++                tool_choice: "auto",
++                parallel_tool_calls: false,
++                reasoning: None,
++                store: false,
++                stream: true,
++                stream_options: None,
++                include: &[],
++                service_tier: None,
++                prompt_cache_key: None,
++                text: None,
++                generate: None,
++                client_metadata: None,
++                access_programs: None,
++            };
++            let mut stream = connection
++                .stream_request(
++                    ResponsesWsRequest::ResponseCreate(request),
++                    /*connection_reused*/ false,
++                    /*turn_state*/ None,
++                )
++                .await
++                .expect("stream");
++            let mut error = None;
++            while let Some(event) = stream.next().await {
++                if let Err(failure) = event {
++                    error = Some(failure);
++                    break;
++                }
++            }
++            let error = crate::map_api_error(error.expect("terminal close error"));
++            assert_eq!(
++                error.retry_delay(/*retry_count*/ 1).is_some(),
++                should_retry,
++                "size rejection before response activity must bypass ordinary retries"
++            );
++            server.await.expect("server exit");
++        }
++    }
++}
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -28,6 +28,7 @@
+         ApiError::Transport(_)
+         | ApiError::Api { .. }
+         | ApiError::Stream(_)
++        | ApiError::WebSocketRequestTooLarge
+         | ApiError::ContentFilter
+         | ApiError::ContextWindowExceeded
+         | ApiError::QuotaExceeded
+@@ -57,6 +58,7 @@
+             CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
+         }
+         ApiError::Stream(msg) => CodexErr::Stream(msg),
++        ApiError::WebSocketRequestTooLarge => CodexErr::WebSocketRequestTooLarge,
+         ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
+         ApiError::ServerOverloaded { .. } => CodexErr::ServerOverloaded,
+         ApiError::FlexUnavailable => CodexErr::new(CodexErrorDetails::FlexUnavailable),
+--- a/codex-rs/protocol/src/error.rs
++++ b/codex-rs/protocol/src/error.rs
+@@ -94,6 +94,9 @@
+     /// The Session loop treats this as a transient error and will automatically retry the turn.
+     #[error("stream disconnected before completion: {0}")]
+     Stream(String),
++    /// A WebSocket request was explicitly rejected before any response event.
++    #[error("WebSocket request rejected as too large (close 1009)")]
++    WebSocketRequestTooLarge,
+     /// A response stopped by the content filter. Sampling retries need developer guidance.
+     #[error(
+         "stream disconnected before completion: Incomplete response returned, reason: content_filter"
+@@ -327,6 +330,7 @@
+     codex_err_unit_constructors!(
+         TurnAborted,
+         SessionBudgetExceeded,
++        WebSocketRequestTooLarge,
+         ContextWindowExceeded,
+         SessionConfiguredNotFirstEvent,
+         Timeout,
+@@ -390,6 +394,7 @@
+         match self.details() {
+             CodexErrorDetails::TurnAborted
+             | CodexErrorDetails::SessionBudgetExceeded
++            | CodexErrorDetails::WebSocketRequestTooLarge
+             | CodexErrorDetails::Interrupted
+             | CodexErrorDetails::EnvVar(_)
+             | CodexErrorDetails::Fatal(_)
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -83,9 +83,13 @@
+         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
+         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
+     };
++    let oversized_websocket_request =
++        matches!(err.details(), CodexErrorDetails::WebSocketRequestTooLarge);
+     let retry_count = retry_state.retries.saturating_add(1);
+-    let Some(delay) = err.retry_delay(retry_count) else {
+-        return Err(err);
++    let delay = match err.retry_delay(retry_count) {
++        Some(delay) => delay,
++        None if oversized_websocket_request => Duration::ZERO,
++        None => return Err(err),
+     };
+     let retry_after = err.retry_after();
+
+@@ -117,7 +121,7 @@
+     }
+
+     // TODO(anp): Respect server retry advice before issuing the fallback HTTP request.
+-    if retry_state.retries >= max_retries
++    if (oversized_websocket_request || retry_state.retries >= max_retries)
+         && client_session.try_switch_fallback_transport(
+             &turn_context.session_telemetry,
+             turn_context.model_info(),
+@@ -132,6 +136,11 @@
+         .await;
+         retry_state.retries = 0;
+         return Ok(());
++    }
++
++    if oversized_websocket_request {
++        // No WebSocket retry or transport cycle if fallback was already active.
++        return Err(err);
+     }
+
+     if retry_state.retries < max_retries {
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -2192,6 +2192,15 @@
+                 while let Some(event) = stream.next().await {
+                     match event {
+                         Ok(ResponseEvent::Completed { .. }) => break,
++                        Err(err)
++                            if matches!(
++                                err.details(),
++                                codex_protocol::error::CodexErrorDetails::WebSocketRequestTooLarge
++                            ) =>
++                        {
++                            self.try_switch_fallback_transport(session_telemetry, model_info);
++                            return Ok(());
++                        }
+                         Err(err) => return Err(err),
+                         _ => {}
+                     }
+--- a/codex-rs/response-debug-context/src/lib.rs
++++ b/codex-rs/response-debug-context/src/lib.rs
+@@ -75,6 +75,9 @@
+         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
+         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
+         ApiError::Stream(err) => err.to_string(),
++        ApiError::WebSocketRequestTooLarge => {
++            "WebSocket request rejected as too large (close 1009)".to_string()
++        }
+         ApiError::ContentFilter => {
+             "Incomplete response returned, reason: content_filter".to_string()
+         }
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -2430,6 +2430,7 @@
+         }
+         ApiError::Stream(message) => format!("handshake stream error: {message}"),
+         ApiError::ContentFilter
++        | ApiError::WebSocketRequestTooLarge
+         | ApiError::ContextWindowExceeded
+         | ApiError::QuotaExceeded
+         | ApiError::UsageNotIncluded
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/sampler/execution.rs
+@@ -54,6 +54,7 @@
+                 ApiError::Retryable { .. }
+                 | ApiError::RateLimitExceeded { .. }
+                 | ApiError::Stream(_)
++                | ApiError::WebSocketRequestTooLarge
+                 | ApiError::ContentFilter
+                 | ApiError::ServerOverloaded { .. }
+                 | ApiError::FlexUnavailable,
+--- a/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
++++ b/codex-rs/ext/guardian-v2/src/async_scorer/metrics.rs
+@@ -43,7 +43,9 @@
+             ApiError::Transport(TransportError::Build(_)) => "request_build_error",
+             ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
+             ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
+-            ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
++            ApiError::Stream(_) | ApiError::ContentFilter | ApiError::WebSocketRequestTooLarge => {
++                "stream_error"
++            }
+             ApiError::ContextWindowExceeded => "context_window_exceeded",
+             ApiError::QuotaExceeded => "quota_exceeded",
+             ApiError::UsageNotIncluded => "usage_not_included",
+--- /dev/null
++++ b/codex-rs/core/tests/websocket_size_fallback.rs
+@@ -0,0 +1,295 @@
++use anyhow::Result;
++use codex_core::TurnInputRequest;
++use codex_model_provider_info::WireApi;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_sse_once;
++use core_test_support::responses::mount_sse_sequence;
++use core_test_support::responses::sse;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::test_codex;
++use pretty_assertions::assert_eq;
++use wiremock::Mock;
++use wiremock::ResponseTemplate;
++use wiremock::http::Method;
++use wiremock::matchers::method;
++use wiremock::matchers::path_regex;
++
++/// Keep WebSocket and HTTP on the same endpoint, forwarding POSTs to the
++/// existing HTTP mock so its parser and captured request oracle remain shared.
++struct SizeRejectingEndpoint {
++    uri: String,
++    frames: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
++    task: tokio::task::JoinHandle<()>,
++}
++
++impl Drop for SizeRejectingEndpoint {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++
++#[derive(Clone, Copy)]
++enum SizeRejection {
++    Warmup,
++    Generation,
++}
++
++async fn size_rejecting_endpoint(
++    http_address: std::net::SocketAddr,
++    rejection: SizeRejection,
++) -> SizeRejectingEndpoint {
++    use futures::SinkExt;
++    use futures::StreamExt;
++    use tokio::net::TcpListener;
++    use tokio::net::TcpStream;
++    use tokio_tungstenite::tungstenite::Message;
++    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
++    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
++
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let uri = format!("http://{}/v1", listener.local_addr().expect("address"));
++    let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
++    let captured = std::sync::Arc::clone(&frames);
++    let task = tokio::spawn(async move {
++        let mut connections = tokio::task::JoinSet::new();
++        loop {
++            let (mut socket, _) = listener.accept().await.expect("accept");
++            let frames = std::sync::Arc::clone(&captured);
++            connections.spawn(async move {
++                // A single-byte peek is sufficient and cannot misclassify a partial method.
++                let mut method = [0; 1];
++                socket.peek(&mut method).await.expect("method");
++                if &method != b"G" {
++                    let mut upstream = TcpStream::connect(http_address).await.expect("HTTP mock");
++                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
++                    return;
++                }
++                let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
++                config.extensions.permessage_deflate = Some(
++                    tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig::default());
++                let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(config)).await.expect("upgrade");
++                while let Some(Ok(message)) = socket.next().await {
++                    let Message::Text(text) = message else { continue; };
++                    let request: serde_json::Value = serde_json::from_str(&text).expect("request JSON");
++                    frames.lock().expect("frames").push(request.clone());
++                    if request["generate"] == false && matches!(rejection, SizeRejection::Generation) {
++                        for event in [ev_response_created("warm"), ev_completed("warm")] {
++                            socket.send(Message::Text(event.to_string().into())).await.expect("warmup");
++                        }
++                    } else {
++                        socket.close(Some(CloseFrame { code: CloseCode::Size,
++                            reason: "private peer diagnostic must not be displayed".into() })).await.expect("size rejection");
++                        break;
++                    }
++                }
++            });
++            while connections.try_join_next().is_some() {}
++        }
++    });
++    SizeRejectingEndpoint { uri, frames, task }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn websocket_size_rejection_falls_back_once_with_unchanged_image_context() -> Result<()> {
++    use codex_features::Feature;
++    use codex_protocol::models::ImageReference;
++    use core_test_support::wait_for_event;
++
++    skip_if_no_network!(Ok(()));
++    let server = responses::start_mock_server().await;
++    let endpoint = size_rejecting_endpoint(*server.address(), SizeRejection::Generation).await;
++    let response_mock = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![ev_response_created("first"), ev_completed("first")]),
++            sse(vec![ev_response_created("second"), ev_completed("second")]),
++        ],
++    )
++    .await;
++    let base_url = endpoint.uri.clone();
++    let test = test_codex()
++        .with_config(move |config| {
++            config.model_provider.base_url = Some(base_url);
++            config.model_provider.wire_api = WireApi::Responses;
++            config.model_provider.supports_websockets = true;
++            config.model_provider.stream_max_retries = Some(2);
++            config.model_provider.request_max_retries = Some(0);
++            config
++                .features
++                .disable(Feature::EnableRequestCompression)
++                .expect("compression setting");
++        })
++        .build_with_auto_env(&server)
++        .await?;
++    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![
++            UserInput::Text {
++                text: "Inspect this image without changing it".into(),
++                text_elements: Vec::new(),
++            },
++            UserInput::Image {
++                image: ImageReference::Inline {
++                    image_url: image_url.to_string(),
++                },
++                detail: None,
++            },
++        ]))
++        .await?;
++    let warnings = std::sync::Mutex::new(Vec::new());
++    wait_for_event(&test.codex, |event| {
++        if let EventMsg::Warning(warning) = event {
++            warnings
++                .lock()
++                .expect("warnings")
++                .push(warning.message.clone());
++        }
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    insta::assert_snapshot!(serde_json::to_string_pretty(&warnings.into_inner().expect("warnings"))?, @r#"
++    [
++      "Falling back from WebSockets to HTTPS transport. WebSocket request rejected as too large (close 1009)"
++    ]
++    "#);
++    test.submit_text_turn("Continue in the same conversation")
++        .await?;
++
++    let frames = endpoint.frames.lock().expect("frames").clone();
++    let attempts: Vec<_> = frames
++        .iter()
++        .filter(|frame| frame["generate"] != false)
++        .collect();
++    assert_eq!(
++        attempts.len(),
++        1,
++        "1009 must not retry the same WebSocket request"
++    );
++    let posts = response_mock.requests();
++    assert_eq!(
++        posts.len(),
++        2,
++        "HTTP fallback must remain sticky in the same thread"
++    );
++    let rejected = attempts[0];
++    let full_input = if rejected["previous_response_id"].is_string() {
++        let mut input = frames
++            .iter()
++            .find(|frame| frame["generate"] == false)
++            .expect("warmup before continuation")["input"]
++            .as_array()
++            .expect("warmup input")
++            .clone();
++        input.extend(
++            rejected["input"]
++                .as_array()
++                .expect("continuation input")
++                .clone(),
++        );
++        serde_json::Value::Array(input)
++    } else {
++        rejected["input"].clone()
++    };
++    assert_eq!(
++        posts[0].body_json()["input"],
++        full_input,
++        "fallback must preserve all context"
++    );
++    let body = posts[0].body_json();
++    assert!(
++        body["input"]
++            .as_array()
++            .expect("HTTP input")
++            .iter()
++            .any(|item| item["content"]
++                .as_array()
++                .is_some_and(|content| content.iter().any(|part| part["image_url"] == image_url)))
++    );
++    test.codex.shutdown_and_wait().await?;
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn websocket_size_rejection_does_not_loop_when_http_also_rejects() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = responses::start_mock_server().await;
++    let endpoint = size_rejecting_endpoint(*server.address(), SizeRejection::Generation).await;
++    Mock::given(method("POST"))
++        .and(path_regex(".*/responses$"))
++        .respond_with(ResponseTemplate::new(413).set_body_json(serde_json::json!({
++            "error": { "message": "request too large", "type": "invalid_request_error" }
++        })))
++        .mount(&server)
++        .await;
++    let base_url = endpoint.uri.clone();
++    let test = test_codex()
++        .with_config(move |config| {
++            config.model_provider.base_url = Some(base_url);
++            config.model_provider.wire_api = WireApi::Responses;
++            config.model_provider.supports_websockets = true;
++            config.model_provider.stream_max_retries = Some(2);
++            config.model_provider.request_max_retries = Some(0);
++        })
++        .build_with_auto_env(&server)
++        .await?;
++    test.submit_turn("Keep the task intact if both transports reject it")
++        .await?;
++    let frames = endpoint.frames.lock().expect("frames").clone();
++    assert_eq!(
++        frames
++            .iter()
++            .filter(|frame| frame["generate"] != false)
++            .count(),
++        1
++    );
++    let posts = server.received_requests().await.unwrap_or_default();
++    assert_eq!(
++        posts
++            .iter()
++            .filter(|request| request.method == Method::POST)
++            .count(),
++        3,
++        "HTTP retains the existing stream retry budget; it must never switch back to WebSocket"
++    );
++    test.codex.shutdown_and_wait().await?;
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn websocket_size_rejection_during_warmup_uses_http_for_generation() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = responses::start_mock_server().await;
++    let endpoint = size_rejecting_endpoint(*server.address(), SizeRejection::Warmup).await;
++    let response_mock = mount_sse_once(
++        &server,
++        sse(vec![ev_response_created("http"), ev_completed("http")]),
++    )
++    .await;
++    let base_url = endpoint.uri.clone();
++    let test = test_codex()
++        .with_config(move |config| {
++            config.model_provider.base_url = Some(base_url);
++            config.model_provider.wire_api = WireApi::Responses;
++            config.model_provider.supports_websockets = true;
++            config.model_provider.stream_max_retries = Some(2);
++            config.model_provider.request_max_retries = Some(0);
++        })
++        .build_with_auto_env(&server)
++        .await?;
++    test.submit_turn("Preserve the task when warmup is rejected")
++        .await?;
++    let frames = endpoint.frames.lock().expect("frames").clone();
++    assert_eq!(
++        frames.len(),
++        1,
++        "warmup rejection must make generation use HTTP directly"
++    );
++    assert_eq!(frames[0]["generate"], false);
++    assert_eq!(response_mock.requests().len(), 1);
++    test.codex.shutdown_and_wait().await?;
++    Ok(())
++}

@@ -1,0 +1,10 @@
+{
+  "version": "1.10.2",
+  "title": "Commerce workspace",
+  "icon": "shopping-cart",
+  "titleKey": "apps.builtin_listing_title",
+  "descriptionKey": "apps.builtin_listing_description",
+  "appType": "local",
+  "entry": "index.html",
+  "contentWorkspace": true
+}

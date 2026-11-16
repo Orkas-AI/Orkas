@@ -497,33 +497,61 @@ export interface CreateTaskInput {
   taskId?: string;
 }
 
+function newTask(cid: string, input: CreateTaskInput): ConversationTask {
+  const now = nowIso();
+  const t: ConversationTask = {
+    task_id: input.taskId || genId12(),
+    cid,
+    assignee: input.assignee,
+    instruction: input.instruction,
+    status: input.running ? 'running' : 'queued',
+    ...(!input.running && input.admissionPending ? { admission_pending: true } : {}),
+    created_by: input.createdBy,
+    created_at: now,
+    ...(input.attachments && input.attachments.length ? { attachments: input.attachments.slice() } : {}),
+    ...(input.sourceMsgId ? { source_msg_id: input.sourceMsgId } : {}),
+    ...(input.turnId ? { turn_id: input.turnId } : {}),
+    ...(input.parentTaskId ? { parent_task_id: input.parentTaskId } : {}),
+    ...(input.backlogTask ? { backlog_tasks: [{ ...input.backlogTask }] } : {}),
+    ...(normalizeTaskAfter(input.after).length ? { after: normalizeTaskAfter(input.after) } : {}),
+    ...(input.assignmentContext ? { assignment_context: input.assignmentContext } : {}),
+    ...(input.running ? { started_at: now } : {}),
+  };
+  return t;
+}
+
 export function createTask(
   uid: string,
   cid: string,
   input: CreateTaskInput,
 ): Promise<ConversationTask> {
   return withBoard(uid, cid, (b) => {
-    const now = nowIso();
-    const t: ConversationTask = {
-      task_id: input.taskId || genId12(),
-      cid,
-      assignee: input.assignee,
-      instruction: input.instruction,
-      status: input.running ? 'running' : 'queued',
-      ...(!input.running && input.admissionPending ? { admission_pending: true } : {}),
-      created_by: input.createdBy,
-      created_at: now,
-      ...(input.attachments && input.attachments.length ? { attachments: input.attachments.slice() } : {}),
-      ...(input.sourceMsgId ? { source_msg_id: input.sourceMsgId } : {}),
-      ...(input.turnId ? { turn_id: input.turnId } : {}),
-      ...(input.parentTaskId ? { parent_task_id: input.parentTaskId } : {}),
-      ...(input.backlogTask ? { backlog_tasks: [{ ...input.backlogTask }] } : {}),
-      ...(normalizeTaskAfter(input.after).length ? { after: normalizeTaskAfter(input.after) } : {}),
-      ...(input.assignmentContext ? { assignment_context: input.assignmentContext } : {}),
-      ...(input.running ? { started_at: now } : {}),
-    };
+    const t = newTask(cid, input);
     b.tasks.push(t);
     return { ...t };
+  });
+}
+
+/** Preserve a failed admission as a never-started terminal row. Creation
+ * may have mutated the board before rejecting; keep that same identity and
+ * never overwrite an execution or a terminal already owned by another path. */
+export function recordCreationFailure(
+  uid: string,
+  cid: string,
+  input: CreateTaskInput & { taskId: string },
+): Promise<ConversationTask | null> {
+  return withBoard(uid, cid, (b) => {
+    let task = b.tasks.find(t => t.task_id === input.taskId);
+    if (task && task.status !== 'queued') return null;
+    if (!task) {
+      task = newTask(cid, { ...input, running: false });
+      b.tasks.push(task);
+    }
+    task.status = 'failed';
+    delete task.admission_pending;
+    task.ended_at = nowIso();
+    if (input.sourceMsgId) task.source_msg_id = input.sourceMsgId;
+    return { ...task };
   });
 }
 

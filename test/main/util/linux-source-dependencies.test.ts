@@ -156,7 +156,17 @@ describe('Linux source dependency contract', () => {
     expect(nativeLane.indexOf('xprop -root _NET_SUPPORTING_WM_CHECK')).toBeLessThan(
       nativeLane.indexOf('npm run test:platform-native'),
     );
-    expect(workflow).toContain('ORKAS_E2E_SHOW_WINDOW=1 xvfb-run --auto-servernum');
+    // Both real Electron journeys need a virtual display and a valid session
+    // bus. The launcher owns hidden-window policy; an inherited visibility
+    // flag is not proof of either desktop prerequisite.
+    const startup = workflow.split('- name: Launch the real Orkas application and renderer')[1]?.split('- name:')[0] ?? '';
+    const pagination = workflow.split('- name: Verify task pagination labels and navigation')[1]?.split('- name:')[0] ?? '';
+    for (const journey of [startup, pagination]) {
+      expect(journey).toContain('dbus-run-session -- xvfb-run --auto-servernum');
+      expect(journey).toContain('npm run test:e2e --');
+    }
+    expect(startup).toContain('test/e2e/app_e2e_smoke.spec.ts');
+    expect(pagination).toContain('test/e2e/sidebar_e2e_pagination_spacing.spec.ts');
     expect(workflow).toContain('test/e2e/app_e2e_smoke.spec.ts');
     expect(workflow).toContain('xvfb-run --auto-servernum npm run test:linux-source');
     expect(workflow).toContain('npm run test:linux-whisper');

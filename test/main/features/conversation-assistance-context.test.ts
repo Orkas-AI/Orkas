@@ -232,7 +232,8 @@ describe('conversation entry assistance', () => {
     // when the global backlog is empty and no task tool is loaded.
     for (const delivery of [{}, { agentId: 'writer', outputDelivery: 'final' as const }]) {
       const turn = await context.resolveConversationAssistanceForTurn('u1', chat.conversation_id, delivery);
-      expect(turn.guidance).toMatch(/explain that this non-project conversation cannot access them/);
+      expect(turn.guidance).toContain('Project to-dos require a conversation in that project');
+      expect(turn.guidance).toContain('except that Commander can manage the project it creates for this conversation during this turn immediately');
       expect(turn.guidance).toMatch(/conversation in that project/);
     }
     expect(accountScan).not.toHaveBeenCalled();
@@ -572,3 +573,51 @@ describe('conversation entry assistance', () => {
     expect(settled.includes('sentence offering a project for it')).toBe(state === 'unfiling');
   });
 });
+
+it('treats an automation run in a conversation it did not create as a run only while that run is in progress', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const autoTasks = await import('../../../src/main/features/auto_tasks');
+    const context = await import('../../../src/main/features/conversation_assistance_context');
+    const conv = await chats.createConversation('u1', { title: 'Inbox triage' });
+    const cid = conv.conversation_id;
+    const created = await autoTasks.applyAutoTaskMutation('u1', {
+      action: 'create', updates: { content: 'Triage the inbox every morning', schedule: { type: 'daily', hour: 9, minute: 0 } },
+    }, { conversationId: cid });
+    if (!created.ok || !created.taskId) throw new Error(created.error);
+    const taskId = created.taskId;
+    const offers = /## Keeping work going|## Giving work a project|## Global open work/;
+    const resolve = async (delivery?: { agentId: string; outputDelivery: 'final' | 'process' }) => (
+      await context.resolveConversationAssistanceForTurn('u1', cid, delivery)).guidance;
+
+    // Before the first run it is the user's ordinary conversation.
+    const before = await resolve();
+    expect(before).not.toContain('## This automation run');
+    expect(before).toMatch(/## Keeping work going/);
+    expect(before).toMatch(/## Giving work a project/);
+
+    await autoTasks.recordRunStart('u1', taskId, cid, '2026-10-27T09:00:00.000Z');
+    const firstRun = await resolve();
+    expect(firstRun).toContain('Host facts: run 1 of this automation. This is its first run.');
+    expect(firstRun).toContain('Do not offer to save a to-do, schedule, or project during this run; no one is here to accept it.');
+    expect(firstRun).not.toMatch(offers);
+    expect(await resolve({ agentId: 'writer', outputDelivery: 'final' })).toContain('run 1 of this automation');
+    expect(await resolve({ agentId: 'writer', outputDelivery: 'process' })).toBe('');
+
+    // Once the run ends, the user's own messages there are ordinary chat again.
+    await autoTasks.recordRunTerminal('u1', taskId, cid, 'completed', '2026-10-27T09:05:00.000Z', '2026-10-27T09:00:00.000Z');
+    const after = await resolve();
+    expect(after).not.toContain('## This automation run');
+    expect(after).toMatch(/## Keeping work going/);
+
+    // The next run is told its predecessor ran in this same conversation.
+    await autoTasks.recordRunStart('u1', taskId, cid, '2026-10-28T09:00:00.000Z');
+    expect(await resolve()).toContain('Host facts: run 2 of this automation. The previous run started '
+      + '2026-10-27T09:00:00.000Z in this conversation and ended with status completed.');
+    // A run that never reported its end is said to be unfinished.
+    await autoTasks.recordRunStart('u1', taskId, cid, '2026-10-29T09:00:00.000Z');
+    const third = await resolve();
+    expect(third).toContain('The previous run started 2026-10-28T09:00:00.000Z in this conversation and did not finish.');
+    expect(third).not.toContain(`conversation id is ${cid}`);
+    // Another account's conversation with the same id is not this run.
+    expect((await context.resolveConversationAssistanceForTurn('u2', cid)).guidance).not.toContain('## This automation run');
+  });

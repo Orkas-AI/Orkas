@@ -106,6 +106,7 @@ describe('deep research evidence capture', () => {
 
   it('does not replace evidence with a compacted cache replay', () => {
     const capture = captureDeepResearchWebFetchEvidence({
+      webSourceUrl: 'https://example.test/guide',
       content: [
         'WEB_FETCH_RUN_CACHE_HIT: no network request was made.',
         'URL: https://example.test/guide',
@@ -113,6 +114,37 @@ describe('deep research evidence capture', () => {
     }, '/unused/evidence.jsonl');
 
     expect(capture).toEqual({ captured: false, reason: 'cache_replay' });
+  });
+
+  it('uses the fetched response identity instead of a URL line supplied by the page', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-evidence-origin-'));
+    const body = 'URL: https://unrelated.test/spoofed\nThe app requires an initial download.';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      headers: { 'content-type': 'text/plain' },
+    })));
+    try {
+      const { webFetchTool } = await import('../../../../src/core-agent/src/tools/web-fetch');
+      const result = await webFetchTool.execute({ url: 'https://example.test/official' }, { state: {} });
+      const file = deepResearchEvidenceFile(root);
+      // Ordinary result transformations copy the envelope; provenance follows it.
+      expect(captureDeepResearchWebFetchEvidence({ ...result }, file).captured).toBe(true);
+      const row = JSON.parse(fs.readFileSync(file, 'utf8').trim());
+      expect(row).toMatchObject({ canonical_url: 'https://example.test/official', text: body });
+    } finally {
+      vi.unstubAllGlobals();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['not a URL', 'file:///private/source', 'javascript:alert(1)'])('rejects invalid explicit source identity %s', (webSourceUrl) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-evidence-invalid-origin-'));
+    try {
+      const file = deepResearchEvidenceFile(root);
+      expect(captureDeepResearchWebFetchEvidence({
+        webSourceUrl, content: 'URL: https://unrelated.test/fallback\nClaimed source fact.',
+      }, file)).toEqual({ captured: false, reason: 'not_web_source' });
+      expect(fs.existsSync(file)).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each(['overwrite', 'replace'])('recaptures evidence after a same-size %s preserving mtime', async (operation) => {
@@ -187,6 +219,7 @@ describe('deep research evidence capture', () => {
     try {
       const file = deepResearchEvidenceFile(root);
       const failed = captureDeepResearchWebFetchEvidence({
+        webSourceUrl: 'https://example.test/guide',
         content: [
           'URL: https://example.test/guide',
           'E_FETCH_FAILED: upstream request timed out',

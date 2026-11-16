@@ -6,21 +6,17 @@ import apps from './playwright.apps.config';
 // so renamed or missing critical journeys fail before a release run.
 const criticalAppJourneys = [
   // Creation/editing, exactly-once dispatch and recoverable task submission.
-  'creates a separate task once with 2 existing tasks and records bounded actions',
+  'creates a separate task once with 2 existing tasks',
   'keeps the description in the new task when sending is rejected and supports retry',
   'opens safely, renames, prepares an edit, persists, and deletes a saved app',
-  // Local/cloud durability and explicit, non-destructive schema migration.
+  // Local durability and explicit, non-destructive schema migration.
   'web app common data survives closing and reopening while host inference remains unavailable',
   'author can export, cancel, and explicitly clear incompatible local data before updating',
-  'calibration web-app-local-data-persistence alert',
   // Real SDK wiring, application isolation and permission lifetime.
   'SDK app discovers, reads a selected file, generates, exports and keeps isolated state across reopening',
   'SDK tools discovery and execution read the real Library without redundant app consent',
   'isolated origin denies forged messages, foreign data and revoked SDK calls',
   'app approval uses Orkas UI, lasts for this use, isolates windows and honors Trusted',
-  // Publish/manage/unpublish and recovery without inventing account quota.
-  'publish, independent metadata, remote management and quota are usable in Electron',
-  'publication list failure 404 shows unknown quota and retry recovers',
 ];
 
 export default defineConfig(apps, {

@@ -72,6 +72,112 @@ function receipt(result: { content: string }) {
 }
 
 describe("run_program", () => {
+  it("returns ordinary child previews in call order without copying image bytes into the guest", async () => {
+    const first = { data: "FIRST_PIXELS", mediaType: "image/png", analysisMode: "quality_review" as const };
+    const second = { data: "SECOND_PIXELS", mediaType: "image/jpeg", analysisMode: "understand" as const };
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const runProgram = tool({ names: ["preview"], invoke: async (_name, input) => {
+      if (input.id === 1) await gate;
+      else release();
+      return { status: "completed", result: { content: "Preview attached", images: [input.id === 1 ? first : second] } };
+    } });
+    const result = await runProgram.execute({ code: `
+      const results = await Promise.all([1, 2].map(id => tools.preview({ id })));
+      json(results.map(result => ({ ok: result.ok, hasImages: 'images' in result })));
+    ` }, ctx());
+    expect(result.isError).not.toBe(true);
+    expect(result.images).toEqual([first, second]);
+    expect(result.imageRetention).toBeUndefined();
+    expect(result.content).toContain('[{"ok":true,"hasImages":false},{"ok":true,"hasImages":false}]');
+    expect(result.content).not.toContain("PIXELS");
+  });
+
+  it.each([-1, 0, 1])("charges preview payloads to the per-result byte boundary (%s)", async delta => {
+    const image = { data: "cGl4ZWxz", mediaType: "image/png", analysisMode: "quality_review" as const };
+    const bytes = Buffer.byteLength("ok") + Buffer.byteLength(JSON.stringify([image]));
+    let calls = 0;
+    const runProgram = tool({ names: ["preview"], limits: { maxToolResultBytes: bytes + delta }, invoke: async () => {
+      calls++;
+      return { status: "completed", result: { content: "ok", images: [image], observations: { fileChanges: [{
+        operation: "create", sourcePath: "/tmp/orkas-run-program-test/report.docx", afterExists: true, coverage: "exact",
+      }] } } };
+    } });
+    const result = await runProgram.execute({ code: "await tools.preview({}); text('done');" }, ctx());
+    expect(calls).toBe(1);
+    expect(result.observations?.fileChanges).toHaveLength(1);
+    if (delta < 0) {
+      expect(incomplete(result).reason).toBe("E_PROGRAM_TOOL_RESULT_LIMIT");
+      expect(result.images).toBeUndefined();
+    } else {
+      expect(result.isError).not.toBe(true);
+      expect(result.images).toEqual([image]);
+    }
+  });
+
+  it("bounds aggregate preview bytes and keeps earlier images without replay", async () => {
+    const image = { data: "cGl4ZWxz", mediaType: "image/png" };
+    const bytes = Buffer.byteLength("ok") + Buffer.byteLength(JSON.stringify([image]));
+    let calls = 0;
+    const runProgram = tool({ names: ["preview"], limits: { maxAggregateToolResultBytes: bytes * 2 - 1 }, invoke: async () => {
+      calls++;
+      return { status: "completed", result: { content: "ok", images: [image] } };
+    } });
+    const result = await runProgram.execute({ code: "await tools.preview({}); await tools.preview({}); await tools.preview({});" }, ctx());
+    expect(incomplete(result).reason).toBe("E_PROGRAM_AGGREGATE_RESULT_LIMIT");
+    expect(incomplete(result).completed_calls).toBe(2);
+    expect(calls).toBe(2);
+    expect(result.images).toEqual([image]);
+  });
+
+  it("delivers a multi-megabyte preview without consuming the guest image heap or output allowance", async () => {
+    const data = "A".repeat(6 * 1024 * 1024);
+    const runProgram = tool({ names: ["preview"], limits: { maxMemoryBytes: 1024 * 1024, maxOutputBytes: 1024 },
+      invoke: async () => ({ status: "completed", result: { content: "ok", images: [{ data, mediaType: "image/png" }] } }),
+    });
+    const result = await runProgram.execute({ code: "const result = await tools.preview({}); json({ ok: result.ok, keys: Object.keys(result) });" }, ctx());
+    expect(result.isError).not.toBe(true);
+    expect(result.images?.[0].data.length).toBe(6 * 1024 * 1024);
+    expect(result.content).toContain('"keys":["ok","content"]');
+    expect(result.content.length).toBeLessThan(1500);
+  });
+
+  it("keeps completed previews after a later program exception", async () => {
+    const image = { data: "cGl4ZWxz", mediaType: "image/png" };
+    const runProgram = tool({ names: ["preview"], invoke: async () => ({ status: "completed", result: { content: "ok", images: [image] } }) });
+    const result = await runProgram.execute({ code: "await tools.preview({}); throw Error('later failure');" }, ctx());
+    expect(incomplete(result).reason).toBe("E_PROGRAM_RUNTIME");
+    expect(result.images).toEqual([image]);
+  });
+
+  it("does not attach late previews after cancellation", async () => {
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let finish!: (outcome: ProgrammaticToolInvokeOutcome) => void;
+    const pending = new Promise<ProgrammaticToolInvokeOutcome>(resolve => { finish = resolve; });
+    const runProgram = tool({ names: ["preview"], invoke: async () => { entered(); return pending; } });
+    const controller = new AbortController();
+    const running = runProgram.execute({ code: "await tools.preview({}); text('done');" }, ctx(controller.signal));
+    await started; controller.abort();
+    const result = await running;
+    expect(incomplete(result).reason).toBe("E_PROGRAM_ABORTED");
+    finish({ status: "completed", result: { content: "late", images: [{ data: "LATE_PIXELS", mediaType: "image/png" }] } });
+    await pending;
+    expect(result.images).toBeUndefined();
+  });
+
+  it("keeps active-turn reference-image results direct instead of changing retention for sibling previews", async () => {
+    let calls = 0;
+    const runProgram = tool({ names: ["reference"], invoke: async () => {
+      calls++;
+      return { status: "completed", result: { content: "Reference", images: [], imageRetention: "active_turn" } };
+    } });
+    const result = await runProgram.execute({ code: "await tools.reference({}); await tools.reference({});" }, ctx());
+    expect(incomplete(result)).toMatchObject({ reason: "E_PROGRAM_IMAGE_RETENTION", direct_call_allowed: true, completed_calls: 1 });
+    expect(calls).toBe(1);
+    expect(result.imageRetention).toBeUndefined();
+  });
+
   it("advertises string child content and conditional JSON parsing at the code parameter", () => {
     const definition = toToolDefinition(tool());
     const code = (definition.inputSchema.properties as Record<string, { description: string }>).code.description;

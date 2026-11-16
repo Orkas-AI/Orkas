@@ -8,6 +8,54 @@ const { ipKeyGenerator } = require('express-rate-limit');
 const { SocksClient } = require('socks');
 
 describe('dependency security boundaries', () => {
+  it('applies wildcard authorization before a matching Hono route', async () => {
+    // GHSA-h7mg-cq63-vhpq: a wildcard route must not bypass its scoped guard.
+    const { Hono } = require('hono');
+    const app = new Hono();
+    app.use('/admin/*', (context: any) => context.text('denied', 401));
+    app.get('/admin*', (context: any) => context.text('protected'));
+    const response = await app.request('http://localhost/admin/secret');
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe('denied');
+  });
+
+  it.each([
+    ['/public\\..\\admin/secret', 400],
+    ['/public%5C..%5Cadmin/secret', 200],
+    ['/public?path=\\admin', 200],
+    ['/admin/secret', 200],
+  ])('keeps the raw HTTP request-target boundary for %s', async (target, status) => {
+    // GHSA-jpvv-r467-5p4w: reject raw path separators before application routing,
+    // while preserving encoded characters, query values and ordinary requests.
+    const http = require('node:http');
+    const { serve } = require('@hono/node-server');
+    let dispatched = 0;
+    const server = serve({ hostname: '127.0.0.1', port: 0, fetch: () => {
+      dispatched += 1;
+      return new Response('routed');
+    } });
+    try {
+      await new Promise<void>(resolve => server.once('listening', resolve));
+      const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const request = http.get({ hostname: '127.0.0.1', port: server.address().port, path: target }, (response: any) => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk: string) => { body += chunk; });
+          response.once('end', () => resolve({ status: response.statusCode, body }));
+          response.once('error', reject);
+        });
+        request.setTimeout(3000, () => request.destroy(new Error('Local HTTP fixture timed out')));
+        request.once('error', reject);
+      });
+      expect(result.status).toBe(status);
+      expect(dispatched).toBe(status === 400 ? 0 : 1);
+      if (status === 200) expect(result.body).toBe('routed');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error: Error | undefined) => error ? reject(error) : resolve()));
+    }
+  });
+
   it('rejects oversized IPv6 zones without stalling the caller process', () => {
     // GHSA-rxp7-6hxx-x8q5: an unpatched parser takes tens of seconds on
     // this input. Isolate it so a regression cannot block the test worker.

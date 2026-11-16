@@ -75,3 +75,38 @@ export function normaliseGeminiImageSize(size: string, model: string): GeminiIma
     + 'from its supported size table. The request was not resized.',
   );
 }
+
+// Ark's recommended 2K sizes for Seedream. Each is inside both the Flash/Pro and the legacy Lite
+// pixel ranges and preserve the public API 2K contract.
+const SEEDREAM_2K_SIZES: ReadonlyArray<readonly [string, number, number]> = [
+  ['1:1', 2048, 2048], ['4:3', 2304, 1728], ['3:4', 1728, 2304], ['16:9', 2560, 1440],
+  ['9:16', 1440, 2560], ['3:2', 2496, 1664], ['2:3', 1664, 2496], ['21:9', 3024, 1296],
+];
+
+/**
+ * The size nearest a width-to-height ratio that this service makes as asked, or none where it
+ * takes no shape and keeps its own default. A still made for a video takes the video's shape
+ * (decided 2026-11-10).
+ */
+export function imageSizeForAspect(capability: { api: string; model: string }, aspect: number): string | undefined {
+  if (!Number.isFinite(aspect) || aspect <= 0) return undefined;
+  const nearest = (sizes: ReadonlyArray<readonly [string, number, number]>) => [...sizes]
+    .sort((a, b) => Math.abs(Math.log(a[1] / a[2] / aspect)) - Math.abs(Math.log(b[1] / b[2] / aspect)))[0];
+  if (capability.api === 'doubao' || capability.api === 'orkas') {
+    const [, width, height] = nearest(SEEDREAM_2K_SIZES);
+    return `${width}x${height}`;
+  }
+  if (capability.api !== 'gemini') return undefined;
+  // Gemini's own table decides which sizes a model takes: 2K where it can, else its one size.
+  const taken = (size: string) => {
+    try {
+      return normaliseGeminiImageSize(size, capability.model) ? size : undefined;
+    } catch (err) {
+      if (err instanceof UnsupportedImageSizeError) return undefined;
+      throw err;
+    }
+  };
+  const [, width, height] = nearest(GEMINI_1K_SIZES);
+  const [, legacyWidth, legacyHeight] = nearest(GEMINI_25_SIZES);
+  return taken(`${width * 2}x${height * 2}`) ?? taken(`${width}x${height}`) ?? taken(`${legacyWidth}x${legacyHeight}`);
+}

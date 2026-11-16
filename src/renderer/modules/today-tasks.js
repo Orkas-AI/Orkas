@@ -68,7 +68,7 @@ function renderTodayTasksSection() {
   const projectByCid = new Map(visibleRows.map((c) => [c.conversation_id, c.project_id || '']));
   container.innerHTML = visibleRows.map((c) => _renderConversationSidebarItem(c, { listId: 'today-list' })).join('');
   if (rows.length > visibleRows.length) {
-    container.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-recent-conv-more="1">
+    container.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-i18n="sidebar.load_more_conversations" data-recent-conv-more="1">
       ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`);
     container.querySelector('[data-recent-conv-more]').addEventListener('click', () => {
       _recentTaskVisibleCount += _RECENT_TASK_PAGE_SIZE;

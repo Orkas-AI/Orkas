@@ -9,14 +9,15 @@ import { webContentCsp } from '../../util/web-content-policy';
 import type { WebAppRuntime } from './runtime';
 
 const scripts = new Map<string,string>();
-export function sdkScript(appType: 'local'|'web'='local') {
-  if(!scripts.has(appType)){
+export function sdkScript(appType: 'local'|'web'='local', builtin=false) {
+  const cacheKey=appType+(builtin?':builtin':'');
+  if(!scripts.has(cacheKey)){
     const methods=Object.keys(METHODS).filter(method=>appType!=='web'||commonMethod(method));
     const common=Object.keys(METHODS).filter(commonMethod);
-    scripts.set(appType,fs.readFileSync(path.join(SRC_ROOT,'main/features/web_apps/sdk.js'),'utf8')
-      .replace('/* HOST_METHOD_NAMES */ []',JSON.stringify(methods)).replaceAll('/* COMMON_METHOD_NAMES */ []',JSON.stringify(common)));
+    scripts.set(cacheKey,(builtin ? fs.readFileSync(path.join(SRC_ROOT,'main/features/web_apps/task-input.js'),'utf8')+'\n' : '')+fs.readFileSync(path.join(SRC_ROOT,'main/features/web_apps/sdk.js'),'utf8')
+      .replace('/* BUILTIN_APP */ false',String(builtin)).replace('/* HOST_METHOD_NAMES */ []',JSON.stringify(methods)).replaceAll('/* COMMON_METHOD_NAMES */ []',JSON.stringify(common)));
   }
-  return scripts.get(appType)!;
+  return scripts.get(cacheKey)!;
 }
 export const APP_CSP = webContentCsp();
 export async function appResource(request: Request, runtime: WebAppRuntime) {
@@ -31,7 +32,7 @@ export async function appResource(request: Request, runtime: WebAppRuntime) {
   if (!scoped.bundle.browserOnly) headers['Content-Security-Policy'] = APP_CSP;
   if (scoped.bundle.browserOnly && (rel === SDK_PATH || rel === '__orkas/capabilities.json')) return { status: 403 };
   const capabilityType = scoped.bundle.appType === 'local' ? 'local' : 'web';
-  if (rel === SDK_PATH) return { status: 200, body: sdkScript(capabilityType), mime: 'text/javascript; charset=utf-8', headers };
+  if (rel === SDK_PATH) return { status: 200, body: sdkScript(capabilityType,!!scoped.bundle.builtinApp), mime: 'text/javascript; charset=utf-8', headers };
   if (rel === artifacts.BRIDGE_RELPATH) return capabilityType==='web'?{status:403}:{ status: 200, body: artifacts.BRIDGE_JS, mime: 'text/javascript; charset=utf-8', headers };
   if (rel === '__orkas/capabilities.json') return { status: 200, body: JSON.stringify(catalogDocument(capabilityType)), mime: 'application/json', headers };
   if (!scoped.resolved) return { status: 404 };

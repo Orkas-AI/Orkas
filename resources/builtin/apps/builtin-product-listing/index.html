@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Commerce workspace</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="workspace">
+<header class="topbar"><nav id="workspace-nav" class="workspace-tabs"></nav></header>
+<main id="main">
+  <div id="page-actions" hidden class="actions page-actions"><button id="import-csv" disabled data-t="import"></button><button id="add-product" disabled class="primary" data-t="add"></button></div>
+  <div id="notice" role="status" aria-live="polite"></div>
+  <section id="stores-page" hidden><button id="back-to-product" class="text-button" data-t="backToProduct" hidden></button><div id="store-connection-guide" class="connection-guide"><div><h2 data-t="connectorStores"></h2><p class="help" data-t="connectHint"></p></div><button id="connect-store" class="primary" data-t="connectStore"></button></div><div class="section-heading store-tools"><span id="store-updated" class="help" role="status" aria-live="polite"></span><div class="actions"><button id="refresh-stores" data-t="refresh"></button></div></div><nav id="store-tabs" class="section-tabs"></nav><div id="store-overview"></div><div id="store-list" class="store-grid"></div></section>
+  <section id="catalog" hidden><div class="catalog-tools"><label class="search"><span id="search-icon"></span><input id="search" type="search"></label><div class="actions catalog-filters"><button id="filter-store"></button><button id="filter-state"></button><span id="product-count" class="help"></span></div></div>
+    <div id="empty" class="empty-state"><span id="empty-icon" class="empty-icon"></span><h2 data-t="empty"></h2><p data-t="productsHint"></p><button id="first-product" disabled class="primary" data-t="add"></button></div>
+    <div id="product-table" class="product-table"><div class="table-head"><span data-t="name"></span><span data-t="sku"></span><span data-t="storeListings"></span><span data-t="updated"></span><span></span></div><div id="products"></div></div>
+    <div id="no-matches" class="empty-state" hidden><h2 data-t="noMatches"></h2><button id="clear-search" data-t="clearSearch"></button></div>
+  </section>
+  <section id="creative-page" hidden><iframe id="media-workspace" title="" src="about:blank"></iframe></section>
+  <section id="editor" hidden>
+    <div class="product-head"><div class="product-identity"><button id="back-products" class="text-button" data-t="allProducts"></button><div class="product-name"><h2 id="product-title"></h2><button id="switch-product" class="text-button" data-t="switchProduct"></button></div></div><div class="actions"><button id="review" class="primary" data-t="review"></button><button id="product-more" class="menu-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="product-menu"></button></div></div>
+    <nav id="sections" class="section-tabs"></nav>
+    <div class="editor-layout"><div id="content" class="content-panel"></div><div id="assistant-disclosure">
+      <section class="assistant"><div class="assistant-title"><span id="assistant-icon"></span><h2 id="assistant-title"></h2></div><p id="assistant-description" class="help"></p><label class="field"><span data-t="requirementsLabel"></span><textarea id="requirements" rows="5"></textarea></label><div class="generation-actions"><button id="generate" class="primary" data-t="generate"></button><small data-t="taskPlan"></small></div><div class="assistant-head"><span id="agent-status" role="status"></span><button id="open-task" data-t="open" hidden></button><button id="stop-task" data-t="cancel" hidden></button></div><pre id="task-result" hidden></pre></section></div>
+    </div>
+    <div id="editor-footer" class="editor-footer"><span id="save-state" role="status" aria-live="polite"></span><button id="save" class="primary" data-t="save"></button></div>
+  </section>
+</main></div>
+<div id="product-menu" class="context-menu" role="menu" hidden><button id="export" role="menuitem" tabindex="-1" data-t="export"></button><button id="delete-product" class="is-danger" role="menuitem" tabindex="-1" data-t="delete"></button></div>
+<dialog id="rename-dialog" aria-labelledby="rename-title"><form id="rename-form"><h2 id="rename-title" data-t="rename"></h2><label class="field"><span data-t="name"></span><input id="rename-input" required></label><p id="rename-error" class="error" role="alert"></p><div class="actions"><button id="rename-cancel" type="button" data-t="cancelEdit"></button><button id="rename-confirm" type="submit" class="primary" data-t="save"></button></div></form></dialog>
+<dialog id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description"><form method="dialog"><h2 id="delete-title" data-t="delete"></h2><p id="delete-name"></p><p id="delete-description" class="help" data-t="deleteDescription"></p><p id="delete-error" class="error" role="alert"></p><div class="actions"><button id="delete-cancel" value="cancel" data-t="cancelEdit"></button><button id="delete-confirm" type="button" class="is-danger" data-t="delete"></button></div></form></dialog>
+<dialog id="picker"><form method="dialog"><h2 id="picker-title"></h2><div id="picker-options"></div><div class="actions"><button value="cancel" data-t="back"></button></div></form></dialog>
+<dialog id="review-dialog"><form method="dialog"><h2 data-t="review"></h2><div id="review-content"></div><label class="check"><input id="review-confirm" type="checkbox"><span data-t="reviewed"></span></label><div class="actions"><button value="cancel" data-t="back"></button><button id="store-draft" type="button" data-t="draft"></button><button id="store-publish" type="button" class="primary" data-t="publish"></button></div></form></dialog>
+<script src="/__orkas/sdk.js"></script><script src="locales.js"></script><script src="store-data.js"></script><script src="model.js"></script><script src="requests.js"></script><script src="store-requests.js"></script><script src="app.js"></script>
+</body></html>

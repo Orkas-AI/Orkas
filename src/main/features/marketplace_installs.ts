@@ -1,10 +1,10 @@
 /**
  * Marketplace install manifest — `<uid>/cloud/marketplace/installs.json`.
  *
- * The ONLY marketplace state that crosses devices. Records what the user has installed (id +
- * version + freshness timestamp + COS URL); the actual content lives at `<uid>/local/marketplace/`
- * on each machine and is reconciled on startup by `features/marketplace_reconcile.ts`
- * (fetches whatever's listed in the manifest but missing locally).
+ * Local durable installation state records installed ids, versions, freshness
+ * timestamps and package URLs. Content lives at `<uid>/local/marketplace/` and
+ * `features/marketplace_reconcile.ts` restores listed content missing locally.
+ * This module does not upload or synchronize the manifest.
  *
  * Manifest format:
  *
@@ -49,19 +49,11 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import { userMarketplaceInstallsFile, userMarketplaceDirCloud } from '../paths';
-import { safeId } from '../storage';
+import { renameWithRetry, safeId } from '../storage';
 import { createLogger } from '../logger';
 import { minAppVersionFrom, type MinAppVersionSource } from '../util/app-version-compat';
 
 const log = createLogger('marketplace_installs');
-
-function _markInstallsDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('marketplace', 'cloud/marketplace/installs.json');
-  } catch { /* sync feature may be stripped or not initialized yet */ }
-}
 
 // Per-uid mutex covering the RMW cycle of add*/remove* (read manifest → mutate → write).
 // Concurrent cascade install (Promise.all over skill_list) used to lose rows because each
@@ -238,8 +230,10 @@ async function _writeInstalls(uid: string, manifest: InstallsManifest): Promise<
   const tmp = `${file}.tmp`;
   const stamped = { ...manifest, version: CURRENT_VERSION };
   await fsp.writeFile(tmp, JSON.stringify(stamped, null, 2), 'utf8');
-  await fsp.rename(tmp, file);
-  _markInstallsDirty();
+  // Windows readers can briefly deny replacement; keep the manifest lock and
+  // atomic publication while reusing storage's bounded, asynchronous backoff.
+  if (process.platform === 'win32') await renameWithRetry(tmp, file);
+  else await fsp.rename(tmp, file);
 }
 
 /** Background work may refresh an existing installation or seed a never-uninstalled id.

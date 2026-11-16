@@ -2,6 +2,52 @@ import { composerText, expectComposerText } from './fixtures/composer';
 import { expect, test } from './fixtures/orkas';
 
 test.describe('conversations and resource picker', () => {
+  test('keeps a pinned running badge first during rename and clears it on stop', async ({ orkas }, info) => {
+    const page = orkas.page!;
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: 'A long pinned task title for running indicator alignment and rename recovery',
+    });
+    const cid = created.conversation.conversation_id;
+    await orkas.invoke('conversations.pin', { cid, pinned: true });
+    await page.evaluate(async id => {
+      const w = window as any;
+      await w.loadConversations();
+      w.eval('pendingConvs.set(' + JSON.stringify(id) + ', {aborted: false})');
+      w._updateConvSidebarBadge(id);
+    }, cid);
+    const rows = page.locator('.conv-item[data-cid="' + cid + '"]');
+    await expect(rows.first()).toHaveClass(/is-pinned/);
+    const firstInEveryCopy = () => rows.evaluateAll(items => items.every(item =>
+      item.querySelector('.conv-item-row')?.firstElementChild?.classList.contains('conv-status-badge')));
+    expect(await rows.count()).toBeGreaterThanOrEqual(2);
+    expect(await firstInEveryCopy()).toBe(true);
+    for (const [lang, width, height] of [['zh', 1440, 900], ['en', 1000, 640]] as const) {
+      await page.setViewportSize({ width, height });
+      await page.evaluate(locale => (window as any).setLang(locale), lang);
+      await page.screenshot({ path: info.outputPath('running-' + lang + '.png') });
+    }
+    await page.evaluate(id => {
+      const w = window as any;
+      w._startConversationInlineRename(id, {anchorListId: 'conversation-list'});
+      document.querySelectorAll('.conv-item[data-cid="' + id + '"] .conv-status-badge').forEach(el => el.remove());
+      w._updateConvSidebarBadge(id);
+    }, cid);
+    const input = page.locator('#conversation-list input[data-conv-rename-cid="' + cid + '"]');
+    await input.fill('Unsaved rename draft');
+    await expect(input).toBeFocused();
+    expect(await firstInEveryCopy()).toBe(true);
+    await page.evaluate(id => {
+      const w = window as any;
+      w.eval('pendingConvs.get(' + JSON.stringify(id) + ').aborted = true');
+      w._updateConvSidebarBadge(id);
+    }, cid);
+    await expect(rows.locator('.conv-status-badge')).toHaveCount(0);
+    await expect(input).toHaveValue('Unsaved rename draft');
+    await input.press('Escape');
+    await expect(rows.first()).toContainText('A long pinned task title');
+    await page.evaluate(id => (window as any).eval('pendingConvs.delete(' + JSON.stringify(id) + ')'), cid);
+  });
+
   test('keeps direct-agent routing mentions out of the task title after refresh', async ({ modelOrkas }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = modelOrkas.page;

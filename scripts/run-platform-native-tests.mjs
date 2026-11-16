@@ -39,7 +39,7 @@ const commonSuites = [
   'test/main/features/connectors/local-cli.test.ts',
   'test/main/features/connectors/local-cli-stdio-adapter.test.ts',
   'test/main/model/local-tools.test.ts',
-  'test/main/model/core-agent/video-studio-state-tool.test.ts',
+  'test/main/model/core-agent/video-timeline-tool.test.ts',
   'test/main/model/core-agent/image-studio-tool.test.ts',
   'test/main/model/core-agent/office-tools.test.ts',
   'test/main/model/core-agent/pdf-tools.test.ts',
@@ -66,6 +66,7 @@ const commonSuites = [
   'test/main/features/packages.test.ts',
   'test/main/util/extract-xls.test.ts',
   'test/main/util/media_probe.test.ts',
+  'test/main/util/tts-audio.test.ts',
   'test/main/features/video_studio_native_qa.test.ts',
   'test/main/features/video_studio_delivery.test.ts',
   'test/main/paths.test.ts',
@@ -113,8 +114,8 @@ if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 
 // The suites above run under `ELECTRON_RUN_AS_NODE`, where `BrowserWindow` does
-// not exist. Composition inspect measures frame 0 in a real window, so its
-// runtime probe — and every verdict that depends on measuring the page — is
+// not exist. Timeline check/render measures real pixels in a window, so its
+// runtime probe and decoded-frame correctness are
 // unreachable from them and belongs in this lane, which already requires a
 // desktop host. Background browser input needs a page that no automation
 // client keeps painting, which Playwright E2E cannot provide. Each canary is
@@ -122,7 +123,7 @@ if (result.status !== 0) process.exit(result.status ?? 1);
 // attributed to the Vitest run.
 let status = 0;
 for (const [label, script] of [
-  ['composition inspect canary', 'run-inspect-canary.mjs'],
+  ['video timeline canary', 'run-video-timeline-canary.mjs'],
   ['background browser input canary', 'run-web-assist-input-canary.mjs'],
 ]) {
   console.log(`[platform-native-tests] ${label} (GUI Electron)`);

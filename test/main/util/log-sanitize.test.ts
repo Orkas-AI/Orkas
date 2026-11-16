@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { inspect } from 'node:util';
 import { sanitizeLogTextForUpload } from '../../../src/main/util/log-sanitize';
 
 describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
@@ -18,6 +19,64 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
   it('masks Bearer token inside a JSON-stringified blob', () => {
     const out = sanitizeLogTextForUpload('{"authorization":"Bearer eyJhbGc"}');
     expect(out).toBe('{"authorization":"***"}');
+  });
+
+  it('masks Basic credentials from a raw Authorization header', () => {
+    // base64("alice:s3cret")
+    const out = sanitizeLogTextForUpload('Authorization: Basic YWxpY2U6czNjcmV0');
+    expect(out).toBe('Authorization: Basic ***');
+  });
+
+  it('masks Basic credentials with a lowercase scheme name (RFC 7617)', () => {
+    const out = sanitizeLogTextForUpload('proxy header basic dXNlcjpwYXNz rejected');
+    expect(out).toBe('proxy header Basic *** rejected');
+  });
+
+  it.each([
+    ['colonless', Buffer.from('synthetic-only').toString('base64')],
+    ['truncated', Buffer.from('long-user-name:synthetic-only').toString('base64').slice(0, 8)],
+    ['malformed', 'not-base64_credential'],
+  ])('masks %s Basic values in explicit authentication headers', (_label, credential) => {
+    // Authentication failures can echo invalid or incomplete credentials.
+    // Their header context is sufficient to establish that they are private.
+    for (const prefix of ['Authorization: Basic ', 'pRoXy-AuThOrIzAtIoN:\t bAsIc\t', 'authorization:\nBasic ']) {
+      expect(sanitizeLogTextForUpload(`${prefix}${credential} rejected`)).toBe(`${prefix}*** rejected`);
+    }
+  });
+
+  it('masks repeated authentication headers without swallowing diagnostic delimiters', () => {
+    const input = '(Authorization: Basic bad), Proxy-Authorization: Basic incomplete; status=401';
+    expect(sanitizeLogTextForUpload(input)).toBe('(Authorization: Basic ***), Proxy-Authorization: Basic ***; status=401');
+  });
+
+  it('masks malformed credentials in structured text representations of authentication fields', () => {
+    for (const field of ['authorization', 'Proxy-Authorization', 'proxy_authorization', 'proxyAuthorization']) {
+      const input = JSON.stringify({ [field]: 'Basic incomplete', status: 401 });
+      expect(sanitizeLogTextForUpload(input)).toBe(JSON.stringify({ [field]: '***', status: 401 }));
+      expect(sanitizeLogTextForUpload(`${field}=Basic incomplete retry=true`)).not.toContain('incomplete');
+      expect(sanitizeLogTextForUpload(`https://example.test/?${field}=Basic%20incomplete&retry=true`))
+        .toBe(`https://example.test/?${field}=***&retry=true`);
+    }
+    expect(sanitizeLogTextForUpload("'Proxy-Authorization': 'Basic incomplete'"))
+      .toBe("'Proxy-Authorization': '***'");
+  });
+
+  it('masks standard credentials with empty fields, Unicode and omitted padding', () => {
+    for (const user of ['', 'a', 'ab', 'alice', '用户', 'ü']) {
+      for (const password of ['', 'x', 'xy', 'xyz', 'long:password', '密码']) {
+        const token = Buffer.from(`${user}:${password}`).toString('base64');
+        for (const value of [token, token.replace(/=+$/, '')]) {
+          expect(sanitizeLogTextForUpload(`bAsIc ${value}`)).toBe('Basic ***');
+        }
+      }
+    }
+  });
+
+  it('keeps redaction stable when an error crosses multiple sanitizing consumers', () => {
+    const input = 'Authorization: Basic incomplete; falling back to basic retrieval';
+    const once = sanitizeLogTextForUpload(input);
+    expect(once).toBe('Authorization: Basic ***; falling back to basic retrieval');
+    expect(sanitizeLogTextForUpload(once)).toBe(once);
   });
 
   it('is case-insensitive on the Bearer scheme name (RFC 6750)', () => {
@@ -44,9 +103,43 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     expect(out).toBe('refresh_token=*** session_id=*** cid=*** uid=ABCD...7890 ok=true');
   });
 
+  it('masks the account identifier used by conversation lifecycle logs', () => {
+    expect(sanitizeLogTextForUpload('turn-start user=ABCDEF1234567890 status=running'))
+      .toBe('turn-start user=ABCD...7890 status=running');
+    expect(sanitizeLogTextForUpload('turn-start user=anonymous status=running'))
+      .toBe('turn-start user=anonymous status=running');
+  });
+
   it('masks secret-looking JSON fields', () => {
     const out = sanitizeLogTextForUpload('{"access_token":"at-value","name":"visible"}');
     expect(out).toBe('{"access_token":"***","name":"visible"}');
+  });
+
+  it('masks private fields in the multi-line object format attached to feedback', () => {
+    const input = inspect({
+      cid: 'synthetic-conversation',
+      session_id: 'synthetic-session',
+      user_id: 'ABCDEF1234567890',
+      nested: { token: 'synthetic-token', status: 'completed' },
+      pending: 0,
+    }, { compact: false });
+    expect(sanitizeLogTextForUpload(input)).toBe(inspect({
+      cid: '***', session_id: '***', user_id: 'ABCD...7890',
+      nested: { token: '***', status: 'completed' }, pending: 0,
+    }, { compact: false }));
+  });
+
+  it.each([
+    "secret-head'quoted\"secret-tail",
+    "secret-head'quoted\"backtick`secret-tail",
+    'secret-head\\escaped-secret-tail',
+  ])('masks the complete inspected string including escaped quotes: %j', (secret) => {
+    const input = inspect({ session_id: secret, status: 'completed' });
+    const out = sanitizeLogTextForUpload(input);
+    expect(out).not.toContain('secret-head');
+    expect(out).not.toContain('secret-tail');
+    expect(out).toContain("status: 'completed'");
+    expect(sanitizeLogTextForUpload(out)).toBe(out);
   });
 
   it('masks sensitive URL query params while preserving harmless params', () => {
@@ -71,7 +164,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     );
     expect(out).toContain('<abs-path:');
     expect(out).toContain('<file-url-path:');
-    expect(out).not.toContain('/Users/alice');
+    expect(out).not.toContain('/Users/test');
     expect(out).not.toContain('Secret Project');
   });
 
@@ -114,6 +207,20 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
 });
 
 describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
+  it('preserves similarly named object fields and non-private diagnostic values', () => {
+    const input = inspect({
+      custom_session_id: 'visible', session_id_count: 3, cid_suffix: 'visible',
+      session_id: null, token_count: 42, status: 'completed',
+    }, { compact: false });
+    expect(sanitizeLogTextForUpload(input)).toBe(input);
+  });
+  it('leaves the word "basic" in prose untouched', () => {
+    // Basic credentials are base64 of "user:password"; a plain word after
+    // "basic" is not one and must stay readable in the log.
+    expect(sanitizeLogTextForUpload('falling back to basic retrieval')).toBe('falling back to basic retrieval');
+    expect(sanitizeLogTextForUpload('Basic auth failed for proxy')).toBe('Basic auth failed for proxy');
+  });
+
   it('leaves "BearerWord" (no whitespace after Bearer) untouched', () => {
     // word-boundary follower required — "Bearer" without trailing whitespace
     // is just a word in prose, not an auth header.
@@ -158,6 +265,62 @@ describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
     // username via REDACT_KEYS; this util only matches value-shaped text.
     const out = sanitizeLogTextForUpload('field "phone" missing in payload');
     expect(out).toBe('field "phone" missing in payload');
+  });
+});
+
+describe('sanitizeLogTextForUpload › quoted key=value fields', () => {
+  it('masks double- and single-quoted values, including spaces', () => {
+    expect(sanitizeLogTextForUpload('login failed password="hunter2 is long" for user'))
+      .toBe('login failed password=*** for user');
+    expect(sanitizeLogTextForUpload("retry api_key='abc def' now")).toBe('retry api_key=*** now');
+    expect(sanitizeLogTextForUpload('token="abcDEF123456"')).toBe('token=***');
+  });
+
+  it('masks two quoted secrets on one line', () => {
+    expect(sanitizeLogTextForUpload('secret="a b" token="c d"')).toBe('secret=*** token=***');
+  });
+
+  it('keeps masking an unquoted value that contains a quote', () => {
+    expect(sanitizeLogTextForUpload('token=abc"def')).toBe('token=***"def');
+  });
+
+  it.each(['"', "'"])('keeps escaped %s quotes inside the sensitive value', (quote) => {
+    // A quoted credential can contain escaped delimiters or backslashes.
+    // Even runs end at the following quote; odd runs escape that quote.
+    for (const count of [1, 2, 3, 4]) {
+      const slashes = '\\'.repeat(count);
+      const tail = count % 2 ? `${quote}private tail` : '';
+      const input = `request password=${quote}private${slashes}${tail}${quote} status=401`;
+      const out = sanitizeLogTextForUpload(input);
+      expect(out).toBe('request password=*** status=401');
+      expect(sanitizeLogTextForUpload(out)).toBe(out);
+    }
+  });
+
+  it.each(['"', "'"])('masks an unfinished %s value through the end of its log line', (quote) => {
+    for (const trailing of ['', '\\']) {
+      for (const lineEnd of ['', '\n', '\r', '\r\n']) {
+        const nextLine = lineEnd ? `${lineEnd}status=401; retry=false` : '';
+        const input = `request token=${quote}unfinished private value${trailing}${nextLine}`;
+        expect(sanitizeLogTextForUpload(input)).toBe(`request token=***${nextLine}`);
+      }
+    }
+  });
+
+  it('keeps neighboring fields and diagnostics after escaped quoted credentials', () => {
+    const input = String.raw`password="private\" tail" status=401 api_key='private\' tail' retry=false`;
+    expect(sanitizeLogTextForUpload(input)).toBe('password=*** status=401 api_key=*** retry=false');
+  });
+
+  it('preserves non-sensitive quoted fields and similar field names', () => {
+    const input = String.raw`reason="expected \"value\"" tokenizer='visible' my_password="visible"`;
+    expect(sanitizeLogTextForUpload(input)).toBe(input);
+  });
+
+  it('masks a long quoted value with repeated escapes without leaving a tail', () => {
+    const input = `password="${String.raw`private\"`.repeat(16_384)}" status=401`;
+    // Keep a regression failure bounded instead of echoing the large value.
+    expect(sanitizeLogTextForUpload(input) === 'password=*** status=401').toBe(true);
   });
 });
 

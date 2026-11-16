@@ -1,7 +1,104 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>Messages</title><script src="/__orkas/sdk.js"></script><body><form><label>Message <input required maxlength="200" name="body"></label><button>Save</button></form><p role="status"></p><ul></ul><script>
-const api=window.orkasApp,status=document.querySelector('[role=status]'),form=document.querySelector('form');
-async function refresh(){const result=await api.data.query({table:'messages'});const list=document.querySelector('ul');list.replaceChildren();for(const record of result.records){const row=document.createElement('li');row.textContent=record.body;list.append(row);}}
-let pending;
-form.onsubmit=async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;let saved=false;try{pending ||= {table:'messages',values:{body:form.body.value},requestId:crypto.randomUUID()};await api.data.insert(pending);pending=undefined;form.reset();saved=true;await refresh();status.textContent='Saved';}catch(error){status.textContent=saved?'Saved. Refresh this page to load messages.':'Could not save. Try again.';}finally{button.disabled=false;}};
-refresh().catch(()=>{status.textContent='Could not load messages.';});
-</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Messages</title>
+  <script src="/__orkas/sdk.js"></script>
+  <style>
+    body { max-width: 48rem; margin: 2rem auto; padding: 0 1rem; font: 16px system-ui; }
+    input { max-width: 100%; box-sizing: border-box; }
+    button { margin: .4rem .3rem .4rem 0; padding: .6rem; }
+    li { overflow-wrap: anywhere; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Messages</h1>
+  <form>
+    <label for="message">Message</label>
+    <input id="message" name="body" required maxlength="200">
+    <button id="save" type="submit">Save</button>
+  </form>
+  <p id="saveStatus" role="status"></p>
+  <section aria-label="Saved messages">
+    <h2>Saved messages</h2>
+    <button id="refresh" type="button">Refresh</button>
+    <ul id="messages"></ul>
+    <p id="listStatus" role="status"></p>
+    <button id="more" type="button" hidden>Load more</button>
+    <button id="retry" type="button" hidden>Retry loading</button>
+  </section>
+  <script>
+    const api = window.orkasApp, form = document.querySelector('form');
+    const input = document.getElementById('message'), save = document.getElementById('save');
+    const list = document.getElementById('messages'), listStatus = document.getElementById('listStatus');
+    const saveStatus = document.getElementById('saveStatus');
+    const more = document.getElementById('more'), refresh = document.getElementById('refresh'), retry = document.getElementById('retry');
+    const pageSize = 20, seen = new Set();
+    let offset = 0, hasMore = true, busy = false, retryRead = null, pending;
+
+    function controls() {
+      save.disabled = refresh.disabled = busy;
+      input.disabled = busy || Boolean(pending);
+      save.textContent = pending ? 'Retry save' : 'Save';
+      more.hidden = !hasMore || retryRead !== null;
+      more.disabled = retry.disabled = busy;
+      retry.hidden = retryRead === null;
+    }
+
+    async function readPage(reset) {
+      const nextOffset = reset ? 0 : offset;
+      listStatus.textContent = 'Loading messages…';
+      try {
+        const { records } = await api.data.query({ table: 'messages', fields: ['id', 'body'],
+          order: { field: 'id', direction: 'asc' }, limit: pageSize, offset: nextOffset });
+        // Commit navigation only after a successful read. Refresh also restarts
+        // offset paging after writes or changes made by another visitor.
+        if (reset) { list.replaceChildren(); seen.clear(); }
+        for (const record of records) {
+          if (seen.has(record.id)) continue;
+          const row = document.createElement('li');
+          row.textContent = record.body;
+          list.append(row); seen.add(record.id);
+        }
+        offset = nextOffset + records.length;
+        hasMore = records.length === pageSize;
+        retryRead = null;
+        listStatus.textContent = !seen.size ? 'No messages yet.'
+          : `${hasMore ? 'Showing' : 'All'} ${seen.size} message(s).`;
+      } catch {
+        retryRead = reset;
+        listStatus.textContent = 'Could not load messages. Your current list is unchanged. Retry loading or refresh.';
+      }
+    }
+
+    async function load(reset) {
+      if (busy) return;
+      busy = true; controls();
+      try { await readPage(reset); }
+      finally { busy = false; controls(); }
+    }
+    more.onclick = () => load(false);
+    refresh.onclick = () => load(true);
+    retry.onclick = () => retryRead === null ? Promise.resolve() : load(retryRead);
+
+    form.onsubmit = async event => {
+      event.preventDefault();
+      if (busy || (!pending && !input.value)) return;
+      busy = true;
+      try {
+        // Keep the original payload and requestId after an uncertain write.
+        // Only the user's next Save action retries it; edits cannot change it.
+        pending ||= { table: 'messages', values: { body: input.value }, requestId: crypto.randomUUID() };
+        controls(); saveStatus.textContent = 'Saving…';
+        await api.data.insert(pending);
+        pending = undefined; form.reset(); saveStatus.textContent = 'Saved.';
+        await readPage(true);
+      } catch {
+        saveStatus.textContent = 'Save was not confirmed. Retry save to try the same message again.';
+      } finally { busy = false; controls(); }
+    };
+    load(true);
+  </script>
+</body>
+</html>

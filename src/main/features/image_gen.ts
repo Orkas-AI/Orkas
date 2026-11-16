@@ -1,3 +1,5 @@
+import { MEDIA_TRANSFER_POLICY } from '../util/media-transfer-policy';
+import { fetchMediaAndRead } from '../util/media-rate-limit';
 import { normaliseSeedreamSize, normaliseGeminiImageSize, isSingleImageSeedream, UnsupportedImageSizeError } from './image_size';
 import { logErrorSummary, logPathRef } from '../util/log-redact';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
@@ -30,7 +32,7 @@ import { listApiKeyEntries, loadImageProfiles, type ApiKeyEntryChoice } from './
 import { findImageGenCapability, type ImageGenCapability } from '../model/provider_catalog';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
-import { composeAbortSignal, fetchAndReadWithTimeout, throwIfAborted } from '../util/abort';
+import { composeAbortSignal, throwIfAborted } from '../util/abort';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import {
   ORKAS_API_BASE_URL,
@@ -43,8 +45,10 @@ import { loadImageReferenceBuffersWithProgress, registerGeneratedMediaUrl, type 
 import type { ImageReferenceBinding } from './image_prompt_contract';
 
 const log = createLogger('image-gen');
-const DIRECT_IMAGE_HTTP_TIMEOUT_MS = 10 * 60_000;
-const IMAGE_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+const fetchAndReadWithTimeout: typeof fetchMediaAndRead = (input, init, timeout, signal, message, read, codes) =>
+  fetchMediaAndRead(input, init, timeout, signal, message, read, codes, 'image');
+const DIRECT_IMAGE_HTTP_TIMEOUT_MS = MEDIA_TRANSFER_POLICY.transferMs;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = MEDIA_TRANSFER_POLICY.transferMs;
 const MAX_IMAGE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 type ImageProgressReporter = GenerationReferenceProgressReporter;
 
@@ -120,6 +124,8 @@ export interface GenerateImageInput {
   signal?: AbortSignal;
   onProgress?: ImageProgressReporter;
   usageContext?: OrkasApiUsageContext;
+  /** Host-only app selection; saved service priorities remain unchanged. */
+  profileId?: string;
 }
 
 export type GenerateImageResult =
@@ -159,7 +165,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
     return { ok: false, errorCode: 'BAD_INPUT', message: 'outputAbsPath is required', dispatched: false };
   }
 
-  const candidates = listOpenImageGenCandidates();
+  const candidates = listOpenImageGenCandidates().filter(candidate => !input.profileId || candidate.entry.entryId === input.profileId);
   if (!candidates.length) {
     log.warn('image gen aborted: no api-key entry maps to an image-capable provider');
     return { ok: false, errorCode: 'NO_CAPABLE_MODEL', message: t('image_gen.no_capable_model'), dispatched: false };
@@ -368,20 +374,32 @@ async function waitForOrkasImageTask(
   let data: any = {};
   while (!signal.aborted) {
     await sleepWithSignal(3_000, signal);
-    const { body: statusData } = await fetchAndReadWithTimeout(
-      `${ORKAS_API_BASE_URL}/images/generations/${encodeURIComponent(taskId)}`,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          ...orkasApiUsageHeaders(usageContext),
+    const query = composeAbortSignal(signal, ORKAS_IMAGE_POLL_TIMEOUT_MS, 'Orkas Image status request timed out');
+    let statusData: any;
+    try {
+      ({ body: statusData } = await fetchAndReadWithTimeout(
+        `${ORKAS_API_BASE_URL}/images/generations/${encodeURIComponent(taskId)}`,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            ...orkasApiUsageHeaders(usageContext),
+          },
         },
-      },
-      ORKAS_IMAGE_POLL_TIMEOUT_MS,
-      signal,
-      'Orkas Image status request timed out',
-      (resp) => readOrkasImageResponse(resp, 'status'),
-    );
+        ORKAS_IMAGE_POLL_TIMEOUT_MS,
+        query.signal,
+        'Orkas Image status request timed out',
+        (resp) => readOrkasImageResponse(resp, 'status'),
+      ));
+    } catch (error) {
+      throwIfAborted(signal);
+      // A local status-read timeout says nothing about the accepted job.
+      // Its own signal identifies this boundary without reading provider prose.
+      if (query.signal.aborted) continue;
+      throw error;
+    } finally {
+      query.cleanup();
+    }
     data = statusData;
     const status = String(data?.status || '').toLowerCase();
     if (['failed', 'cancelled', 'canceled'].includes(status)) {

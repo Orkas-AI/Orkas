@@ -29,6 +29,7 @@ import { fileEditLock } from '../../util/locks';
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
   setCodingProjectDir, setStatus, recoverOrphanRunningState, actorSessionId, setActiveRecipients, type Actor,
+  boundOrchestrationGoal,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
 import type { CommanderMentionDisplay } from './message-display';
@@ -159,8 +160,10 @@ export interface SendInput {
   text: string;
   /** Host feature bookkeeping after routing accepts the message and before
    * recipient work becomes runnable. Never part of the persisted message. */
-  beforeDispatch?: () => Promise<void>;
+  beforeDispatch?: (run: { runId: string }) => Promise<void>;
   notificationKind?: 'task' | 'automation';
+  /** Host-only explicit recipients; no change to the conversation reply target. */
+  forceTo?: string[];
   commander_mention_display?: CommanderMentionDisplay;
   /** Host-owned delivery decision for the explicit queue "Send now" action.
    * Analytics attribution must never imply this execution control. */
@@ -322,6 +325,7 @@ export async function send(
       uid: userId, cid,
       fromActorId: USER_ID,
       text,
+      ...(input.forceTo?.length ? { forceTo: [...input.forceTo] } : {}),
       ...(input.beforeDispatch ? { beforeDispatch: input.beforeDispatch } : {}),
       ...(input.notificationKind ? { notificationKind: input.notificationKind } : {}),
       ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
@@ -334,7 +338,6 @@ export async function send(
       ...(attachments && attachments.length ? { attachments: [...attachments] } : {}),
       ...(use_selections && use_selections.length ? { use_selections } : {}),
       ...(resolvedReferences.length ? { references: resolvedReferences } : {}),
-      ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
     });
     // Auto-title: the first real user message in a fresh / unnamed
     // conversation overwrites the placeholder title so the sidebar item
@@ -344,7 +347,7 @@ export async function send(
       const conv = await chats.getConversation(userId, cid);
       const titleSeed = hasTitleText ? titleText : text;
       if (titleSeed && conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
-        const updated = await chats.updateConversation(
+        await chats.updateConversation(
           userId,
           cid,
           { title: chats.autoTitle(titleSeed) },
@@ -669,6 +672,8 @@ export async function resolveFailedTurnRetry(
     interrupted,
   });
   const originalModelText = String(source.model_text || source.text || '');
+  const retryGoal = typeof failed.orchestration_goal === 'string'
+    ? failed.orchestration_goal : source.orchestration_goal;
   const commanderRetry = source.commander_retry?.source_tool === 'dispatch_to'
     ? source.commander_retry
     : null;
@@ -679,9 +684,13 @@ export async function resolveFailedTurnRetry(
         && !!String(row.model_text || row.text || '').trim()
       ))
     : undefined;
+  const commanderSourceGoal = typeof source.orchestration_goal === 'string'
+    ? source.orchestration_goal : commanderGoal?.orchestration_goal;
   const commanderRetryContinuation = commanderRetry && commanderGoal
     ? {
-        userGoal: String(commanderGoal.model_text || commanderGoal.text || '').slice(0, 6000),
+        userGoal: typeof commanderSourceGoal === 'string'
+          ? boundOrchestrationGoal(commanderSourceGoal)
+          : String(commanderGoal.model_text || commanderGoal.text || '').slice(0, 6000),
         agentTask: originalModelText.slice(0, 6000),
         resumeInstruction: String(commanderRetry.resume_instruction || '').slice(0, 6000),
       }
@@ -713,6 +722,8 @@ export async function resolveFailedTurnRetry(
         failedTurnRetryMode: mode,
         retrySourceMessageId: source.id,
         retryUncertainOperationCount: recovery.uncertain_operation_count,
+        ...(typeof retryGoal === 'string'
+          ? { orchestrationGoal: boundOrchestrationGoal(retryGoal) } : {}),
         ...(commanderRetryContinuation ? {
           source_message_id: commanderGoal!.id,
           commanderRetryContinuation,
@@ -853,18 +864,20 @@ export function cancelTaskEdit(userId: string, cid: string, taskId: string) {
 
 export async function editTask(
   userId: string, cid: string, taskId: string, instruction: string, expectedInstruction: string,
-  resources?: Pick<SendInput, 'attachments' | 'references' | 'use_selections'>,
+  resources?: Pick<SendInput, 'attachments' | 'references' | 'use_selections' | 'model_text'>,
 ) {
   if (!safeId(cid) || !safeId(taskId) || typeof instruction !== 'string'
     || !instruction.trim() || typeof expectedInstruction !== 'string') {
     return { ok: false as const, error: 'invalid arguments' };
   }
-  if (resources && (!Array.isArray(resources.attachments)
+  if (resources && ((resources.model_text !== undefined && typeof resources.model_text !== 'string')
+    || !Array.isArray(resources.attachments)
     || resources.attachments.some((name) => typeof name !== 'string' || !name || /[/\\\0]/.test(name) || name === '.' || name === '..')
     || !Array.isArray(resources.references) || !Array.isArray(resources.use_selections))) {
     return { ok: false, error: 'invalid arguments' };
   }
   const resolved = resources ? { attachments: resources.attachments,
+    ...(resources.model_text?.trim() ? { model_text: resources.model_text } : {}),
     use_selections: resources.use_selections,
     references: await _resolveMessageReferences(userId, resources.references),
   } : undefined;
