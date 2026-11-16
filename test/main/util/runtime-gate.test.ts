@@ -23,11 +23,13 @@ const {
     allowedKeys?: string[];
     whisperContract?: any;
     windowsVcContract?: any;
+    librawContract?: any;
   }) => string[];
   verifyWhisperRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string;
   verifyWindowsVcImportClosure: (root: string, arch: string) => string;
 };
 
+const librawFixture = require('../../fixtures/libraw-runtime.cjs');
 let tmpDir: string;
 
 beforeEach(() => {
@@ -364,6 +366,7 @@ function writeAllRuntimes(root: string, key: string, contract: any, withNodeComp
   writeRuntime(root, 'uv', key);
   writeRuntime(root, 'node', key, withNodeCompanions);
   writeFfmpegRuntime(root, key);
+  librawFixture.write(root, key);
   writeWhisperRuntime(root, key, contract);
   writeVcRuntime(root, key, windowsVcContract(key));
 }
@@ -400,6 +403,7 @@ describe('runtime-gate', () => {
 
     expect(verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     })).toEqual([
       'runtime:python:win32-x64',
@@ -407,6 +411,7 @@ describe('runtime-gate', () => {
       'runtime:node:win32-x64',
       'runtime:ffmpeg:win32-x64',
       'runtime:whisper:win32-x64',
+      'runtime:libraw:win32-x64',
       'runtime:vc:win32-x64',
     ]);
   });
@@ -423,6 +428,7 @@ describe('runtime-gate', () => {
 
     expect(() => verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     })).toThrow(/missing runtime ffmpeg directory/);
   });
@@ -437,6 +443,7 @@ describe('runtime-gate', () => {
 
     expect(() => verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     })).toThrow(/ffmpeg runtime hash\/size mismatch/);
   });
@@ -513,6 +520,7 @@ describe('runtime-gate', () => {
 
     expect(() => verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     })).toThrow(/unexpected runtime ffmpeg payload/);
   });
@@ -527,6 +535,7 @@ describe('runtime-gate', () => {
 
     expect(() => verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     })).toThrow(/unregistered packaged runtime dependency/);
   });
@@ -540,6 +549,7 @@ describe('runtime-gate', () => {
 
     expect(() => verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     })).toThrow(/node runtime companion/);
   });
@@ -554,11 +564,13 @@ describe('runtime-gate', () => {
     expect(verifyRuntimeRoot(root, 'win32', 'x64', {
       allowedKeys: keys,
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(keys[0]),
     })).toContain('runtime:node:win32-x64');
     expect(verifyRuntimeRoot(root, 'win32', 'arm64', {
       allowedKeys: keys,
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(keys[1]),
     })).toContain('runtime:node:win32-arm64');
   });
@@ -573,6 +585,7 @@ describe('runtime-gate', () => {
 
     expect(() => verifyRuntimeRoot(root, 'win32', 'x64', {
       whisperContract: contract,
+      librawContract: librawFixture.spec(),
       windowsVcContract: windowsVcContract(key),
     }))
       .toThrow(/whisper runtime hash\/size mismatch/);

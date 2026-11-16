@@ -25,13 +25,16 @@ function fixture() {
   write('package.json', JSON.stringify({ name: 'test-entry-fixture', private: true, scripts: {
     test: pkg.scripts.test, 'test:js': pkg.scripts['test:js'], 'test:resources': pkg.scripts['test:resources'],
   } }));
-  for (const file of ['run-tests.mjs', 'test-runtime-env.mjs', 'check-installed-dependencies.mjs']) {
+  for (const file of ['run-tests.mjs', 'test-runtime-env.mjs', 'check-installed-dependencies.mjs', 'test-stderr-receipt.mjs']) {
     write(`scripts/${file}`, fs.readFileSync(path.join(pcRoot, 'scripts', file), 'utf8'));
   }
   // Real npm and launcher, recording child executables: exercising routing
   // cannot recursively run this suite or depend on native/Python availability.
   write('node_modules/electron/index.js', `module.exports = ${JSON.stringify(node)};`);
   const child = (family: string) => `
+    import { writeFileSync } from 'node:fs';
+    import { spawn } from 'node:child_process';
+    import { createStderrReceipt } from '${family === 'js' ? '../../scripts/' : './'}test-stderr-receipt.mjs';
     if (process.env.HOLD_FAMILY === '${family}') {
       process.on('SIGTERM', () => { console.error('${family}-stopped'); process.exit(0); });
       setTimeout(() => process.exit(12), 5000);
@@ -40,6 +43,25 @@ function fixture() {
       electronNode: process.env.ELECTRON_RUN_AS_NODE, outerNode: process.env.ORKAS_TEST_NODE,
       testPython: process.env.ORKAS_TEST_PYTHON, evalPython: process.env.ORKAS_EVAL_PYTHON }));
     console.error('${family}-diagnostic');
+    if (process.env.ORKAS_TEST_PROCESS_REPORT) {
+      const receipt = createStderrReceipt();
+      receipt.ingest('${family}-diagnostic\\n');
+      const mode = process.env.RECEIPT_FIXTURE;
+      const report = mode === 'malformed' ? '{"stderr":'
+        : mode === 'oversized' ? 'x'.repeat(4097)
+        : JSON.stringify({ schema: 1, stderr: mode === 'invalid'
+          ? { valid: true, bytes: 1, lines: 1, digest: 'fixture-private-receipt', private: 'fixture-private-receipt' }
+          : receipt.finish() });
+      if (mode !== 'missing') writeFileSync(process.env.ORKAS_TEST_PROCESS_REPORT, report);
+    }
+    if (process.env.HOLD_STDERR && '${family}' === 'js') {
+      const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'],
+        // Windows otherwise terminates the attached descendant with its parent,
+        // closing FD2 before the launcher's drain deadline can be exercised.
+        { detached: process.platform === 'win32', windowsHide: true, stdio: ['ignore', 'ignore', 'inherit'] });
+      console.log('HOLDER:' + holder.pid);
+      holder.unref();
+    }
     if (process.env.HOLD_FAMILY !== '${family}') process.exit(Number(process.env.${family === 'js' ? 'JS' : 'RESOURCE'}_EXIT || 0));
   `;
   write('node_modules/vitest/vitest.mjs', child('js'));
@@ -53,6 +75,12 @@ function invoke(root: string, args: string[], env: Record<string, string> = {}) 
   const result = spawnSync(node, [npm, ...args], {
     cwd: root, env: { ...process.env, ...env }, encoding: 'utf8', timeout: 15_000,
   });
+  if (env.HOLD_STDERR) {
+    const pid = Number(/^HOLDER:(\d+)$/m.exec(result.stdout)?.[1]);
+    if (pid) { try { process.kill(pid, 'SIGTERM'); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    } }
+  }
   expect(result.error).toBeUndefined();
   const records = result.stdout.split(/\r?\n/).filter(line => line.startsWith('EXEC:'))
     .map(line => JSON.parse(line.slice(5)));
@@ -62,6 +90,32 @@ function invoke(root: string, args: string[], env: Record<string, string> = {}) 
 }
 
 describe('npm test selection and outcome', () => {
+  it.each(['missing', 'malformed', 'oversized', 'invalid'])('retains a safe failure receipt for a %s reporter result', mode => {
+    const result = invoke(fixture(), ['test'], { RECEIPT_FIXTURE: mode });
+    expect(result.status).toBe(1);
+    expect(result.records.map(record => record.family)).toEqual(['js']);
+    const line = result.stdout.split('\n').find(line => line.startsWith('[test-process-log-analysis] receipt '));
+    const audit = JSON.parse(line!.slice('[test-process-log-analysis] receipt '.length));
+    expect(audit).toMatchObject({ schema: 1, expectedStatus: mode === 'malformed' ? 'invalid' : mode,
+      expected: null, drainTimedOut: false, actual: { valid: true, bytes: 14, lines: 1 } });
+    expect(audit.actual.digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(line).not.toContain('fixture-private-receipt');
+  });
+
+  it('bounds stderr EOF wait after runtime exit and rejects a descendant that retains the descriptor', () => {
+    const started = performance.now();
+    const result = invoke(fixture(), ['test'], { HOLD_STDERR: '1' });
+    expect(result.status).toBe(1);
+    expect(result.records.map(record => record.family)).toEqual(['js']);
+    expect(result.stdout).toContain('stderr drain timed out after runtime exit');
+    expect(result.stdout).toContain('[test-process-log-analysis] FAIL');
+    const audit = JSON.parse(result.stdout.split('\n').find(line => line.startsWith('[test-process-log-analysis] receipt '))!
+      .slice('[test-process-log-analysis] receipt '.length));
+    expect(audit).toMatchObject({ schema: 1, expectedStatus: 'valid', drainTimedOut: true });
+    expect(audit.actual).toEqual(audit.expected);
+    expect(performance.now() - started).toBeLessThan(12_000);
+  });
+
   it('runs the real npm fixture when a direct Node parent does not export npm_execpath', () => {
     const previous = process.env.npm_execpath;
     delete process.env.npm_execpath;

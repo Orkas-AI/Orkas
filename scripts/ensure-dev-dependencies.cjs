@@ -32,6 +32,7 @@ function shouldProvisionWhisper(platform = process.platform, arch = process.arch
 }
 
 async function main() {
+  require('./media-transfer-policy.cjs').verifyMediaTransferPolicy(pcRoot);
   require('../bin/packaged-resource-gate.cjs').verifyXlsReaderRoot(path.join(pcRoot, 'resources', 'xls-reader'));
   await run('Node bootstrap', 'scripts/verify-native-dependencies.cjs', ['--host-only']);
   if (process.platform === 'linux') {
@@ -76,6 +77,9 @@ async function main() {
       '--platform', process.platform,
       '--arch', process.arch,
     ]);
+    if (require('../bin/runtime-gate.cjs').LIBRAW_RUNTIME_CONTRACT.targets[`${process.platform}-${process.arch}`]) {
+      await step('LibRaw', 'scripts/fetch-libraw.cjs', ['--platform', process.platform, '--arch', process.arch]);
+    }
   }
   const results = await Promise.allSettled([prepareNative(), prepareAssets()]);
   const failure = results.find(result => result.status === 'rejected');

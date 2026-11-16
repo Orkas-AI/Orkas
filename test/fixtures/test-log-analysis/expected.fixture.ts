@@ -2,6 +2,7 @@ import { expect, it } from 'vitest';
 import { expectTestLog } from '../../helpers/test-log-analysis';
 
 it('passes a declared recoverable warning', () => {
+  console.info('fixture ordinary stdout remains visible');
   expectTestLog({ level: 'warn', source: 'console', message: /fixture recoverable retry/ });
   console.warn('fixture recoverable retry', { attempt: 2 });
   expect(true).toBe(true);

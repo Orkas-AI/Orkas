@@ -28,7 +28,7 @@
       <div class="sidebar-actions">
         <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">New Task</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
         <!-- One flat list, in the release_1.8.0 order. -->
-        <button class="sidebar-btn" id="todos-btn"><span data-ui-icon="clipboard-list" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="project.todo.title">To-do</span></button>
+        <button class="sidebar-btn" id="todos-btn"><span data-ui-icon="clipboard-list" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="project.todo.title">To-do</span><span class="task-unread-dot" id="todos-due-dot" hidden></span></button>
         <button class="sidebar-btn" id="auto-btn"><span data-ui-icon="clock" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.auto">Auto</span></button>
         <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
         <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
@@ -196,18 +196,22 @@
                   <input type="text" class="chat-header-title-input" id="chat-header-title-input"
                          autocomplete="off" spellcheck="false" hidden />
                 </div>
-                <div class="chat-header-meta" id="chat-header-meta"></div>
+                <div class="chat-header-context">
+                  <div class="chat-header-meta" id="chat-header-meta"></div>
+                  <div class="chat-header-task-links" id="chat-header-task-links" hidden></div>
+                </div>
               </div>
               <div class="chat-header-actions">
                 <button type="button" class="chat-header-menu-btn" id="chat-header-menu-btn"
                         title="More actions" aria-label="More actions">
                   <span data-ui-icon="more-horizontal" data-ui-icon-class="chat-header-menu-icon"></span>
                 </button>
-                <button type="button" class="chat-header-details-btn" id="video-review-toggle" hidden
-                        data-i18n-title="video_review.toggle_title"
-                        data-i18n-aria-label="video_review.toggle_title"
-                        title="Video review" aria-label="Video review" aria-expanded="false">
+                <button type="button" class="chat-header-details-btn" id="video-canvas-toggle" hidden
+                        data-i18n-title="video_canvas.toggle_title"
+                        data-i18n-aria-label="video_canvas.toggle_title"
+                        title="Video canvas" aria-label="Video canvas" aria-expanded="false">
                   <span data-ui-icon="film" data-ui-icon-class="chat-header-details-icon"></span>
+                  <span class="task-unread-dot video-canvas-update-dot" id="video-canvas-update-dot" aria-hidden="true" hidden></span>
                 </button>
                 <button type="button" class="chat-header-details-btn" id="conversation-info-toggle"
                         data-i18n-title="conversation_info.toggle_title"
@@ -249,14 +253,14 @@
               </div>
               <div class="chat-input-area">
                 <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
-                <div data-composer="1" id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files."></div>
+                <div data-composer="1" id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files. Agents support parallel execution: @A @B analyze data; sequential execution: @A analyze data @B write a report."></div>
                 <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                      P11: [+] | divider | [To] | [workspace - JS-injected] |
                      [skill] | spacer | [send].                      by `chat-send-btn { margin-left: auto }`. -->
                 <div class="chat-bottom-bar">
                   <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
                   <span class="chat-composer-divider" aria-hidden="true"></span>
-                  <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                  <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                     <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                     <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                   </button>
@@ -285,6 +289,7 @@
                  tabindex="0" aria-orientation="vertical"
                  data-i18n-title="conversation_info.resize" data-i18n-aria-label="conversation_info.resize"
                  title="Resize task details" aria-label="Resize task details"></div>
+            <div class="conversation-info-chrome">
             <div class="conversation-info-header">
               <div class="conversation-info-title" data-i18n="conversation_info.title">Conversation info</div>
               <button type="button" class="conversation-info-icon-btn conversation-info-close" id="conversation-info-close"
@@ -314,6 +319,7 @@
                 <span class="conversation-info-tab-count" id="conversation-info-tab-count-browser"></span>
               </button>
             </div>
+            </div>
             <div class="conversation-info-body" id="conversation-info-body"></div>
           </aside>
           <!-- Markdown viewer / editor drawer. Hosts the shared mountMdViewEdit
@@ -332,25 +338,40 @@
             </div>
             <div class="chat-md-drawer-body markdown-body" id="chat-md-drawer-body"></div>
           </aside>
-          <!-- Host-owned VideoStudio review panel (P2): renders scenes,
-               preview evidence, and narration audition for the CURRENT
-               production straight from production state. Read-only; its
-               action buttons only prefill the composer.
-               See modules/video-review-panel.js. -->
-          <aside class="video-review-panel task-side-panel" id="video-review-panel" hidden>
-            <div class="task-side-panel-resize" id="video-review-resize" role="separator"
-                 tabindex="0" aria-orientation="vertical" aria-labelledby="video-review-panel-title"></div>
-            <div class="chat-md-drawer-header">
-              <div class="chat-md-drawer-title" id="video-review-panel-title" data-i18n="video_review.title">Video production</div>
-              <div class="chat-md-drawer-actions detail-actions">
-                <button type="button" class="btn btn-sm" id="video-review-panel-refresh"
-                        data-i18n="video_review.refresh">Refresh</button>
-              </div>
-              <button type="button" class="chat-md-drawer-close" id="video-review-panel-close"
+          <!-- The video canvas: this conversation's productions as cards (PATTERNS P23).
+               See modules/video-canvas.js. -->
+          <aside class="video-canvas-panel task-side-panel" id="video-canvas-panel" hidden>
+            <div class="task-side-panel-resize" id="video-canvas-resize" role="separator"
+                 tabindex="0" aria-orientation="vertical" aria-labelledby="video-canvas-title"></div>
+            <div class="chat-md-drawer-header video-canvas-header">
+              <div class="chat-md-drawer-title" id="video-canvas-title" data-i18n="video_canvas.title">Video canvas</div>
+              <div class="video-canvas-production" id="video-canvas-production" hidden></div>
+              <span class="video-canvas-pill is-running" id="video-canvas-status" hidden></span>
+              <button type="button" class="chat-md-drawer-close" id="video-canvas-close"
                       data-i18n-title="common.close" data-i18n-aria-label="common.close"
                       title="Close" aria-label="Close">×</button>
             </div>
-            <div class="chat-md-drawer-body" id="video-review-panel-body"></div>
+            <div class="video-canvas-viewport" id="video-canvas-viewport" tabindex="0" role="region"
+                 data-i18n-aria-label="video_canvas.title" aria-label="Video canvas">
+              <div class="video-canvas-world" id="video-canvas-world">
+                <svg class="video-canvas-lines" id="video-canvas-lines" aria-hidden="true"></svg>
+              </div>
+              <div class="video-canvas-empty" id="video-canvas-empty" hidden></div>
+              <div class="video-canvas-board-hint" id="video-canvas-board-hint" data-i18n="video_canvas.board_hint" hidden>Drag empty space to pan · Ctrl / ⌘ + scroll to zoom · Arrow keys to move</div>
+              <div class="video-canvas-zoom" id="video-canvas-zoom" hidden>
+                <button type="button" class="video-canvas-icon-btn" id="video-canvas-zoom-out"
+                        data-i18n-title="video_canvas.zoom_out" data-i18n-aria-label="video_canvas.zoom_out"
+                        title="Zoom out" aria-label="Zoom out"><span data-ui-icon="minus"></span></button>
+                <span class="video-canvas-zoom-label" id="video-canvas-zoom-label">100%</span>
+                <button type="button" class="video-canvas-icon-btn" id="video-canvas-zoom-in"
+                        data-i18n-title="video_canvas.zoom_in" data-i18n-aria-label="video_canvas.zoom_in"
+                        title="Zoom in" aria-label="Zoom in"><span data-ui-icon="plus"></span></button>
+                <button type="button" class="video-canvas-icon-btn" id="video-canvas-zoom-fit"
+                        data-i18n-title="video_canvas.zoom_fit" data-i18n-aria-label="video_canvas.zoom_fit"
+                        title="Fit to view" aria-label="Fit to view"><span data-ui-icon="maximize"></span></button>
+              </div>
+              <input type="file" id="video-canvas-file" hidden accept="image/*,video/*,audio/*">
+            </div>
           </aside>
         </div>
       </section>
@@ -678,6 +699,7 @@
                   <button class="btn btn-sm" type="button" data-todo-group="status" aria-pressed="false" data-i18n="todo.by_status">By status</button>
                 </div>
                 <button class="btn btn-sm" id="todos-add-btn" type="button" data-i18n="todo.add_short">+ Create</button>
+                <button type="button" class="btn btn-sm" id="todos-cleanup-btn" data-i18n="settings.cleanup.clean">Clean up</button>
               </div>
             </header>
             <div class="todos-workarea">
@@ -718,12 +740,12 @@
                     <div class="chat-attachments" id="project-chat-attachments" style="display:none"></div>
                   </div>
                   <div class="chat-quote-preview" id="project-chat-quote-preview" style="display:none"></div>
-                  <div data-composer="1" id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files."></div>
+                  <div data-composer="1" id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files. Agents support parallel execution: @A @B analyze data; sequential execution: @A analyze data @B write a report."></div>
                   <!-- Bottom bar: attach | divider | model (JS-injected) | recipient | workspace (JS-injected) | order toggle | skill | send. -->
                   <div class="chat-bottom-bar">
                     <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
                     <span class="chat-composer-divider" aria-hidden="true"></span>
-                    <button type="button" class="chat-recipient-chip" id="project-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                    <button type="button" class="chat-recipient-chip" id="project-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                       <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                       <span class="chat-recipient-name" id="project-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                     </button>
@@ -761,6 +783,7 @@
                       <button type="button" class="project-detail-tab" data-project-tab="todo">
                         <span data-i18n="project.todo.title">To-do</span>
                         <span class="project-detail-tab-count" id="project-todo-count">0</span>
+                        <span class="task-unread-dot" id="project-todo-due-dot" hidden></span>
                       </button>
                     </div>
                     <!-- _syncProjectDetailTabState shows the active tab's group. -->
@@ -778,6 +801,7 @@
                               aria-describedby="project-driver-tooltip"><span data-ui-icon="info" data-ui-icon-class="project-driver-hint-icon"></span></button>
                       <button type="button" class="btn btn-sm" id="project-todo-add-btn"
                               data-i18n="todo.add_short" data-i18n-title="project.todo.add" title="Create task">+ Create</button>
+                <button type="button" class="btn btn-sm" id="project-todo-cleanup-btn" data-i18n="settings.cleanup.clean">Clean up</button>
                     </div>
                   </div>
                   <div class="project-detail-tab-panel" data-project-panel="tasks">
@@ -785,7 +809,6 @@
                     <div class="project-tasks-empty empty muted" id="project-tasks-empty" data-i18n="project.tasks_empty">No tasks yet</div>
                   </div>
                   <div class="project-detail-tab-panel" data-project-panel="auto" hidden>
-                    <div class="auto-sync-note" id="project-auto-sync-note" hidden></div>
                     <div class="auto-list" id="project-auto-list"></div>
                     <div class="empty muted" id="project-auto-empty" data-i18n="auto.empty">No auto tasks yet</div>
                   </div>
@@ -984,6 +1007,7 @@
               </div>
             </div>
             <div class="connectors-page-header-actions">
+              <button class="btn btn-sm" id="connectors-return-app" hidden><span data-i18n="common.back">Back</span> · <span data-i18n="apps.builtin_listing_title">Commerce workspace</span></button>
               <label class="connectors-search" for="connectors-search-input">
                 <span data-ui-icon="search" data-ui-icon-class="connectors-search-icon"></span>
                 <input type="search" id="connectors-search-input"
@@ -1080,7 +1104,6 @@
             <button type="button" class="btn btn-sm auto-header-add" id="auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
           </header>
           <div class="auto-scroll">
-            <div class="auto-sync-note" id="auto-sync-note" hidden></div>
             <div class="auto-list" id="auto-list"></div>
             <div class="auto-empty empty" id="auto-empty" data-i18n="auto.empty">No auto tasks yet</div>
           </div>
@@ -1431,6 +1454,28 @@
     </main>
   </div>
 
+  <div class="modal-overlay ui-dialog-overlay" id="cleanup-overlay">
+    <div class="modal modal-standard todo-cleanup-dialog" role="dialog" aria-modal="true" aria-labelledby="cleanup-title">
+      <header class="modal-header"><h2 class="modal-title" id="cleanup-title" data-i18n="todo.cleanup.title">Clean up to-dos</h2></header>
+      <div class="todo-cleanup-body">
+        <p class="todo-cleanup-feedback" id="cleanup-feedback" role="status" hidden></p>
+        <div class="todo-editor-field-grid todo-cleanup-fields">
+          <div class="todo-editor-field"><div class="todo-cleanup-field-head"><span id="project-label" data-i18n="todo.project">Project</span><span class="todo-cleanup-lock" id="scope-lock" hidden><span data-ui-icon="lock"></span><span data-i18n="todo.cleanup.current_project">Current project</span></span></div><div class="todo-editor-select" id="cleanup-project"></div></div>
+          <div class="todo-editor-field"><span data-i18n="todo.cleanup.age">Last updated</span><div class="todo-editor-select" id="cleanup-age"></div></div>
+          <div class="todo-editor-field"><span data-i18n="todo.status">Status</span><div class="todo-editor-select" id="cleanup-status"></div></div>
+        </div>
+        <section class="todo-cleanup-results" aria-labelledby="results-title">
+          <div class="todo-cleanup-results-head"><h3 id="results-title"><span data-i18n="todo.cleanup.matches">Matching to-dos</span><span class="todo-cleanup-count" id="match-count" role="status" aria-live="polite">0</span></h3><span class="todo-cleanup-time-label" data-i18n="todo.cleanup.updated">Last updated</span></div>
+          <div class="todo-cleanup-list" id="cleanup-list" role="list" tabindex="0" aria-labelledby="results-title"></div>
+        </section>
+      </div>
+      <footer class="modal-actions">
+        <button class="btn" id="cleanup-cancel" data-i18n="common.cancel">Cancel</button>
+        <button class="btn btn-danger" id="cleanup-confirm">Clean up 0 to-dos</button>
+      </footer>
+    </div>
+  </div>
+
   <!-- Shared global/project to-do editor -->
   <div class="modal-overlay ui-dialog-overlay" id="todo-editor-modal">
     <div class="modal modal-standard todo-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="project-todo-editor-title">
@@ -1602,7 +1647,7 @@
     </div>
   </div>
 
-  <!-- Agent / skill / connector picker popup -->
+  <!-- Agent / skill / connector / Library picker popup -->
   <div class="skill-picker" id="agent-picker" style="display:none">
     <div class="skill-picker-tabs" role="tablist" aria-label="Picker type">
       <button type="button" class="skill-picker-tab active" data-agent-picker-tab="agents" data-i18n="agent_picker.tab_agents">Agents</button>
@@ -1714,8 +1759,16 @@
             <div class="ai-select" id="settings-video-provider"></div>
           </div>
           <div class="settings-row settings-form-row" id="settings-video-key-row">
-            <label data-i18n="settings.video.api_key">API Key</label>
+            <label id="settings-video-key-label" data-i18n="settings.video.api_key">API Key</label>
             <input type="password" class="form-input" id="settings-video-key-input" autocomplete="new-password" spellcheck="false" />
+          </div>
+          <div class="settings-row settings-form-row" id="settings-video-workspace-row" hidden>
+            <label for="settings-video-workspace-input" data-i18n="settings.video.workspace_id">Workspace ID</label>
+            <input type="text" class="form-input" id="settings-video-workspace-input" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="settings-row settings-form-row" id="settings-video-region-row" hidden>
+            <label data-i18n="settings.video.region">Region</label>
+            <div class="ai-select" id="settings-video-region"></div>
           </div>
           <div class="settings-form-status"><span class="settings-status" id="settings-video-status"></span></div>
           <div class="modal-actions settings-add-form-actions">
@@ -1728,6 +1781,14 @@
           <div class="settings-row settings-form-row">
             <label data-i18n="settings.tts.provider">Provider</label>
             <div class="ai-select" id="settings-tts-provider"></div>
+          </div>
+          <div class="settings-row settings-form-row tts-row-model-select" hidden>
+            <label data-i18n="settings.tts.model">Model</label>
+            <div class="ai-select" id="settings-tts-model-select"></div>
+          </div>
+          <div class="settings-row settings-form-row" id="settings-tts-workspace-row" hidden>
+            <label for="settings-tts-workspace-input" data-i18n="settings.video.workspace_id">Workspace ID</label>
+            <input type="text" class="form-input" id="settings-tts-workspace-input" autocomplete="off" spellcheck="false" />
           </div>
           <div class="settings-row settings-form-row" id="settings-tts-key-row">
             <label data-i18n="settings.tts.api_key">API Key</label>
@@ -1791,7 +1852,7 @@
             </div>
             <div data-composer="1" id="auto-task-input"
                       data-i18n-placeholder="auto.content_placeholder"
-                      placeholder="Type @ to choose agents, skills, connectors, Library files."></div>
+                      placeholder="Type @ to choose agents, skills, connectors, Library files. Agents support parallel execution: @A @B analyze data; sequential execution: @A analyze data @B write a report."></div>
             <div class="chat-bottom-bar">
               <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
               <span class="chat-composer-divider" aria-hidden="true"></span>
@@ -1842,24 +1903,23 @@
               <div id="auto-minute-select"></div>
             </div>
           </div>
-        </div>
-
-        <div class="auto-end-row" id="auto-row-end">
-          <div class="form-row auto-schedule-cell">
-            <label data-i18n="auto.end_label">Ends</label>
-            <div id="auto-end-select"></div>
-          </div>
-          <div class="form-row auto-schedule-cell" id="auto-row-end-date" hidden>
-            <label for="auto-end-date-input" data-i18n="auto.end_date_label">End date</label>
-            <div class="auto-date-picker" id="auto-end-date-picker">
-              <input type="text" id="auto-end-date-input" inputmode="numeric" autocomplete="off" placeholder="YYYY-MM-DD" />
-              <button type="button" class="auto-date-picker-toggle" aria-haspopup="dialog" aria-controls="auto-end-date-picker-popover" data-i18n-aria-label="auto.calendar_open" data-i18n-title="auto.calendar_open"></button>
-              <div class="auto-date-picker-popover" id="auto-end-date-picker-popover" role="dialog" hidden></div>
+          <div class="auto-end-row" id="auto-row-end">
+            <div class="form-row auto-schedule-cell">
+              <label data-i18n="auto.end_label">Ends</label>
+              <div id="auto-end-select"></div>
             </div>
-          </div>
-          <div class="form-row auto-schedule-cell" id="auto-row-end-count" hidden>
-            <label data-i18n="auto.end_count_label">Run count</label>
-            <input type="number" id="auto-end-count-input" min="1" step="1" inputmode="numeric" />
+            <div class="form-row auto-schedule-cell" id="auto-row-end-date" hidden>
+              <label for="auto-end-date-input" data-i18n="auto.end_date_label">End date</label>
+              <div class="auto-date-picker" id="auto-end-date-picker">
+                <input type="text" id="auto-end-date-input" inputmode="numeric" autocomplete="off" placeholder="YYYY-MM-DD" />
+                <button type="button" class="auto-date-picker-toggle" aria-haspopup="dialog" aria-controls="auto-end-date-picker-popover" data-i18n-aria-label="auto.calendar_open" data-i18n-title="auto.calendar_open"></button>
+                <div class="auto-date-picker-popover" id="auto-end-date-picker-popover" role="dialog" hidden></div>
+              </div>
+            </div>
+            <div class="form-row auto-schedule-cell" id="auto-row-end-count" hidden>
+              <label data-i18n="auto.end_count_label">Run count</label>
+              <input type="number" id="auto-end-count-input" min="1" step="1" inputmode="numeric" />
+            </div>
           </div>
         </div>
 
@@ -1869,14 +1929,15 @@
              - hidden when the user has no projects at all (no options to
                pick from — the "default = none" outcome is automatic)
              - otherwise visible, defaulting to "no project" (`value=''`). -->
-        <div class="form-row" id="auto-row-project" hidden>
-          <label data-i18n="auto.project_label">Project</label>
-          <div id="auto-project-select"></div>
-        </div>
-
-        <div class="form-row" id="auto-row-run-device" hidden>
-          <label data-i18n="auto.run_label">Run on</label>
-          <div id="auto-run-device-select"></div>
+        <div class="auto-destination-row">
+          <div class="form-row" id="auto-row-project" hidden>
+            <label data-i18n="auto.project_label">Project</label>
+            <div id="auto-project-select"></div>
+          </div>
+          <div class="form-row" id="auto-row-run-device" hidden>
+            <label data-i18n="auto.run_label">Run on</label>
+            <div id="auto-run-device-select"></div>
+          </div>
         </div>
 
         <div class="form-row">
@@ -1994,6 +2055,7 @@
   <script src="./modules/ipc-shim.js"></script>
   <script src="./modules/lazy-features.js"></script>
   <script src="./modules/i18n.js"></script>
+  <script src="./modules/todo-due.js"></script>
   <script src="./modules/desktop-startup.js"></script>
   <script src="./modules/chat-use.js"></script>
   <script src="./modules/user-error.js"></script>
@@ -2021,7 +2083,7 @@
   <script src="./modules/context-menu.js"></script>
   <script src="./modules/chat-md-drawer.js"></script>
   <script src="./modules/task-side-panel.js"></script>
-  <script src="./modules/video-review-panel.js"></script>
+  <script src="./modules/video-canvas.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/name-limit.js"></script>
   <script src="./modules/projects.js"></script>

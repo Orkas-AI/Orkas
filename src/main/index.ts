@@ -1,3 +1,4 @@
+import { onVideoCanvasJob } from './features/video_canvas_jobs';
 import { createShutdownCoordinator } from './util/shutdown';
 import { scheduleChatApiPreload } from './features/model-api-preload';
 /**
@@ -282,9 +283,12 @@ function rendererChannel(channel: string, options: RendererChannelOptions): Rend
   return created;
 }
 const taskTerminalUi = rendererChannel('conversation:task_terminal', { maxPending: 100, ownerScoped: true });
+const videoCanvasJob = rendererChannel('conversations:video-canvas-job', { maxPending: 50, ownerScoped: true });
 const conversationFilingFailure = rendererChannel('conversations:filing-failed', { maxPending: 20, ownerScoped: true });
 
 function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
+  // App requests own their result UI and private execution lifecycle.
+  if (paths.appConversationOwner(event.conversation_id)) return;
   const { user_id: ownerUserId, ...terminal } = event;
   taskTerminalUi.emit({ type: 'terminal', ...terminal }, ownerUserId);
 }
@@ -453,6 +457,7 @@ function registerIpc(
   isShutdownQuiescent: () => boolean,
 ): void {
   ipc.register();
+  onVideoCanvasJob(({ userId, ...event }) => videoCanvasJob.emit(event, userId));
   // Subscribe before opening the renderer. The deferred driver scheduler must
   // not determine whether foreground or early background writes are visible.
   projectTasks.onTasksChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
@@ -1314,7 +1319,14 @@ function registerChatMediaProtocol(): void {
         // on bad-ext only — every other failure (not_found / too_large) is
         // terminal, so we don't mask a real error by re-checking under a
         // different bucket.
-        const abs = _pathnameToAbsPath(u.pathname || '');
+        let abs: string;
+        try {
+          abs = _pathnameToAbsPath(u.pathname || '');
+        } catch {
+          // A link whose path encoding is broken names no file: the request is at fault.
+          log.warn('chat-media/local: reject', { error_code: 'bad_input' });
+          return new Response('bad request', { status: 400 });
+        }
         let resolved: ReturnType<typeof chatAttachments.resolveLocalMediaPath>
           | ReturnType<typeof chatAttachments.resolveLocalPreviewPath>
           = chatAttachments.resolveLocalMediaPath(abs);
@@ -1519,6 +1531,7 @@ if (!gotLock) {
   const shutdown = createShutdownCoordinator({
     captureProcesses: () => captureWindowsShutdownProcesses(),
     quiesce: async () => {
+      (await import('./features/web_apps/task-host')).stopAppTaskMaintenance();
       autoTasks.stopScheduler();
       projectDriverRunner.stopDriverScheduler();
       await Promise.all([
@@ -1534,6 +1547,10 @@ if (!gotLock) {
       library.closeAllLibraryCorpora();
     },
     localTasks: [
+      { name: 'conversation-history', run: async () => {
+        const history = await import('./features/conversation-history-client');
+        await history.closeConversationHistoryWorker();
+      } },
       { name: 'open-lifecycle', run: async () => { await openLifecycleTracking?.flushQuit(); } },
       { name: 'connectors', run: () => connectorsFeature.shutdown() },
       { name: 'search', run: () => searchFeature.flushAll() },
@@ -1574,6 +1591,7 @@ if (!gotLock) {
       await library.resumeLibraryAdmission();
       const boot = await import('./util/boot_init');
       boot.resumeBootAdmission();
+      (await import('./features/web_apps/task-host')).startAppTaskMaintenance();
       autoTasks.startScheduler();
       projectDriverRunner.startDriverScheduler();
     },
@@ -1843,6 +1861,11 @@ if (!gotLock) {
       await warmLocalClis(signal);
     }, 'parallel', 0, idleProcess);
     registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
+    registerDeferred('app-tasks:finalize', async () => {
+      const tasks = await import('./features/web_apps/task-host');
+      await tasks.maintainAppTasks();
+      tasks.startAppTaskMaintenance();
+    });
     // To-do driver loop — opt-in per global/project backlog (default off); the
     // poll early-exits on scopes that have not enabled it.
     // Surface each driver-created conversation to the renderer so it appears in

@@ -35,7 +35,7 @@ function runtimeRoots(): string[] {
   return roots;
 }
 
-function runtimeVariantDirs(kind: 'python' | 'uv' | 'node' | 'ffmpeg' | 'whisper'): string[] {
+function runtimeVariantDirs(kind: 'python' | 'uv' | 'node' | 'ffmpeg' | 'whisper' | 'libraw'): string[] {
   const dirs: string[] = [];
   for (const runtimeRoot of runtimeRoots()) {
     const root = path.join(runtimeRoot, kind);
@@ -307,6 +307,15 @@ export function bundledNodeExecutable(): string | undefined {
   return resolveNodeExecutable();
 }
 
+/** Only the shipped RAW engine is selected; no system PATH fallback. */
+export function bundledLibRawExecutable(): string | undefined {
+  for (const dir of runtimeVariantDirs('libraw')) {
+    const file = path.join(dir, 'bin', process.platform === 'win32' ? 'dcraw_emu.exe' : 'dcraw_emu');
+    if (isFile(file)) return file;
+  }
+  return undefined;
+}
+
 /**
  * Absolute path to the bundled npm `npx-cli.js`, or undefined when not present.
  * Resolved relative to the bundled Node so callers can run it as
@@ -341,5 +350,7 @@ export function bundledRuntimeEnv(): Record<string, string> {
   const { cli: whisperCli, model: whisperModel } = bundledWhisperPaths();
   if (whisperCli) env.ORKAS_WHISPER_CPP = whisperCli;
   if (whisperModel) env.ORKAS_WHISPER_MODEL = whisperModel;
+  const libraw = bundledLibRawExecutable();
+  if (libraw) env.ORKAS_LIBRAW = libraw;
   return env;
 }

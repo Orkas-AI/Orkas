@@ -164,6 +164,44 @@ export const webAppSandboxRoot = (uid: string, key: string, scope: WebAppStorage
 export const webAppDataFile = (uid: string, key: string, scope: WebAppStorageScope = 'local') =>
   path.join(webAppSandboxRoot(uid, key, scope), 'state.json');
 
+/** Host-minted execution identity; no account identity or project membership.
+ * Routing is constant-time and never scans ordinary conversation indexes. */
+export function appConversationOwner(cid: string): { key: string; keepSession: boolean; token: string } | null {
+  const match = /^app_([a-f0-9]{64})_(once|retain)_([a-f0-9]{32})$/.exec(cid);
+  return match ? { key: match[1], keepSession: match[2] === 'retain', token: match[3] } : null;
+}
+export function appConversationRoot(uid: string, cid: string): string | null {
+  const owner = appConversationOwner(cid);
+  return owner ? path.join(webAppSandboxRoot(uid, owner.key, owner.keepSession ? 'cloud' : 'local'),
+    owner.keepSession ? 'sessions' : 'runs', owner.token) : null;
+}
+export function appLocalConversationRoot(uid: string, cid: string): string | null {
+  const owner = appConversationOwner(cid);
+  return owner ? path.join(webAppSandboxRoot(uid, owner.key, 'local'), owner.keepSession ? 'sessions' : 'runs', owner.token) : null;
+}
+export function appConversationIdFromSession(sessionId: string): string | null {
+  const match = /^(?:gconv|gmember|gworker|cli)-(app_[a-f0-9]{64}_(?:once|retain)_[a-f0-9]{32})(?:-|$)/.exec(sessionId);
+  return match?.[1] || null;
+}
+export function appExecutionSessionRoot(uid: string, sessionId: string): string | null {
+  const cid = appConversationIdFromSession(sessionId);
+  const root = cid && appConversationRoot(uid, cid);
+  return root ? path.join(root, 'execution') : null;
+}
+export function appExecutionFileStem(sessionId: string): string {
+  return createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
+}
+
+/** Recover a host-owned execution identity from a scoped working path. This
+ * accepts the structured layout only; arbitrary titles/filenames confer no ownership. */
+export function appConversationForPath(uid: string, absolute: string): string | null {
+  const parts = path.relative(userRoot(uid), path.resolve(absolute)).split(path.sep);
+  if (parts[1] !== 'web_apps' || !/^[a-f0-9]{64}$/.test(parts[2] || '') || !/^[a-f0-9]{32}$/.test(parts[4] || '')) return null;
+  const mode = parts[0] === 'local' && parts[3] === 'runs' ? 'once'
+    : parts[0] === 'cloud' && parts[3] === 'sessions' ? 'retain' : '';
+  return mode ? `app_${parts[2]}_${mode}_${parts[4]}` : null;
+}
+
 // core-agent session jsonl (LLM-view). Two regions:
 //   cloud/sessions/  — "resumable" kinds: gconv / gmember / skill / agent.
 //     The user (or the system on the user's behalf) may continue these
@@ -384,6 +422,8 @@ export const userPermissionsFile = (uid: string) => path.join(userCloudConfigDir
 // `resources/builtin/` (extraResources in packaged builds); startup/login
 // mirrors the relevant pieces into per-user runtime roots.
 export const packagedBuiltinDir = () => packagedResourceDir('builtin');
+export const packagedBuiltinAppsDir = () => path.join(packagedBuiltinDir(), 'apps');
+export const userBuiltinAppsDir = (uid: string) => path.join(userLocalRoot(uid), 'builtin_apps');
 export const packagedBuiltinMarketplaceDir = () => path.join(packagedBuiltinDir(), 'marketplace');
 export const packagedBuiltinMarketplaceAgentsDir = () => path.join(packagedBuiltinMarketplaceDir(), 'agents');
 export const packagedBuiltinMarketplaceSkillsDir = () => path.join(packagedBuiltinMarketplaceDir(), 'skills');
@@ -481,12 +521,14 @@ export const userTestDir = (uid: string) => path.join(userLocalRoot(uid), 'test'
 // persisted-output refs travel with `cloud/sessions/<sid>.jsonl`.
 export const userToolResultsDir = (uid: string) => path.join(userLocalRoot(uid), 'tool-results');
 export const sessionToolResultsDir = (uid: string, sessionId: string) =>
-  path.join(userToolResultsDir(uid), sessionId);
+  appExecutionSessionRoot(uid, sessionId)
+    ? path.join(appExecutionSessionRoot(uid, sessionId)!, `${appExecutionFileStem(sessionId)}.tool-results`)
+    : path.join(userToolResultsDir(uid), sessionId);
 // Machine-local working copies created when an Agent explicitly materializes
 // a persisted result for shell/code analysis. They never sync, are isolated by
 // session, and share the local Result Store sweep lifecycle.
 export const sessionAnalysisInputsDir = (uid: string, sessionId: string) =>
-  path.join(userToolResultsDir(uid), `${sessionId}.analysis-inputs`);
+  path.join(appExecutionSessionRoot(uid, sessionId) || userToolResultsDir(uid), `${appExecutionSessionRoot(uid, sessionId) ? appExecutionFileStem(sessionId) : sessionId}.analysis-inputs`);
 
 // On-demand preprocessing cache for workspace / external path files
 // (features/file_indexer.ts). The subdirectory name is
@@ -597,10 +639,12 @@ export const localAgentRunDir = (uid: string, runId: string) =>
 export const userLocalCliSessionsDir = (uid: string) =>
   path.join(userLocalRoot(uid), 'cli-sessions');
 export const localCliSessionsFile = (uid: string, cid: string) =>
-  path.join(userLocalCliSessionsDir(uid), `${cid}.json`);
+  appLocalConversationRoot(uid, cid) ? path.join(appLocalConversationRoot(uid, cid)!, 'cli-sessions.json')
+    : path.join(userLocalCliSessionsDir(uid), `${cid}.json`);
 // User selections are durable device state, independent of resumable sessions.
 export const localCliDirectoryFile = (uid: string, cid: string) =>
-  path.join(userLocalRoot(uid), 'cli-directories', `${assertProjectSegment(cid)}.json`);
+  appLocalConversationRoot(uid, cid) ? path.join(appLocalConversationRoot(uid, cid)!, 'cli-directory.json')
+    : path.join(userLocalRoot(uid), 'cli-directories', `${assertProjectSegment(cid)}.json`);
 
 // ── External packages (machine-private, verbatim third-party repos) ─────
 // `<uid>/local/packages/<name>/` hosts a cloned open-source repo UNMODIFIED

@@ -106,6 +106,86 @@ test('${name}', async () => {
   return { root, pc, write, add, run, start, count, stateFile };
 }
 
+it('fails a passing Python assertion when its real process emits a Server ERROR', () => {
+  const f = fixture('python');
+  f.add('a', false, "print('[12:34:56.789][ERROR][rid=-] synthetic server failure')");
+  f.add('b', false);
+  const result = f.run();
+  expect(result.status, result.stdout + result.stderr).toBe(1);
+  const base = path.join(f.pc, 'test-results/checkpoints', path.dirname(f.stateFile()));
+  // Failed batches are retained but intentionally absent from reusable completed entries.
+  const reports = fs.readdirSync(base, { recursive: true }).map(String)
+    .filter(file => /^batch-\d+\.json$/.test(path.basename(file)))
+    .map(file => JSON.parse(fs.readFileSync(path.join(base, file), 'utf8')));
+  expect(reports.some(report => report.logs.analysis.findings.some((finding: any) => finding.code === 'runtime-error' && finding.source === 'python-server'))).toBe(true);
+});
+
+it.each(['exact', 'extra', 'missing', 'lookalike', 'stderr', 'setup', 'assertion', 'other-case', 'critical', 'skipped', 'deferred', 'drain-timeout', 'subtest-progress'])(
+  'Python fault-log receipts retain raw errors and reject %s mismatches', mode => {
+    const f = fixture('python');
+    f.add('b', false);
+    const row = '[12:34:56.789][ERROR][rid=-] Controlled injected transport failure code=EIO';
+    const output = mode === 'deferred' || mode === 'drain-timeout'
+      ? `from types import SimpleNamespace
+    pending = [${JSON.stringify(row)}]
+    def wait_idle(timeout):
+        while pending:
+            print(pending.pop())
+        return ${mode === 'drain-timeout' ? 'False' : 'True'}
+    sys.modules['utils.log'] = SimpleNamespace(_console_sink=SimpleNamespace(wait_idle=wait_idle))`
+      : mode === 'missing' || mode === 'setup' ? 'pass'
+      : mode === 'stderr' ? "sys.stderr.write('unclassified transport failure\\n')"
+      : `print(${JSON.stringify(mode === 'lookalike' ? row.replace('EIO', 'EACCES')
+        : mode === 'critical' ? row.replace('[ERROR]', '[CRITICAL]') : mode === 'subtest-progress' ? 'u' + row : row)})`;
+    f.write('tests/test_a.py', `import pytest, sys
+@pytest.fixture(autouse=True)
+def boundary():
+    ${mode === 'setup' ? `print(${JSON.stringify(row)})` : 'pass'}
+@pytest.mark.orkas_expected_errors(('Controlled injected transport failure code=EIO', 1))
+${mode === 'skipped' ? "@pytest.mark.skip(reason='explicit platform fixture')" : ''}
+def test_fault_and_recovery():
+    ${output}
+    ${mode === 'extra' ? `print(${JSON.stringify(row)})` : 'pass'}
+    assert ${mode === 'assertion' ? 'False' : 'True'}
+`);
+    if (mode === 'other-case') f.add('b', false, `print(${JSON.stringify(row)})`);
+    const result = f.run();
+    expect(result.status, result.stdout + result.stderr).toBe(['exact', 'skipped', 'deferred', 'subtest-progress'].includes(mode) ? 0 : 1);
+    const base = path.join(f.pc, 'test-results/checkpoints', path.dirname(f.stateFile()));
+    const reports = fs.readdirSync(base, { recursive: true }).map(String)
+      .filter(file => /^batch-\d+\.json$/.test(path.basename(file)))
+      .map(file => JSON.parse(fs.readFileSync(path.join(base, file), 'utf8')));
+    const fault = reports.find(report => report.inventory.some((id: string) => id.endsWith('test_fault_and_recovery')));
+    expect(fault.logs.expected).toBe(['exact', 'extra', 'assertion', 'other-case', 'deferred', 'drain-timeout', 'subtest-progress'].includes(mode) ? 1 : 0);
+    if (['exact', 'deferred', 'subtest-progress'].includes(mode)) {
+      expect(fault.logs).toMatchObject({ status: 'WARN', unexpected: 0, unmetExpectations: 0 });
+      expect(fault.logs.rawAnalysis.levelCounts.error).toBe(1);
+      expect(fault.logs.analysis.levelCounts.error).toBe(0);
+      expect(fs.readFileSync(path.join(base, fault.artifacts.find((item: any) => item.file.endsWith('.events.jsonl')).file), 'utf8')).toContain(mode === 'subtest-progress' ? 'u[12:34:56.789][ERROR]' : '[ERROR]');
+    }
+  }, 120_000);
+
+it('retains a failed unittest subtest when the enclosing call later reports passed', () => {
+  const f = fixture('python');
+  f.add('b', false);
+  f.write('tests/test_subtest.py', `
+import unittest
+class SubtestCase(unittest.TestCase):
+    def test_accounting(self):
+        with self.subTest(case='controlled failure'):
+            self.assertEqual(1, 2)
+        with self.subTest(case='later success'):
+            self.assertEqual(1, 1)
+`);
+  const result = f.run();
+  expect(result.status, result.stdout + result.stderr).toBe(1);
+  const base = path.join(f.pc, 'test-results/checkpoints', path.dirname(f.stateFile()));
+  const cases = fs.readdirSync(base, { recursive: true }).map(String)
+    .filter(file => /^batch-\d+\.json$/.test(path.basename(file)))
+    .flatMap(file => JSON.parse(fs.readFileSync(path.join(base, file), 'utf8')).files);
+  expect(cases.find((row: any) => row.file.includes('SubtestCase'))).toMatchObject({ state: 'failed', failed: 1, passed: 0 });
+});
+
 it.each(['python', 'e2e'] as const)('%s resumes failed work, preserves evidence and discovers new cases', kind => {
   const f = fixture(kind);
   const first = f.run();

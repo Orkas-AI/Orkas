@@ -45,10 +45,46 @@ function runFixtures(files: string[], env: Record<string, string> = {}, args: st
   });
   const batchPath = `${json}.batch.json`;
   const batch = fs.existsSync(batchPath) ? JSON.parse(fs.readFileSync(batchPath, 'utf8')) : null;
-  return { status: result.status, summary: summary.join('\n'), head: summary[0] || '', cases, stderr: result.stderr, batch };
+  return { stdout: result.stdout, status: result.status, summary: summary.join('\n'), head: summary[0] || '', cases, stderr: result.stderr, batch };
 }
 
 describe('default Vitest log analysis', () => {
+  it('preserves declared Server faults and still rejects independent unexpected faults', () => {
+    const run = runFixtures(['server.fixture.ts']);
+    expect(run.status).toBe(1); // independent unexpected control
+    expect(run.cases.get('matches a declared Server fault by message without keeping its request identity')?.status).toBe('passed');
+    expect(run.cases.get('rejects a different Server fault after the expected case')?.status).toBe('failed');
+    expect(run.head).toMatch(/error=2 unexpected=1 expected=1 unmet=0 gaps=0$/);
+    expect(run.summary).not.toContain('synthetic-private-request');
+  }, 120_000);
+
+  it('rejects native FD output and inherited child stderr even when every business assertion passes', () => {
+    const run = runFixtures(['native.fixture.ts']);
+    expect([...run.cases.values()].map(item => item.status)).toEqual(['passed', 'passed']);
+    expect(run.stderr).toContain('CompileAndCall failed to evaluate electron script');
+    expect(run.status).toBe(1);
+    expect(run.summary).toContain('[test-process-log-analysis] FAIL');
+    expect(run.summary).toContain('unattributed stderr');
+    expect(run.summary).not.toContain('fixture-native-private-value');
+    expect(run.summary).not.toContain('/Users/test');
+    const audit = JSON.parse(run.stdout.split('\n').find(line => line.startsWith('[test-process-log-analysis] receipt '))!
+      .slice('[test-process-log-analysis] receipt '.length));
+    const actual = createStderrReceipt();
+    actual.ingest(run.stderr);
+    expect(audit).toMatchObject({ schema: 1, expectedStatus: 'valid', drainTimedOut: false,
+      actual: actual.finish(), expected: run.batch.stderr });
+    expect(audit.actual.bytes).toBeGreaterThan(audit.expected.bytes);
+  }, 120_000);
+
+  it('rejects a successful invocation whose custom reporter omits the process receipt', () => {
+    const run = runFixtures(['expected.fixture.ts'], {}, ['--reporter=dot', '--silent=passed-only']);
+    expect(run.status).toBe(1);
+    expect(run.stdout).toContain('[test-process-log-analysis] FAIL');
+    const audit = JSON.parse(run.stdout.split('\n').find(line => line.startsWith('[test-process-log-analysis] receipt '))!
+      .slice('[test-process-log-analysis] receipt '.length));
+    expect(audit).toMatchObject({ schema: 1, expectedStatus: 'missing', expected: null, drainTimedOut: false });
+  }, 120_000);
+
   it('keeps warning and error analysis when checkpoint mode suppresses successful console replay', () => {
     const expected = runFixtures(['expected.fixture.ts'], {}, ['--silent=passed-only']);
     expect(expected.status).toBe(0);
@@ -66,6 +102,7 @@ describe('default Vitest log analysis', () => {
   }, 120_000);
   it('passes declared output but surfaces it, and surfaces an undeclared warning with its owning case', () => {
     const run = runFixtures(['expected.fixture.ts']);
+    expect(run.stdout).toContain('fixture ordinary stdout remains visible');
     expect(run.status).toBe(0);
     expect([...run.cases.values()].map(item => item.status)).toEqual(['passed', 'passed', 'passed', 'passed']);
     expect(run.head).toMatch(/^\[test-log-analysis\] WARN files=1 cases=4 .* warn=2 error=1 unexpected=0 expected=2 unmet=0 gaps=0$/);

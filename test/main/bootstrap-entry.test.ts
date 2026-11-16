@@ -118,6 +118,7 @@ describe('desktop bootstrap entry', () => {
             require(dependency: string) {
               if (dependency === 'node:fs') return fs;
               if (dependency === 'node:path') return path;
+              if (dependency === 'node:crypto') return require(dependency);
               if (dependency === 'node:os') return { homedir: () => root };
               if (dependency === 'node:child_process') return { execFileSync() { throw new Error('Unexpected host probe'); } };
               if (dependency === './util/migrate-source-data-root.cjs') return { migrateSourceDataRoot() {} };

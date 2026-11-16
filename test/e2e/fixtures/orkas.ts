@@ -18,7 +18,6 @@ import type { ChildProcess } from 'node:child_process';
 import type { Duplex } from 'node:stream';
 import AdmZip from 'adm-zip';
 import { estimateTextTokens } from '../../../src/core-agent/src/agent/session';
-import { BackgroundServices } from './background-services';
 import { closeElectronFixture, requestElectronQuit } from './electron-cleanup';
 import { ownFixtureServer } from './server-cleanup';
 import { expectedBrowserDenialIndices, expectedResourceDenialIndex, invokeFailureReceipt, navigationFailureReceipt, analyzeWebAppLogs,
@@ -40,16 +39,6 @@ const { collectLogFiles } = require('./electron-log-files.cjs') as { collectLogF
 /** One read per round lets the runtime compact before admitting more evidence;
  * parallel read-budget rejection is covered by the owning deterministic cases. */
 const CONTEXT_SOURCE_READS_PER_ROUND = 1;
-const E2E_PNG_B64 =
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
-const E2E_MP4_BYTES = Buffer.from([
-  0x00, 0x00, 0x00, 0x18,
-  0x66, 0x74, 0x79, 0x70,
-  0x69, 0x73, 0x6f, 0x6d,
-  0x00, 0x00, 0x02, 0x00,
-  0x69, 0x73, 0x6f, 0x6d,
-  0x69, 0x73, 0x6f, 0x32,
-]);
 
 type OrkasOptions = {
   /** Opt in only for journeys that require an activatable native owner. */
@@ -103,6 +92,12 @@ export type CliStubState = {
 };
 
 type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
+export type ScriptedModelReply = {
+  calls?: Array<{ callId: string; name: string; args: Record<string, unknown> }>;
+  text?: string;
+  /** Test-owned arrival barrier; cancelled sockets must never receive a late reply. */
+  waitFor?: Promise<void>;
+};
 type VoiceStubMode = 'success' | 'blocked-open';
 const VOICE_API_KEY = 'orkas-e2e-voice-api-key-xxxxxxxx';
 const VOICE_TICKET = 'E'.repeat(43);
@@ -154,6 +149,8 @@ type ModelToolScenario =
     kind: 'interactive-cli';
     command: string;
     purpose: string;
+    invalidStartFirst: boolean;
+    invalidStartIssued: boolean;
     issued: boolean;
     toolLoadRequested: boolean;
   }
@@ -171,23 +168,6 @@ type ModelToolScenario =
     text: string;
     outputPath: string;
     finalText: string;
-    issued: boolean;
-    toolLoadRequested: boolean;
-  }
-  | {
-    kind: 'generate-image';
-    prompt: string;
-    outputPath: string;
-    finalText: string;
-    issued: boolean;
-    toolLoadRequested: boolean;
-  }
-  | {
-    kind: 'generate-video';
-    prompt: string;
-    outputPath: string;
-    finalText: string;
-    referenceImagePath?: string;
     issued: boolean;
     toolLoadRequested: boolean;
   }
@@ -314,7 +294,14 @@ if (args[0] === 'models') {
   process.exit(0);
 }
 if (args[0] === 'run' && args.includes('--help')) {
-  process.stdout.write('Usage: opencode run --model <id> --variant <name>\n');
+  let helpFault = false;
+  try { helpFault = JSON.parse(fs.readFileSync(process.env.ORKAS_E2E_CLI_STATE, 'utf8')).opencodeHelpFault === true; } catch {}
+  if (helpFault) {
+    process.stderr.write('deterministic OpenCode help failure\n');
+    process.exit(1);
+  }
+  // 1.x run shape: the host directory flag follows this help.
+  process.stdout.write('Usage: opencode run --model <id> --variant <name> --dir <path>\n');
   process.exit(0);
 }
 const statePath = process.env.ORKAS_E2E_CLI_STATE;
@@ -917,20 +904,6 @@ export class OrkasTestApp {
   readonly fakeCodexPath: string | null;
   readonly fakeClaudePath: string | null;
   readonly modelRequests: Array<Record<string, unknown>> = [];
-  readonly imageGenerationRequests: Array<Record<string, unknown>> = [];
-  readonly videoEstimateRequests: Array<Record<string, unknown>> = [];
-  readonly videoGenerationRequests: Array<Record<string, unknown>> = [];
-  /** Isolate the reference upload origin from the API in native scenarios. */
-  generationReferenceUploadHost = '127.0.0.1';
-  readonly generationReferenceUploads: Array<{
-    bytes: number;
-    contentLength: string;
-    contentType: string;
-    contentMd5: string;
-    acl: string;
-    encryption: string;
-    body: string;
-  }> = [];
   readonly marketplaceRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
   readonly apiRequests: Array<{ method: string; path: string; channel: string }> = [];
   readonly apiResponses: Array<{ method: string; path: string; status: number }> = [];
@@ -939,9 +912,6 @@ export class OrkasTestApp {
     this.expectedApiFailures.push({ method, path: route, status });
   }
   compactionRequestAborts = 0;
-  imageTaskPolls = 0;
-  videoTaskPolls = 0;
-  videoTaskHeld = false;
 
   electronApp: ElectronApplication | null = null;
   page: Page | null = null;
@@ -993,8 +963,7 @@ export class OrkasTestApp {
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
-  private generatedImageBytes = Buffer.from(E2E_PNG_B64, 'base64');
-  private generatedVideoBytes = E2E_MP4_BYTES;
+  private modelRequestScript: ((request: Record<string, unknown>, tools: ReadonlySet<string>) => ScriptedModelReply | undefined) | null = null;
   private modelToolScenarioRequestStart = 0;
   private pendingAgentHandoffReply: (() => void) | null = null;
   private pendingCommentaryReply: (() => void) | null = null;
@@ -1056,6 +1025,33 @@ export class OrkasTestApp {
     mkdirSync(this.userDataRoot, { recursive: true });
     mkdirSync(this.authRoot, { recursive: true });
     mkdirSync(this.userWorkspaceRoot, { recursive: true });
+  }
+
+  /** Fail before a settings-only journey can dispatch an external provider request. */
+  async guardExternalFetches(): Promise<void> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    await this.electronApp.evaluate(() => {
+      const state = globalThis as typeof globalThis & { __e2eExternalFetchAttempts?: number };
+      state.__e2eExternalFetchAttempts = 0;
+      const original = globalThis.fetch;
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (!['localhost', '127.0.0.1', '[::1]'].includes(new URL(raw).hostname)) {
+          state.__e2eExternalFetchAttempts! += 1;
+          return Promise.reject(new Error('E_E2E_UNEXPECTED_EXTERNAL_REQUEST'));
+        }
+        return original(input, init);
+      }) as typeof fetch;
+    });
+  }
+
+  async externalFetchAttempts(): Promise<number> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    return this.electronApp.evaluate(() => {
+      const attempts = (globalThis as any).__e2eExternalFetchAttempts;
+      if (!Number.isSafeInteger(attempts) || attempts < 0) throw new Error('Network guard is not installed');
+      return attempts;
+    });
   }
 
   async launch(): Promise<void> {
@@ -1508,6 +1504,12 @@ export class OrkasTestApp {
     this.modelTextReplies = replies.slice();
   }
 
+  /** Script by request identity rather than a global round counter for concurrent turns. */
+  setModelRequestScript(script: typeof this.modelRequestScript): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.modelRequestScript = script;
+  }
+
   /** Queue exact planner replies (JSON text) for the next planned sends; when
    * empty, the stub chains every mentioned actor in mention order. */
   setDispatchPlanReplies(replies: string[]): void {
@@ -1626,7 +1628,7 @@ export class OrkasTestApp {
     };
   }
 
-  setInteractiveCliScenario(command: string, purpose: string): void {
+  setInteractiveCliScenario(command: string, purpose: string, options: { invalidStartFirst?: boolean } = {}): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     if (!command.trim() || !purpose.trim()) {
       throw new Error('The interactive CLI scenario requires a command and purpose');
@@ -1636,6 +1638,8 @@ export class OrkasTestApp {
       kind: 'interactive-cli',
       command,
       purpose,
+      invalidStartFirst: options.invalidStartFirst === true,
+      invalidStartIssued: false,
       issued: false,
       toolLoadRequested: false,
     };
@@ -1665,12 +1669,6 @@ export class OrkasTestApp {
     this.modelToolScenarioRequestStart = this.modelRequests.length;
     this.modelToolScenario = { kind: 'create-pdf', sourceType, content, outputPath, finalText,
       issued: false, toolLoadRequested: false };
-  }
-
-  setGeneratedMediaFixture(kind: 'image' | 'video', bytes: Buffer): void {
-    if (!this.modelStub || !bytes.length) throw new Error('Generated media requires a local model stub and nonempty bytes');
-    if (kind === 'image') this.generatedImageBytes = Buffer.from(bytes);
-    else this.generatedVideoBytes = Buffer.from(bytes);
   }
 
   setDelayedWriteFileScenario(
@@ -1712,49 +1710,6 @@ export class OrkasTestApp {
       text,
       outputPath,
       finalText,
-      issued: false,
-      toolLoadRequested: false,
-    };
-  }
-
-  setGenerateImageScenario(prompt: string, outputPath: string, finalText: string): void {
-    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
-    if (!prompt.trim() || !path.isAbsolute(outputPath) || !finalText.trim()) {
-      throw new Error('The image scenario requires a prompt, an absolute output path, and a final reply');
-    }
-    this.modelToolScenarioRequestStart = this.modelRequests.length;
-    this.modelToolScenario = {
-      kind: 'generate-image',
-      prompt,
-      outputPath,
-      finalText,
-      issued: false,
-      toolLoadRequested: false,
-    };
-  }
-
-  setGenerateVideoScenario(
-    prompt: string,
-    outputPath: string,
-    finalText: string,
-    referenceImagePath?: string,
-  ): void {
-    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
-    if (
-      !prompt.trim()
-      || !path.isAbsolute(outputPath)
-      || !finalText.trim()
-      || (referenceImagePath !== undefined && !path.isAbsolute(referenceImagePath))
-    ) {
-      throw new Error('The video scenario requires a prompt, absolute media paths, and a final reply');
-    }
-    this.modelToolScenarioRequestStart = this.modelRequests.length;
-    this.modelToolScenario = {
-      kind: 'generate-video',
-      prompt,
-      outputPath,
-      finalText,
-      ...(referenceImagePath ? { referenceImagePath } : {}),
       issued: false,
       toolLoadRequested: false,
     };
@@ -2364,29 +2319,7 @@ export class OrkasTestApp {
       });
       const isChat = requestUrl.pathname === '/api/v1/chat/completions';
       const isResponses = requestUrl.pathname === '/api/v1/responses';
-
-      const isImageCreate = requestUrl.pathname === '/api/e2e-image/generations';
-      const isImageTask = requestUrl.pathname === '/api/e2e-image/generations/e2e-image-task';
-      const isImageOutput = requestUrl.pathname === '/generated/e2e-managed-image.png';
-      const isGenerationReferenceAuth = requestUrl.pathname === '/api/file/auth';
-      const isGenerationReferenceUpload = requestUrl.pathname === '/cos-upload/e2e-reference';
-      const isGenerationReferenceComplete = requestUrl.pathname === '/api/file/upload/complete';
-      const isVideoEstimate = requestUrl.pathname === '/api/e2e-video/estimate';
-      const isVideoCreate = requestUrl.pathname === '/api/e2e-video/generations';
-      const isVideoTask = requestUrl.pathname === '/api/e2e-video/generations/e2e-video-task';
-      const isVideoOutput = requestUrl.pathname === '/generated/e2e-managed-video.mp4';
-      const isModelStubRoute = this.modelStub
-        && (
-          isChat
-          || isResponses
-          || isImageCreate
-
-          || isGenerationReferenceAuth
-          || isGenerationReferenceUpload
-          || isGenerationReferenceComplete
-          || isVideoEstimate
-          || isVideoCreate
-        );
+      const isModelStubRoute = this.modelStub && (isChat || isResponses);
       const marketplacePath = requestUrl.pathname.startsWith('/api/marketplace/')
         ? requestUrl.pathname.slice('/api'.length)
         : '';
@@ -2422,62 +2355,8 @@ export class OrkasTestApp {
         response.end(marketplaceUnsafeSkillBundle);
         return;
       }
-      if (request.method === 'GET' && isImageTask && this.modelStub) {
-        this.imageTaskPolls += 1;
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({
-          code: 0,
-          task_id: 'e2e-image-task',
-          status: 'succeeded',
-          url: `${this.apiBaseUrl.replace(/\/api$/, '')}/generated/e2e-managed-image.png`,
-        }));
-        return;
-      }
-      if (request.method === 'GET' && isImageOutput && this.modelStub) {
-        const image = this.generatedImageBytes;
-        response.writeHead(200, {
-          'Content-Type': 'image/png',
-          'Content-Length': String(image.length),
-        });
-        response.end(image);
-        return;
-      }
-      if (request.method === 'GET' && isVideoTask && this.modelStub) {
-        this.videoTaskPolls += 1;
-        if (this.videoTaskHeld) {
-          response.writeHead(202, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({ code: 0, task_id: 'e2e-video-task', status: 'running' }));
-          return;
-        }
-
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({
-          code: 0,
-          task_id: 'e2e-video-task',
-          status: 'succeeded',
-          model: 'doubao-seedance-2-0-fast-260128',
-          ratio: '16:9',
-          duration: 5,
-          resolution: '720p',
-          video_url: `${this.apiBaseUrl.replace(/\/api$/, '')}/generated/e2e-managed-video.mp4`,
-        }));
-        return;
-      }
-      if (request.method === 'GET' && isVideoOutput && this.modelStub) {
-        response.writeHead(200, {
-          'Content-Type': 'video/mp4',
-          'Content-Length': String(this.generatedVideoBytes.length),
-        });
-        response.end(this.generatedVideoBytes);
-        return;
-      }
-      const validGenerationUpload = this.modelStub
-        && request.method === 'PUT'
-        && isGenerationReferenceUpload;
-      if (!validGenerationUpload && (
-        request.method !== 'POST'
-        || (!isModelStubRoute && !(this.marketplaceStub && marketplacePath))
-      )) {
+      if (request.method !== 'POST'
+        || (!isModelStubRoute && !(this.marketplaceStub && marketplacePath))) {
         response.writeHead(404, { 'Content-Type': 'application/json' });
         response.end(JSON.stringify({ ok: false, error: 'e2e_stub_route_not_found' }));
         return;
@@ -2486,55 +2365,6 @@ export class OrkasTestApp {
       const chunks: Buffer[] = [];
       request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
       request.on('end', async () => {
-        if (isGenerationReferenceAuth) {
-          const authRequest = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
-            content_length: number;
-            content_type: string;
-            content_md5: string;
-          };
-          response.writeHead(200, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({
-            code: 0,
-            auth: {
-              method: 'PUT',
-              upload_url: `http://${this.generationReferenceUploadHost}:${new URL(this.apiBaseUrl).port}/cos-upload/e2e-reference?q-signature=opaque`,
-              file_url: 'https://cos.example/temp/e2e/image/reference.png',
-              content_length: authRequest.content_length,
-              headers: {
-                'Content-Type': authRequest.content_type,
-                'Content-Length': String(authRequest.content_length),
-                'Content-MD5': authRequest.content_md5,
-                'Content-Disposition': 'attachment; filename="reference.png"',
-                'x-cos-acl': 'private',
-                'x-cos-server-side-encryption': 'AES256',
-              },
-            },
-          }));
-          return;
-        }
-        if (isGenerationReferenceUpload) {
-          const body = Buffer.concat(chunks);
-          this.generationReferenceUploads.push({
-            bytes: body.length,
-            contentLength: String(request.headers['content-length'] || ''),
-            contentType: String(request.headers['content-type'] || ''),
-            contentMd5: String(request.headers['content-md5'] || ''),
-            acl: String(request.headers['x-cos-acl'] || ''),
-            encryption: String(request.headers['x-cos-server-side-encryption'] || ''),
-            body: body.toString('latin1'),
-          });
-          response.writeHead(200);
-          response.end();
-          return;
-        }
-        if (isGenerationReferenceComplete) {
-          response.writeHead(200, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({
-            code: 0,
-            signed_url: 'https://cdn.example/e2e-uploaded-reference.png',
-          }));
-          return;
-        }
         let requestBody: Record<string, unknown>;
         try {
           requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
@@ -2600,42 +2430,6 @@ export class OrkasTestApp {
           }
           response.writeHead(200, { 'Content-Type': 'application/json' });
           response.end(JSON.stringify(payload));
-          return;
-        }
-        if (isImageCreate) {
-          this.imageGenerationRequests.push(requestBody);
-          response.writeHead(202, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({
-            code: 0,
-            task_id: 'e2e-image-task',
-            status: 'processing',
-          }));
-          return;
-        }
-        if (isVideoEstimate) {
-          this.videoEstimateRequests.push(requestBody);
-          response.writeHead(200, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({
-            code: 0,
-            model: 'doubao-seedance-2-0-fast-260128',
-            model_tier: 'balanced',
-            duration: Number(requestBody.duration || 5),
-            resolution: String(requestBody.resolution || '720p'),
-            usage: {
-              credits_milli_per_second: 80_000,
-              credits_milli: 400_000,
-            },
-          }));
-          return;
-        }
-        if (isVideoCreate) {
-          this.videoGenerationRequests.push(requestBody);
-          response.writeHead(202, { 'Content-Type': 'application/json' });
-          response.end(JSON.stringify({
-            code: 0,
-            task_id: 'e2e-video-task',
-            status: 'processing',
-          }));
           return;
         }
         // Measure the wire payload before adding the fixture-only messages
@@ -3203,6 +2997,20 @@ export class OrkasTestApp {
           }
         }
 
+        const scripted = this.modelRequestScript?.(requestBody, advertisedToolNames);
+        if (scripted) {
+          const reply = () => {
+            if (response.destroyed || response.writableEnded) return;
+            finishImmediately(scripted.calls
+              ? toolCallsEvents(scripted.calls)
+              : finalTextEvents(scripted.text || ''));
+          };
+          if (scripted.waitFor) {
+            void scripted.waitFor.then(reply, () => response.destroy());
+          } else reply();
+          return;
+        }
+
         if (scenario?.kind === 'connector') {
           if (requestNumber === 1) {
             finishImmediately(toolCallEvents(
@@ -3300,6 +3108,13 @@ export class OrkasTestApp {
             && !scenario.toolLoadRequested) {
             scenario.toolLoadRequested = true;
             requestToolGroup('call-e2e-load-interactive-cli', 'workspace.execute.session');
+          } else if (scenario.invalidStartFirst && !scenario.invalidStartIssued) {
+            scenario.invalidStartIssued = true;
+            finishImmediately(toolCallEvents(
+              'call-e2e-invalid-interactive-start',
+              'interactive_cli',
+              { action: 'start', session_id: 'cli-not-created', command: scenario.command, purpose: scenario.purpose },
+            ));
           } else if (!scenario.issued) {
             scenario.issued = true;
             finishImmediately(toolCallEvents(
@@ -3373,29 +3188,6 @@ export class OrkasTestApp {
               'call-e2e-generate-speech',
               'generate_speech',
               { text: scenario.text, output_path: scenario.outputPath },
-            ));
-          } else {
-            finishImmediately(finalTextEvents(scenario.finalText));
-          }
-          return;
-        }
-        if (scenario?.kind === 'generate-image') {
-          if (!scenario.issued
-            && !advertisedToolNames.has('generate_image')
-            && advertisedToolNames.has('tool_load')
-            && !scenario.toolLoadRequested) {
-            scenario.toolLoadRequested = true;
-            requestToolGroup('call-e2e-load-generate-image', 'media.image');
-          } else if (!scenario.issued) {
-            scenario.issued = true;
-            finishImmediately(toolCallEvents(
-              'call-e2e-generate-image',
-              'generate_image',
-              {
-                prompt: scenario.prompt,
-                output_path: scenario.outputPath,
-                size: '1024x1024',
-              },
             ));
           } else {
             finishImmediately(finalTextEvents(scenario.finalText));

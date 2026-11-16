@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const asarCli = path.join(path.dirname(require.resolve('@electron/asar/package.json')), 'bin', 'asar.js');
@@ -217,6 +218,79 @@ describe('packaged-dependency-gate', () => {
     lock.packages['node_modules/sharp'].dependencies['future-image-codec'] = '^1.0.0';
     lock.packages['node_modules/future-image-codec'] = { version: '1.0.0' };
     expect(() => gate.verifyNodeRuntimeBuildConfig(pkg, lock)).toThrow(/future-image-codec/);
+  });
+
+  it.each(['darwin', 'win32'])('requires the resolved PSD writer and nested compression library outside asar on %s', async platform => {
+    const value = fixture();
+    delete value.packages['node_modules/platform-addon'];
+    value.sourcePackage.dependencies['ag-psd'] = '34.1.0';
+    value.packedRoot = structuredClone(value.sourcePackage);
+    const additions = {
+      'node_modules/ag-psd': { name: 'ag-psd', version: '34.1.0', dependencies: { pako: '^2.1.0', 'base64-js': '^1.5.1' } },
+      'node_modules/ag-psd/node_modules/pako': { name: 'pako', version: '2.1.0' },
+      'node_modules/base64-js': { name: 'base64-js', version: '1.5.1' },
+    };
+    Object.assign(value.packages, additions); Object.assign(value.lock.packages, additions);
+    const paths = await buildFixture(value, '**/{ag-psd,base64-js}/**');
+    const options = { ...paths, platform, arch: 'x64' };
+    expect(gate.verifyPackagedDependencyGraph(options).nodeRuntimeInventory).toEqual(Object.keys(additions).sort());
+    fs.rmSync(`${paths.appAsar}.unpacked/node_modules/ag-psd/node_modules/pako/index.js`);
+    expect(() => gate.verifyPackagedDependencyGraph(options)).toThrow(/stock Node.*pako.*missing/);
+  });
+
+  it('uses only declared public verifier dependencies when a development dependency is missing', () => {
+    const requested: string[] = [];
+    const missing = Object.assign(new Error("Cannot find module '@electron/asar'"), { code: 'MODULE_NOT_FOUND' });
+    const dependency = (name: string) => {
+      requested.push(name);
+      if (name === 'node:fs' || name === 'node:path') return require(name);
+      throw missing;
+    };
+    const file = path.join(process.cwd(), 'bin/packaged-dependency-gate.cjs');
+    expect(() => vm.runInNewContext(fs.readFileSync(file, 'utf8'), {
+      require: dependency, __dirname: path.dirname(file), module: { exports: {} },
+    }, { filename: 'isolated-dependency-gate.cjs' })).toThrow(missing.message);
+    expect(requested).toEqual(['node:fs', 'node:path', '@electron/asar']);
+  });
+
+  it('unpacks the complete PSD payload under the public manifest patterns, including extensionless and browser files', async () => {
+    const project = process.cwd();
+    const pkg = JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8'));
+    const files = [
+      ...['package.json', 'LICENSE', 'index.js', 'lib/zlib/README', 'lib/zlib/deflate.js']
+        .map(name => `node_modules/ag-psd/node_modules/pako/${name}`),
+      ...['package.json', 'LICENSE', 'index.js', 'base64js.min.js'].map(name => `node_modules/base64-js/${name}`),
+    ];
+    const source = path.join(tmpDir, 'psd-payload');
+    const archive = path.join(tmpDir, 'psd-payload.asar');
+    for (const file of files) {
+      const destination = path.join(source, file);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(path.join(project, file), destination);
+    }
+    const patterns = pkg.build.asarUnpack.filter((pattern: string) =>
+      pattern.startsWith('node_modules/ag-psd/') || pattern.startsWith('node_modules/base64-js/'));
+    expect(patterns.length).toBeGreaterThan(0);
+    // Use the public project's actual ASAR implementation and declared unpack
+    // patterns. The private product-builder toolchain is not a dependency.
+    const absolutePatterns = patterns.map((pattern: string) => path.join(source, pattern).split(path.sep).join('/'));
+    execFileSync(process.execPath, [asarCli, 'pack', source, archive, '--unpack', `{${absolutePatterns.join(',')}}`], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    });
+    const asar = require('@electron/asar');
+    const hadNoAsar = Object.prototype.hasOwnProperty.call(process, 'noAsar');
+    const originalNoAsar = (process as any).noAsar;
+    (process as any).noAsar = true;
+    try {
+      for (const file of files) {
+        expect(asar.statFile(archive, file).unpacked, file).toBe(true);
+        expect(fs.readFileSync(path.join(`${archive}.unpacked`, file)).equals(fs.readFileSync(path.join(project, file))), file).toBe(true);
+      }
+    } finally {
+      asar.uncache(archive);
+      if (hadNoAsar) (process as any).noAsar = originalNoAsar;
+      else delete (process as any).noAsar;
+    }
   });
 
   it('validates the complete packaged graph, nested resolution, optional package, and root override', async () => {

@@ -10,7 +10,8 @@ const path = require('node:path');
 // different, but pruning, post-pack verification, release validation, and cache
 // isolation must all consume these exported lists instead of copying them.
 const MANIFEST_RUNTIME_KINDS = ['python', 'uv', 'node'];
-const PACKAGED_RUNTIME_KINDS = [...MANIFEST_RUNTIME_KINDS, 'ffmpeg', 'whisper', 'vc', 'phone-passkey'];
+const PACKAGED_RUNTIME_KINDS = [...MANIFEST_RUNTIME_KINDS, 'ffmpeg', 'whisper', 'libraw', 'vc', 'phone-passkey'];
+const LIBRAW_RUNTIME_CONTRACT = require('../vendor/libraw/0.22.3/contract.json');
 const FFMPEG_CAPABILITIES = ['libass', 'ass', 'subtitles'];
 const WINDOWS_VC_RUNTIME_CONTRACT = Object.freeze({
   schema: 1,
@@ -498,6 +499,33 @@ function verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, option
   return path.join(dir, targetPlatform === 'win32' ? 'bin/whisper-cli.exe' : 'bin/whisper-cli');
 }
 
+function verifyLibRawRuntimeDir(runtimeRoot, targetPlatform, targetArch, options = {}) {
+  const contract = options.librawContract || LIBRAW_RUNTIME_CONTRACT;
+  const key = runtimeKey(targetPlatform, targetArch), target = contract.targets[key];
+  requireOnlyRuntimeDirs(runtimeRoot, 'libraw', options.allowedKeys || [key]);
+  if (!target) throw new Error(`[native-deps-gate] LibRaw runtime is not configured for ${key}`);
+  const dir = path.join(runtimeRoot, 'libraw', key);
+  const marker = readJsonFile('LibRaw runtime marker', path.join(dir, '.orkas-libraw-ready.json'));
+  if (marker.schema !== contract.schema || marker.version !== contract.version || marker.platformKey !== key) {
+    throw new Error('[native-deps-gate] LibRaw runtime marker mismatch');
+  }
+  const files = { ...target.files, ...contract.licenses, [contract.source.name]: contract.source,
+    ...Object.fromEntries((target.vcFiles || []).map(name => [`bin/${name}`, WINDOWS_VC_RUNTIME_CONTRACT.files[name]])) };
+  for (const [name, expected] of Object.entries(files)) {
+    const file = path.join(dir, name); requiredFile(`LibRaw ${name}`, file);
+    const recorded = marker.files?.[name];
+    const recordedMatches = recorded?.sha256 === expected.sha256 && recorded?.bytes === expected.bytes;
+    const matches = fs.statSync(file).size === expected.bytes && sha256File(file) === expected.sha256;
+    if (!recordedMatches || (!matches && !(expected.executable
+      && acceptSignedDarwinRuntimeMutation(file, targetPlatform, options)))) {
+      throw new Error(`[native-deps-gate] LibRaw runtime hash/size mismatch: ${name}`);
+    }
+    if (expected.executable) { verifyExecutableMode(file, targetPlatform, options); assertExecutableArch(file, targetPlatform, targetArch, options); }
+  }
+  requiredFile('LibRaw notice', path.join(dir, 'NOTICE.txt'));
+  return path.join(dir, 'bin', targetPlatform === 'win32' ? 'dcraw_emu.exe' : 'dcraw_emu');
+}
+
 function verifyWindowsVcRuntimeDir(runtimeRoot, targetPlatform, targetArch, options = {}) {
   const contract = options.windowsVcContract || WINDOWS_VC_RUNTIME_CONTRACT;
   const key = runtimeKey(targetPlatform, targetArch);
@@ -827,7 +855,8 @@ function verifyPhonePasskeyRuntimeDir(runtimeRoot, targetPlatform, targetArch, o
 function requiredRuntimeVerificationEntries(targetPlatform, targetArch) {
   const key = runtimeKey(targetPlatform, targetArch);
   const kinds = PACKAGED_RUNTIME_KINDS.filter(kind => (kind !== 'vc' || targetPlatform === 'win32')
-    && (kind !== 'phone-passkey' || targetPlatform === 'darwin'));
+    && (kind !== 'phone-passkey' || targetPlatform === 'darwin')
+    && (kind !== 'libraw' || Boolean(LIBRAW_RUNTIME_CONTRACT.targets[key])));
   return kinds.map(kind => `runtime:${kind}:${key}`);
 }
 
@@ -856,6 +885,10 @@ function verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch, options = {}
   verified.push(`runtime:ffmpeg:${key}`);
   verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, { ...options, allowedKeys });
   verified.push(`runtime:whisper:${key}`);
+  if ((options.librawContract || LIBRAW_RUNTIME_CONTRACT).targets[key]) {
+    verifyLibRawRuntimeDir(runtimeRoot, targetPlatform, targetArch, { ...options, allowedKeys });
+    verified.push(`runtime:libraw:${key}`);
+  }
   if (targetPlatform === 'darwin') {
     verifyPhonePasskeyRuntimeDir(runtimeRoot, targetPlatform, targetArch, { ...options, allowedKeys });
     verified.push(`runtime:phone-passkey:${key}`);
@@ -876,6 +909,8 @@ function verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch, options = {}
 }
 
 module.exports = {
+  LIBRAW_RUNTIME_CONTRACT,
+  verifyLibRawRuntimeDir,
   verifyPhonePasskeyRuntimeDir,
   FFMPEG_CAPABILITIES,
   WHISPER_RUNTIME_CONTRACT,

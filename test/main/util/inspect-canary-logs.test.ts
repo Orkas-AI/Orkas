@@ -42,3 +42,25 @@ describe('GUI canary process diagnostics', () => {
     expect(reviewInspectStderr('\n', 'darwin')).toEqual({ warnings: {}, unexpected: 0 });
   });
 });
+
+const macCategory = '[56461:1114/181718.960285:ERROR:base/process/process_mac.cc:53] task_policy_set TASK_CATEGORY_POLICY: (os/kern) invalid argument (4)';
+const macSuppression = '[56461:1114/181718.963347:ERROR:base/process/process_mac.cc:98] task_policy_set TASK_SUPPRESSION_POLICY: (os/kern) invalid argument (4)';
+it('retains the existing bounded macOS child task-policy advisory for review', () => {
+  expect(reviewInspectStderr(macCategory + '\n' + macSuppression, 'darwin')).toEqual({
+    warnings: { 'macos-task-policy': 2 }, unexpected: 0,
+  });
+});
+it.each([
+  macCategory.replace('(4)', '(5)'), macCategory.replace('process_mac.cc', 'other.cc'),
+  macCategory + ' extra', 'unrelated process failure',
+])('does not excuse another macOS native error: %s', line => {
+  expect(reviewInspectStderr(line, 'darwin').unexpected).toBe(1);
+});
+it.each(['win32', 'linux'])('keeps a macOS diagnostic unexpected on %s', platform => {
+  expect(reviewInspectStderr(macCategory, platform).unexpected).toBe(1);
+});
+it('fails a repeated macOS task-policy warning storm', () => {
+  const report = reviewInspectStderr(Array(5).fill(macCategory).join('\n'), 'darwin');
+  expect(report).toEqual({ warnings: { 'macos-task-policy': 5 }, unexpected: 1 });
+  expect(inspectCanaryExitCode(0, false, report)).toBe(1);
+});

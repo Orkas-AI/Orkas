@@ -55,6 +55,7 @@ function pruneRuntimeRoot(root, keys) {
 
 module.exports = async function ensureRuntimeBeforePack(context) {
   const pcRoot = path.resolve(__dirname, '..');
+  require('./media-transfer-policy.cjs').verifyMediaTransferPolicy(pcRoot);
   const runtimeRoot = path.join(pcRoot, 'resources', 'runtime');
   const platform = context && context.electronPlatformName
     ? String(context.electronPlatformName)
@@ -198,6 +199,14 @@ module.exports = async function ensureRuntimeBeforePack(context) {
     if (res.status !== 0) {
       throw new Error(`fetch-whisper failed for ${platform}-${targetArch} with status ${res.status}`);
     }
+  }
+
+  for (const targetArch of arches) {
+    if (!require('../bin/runtime-gate.cjs').LIBRAW_RUNTIME_CONTRACT.targets[`${platform}-${targetArch}`]) continue;
+    const result = spawnSync(process.execPath, [path.join(pcRoot, 'scripts/fetch-libraw.cjs'),
+      '--platform', platform, '--arch', targetArch], { cwd: pcRoot, stdio: 'inherit', env: process.env });
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(`LibRaw provisioning failed for ${platform}-${targetArch}`);
   }
 
   slimRuntimeRoot(runtimeRoot, { platform, arch });
