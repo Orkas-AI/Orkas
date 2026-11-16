@@ -25,7 +25,7 @@ const test = base.extend({
   },
 });
 
-test('AI native dialogs resume website scripts without modal UI and preserve manual handling', async ({ orkas }) => {
+test('keeps website dialogs in their task tab across AI and human handoff', async ({ orkas }, testInfo) => {
   test.setTimeout(90_000);
   // Playwright normally dismisses unattended dialogs itself. Observe only so
   // the production host, rather than the harness, determines website results.
@@ -132,14 +132,88 @@ test('AI native dialogs resume website scripts without modal UI and preserve man
     await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, a) => {
       (process as any).mainModule.require(a.lifePath).finishBrowserTaskRun('account-e2e', a.cid, 'dialogs');
       const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
-      await view.webContents.executeJavaScript("alert('Manual alert')");
+      void view.webContents.executeJavaScript("alert('Something went wrong. Please try again.'); window.manualAlertFinished = true");
     }, args);
-    expect((await facts()).nativeCalls).toBe(1);
-    const manualPrompt = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }) => {
+    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.tabs
+      .find((tab: any) => tab.page_dialog)?.page_dialog?.message).toBe('Something went wrong. Please try again.');
+    expect((await orkas.electronApp!.evaluate(() => (globalThis as any).__dialogTest.nativeCalls))).toBe(0);
+    await orkas.page!.evaluate(async cid => {
+      const runtime = window as any;
+      await runtime.loadConversations({ fresh: true });
+      runtime.setView('conversation', cid);
+      runtime.ConversationInfo.openAndSetTab('browser', cid);
+    }, args.cid);
+    const card = orkas.page!.locator('.web-assist-page-dialog');
+    await expect(card).toBeVisible();
+    await expect(card.locator('.web-assist-permission-message')).toHaveText('Something went wrong. Please try again.');
+    await expect(card.locator('[data-act="cancel-dialog"]')).toBeHidden();
+    for (const [width, height, locale] of [[1440, 900, 'en'], [1024, 600, 'zh']] as const) {
+      await orkas.page!.setViewportSize({ width, height });
+      await orkas.page!.evaluate(locale => (window as any).setLang(locale), locale);
+      await expect(card).toBeInViewport();
+      await orkas.page!.screenshot({ path: testInfo.outputPath(`tab-local-alert-${locale}.png`) });
+    }
+    // A fresh task turn can read and acknowledge a delayed failure. It never
+    // retries the website submission that caused it.
+    await orkas.electronApp!.evaluate((_electron, a) => {
+      (process as any).mainModule.require(a.lifePath).beginBrowserTaskRun('account-e2e', a.cid, 'dialogs-next');
+    }, args);
+    s = await observe();
+    expect(s).toMatchObject({ dialog_type: 'alert', text: 'Something went wrong. Please try again.' });
+    expect(s.elements.map((e: any) => e.label)).toEqual(['OK']);
+    expect(await act(s, 'click', 'e1')).toMatchObject({ ok: true });
+    await expect(card).toBeHidden();
+    await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, a) => {
+      (process as any).mainModule.require(a.lifePath).finishBrowserTaskRun('account-e2e', a.cid, 'dialogs-next');
       const view = BrowserWindow.getAllWindows()[0].contentView.children.find(v => v instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
-      return view.webContents.executeJavaScript("(() => { try { prompt('Manual'); return 'unexpected'; } catch (error) { return error.message; } })()");
-    });
-    expect(manualPrompt).toBe('prompt() is not supported.');
+      void view.webContents.executeJavaScript("window.manualConfirm = confirm('Keep this change?')");
+    }, args);
+    await expect(card).toBeVisible();
+    await card.locator('[data-act="cancel-dialog"]').click();
+    await expect(card).toBeHidden();
+    await expect.poll(() => orkas.electronApp!.evaluate(async ({ webContents }, a) => webContents.getAllWebContents()
+      .find(w => w.getURL() === a.url)!.executeJavaScript('window.manualConfirm'), args)).toBe(false);
+    await orkas.electronApp!.evaluate(async ({ webContents }, a) => {
+      void webContents.getAllWebContents().find(w => w.getURL() === a.url)!
+        .executeJavaScript("window.manualPrompt = prompt('Your reply?', 'private-default')");
+    }, args);
+    await expect(card).toBeVisible();
+    await expect(card.locator('input')).toHaveValue('private-default');
+    await card.locator('input').fill('  人类回答😀  ');
+    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.tabs
+      .find((tab: any) => tab.page_dialog)?.page_dialog?.value).toBe('  人类回答😀  ');
+    // Browser state refreshes must not overwrite a user draft or steal focus.
+    await orkas.electronApp!.evaluate(({ BrowserWindow }, a) => {
+      const owner = BrowserWindow.getAllWindows()[0].webContents;
+      owner.send('web-assist:state', (process as any).mainModule.require(a.webPath).webAssistState(owner).state);
+    }, args);
+    await expect(card.locator('input')).toHaveValue('  人类回答😀  ');
+    await expect(card.locator('input')).toBeFocused();
+    await orkas.page!.evaluate(cid => (window as any).ConversationInfo.openAndSetTab('files', cid), args.cid);
+    await expect(card).toBeHidden();
+    await orkas.page!.evaluate(cid => (window as any).ConversationInfo.openAndSetTab('browser', cid), args.cid);
+    await expect(card.locator('input')).toHaveValue('  人类回答😀  ');
+    await card.locator('[data-act="accept-dialog"]').click();
+    await expect(card).toBeHidden();
+    await expect.poll(() => orkas.electronApp!.evaluate(async ({ webContents }, a) => webContents.getAllWebContents()
+      .find(w => w.getURL() === a.url)!.executeJavaScript('window.manualPrompt'), args)).toBe('  人类回答😀  ');
+    expect((await facts()).nativeCalls).toBe(0);
+    await orkas.page!.evaluate(() => (window as any).setView('settings'));
+    await orkas.electronApp!.evaluate(async ({ webContents }, a) => {
+      void webContents.getAllWebContents().find(w => w.getURL() === a.url)!
+        .executeJavaScript("alert('Background failure'); window.backgroundAlertFinished = true");
+    }, args);
+    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.tabs
+      .find((tab: any) => tab.page_dialog)?.page_dialog?.message).toBe('Background failure');
+    await expect(card).toBeHidden();
+    expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__dialogTest.nativeCalls)).toBe(0);
+    await orkas.page!.evaluate(cid => {
+      (window as any).setView('conversation', cid);
+      (window as any).ConversationInfo.openAndSetTab('browser', cid);
+    }, args.cid);
+    await expect(card.locator('.web-assist-permission-message')).toHaveText('Background failure');
+    await card.locator('[data-act="accept-dialog"]').click();
+    await expect(card).toBeHidden();
     // Session preloads also run in unowned authorization windows. Their sync
     // prompt request must be released without access to task browser decisions.
     const unowned = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, a) => {
@@ -157,6 +231,7 @@ test('AI native dialogs resume website scripts without modal UI and preserve man
   } finally {
     await orkas.electronApp?.evaluate(({ dialog }, a) => {
       (process as any).mainModule.require(a.lifePath).finishBrowserTaskRun('account-e2e', a.cid, 'dialogs');
+      (process as any).mainModule.require(a.lifePath).finishBrowserTaskRun('account-e2e', a.cid, 'dialogs-next');
       const state = (globalThis as any).__dialogTest;
       if (state) dialog.showMessageBox = state.original;
     }, args);

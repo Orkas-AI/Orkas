@@ -1,3 +1,5 @@
+import type { PageVideoBrowser, PageVideoDownload } from './web_assist_page_video';
+import { armWebAssistMediaCapture } from './web_assist_media_capture';
 /**
  * In-app Web Assist runtime for model-originated web work.
  *
@@ -20,6 +22,7 @@ import {
   shell,
   WebContentsView,
   type Rectangle,
+  type DownloadItem,
   type Session,
   type WebContents,
   type WebContentsViewConstructorOptions,
@@ -124,6 +127,8 @@ export interface WebAssistTabSnapshot {
   address_url?: string;
   /** Pending site permission for trusted browser chrome, never model output. */
   permission_request?: WebAssistPermissionRequest;
+  /** Page-owned JavaScript dialog, presented only in this tab's trusted chrome. */
+  page_dialog?: { id: string; type: 'alert' | 'confirm' | 'prompt'; message: string; value?: string };
   can_go_back: boolean;
   can_go_forward: boolean;
   conversation_id: string;
@@ -610,6 +615,13 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
   // preventDefault *without* setSavePath: setting a path and cancelling later
   // still leaves a partial file on disk.
   ses.on('will-download', (event, item, webContents) => {
+    const claim = downloadClaims.get(webContents.id);
+    if (claim && (item.getURLChain()[0] ?? item.getURL()) === claim.url) {
+      downloadClaims.delete(webContents.id);
+      item.setSavePath(claim.savePath);
+      claim.accept(item);
+      return;
+    }
     let owner: { record: WebAssistRecord; tab: WebAssistTabRecord } | null = null;
     for (const record of records.values()) {
       for (const tab of record.tabs.values()) {
@@ -782,10 +794,14 @@ function rendererSnapshot(record: WebAssistRecord): WebAssistSnapshot {
         ? source.pendingAddressUrl
         : contents && !contents.isDestroyed() ? contents.getURL() : source.suspended?.url || '';
       const permission = contents && !contents.isDestroyed() ? webAssistPermissionRequest(contents) : undefined;
+      const dialog = webAssistDialogs(contents)?.pending();
       return {
         ...tab,
         address_url: rawUrl === 'about:blank' ? rawUrl : safeWebAssistUrl(rawUrl) || '',
         ...(permission ? { permission_request: permission } : {}),
+        ...(dialog ? { page_dialog: { id: dialog.id, type: dialog.info.dialogType,
+          message: dialog.info.messageText.slice(0, 6000),
+          ...(dialog.info.dialogType === 'prompt' ? { value: dialog.value } : {}) } } : {}),
       };
     }),
   };
@@ -873,7 +889,6 @@ function takePageControl(record: WebAssistRecord, tab: WebAssistTabRecord, contr
   const changed = Boolean(tab.userControlled) !== controlled;
   if (!changed && !controlled) return;
   tab.userControlled = controlled;
-  if (controlled && tab.view) webAssistDialogs(tab.view.webContents)?.handback();
   if (tab.view) void refreshWebAssistFileChoosers(tab.view.webContents).catch(error => {
     log.warn('file chooser control update failed', { error: logErrorRef(error) });
   });
@@ -1669,10 +1684,19 @@ function mountTab(
       && tab.view === view && records.get(record.owner.id) === record && record.tabs.get(tab.id) === tab
       ? runId : undefined;
   };
-  const dialogs = attachWebAssistDialogs(contents, authority, () => invalidateObservation(tab));
+  // Dialog presentation follows the owned page, including delayed responses
+  // after handoff. Only actual AI control auto-acknowledges alert receipts.
+  attachWebAssistDialogs(contents, () => tab.view === view && records.get(record.owner.id) === record
+    && record.tabs.get(tab.id) === tab ? tab.id : undefined,
+  pendingChanged => {
+    invalidateObservation(tab);
+    // Auto-acknowledged alert bursts only update the bounded model receipt;
+    // they do not produce one full renderer snapshot per message.
+    if (pendingChanged) emit(record);
+  }, () => Boolean(authority()));
   attachWebAssistFileChoosers(contents, authority, () => invalidateObservation(tab));
   const stopWatching = watchBrowserTaskRun(record.ownerUserId, conversationId, () => {
-    dialogs?.cancel(); invalidateObservation(tab);
+    invalidateObservation(tab); emit(record);
     void refreshWebAssistFileChoosers(contents).catch(error => {
       log.warn('file chooser control update failed', { error: logErrorRef(error) });
     });
@@ -1833,7 +1857,7 @@ function mountTab(
     tab.pendingAddressUrl = undefined;
     tab.errorCode = 'page_load_failed';
     if (details?.reason !== 'clean-exit') {
-      logWebAssistFailure(record.owner.webContents, 'renderer_gone', undefined, undefined, details);
+      logWebAssistFailure(record.owner.webContents, 'renderer_gone', undefined, details);
     }
     emit(record);
   });
@@ -2199,7 +2223,7 @@ function observeWebAssistDialog(tab: WebAssistTabRecord, scope: 'full' | 'meta' 
   const pageId = genId12();
   const elements = [
     { ref: 'e1', tag: 'button', role: 'button', label: 'OK' },
-    { ref: 'e2', tag: 'button', role: 'button', label: 'Cancel' },
+    ...(dialog.info.dialogType !== 'alert' ? [{ ref: 'e2', tag: 'button', role: 'button', label: 'Cancel' }] : []),
     ...(dialog.info.dialogType === 'prompt' ? [{ ref: 'e3', tag: 'input', role: 'textbox', label: 'Prompt', input_type: 'text', fillable: true, sensitive: true }] : []),
   ];
   tab.observation = { pageId, dialogId: dialog.id, url: contents.getURL(), hrefs: new Set(),
@@ -2345,6 +2369,9 @@ async function observeWebAssistTab(
     }
     log.warn('page observation failed', { error: logErrorRef(error) });
     invalidateObservation(tab);
+    if (error instanceof OperationTimeoutError && error.code === 'observation_timeout') {
+      return { ok: false, code: 'observation_timeout', error: 'The page took too long to read. Observe it again when the page is ready.' };
+    }
     return { ok: false, code: 'observation_failed', error: 'The page could not be observed.' };
   }
 }
@@ -3111,6 +3138,112 @@ export function closeModelWebAssistTab(
   return { ok: true, closed: true, tab_id: closedTabId };
 }
 
+const downloadClaims = new Map<number, { url: string; savePath: string; accept: (item: DownloadItem) => void }>();
+
+const PAGE_VIDEO_IDLE_MS = 30_000;
+
+/** The largest video in view whose length is known. A fixed read-only script in
+ *  the controller's isolated world; `src` only when the player names a file. */
+const PLAYING_VIDEO_SCRIPT = `(() => {
+  const width = innerWidth, height = innerHeight;
+  let best = null;
+  for (const video of document.querySelectorAll('video')) {
+    const duration = video.duration;
+    if (!Number.isFinite(duration) || duration <= 0) continue;
+    const box = video.getBoundingClientRect();
+    const area = Math.max(0, Math.min(box.right, width) - Math.max(box.left, 0)) * Math.max(0, Math.min(box.bottom, height) - Math.max(box.top, 0));
+    if (area < 1 || (best && area <= best.area)) continue;
+    best = { area, durationSec: duration, src: /^https?:/i.test(video.currentSrc) ? video.currentSrc : '' };
+  }
+  return best && { durationSec: best.durationSec, src: best.src };
+})()`;
+
+/** The task browser side of saving a page's video for VideoStudio
+ *  (web_assist_page_video): a visible task tab with the user's own sign-ins. */
+export function createModelPageVideoBrowser(
+  userId: string,
+  conversationId: string,
+  lifetime: WebAssistActionLifetime = {},
+): PageVideoBrowser | null {
+  if (!safeId(userId) || !safeId(conversationId) || !boundSender(userId, conversationId)
+    || !browserTaskRunId(userId, conversationId)) return null;
+  // Armed before the page opens, so its first media responses are seen too.
+  const capture = armWebAssistMediaCapture(session.fromPath(userWebAssistProfileDir(userId), { cache: true }));
+  const contentsFor = (tabId: string): WebContents | null => {
+    const resolved = taskTab(userId, conversationId, tabId);
+    const contents = resolved.ok ? resolved.tab.view?.webContents : undefined;
+    return contents && !contents.isDestroyed() ? contents : null;
+  };
+  return {
+    async open(url) {
+      const opened = await openModelWebAssist(userId, conversationId, { url, retention: 'temporary' });
+      return opened.ok === true && typeof opened.active_tab_id === 'string' ? { ok: true, tabId: opened.active_tab_id } : { ok: false };
+    },
+    async waitLoaded(tabId) {
+      await waitForModelWebAssist(userId, conversationId, { tabId, condition: 'loaded', timeoutMs: 15_000 }, lifetime);
+    },
+    async playingVideo(tabId) {
+      const contents = contentsFor(tabId);
+      if (!contents) return null;
+      try {
+        const found = await webAssistEvaluate(contents, PLAYING_VIDEO_SCRIPT);
+        return found && Number.isFinite(found.durationSec) && typeof found.src === 'string'
+          ? { durationSec: found.durationSec, src: found.src } : null;
+      } catch {
+        return null;
+      }
+    },
+    media(tabId) {
+      const contents = contentsFor(tabId);
+      return contents ? capture.media(contents.id) : [];
+    },
+    download(tabId, url, savePath, limits) {
+      const contents = contentsFor(tabId);
+      if (!contents || limits.signal.aborted) return Promise.resolve({ state: limits.signal.aborted ? 'cancelled' : 'refused' });
+      const id = contents.id;
+      return new Promise<PageVideoDownload>((resolve) => {
+        let item: DownloadItem | null = null;
+        let settled = false;
+        let received = 0;
+        const finish = (state: PageVideoDownload['state']) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(idleTimer);
+          limits.signal.removeEventListener('abort', onAbort);
+          if (downloadClaims.get(id)?.savePath === savePath) downloadClaims.delete(id);
+          if (state !== 'completed' && item?.getState() === 'progressing') item.cancel();
+          resolve({ state });
+        };
+        const onAbort = () => finish('cancelled');
+        // A download that never starts, or stops receiving for this long, counts as
+        // refused rather than holding the call until its overall budget.
+        let idleTimer = setTimeout(() => finish('refused'), PAGE_VIDEO_IDLE_MS);
+        const progressed = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => finish('refused'), PAGE_VIDEO_IDLE_MS); };
+        limits.signal.addEventListener('abort', onAbort, { once: true });
+        downloadClaims.set(id, { url, savePath, accept: (started) => {
+          item = started;
+          if (settled) { started.cancel(); return; }
+          progressed();
+          started.on('updated', () => {
+            const bytes = started.getReceivedBytes();
+            if (bytes > limits.maxBytes) { finish('too_large'); return; }
+            if (bytes > received) { received = bytes; progressed(); }
+          });
+          started.once('done', (_event, state) => finish(state === 'completed' ? 'completed' : 'refused'));
+        } });
+        try {
+          contents.downloadURL(url, { headers: { Referer: contents.getURL() } });
+        } catch {
+          finish('refused');
+        }
+      });
+    },
+    keepOpen(tabId) { retainModelWebAssistTab(userId, conversationId, tabId, 'handoff'); },
+    close(tabId) { closeModelWebAssistTab(userId, conversationId, tabId); },
+    release() { capture.release(); },
+  };
+}
+
 /** Kept for native/CLI input compatibility; AI never opens a human file picker. */
 export async function chooseModelWebAssistFiles(_uid: string, _cid: string, _directory: boolean, lifetime: WebAssistActionLifetime = {}): Promise<Record<string, unknown>> {
   if (lifetime.signal?.aborted || lifetime.isActive?.() === false) return { ok: false, code: 'task_run_ended' };
@@ -3278,7 +3411,7 @@ export function setWebAssistOverlayState(
 export function layoutWebAssist(
   sender: WebContents,
   rawBounds: unknown,
-): { ok: true; state: WebAssistSnapshot } | { ok: false; code: string; error: string } {
+): { ok: true; state: WebAssistSnapshot; bounds?: Rectangle } | { ok: false; code: string; error: string } {
   const record = recordForSender(sender);
   if (!record) return { ok: false, code: 'not_open', error: 'Web Assist is not open.' };
   const epoch = (rawBounds as { overlayEpoch?: unknown } | null)?.overlayEpoch;
@@ -3302,7 +3435,7 @@ export function layoutWebAssist(
   }
   if (tab.userActivity?.pointerHeld()) {
     tab.pendingBounds = bounds;
-    return { ok: true, state: rendererSnapshot(record) };
+    return { ok: true, state: rendererSnapshot(record), bounds: tab.view.getBounds() };
   }
   clearDeferredWebAssistBounds(tab);
   tab.view.setBounds(bounds);
@@ -3311,7 +3444,7 @@ export function layoutWebAssist(
   revealDeferredAuthorizationPopups(record, tab);
   // The drawer is user-draggable, so the room available changed with it.
   applyDesktopViewport(tab);
-  return { ok: true, state: rendererSnapshot(record) };
+  return { ok: true, state: rendererSnapshot(record), bounds: tab.view.getBounds() };
 }
 
 export function navigateWebAssist(
@@ -3385,4 +3518,30 @@ export function answerWebAssistPermission(sender: WebContents, input: { tabId?: 
   if (!record || record.owner.webContents !== sender || record.activeTabId !== tab?.id
     || activeConversationBySender.get(sender) !== tab?.conversationId || !tab?.view) return { handled: false };
   return { handled: respondWebAssistPermission(tab.view.webContents, input.requestId, input.allowed) };
+}
+
+/** Only the active task tab's trusted chrome can answer a page-owned dialog. */
+export function answerWebAssistDialog(sender: WebContents,
+  input: { tabId?: unknown; requestId?: unknown; accepted?: unknown; value?: unknown; editing?: unknown }): { handled: boolean } {
+  const record = recordForSender(sender);
+  const tab = typeof input.tabId === 'string' ? record?.tabs.get(input.tabId) : undefined;
+  if (!record || record.activeTabId !== tab?.id || !tab?.view
+    || activeConversationBySender.get(sender) !== tab.conversationId) return { handled: false };
+  const controller = webAssistDialogs(tab.view.webContents);
+  const pending = controller?.pending();
+  if (!pending || pending.id !== input.requestId) return { handled: false };
+  if (input.value !== undefined && (typeof input.value !== 'string'
+    || input.value.length > MAX_PAGE_ACTION_TEXT_LENGTH)) return { handled: false };
+  if (input.editing === true) {
+    if (pending.info.dialogType === 'prompt' && typeof input.value === 'string') controller!.act(pending.id, 'fill', 'e3', input.value);
+    tab.userActivity?.touch(true);
+    return { handled: true };
+  }
+  if (typeof input.accepted !== 'boolean') return { handled: false };
+  tab.userActivity?.touch();
+  if (pending.info.dialogType === 'prompt' && input.accepted && typeof input.value === 'string') {
+    controller!.act(pending.id, 'fill', 'e3', input.value);
+  }
+  return { handled: controller!.act(pending.id, 'click',
+    input.accepted || pending.info.dialogType === 'alert' ? 'e1' : 'e2').ok === true };
 }
