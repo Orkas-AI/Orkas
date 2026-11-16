@@ -77,6 +77,36 @@ function appendCanonicalMessages(
 test.describe('CLI Agent runtime settings', () => {
   test.describe.configure({ timeout: 120_000 });
 
+  test('stops OpenCode before dispatch when help fails and recovers on user retry', async ({ cliOrkas }) => {
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), opencodeHelpFault: true }));
+    const { page, agentId } = await createCliAgent(cliOrkas, 'OpenCodeHelpRetryE2E', 'opencode');
+    const failureCheckpoint = cliOrkas.rendererDiagnosticCheckpoint();
+    await expect(cliOrkas.invoke('localAgents.runtimeOptions', { agent_id: agentId }))
+      .resolves.toMatchObject({ ok: false, error: "Could not check OpenCode's run options. Please retry." });
+    const conversationId = await sendNewChat(page, '@OpenCodeHelpRetryE2E Return a short reply.');
+    const retry = page.locator('#chat-history .bubble-retry-btn').last();
+    await expect(retry).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('#chat-history')).toContainText("Could not check OpenCode's run options. Please retry.");
+    expect(cliOrkas.readCliState().invocations).toHaveLength(0);
+
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), opencodeHelpFault: false }));
+    await expect(cliOrkas.invoke<any>('localAgents.runtimeOptions', { agent_id: agentId }))
+      .resolves.toMatchObject({ options: { status: 'ready' } });
+    await retry.locator('xpath=ancestor::*[contains(@class, "chat-message")]').hover();
+    await retry.click();
+    await expect(page.locator('#chat-history')).toContainText('E2E_CLI_DEFAULT_OK', { timeout: 30_000 });
+    expect(cliOrkas.readCliState().invocations).toHaveLength(1);
+    // Streamed text precedes canonical history settlement. Observe the terminal
+    // UI and durable binding before teardown stops the history worker.
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    await expect.poll(() => {
+      const file = cliSessionFile(cliOrkas, conversationId);
+      if (!existsSync(file)) return null;
+      return Object.values(JSON.parse(readFileSync(file, 'utf8')))[0];
+    }).toMatchObject({ terminalStatus: 'completed' });
+    await cliOrkas.acknowledgeInvokeFailures('localAgents.runtimeOptions', 1, failureCheckpoint);
+  });
+
   test('runs a first OpenCode task in the custom directory shown on its Agent detail page', async ({ cliOrkas }) => {
     const agentName = 'OpenCodeProjectDirE2E';
     const { page, agentId } = await createCliAgent(cliOrkas, agentName, 'opencode');

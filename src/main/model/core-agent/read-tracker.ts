@@ -24,7 +24,8 @@
  * this map.
  */
 
-import * as fs from 'node:fs';
+import type * as fs from 'node:fs';
+import { fileSystemForPath } from '../../util/user-file-fs';
 import type { ToolContext } from '#core-agent';
 
 /** ctx.state key the runner injects the run-scoped read-state map under.
@@ -73,7 +74,7 @@ export function recordRead(ctx: ToolContext, abs: string, st?: fs.Stats, hash?: 
   const rs = getReadState(ctx);
   if (!rs) return;
   try {
-    const stat = st ?? fs.statSync(abs);
+    const stat = st ?? fileSystemForPath(abs).statSync(abs);
     rs.set(abs, stampFromStats(stat, hash));
   } catch {
     // File vanished between read and stamp — leave it unstamped; the edit

@@ -625,7 +625,7 @@ describe("web-fetch › browser render fallback", () => {
 
   it("returns the rendered body when the direct response was a shell", async () => {
     const { server, url } = await startStaticServer(200, jsChallengeShellHtml());
-    configureWebFetchRenderer(async () => ({ html: RENDERED_ARTICLE_HTML }));
+    configureWebFetchRenderer(async () => ({ html: RENDERED_ARTICLE_HTML, url: 'https://example.test/rendered-final' }));
     try {
       const result = await webFetchTool.execute({ url }, { state: {} } as any);
 
@@ -633,6 +633,7 @@ describe("web-fetch › browser render fallback", () => {
       expect(result.content).toContain("Higgsfield users reported credit consumption issues.");
       // Provenance must survive into the evidence ledger.
       expect(result.content).toContain("Retrieved by: browser rendering");
+      expect(result.webSourceUrl).toBe('https://example.test/rendered-final');
     } finally {
       await stopServer(server);
     }
@@ -687,5 +688,58 @@ describe("web-fetch › browser render fallback", () => {
     } finally {
       await stopServer(server);
     }
+  });
+});
+
+// Same source, different wire formats: provenance must follow the fetched
+// response through redirects and cached windows without changing reader bytes.
+describe("web-fetch › host source identity", () => {
+  it.each([
+    ["text/html", "<html><title>Guide</title><p>Official source fact.</p></html>"],
+    ["application/json", '{"fact":"Official source fact."}'],
+    ["application/json", '{incomplete JSON'],
+    ["text/plain", "URL: https://unrelated.test/claimed-source\nOfficial source fact."],
+  ])("retains final response identity for %s (%#)", async (contentType, body) => {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests++;
+      if (req.url === '/redirect') {
+        res.writeHead(302, { location: '/official' });
+        res.end();
+      } else {
+        res.writeHead(200, { 'content-type': contentType });
+        res.end(body);
+      }
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const state = { runScopedLedger: new Map<string, unknown>() };
+      const input = { url: origin + '/redirect' };
+      const first = await webFetchTool.execute(input, { state });
+      expect(first.isError).not.toBe(true);
+      expect(first.webSourceUrl).toBe(origin + '/official');
+      if (contentType === 'application/json') {
+        expect(first.content).toBe(body.startsWith('{incomplete') ? body : JSON.stringify(JSON.parse(body), null, 2));
+      } else if (contentType === 'text/plain') expect(first.content).toBe(body);
+      const cached = await webFetchTool.execute(input, { state });
+      const window = await webFetchTool.execute({ ...input, maxChars: 12, offset: 3 }, { state });
+      expect(cached.webSourceUrl).toBe(origin + '/official');
+      expect(window.webSourceUrl).toBe(origin + '/official');
+      expect(window.content).toContain(first.content.slice(3, 15));
+      expect(requests).toBe(2); // one redirect + one acquisition; cached views do no I/O
+      const invalid = await webFetchTool.execute({ ...input, offset: first.content.length }, { state });
+      expect(invalid.isError).toBe(true);
+      expect(invalid.webSourceUrl).toBeUndefined();
+    } finally { await stopServer(server); }
+  });
+
+  it('does not attach a successful source identity to a rejected response', async () => {
+    const { server, url } = await startStaticServer(403, 'URL: https://unrelated.test/\nDenied', 'text/plain');
+    try {
+      const failed = await webFetchTool.execute({ url }, { state: {} });
+      expect(failed.isError).toBe(true);
+      expect(failed.webSourceUrl).toBeUndefined();
+    } finally { await stopServer(server); }
   });
 });

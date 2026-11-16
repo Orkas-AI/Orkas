@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { expect, OrkasTestApp, test } from './fixtures/orkas';
 
 test.describe('TTS generation lifecycle', () => {
-  test('runs the real chat-to-tool-to-provider-to-audio-file path once', async ({}, testInfo) => {
+  for (const surface of ['commander', 'en', 'zh'] as const) test(`runs the real chat-to-tool-to-provider-to-audio-file path once (${surface})`, async ({}, testInfo) => {
     const audio = Buffer.from([
       0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x00, 0xff, 0xfb, 0x90, 0x64,
@@ -44,7 +44,7 @@ test.describe('TTS generation lifecycle', () => {
 
     const address = provider.address() as AddressInfo;
 
-    const app = new OrkasTestApp(testInfo, { modelStub: true });
+    const app = new OrkasTestApp(testInfo, { modelStub: true, seedLanguage: surface === 'zh' ? 'zh' : 'en' });
     try {
       await app.launch();
       if (!app.page) throw new Error('Orkas renderer is unavailable');
@@ -64,8 +64,15 @@ test.describe('TTS generation lifecycle', () => {
         'E2E speech generation completed once.',
       );
 
+      if (surface !== 'commander') {
+        const created = await app.invoke<any>('agents.create', {
+          name: 'AccountNarrator', description: 'Narrates the supplied fixture.', tool_list: ['media.speech'],
+        });
+        expect(created.agent.agent_id).toBeTruthy();
+        await app.page.evaluate(async () => { await (window as any).loadAgents(); });
+      }
       await app.page.locator('#new-chat-btn').click();
-      await app.page.locator('#new-chat-input').fill('Create the deterministic E2E narration.');
+      await app.page.locator('#new-chat-input').fill((surface === 'commander' ? '' : '@AccountNarrator ') + 'Create the deterministic E2E narration.');
       await app.page.locator('#new-chat-send-btn').click();
 
       await expect(app.page.locator(
@@ -99,6 +106,20 @@ test.describe('TTS generation lifecycle', () => {
       expect(toolResult).toBeDefined();
       expect(toolResult?.content).toContain('chat_media_url');
       expect(toolResult?.content).toContain(outputPath);
+      expect(toolResult?.content).not.toContain('billedToOwnAccount');
+      expect(toolResult?.content).not.toContain('own service account');
+      if (surface !== 'commander') {
+        const notice = surface === 'zh'
+          ? '这次有 1 个文件用你自己配置的服务账户生成，费用走该账户。'
+          : 'Generated 1 file(s) with your own service account, which bills you directly.';
+        const bubble = app.page.locator('#chat-history .chat-message.assistant [data-role="final"]',
+          { hasText: 'E2E speech generation completed once.' });
+        await expect(bubble).toContainText(notice);
+        await expect(bubble).not.toContainText('No credits were used');
+        await expect(bubble).not.toContainText('没有扣积分');
+        await bubble.screenshot({ path: testInfo.outputPath(`own-account-${surface}.png`) });
+      }
+
     } finally {
       await app.dispose();
       await new Promise<void>((resolve) => provider.close(() => resolve()));

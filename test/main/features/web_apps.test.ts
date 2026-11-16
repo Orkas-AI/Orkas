@@ -35,6 +35,52 @@ afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 describe('Web app capability journeys', () => {
+  it('opens or reveals only existing app-private data files and denies executable, foreign and linked targets',async()=>{
+    const actions:any[]=[];(host as any).openFile=vi.fn(async(file:string,reveal:boolean)=>{actions.push({file,reveal});});
+    const app=open('file-actions',['appFiles']);await call(app.token,'appFiles.writeText',{path:'result.txt',text:'Saved result'});expect((await call(app.token,'capabilities.list')).methods.filter((m:any)=>['appFiles.open','appFiles.reveal'].includes(m.name)).every((m:any)=>m.available&&m.authorized)).toBe(true);
+    expect(await call(app.token,'appFiles.open',{path:'result.txt'})).toEqual({opened:true});expect(await call(app.token,'appFiles.reveal',{path:'result.txt'})).toEqual({revealed:true});expect(actions).toHaveLength(2);expect(actions[0]).toMatchObject({reveal:false});expect(actions[1]).toMatchObject({reveal:true});expect(actions[0].file).toBe(actions[1].file);
+    const other=open('foreign',['appFiles']);await expect(call(other.token,'appFiles.open',{path:'result.txt'})).rejects.toMatchObject({code:'E_FILE'});
+    await call(app.token,'appFiles.writeText',{path:'unsafe.command',text:'exit'});await expect(call(app.token,'appFiles.open',{path:'unsafe.command'})).rejects.toMatchObject({code:'E_FILE'});
+    await expect(call(app.token,'appFiles.reveal',{path:'../result.txt'})).rejects.toMatchObject({code:'E_INPUT'});
+    const file=actions[0].file;await fs.unlink(file);const outside=path.join(root,'outside.txt');await fs.writeFile(outside,'Foreign data');await fs.symlink(outside,file);await expect(call(app.token,'appFiles.open',{path:'result.txt'})).rejects.toMatchObject({code:'E_FILE'});expect(actions).toHaveLength(2);
+    const preview=new mod.WebAppRuntime(host,{storageRoot:path.join(root,'file-preview')}),temporary=preview.open(uid,1,bundle('file-preview',['appFiles']));await preview.call(uid,1,temporary.token,'preview-write','appFiles.writeText',{path:'result.txt',text:'Preview only'});await expect(preview.call(uid,1,temporary.token,'preview-open','appFiles.open',{path:'result.txt'})).rejects.toMatchObject({code:'E_UNAVAILABLE'});preview.closeOwner(1);expect(actions).toHaveLength(2);
+    const denied=open('undeclared',[]);await expect(call(denied.token,'appFiles.open',{path:'result.txt'})).rejects.toMatchObject({code:'E_NOT_DECLARED'});
+  });
+
+  it('checkpoints a committed entry when the last app window closes before its response arrives', async () => {
+    const { userLocalRoot } = await import('../../../src/main/paths');
+    const definition = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
+    const b = { ...bundle('close-committed-entry', ['data']), manifest: { sdkVersion: 1, capabilities: ['data'], data: definition } };
+    const app = runtime.open(uid, 1, b);
+    await call(app.token, 'data.insert', { table: 'notes', values: { body: 'BASE' } });
+    const { LocalAppData } = await import('../../../src/main/features/web_apps/data');
+    let entered!: () => void, release!: () => void;
+    const committed = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const actual = LocalAppData.prototype.call;
+    const spy = vi.spyOn(LocalAppData.prototype, 'call').mockImplementation(async function (method, args) {
+      const result = await actual.call(this, method, args);
+      if (method === 'data.insert') { entered(); await gate; }
+      return result;
+    });
+    try {
+      const inserting = call(app.token, 'data.insert', { table: 'notes', values: { body: 'NEW' } })
+        .then(value => ({ value }), error => ({ error }));
+      await committed;
+      runtime.closeOwner(1); release();
+      expect(await inserting).toMatchObject({ error: { code: 'E_CANCELLED' } });
+      await runtime.drainData();
+    } finally { release(); spy.mockRestore(); }
+    const localFile = path.join(userLocalRoot(uid), 'web_apps', b.key, 'data.sqlite');
+    const local = new LocalAppData(localFile, userLocalRoot(uid), definition);
+    try {
+      const { records }: any = await local.call('data.query', { table: 'notes' });
+      expect(records.map((r: any) => r.body).sort()).toEqual(['BASE', 'NEW']);
+    } finally { await local.close(); }
+    expect(host.generate).not.toHaveBeenCalled(); expect(host.tools).not.toHaveBeenCalled();
+  });
+
+
   it('waits for the same local database to close while keeping other apps usable', async () => {
     const { LocalAppData } = await import('../../../src/main/features/web_apps/data');
     const definition = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
@@ -279,7 +325,7 @@ describe('Web app capability journeys', () => {
     expect(await call(a.token, 'host.getContext')).toMatchObject({ mode: 'preview' });
     const catalog = await call(a.token, 'capabilities.list');
     expect(catalog.methods.filter((m: any) => !m.available).map((m: any) => m.name).sort()).toEqual([
-      'files.pick', 'files.readText', 'files.readBase64', 'files.release', 'files.saveAs', 'ai.generate', 'tools.call',
+      'appFiles.open', 'appFiles.reveal', 'files.pick', 'files.readText', 'files.readBase64', 'files.release', 'files.saveAs', 'ai.generate', 'tools.call', 'connectors.list', 'connectors.uploadAsset', 'tasks.agents', 'tasks.services', 'tasks.start', 'tasks.get', 'tasks.cancel', 'tasks.open', 'tasks.output', 'tasks.release', 'tasks.respond',
     ].sort());
     await call(a.token, 'storage.set', { key: 'draft', value: { text: 'Real preview state' } });
     expect(await call(a.token, 'storage.get', { key: 'draft' })).toEqual({ value: { text: 'Real preview state' } });
@@ -289,6 +335,8 @@ describe('Web app capability journeys', () => {
     for (const [method, args] of [
       ['files.pick', {}], ['files.saveAs', { name: 'export.txt', text: 'No write' }],
       ['ai.generate', { prompt: 'No spend' }], ['tools.call', { name: 'library', arguments: {} }],
+      ['tasks.respond', { requestId: 'private', kind: 'bash:permission', interactionId: 'private-approval', decision: 'allow_once' }],
+      ['tasks.release', { requestId: 'private' }],
     ] as const) await expect(call(a.token, method, args)).rejects.toMatchObject({ code: 'E_UNAVAILABLE' });
     for (const fn of [host.pick, host.save, host.generate, host.tools]) expect(fn).not.toHaveBeenCalled();
     runtime.closeOwner(1);
@@ -1203,3 +1251,25 @@ it('bounds concurrently open application databases and recovers once one closes'
   await call(apps[4].app.token, 'data.insert', { table: 'notes', values: { body: 'accepted' } });
   expect(await call(apps[4].app.token, 'data.query', { table: 'notes' })).toEqual({ records: [{ body: 'accepted' }] });
 });
+
+describe('application-owned task and media authority',()=>{
+ it('requires the tasks declaration, passes only host scope, and denies preview or web task execution',async()=>{
+  host.tasks=vi.fn(async(_uid,key,method,args)=>({key,method,requestId:args.requestId,status:'submitted'}));
+  const plain=open('plain');await expect(call(plain.token,'tasks.start',{requestId:'one',title:'Product',prompt:'Write copy'})).rejects.toMatchObject({code:'E_NOT_DECLARED'});expect(host.tasks).not.toHaveBeenCalled();
+  const task=open('task',['tasks']);expect(await call(task.token,'tasks.start',{requestId:'one',title:'Product',prompt:'Write copy'})).toMatchObject({method:'tasks.start',requestId:'one'});expect(vi.mocked(host.tasks).mock.calls[0][0]).toBe(uid);expect(vi.mocked(host.tasks).mock.calls[0][1]).toBe(bundle('task').key);
+  const preview=new mod.WebAppRuntime(host,{storageRoot:path.join(root,'preview')});const instance=preview.open(uid,1,bundle('preview',['tasks']));await expect(preview.call(uid,1,instance.token,'q1','tasks.start',{requestId:'one',title:'Product',prompt:'Write copy'})).rejects.toMatchObject({code:'E_UNAVAILABLE'});preview.closeOwner(1);
+  expect(()=>runtime.open(uid,1,{...bundle('web',['tasks']),appType:'web'})).toThrow();expect(host.tasks).toHaveBeenCalledOnce();
+ });
+ it('requires both app files and connectors before staging private media',async()=>{
+  host.uploadAsset=vi.fn(async()=>({sourceUrl:'https://example.invalid/staged.png'}));const one=open('one',['connectors']);await expect(call(one.token,'connectors.uploadAsset',{connectorId:'shopify-admin',path:'cup.png'})).rejects.toMatchObject({code:'E_NOT_DECLARED'});expect(host.uploadAsset).not.toHaveBeenCalled();const both=open('both',['connectors','appFiles']);expect(await call(both.token,'connectors.uploadAsset',{connectorId:'shopify-admin',path:'cup.png'})).toHaveProperty('sourceUrl');await expect(call(both.token,'connectors.uploadAsset',{connectorId:'shopify-admin',path:'../private.png'})).rejects.toMatchObject({code:'E_INPUT'});expect(host.uploadAsset).toHaveBeenCalledOnce();
+ });
+});
+
+ it('keeps media discovery and selection inside the declared native Tasks capability',async()=>{
+  host.tasks=vi.fn(async(_uid,key,method,args)=>({key,method,args}));
+  const plain=open('plain-media');await expect(call(plain.token,'tasks.services',{kind:'video'})).rejects.toMatchObject({code:'E_NOT_DECLARED'});
+  const app=open('media-task',['tasks']);expect(await call(app.token,'tasks.services',{kind:'video',refresh:true})).toMatchObject({method:'tasks.services',args:{kind:'video',refresh:true}});
+  const media={kind:'image',serviceId:'a'.repeat(32)};expect(await call(app.token,'tasks.start',{requestId:'media-one',title:'Product',prompt:'Create image',media})).toMatchObject({args:{media}});
+  await expect(call(app.token,'tasks.start',{requestId:'bad-media',title:'Product',prompt:'Create',media:{...media,apiKey:'forged'}})).rejects.toMatchObject({code:'E_INPUT'});
+  const preview=new mod.WebAppRuntime(host,{storageRoot:path.join(root,'media-preview')}),instance=preview.open(uid,1,bundle('media-preview',['tasks']));await expect(preview.call(uid,1,instance.token,'q1','tasks.services',{kind:'video'})).rejects.toMatchObject({code:'E_UNAVAILABLE'});preview.closeOwner(1);expect(host.tasks).toHaveBeenCalledTimes(2);
+ });

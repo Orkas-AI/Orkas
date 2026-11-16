@@ -11,7 +11,7 @@ import { getTask, uploadTaskAttachment, TASK_ATTACHMENT_MAX_BYTES, type ProjectT
 
 export async function addTaskAttachmentFromPath(
   uid: string, pid: string, cid: string, taskId: string, sourcePath: string,
-  context: { sourceProjectId?: string; workingDir?: string } = {},
+  context: { sourceProjectId?: string; workingDir?: string; beforeWrite?: () => void } = {},
 ): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: string }> {
   const fail = (error: string) => ({ ok: false as const, error });
   if (getActiveUserId() !== uid) return fail('account_changed');
@@ -52,7 +52,8 @@ export async function addTaskAttachmentFromPath(
   if (getActiveUserId() !== uid) return fail('account_changed');
   if (!await getTask(uid, pid, taskId)) return fail('task_not_found');
   try {
-    const saved = await uploadTaskAttachment(uid, pid, taskId, name, body, { overwrite: false, requireTask: true });
+    context.beforeWrite?.();
+    const saved = await uploadTaskAttachment(uid, pid, taskId, name, body, { overwrite: false, requireTask: true, beforeWrite: context.beforeWrite });
     if (saved.ok === false) return saved;
     const updated = await getTask(uid, pid, taskId);
     return updated ? { ok: true, task: updated } : fail('task_not_found');

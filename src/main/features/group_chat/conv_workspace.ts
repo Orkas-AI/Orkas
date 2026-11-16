@@ -33,6 +33,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { appConversationRoot } from '../../paths';
 
 import { getWorkspacePath } from '../user_workspace';
 import { getConversation } from '../chats';
@@ -161,6 +162,8 @@ function uniquifySlug(workspaceRoot: string, slug: string): string {
  * never produced anything.
  */
 export async function getConversationWorkspacePath(uid: string, cid: string): Promise<string> {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return path.join(appRoot, 'workspace');
   // Resolve the conv's project membership ONCE so workspace resolution
   // picks up the project-scoped selection (per CLAUDE.md projects feature).
   // For convs without a project this is a no-op (projectId stays undefined).
@@ -237,6 +240,8 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
  * uniquifies, or persists a slug, so a caller that merely wants to interpret a
  * path an agent already wrote cannot give a chat a workspace it never had. */
 export async function readConversationAuthoringDir(uid: string, cid: string): Promise<string> {
+  const appRoot = appConversationRoot(uid, cid);
+  if (appRoot) return path.join(appRoot, 'workspace');
   const state = await readState(uid, cid).catch(() => null);
   if (!state) return '';
   const codingDir = String(state.coding_project_dir || '');

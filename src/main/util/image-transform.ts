@@ -31,6 +31,7 @@ export interface FeedbackImageTransformOpts {
   mimeType?: string;
   maxBytes?: number;
   maxDim?: number;
+  /** Default 0: attempt compression even for small feedback images. */
   compressTriggerBytes?: number;
 }
 
@@ -47,7 +48,6 @@ export interface FeedbackImageTransformResult {
 
 const FEEDBACK_DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 const FEEDBACK_DEFAULT_MAX_DIM = 1920;
-const FEEDBACK_DEFAULT_TRIGGER_BYTES = 1536 * 1024;
 const FEEDBACK_JPEG_CONFIGS = [
   { maxDim: 1920, quality: 82 },
   { maxDim: 1920, quality: 72 },
@@ -148,7 +148,7 @@ export async function prepareFeedbackUploadImage(
 
   const maxBytes = Math.max(1, opts.maxBytes ?? FEEDBACK_DEFAULT_MAX_BYTES);
   const maxDim = Math.max(64, opts.maxDim ?? FEEDBACK_DEFAULT_MAX_DIM);
-  const compressTriggerBytes = Math.max(0, opts.compressTriggerBytes ?? FEEDBACK_DEFAULT_TRIGGER_BYTES);
+  const compressTriggerBytes = Math.max(0, opts.compressTriggerBytes ?? 0);
   const originalMime = feedbackImageMime(opts.mimeType, opts.fileName);
   const originalName = normalizeFileName(opts.fileName || `image${extForMime(originalMime)}`);
 
@@ -192,6 +192,9 @@ export async function prepareFeedbackUploadImage(
       compressed: false,
     };
   }
+
+  // JPEG cannot preserve alpha; keep transparent screenshots readable.
+  img = flattenAlphaOnWhite(Jimp, img).image;
 
   let best: ImageTransformResult | null = null;
   for (const cfg of FEEDBACK_JPEG_CONFIGS) {

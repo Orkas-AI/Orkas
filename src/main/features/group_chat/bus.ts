@@ -1,3 +1,9 @@
+import { createTavilySearchTurn, currentTavilySearchTurn, withTavilySearchTurn,
+  type TavilySearchTurn } from '../../util/tavily-search-turn';
+import { buildSaveAppTool } from './app_save_tool';
+import { buildListAppsTool } from './app_catalog_tool';
+import { appConversationOwner } from '../../paths';
+import { appTaskExecutionGuidance, withAppTaskExecution } from '../app_task_execution';
 import { yieldReflectionForTask } from '../reflection-coordination';
 import { drainConversationFiling, hasPendingConversationFiling } from '../conversation_filing';
 /**
@@ -27,6 +33,7 @@ import { drainConversationFiling, hasPendingConversationFiling } from '../conver
  */
 
 import { splitMarkdownProseCode } from '../../util/markdown-prose-code';
+import { captureFileCreationFence, isFileCreatedAfterFence } from './file-creation-fence';
 import { classifyNativeCommentary, commanderMentionDisplayText, stripReservedRoutingMentions, type CommanderMentionDisplay } from './message-display';
 import type {
   AgentRunSteerMessage,
@@ -73,6 +80,7 @@ import {
   takeOrchestrationLedgerForAgent, takeOrchestrationLedgerForForm, clearOrchestrationLedger,
   beginAgentHandoff, rollbackAgentHandoff, clearOrchestrationForCancellation,
   setOrchestrationLedgerIfFree, claimFloorForWaitingTask, releaseWaitingFloor, waitingFloorBinding,
+  boundOrchestrationGoal,
 } from './state';
 import type { StateFile } from './state';
 import { maxToolLoopsForActorKind } from './actor-budgets';
@@ -162,6 +170,7 @@ import {
 import { AGENT_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
 import * as connectorActionConfirm from '../connectors/action_confirm';
 import * as bashPermissions from '../../model/core-agent/bash-permissions';
+import { OWN_KEY_RESULT_PREFIX } from '../video_production_spend';
 import { toolExecutionFactKind } from '../../model/core-agent/tool-catalog';
 import {
   buildInputChannelProtocol,
@@ -202,6 +211,7 @@ import {
   type CliContextPlan,
 } from '../local_agents/context';
 import { registerUserSwitchHook } from '../user-switch-hooks';
+import { boundedRunHealth, type RunHealthReader } from '../local_agents/run_health';
 
 const log = createLogger('group_chat.bus');
 const REVIEW_FINALIZABLE_VIDEO_EXTS = new Set(['.m4v', '.mov', '.mp4', '.webm']);
@@ -236,20 +246,6 @@ function escapeXmlText(s: string): string {
 function isExistingProducedFile(absPath: string): boolean {
   try {
     return fs.statSync(absPath).isFile();
-  } catch {
-    return false;
-  }
-}
-
-/** Regular file created at or after `sinceMs`. Creation time, not mtime:
- * adoption makes a file conversation-owned (later writes overwrite it in
- * place instead of uniquifying, and it becomes a conversation deliverable),
- * so a user's existing file edited during the run must stay foreign.
- * Filesystems without a birth time report 0 and fail closed. */
-function isFileCreatedSince(absPath: string, sinceMs: number): boolean {
-  try {
-    const stat = fs.statSync(absPath);
-    return stat.isFile() && stat.birthtimeMs > 0 && stat.birthtimeMs >= sinceMs;
   } catch {
     return false;
   }
@@ -301,41 +297,7 @@ function parseXmlAttrs(raw: string): Record<string, string> {
   return attrs;
 }
 
-function xmlChild(body: string, tag: string): string {
-  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
-  const m = re.exec(body);
-  return m ? decodeXmlAttr(m[1].trim()) : '';
-}
 
-function extractSyncConflictResults(text: string): Array<{
-  conflictId: string;
-  relPath: string;
-  targetPath: string;
-  status: string;
-  action: string;
-}> {
-  const out: Array<{
-    conflictId: string;
-    relPath: string;
-    targetPath: string;
-    status: string;
-    action: string;
-  }> = [];
-  const re = /<sync-conflict-result\b([^>]*?)(?:\/>|>([\s\S]*?)<\/sync-conflict-result>)/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const attrs = parseXmlAttrs(m[1] || '');
-    const body = m[2] || '';
-    out.push({
-      conflictId: (attrs.conflict_id || attrs.id || xmlChild(body, 'conflict_id') || xmlChild(body, 'id')).trim(),
-      relPath: (attrs.rel_path || attrs.relative_path || xmlChild(body, 'rel_path') || xmlChild(body, 'relative_path')).trim(),
-      targetPath: (attrs.target_path || attrs.current_path || xmlChild(body, 'target_path') || xmlChild(body, 'current_path')).trim(),
-      status: (attrs.status || xmlChild(body, 'status')).trim().toLowerCase(),
-      action: (attrs.action || xmlChild(body, 'action')).trim().toLowerCase(),
-    });
-  }
-  return out;
-}
 
 function _normaliseSkillMentionText(s: string): string {
   return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -876,7 +838,10 @@ export interface ActiveTurn {
 // ── Per-cid state ────────────────────────────────────────────────────────
 
 interface QueueItem {
-  /** Shared by this user message's actors and descendants; never persisted. */
+  /** Memory-only search count shared by this user message and its descendants. */
+  tavilySearchTurn?: TavilySearchTurn;
+  /** Goal of this specific host continuation, never inferred from its text. */
+  orchestrationGoal?: string;
   /** Target actor of this turn — who runs it. G8d: top-level turns funnel
    * through one per-conversation runtime (not a per-actor worker map), so the
    * target rides on the item and the runtime sets its `actor` per turn before
@@ -1043,6 +1008,8 @@ interface WorkerState {
   /** Native CLI ingress for this exact run. CoreAgent uses drainSteer directly
    * and leaves this null. */
   currentTurnIngress: LocalActiveRunIngress | null;
+  /** A revoked reader cannot outlive its owning dispatch. */
+  readRunHealth?: RunHealthReader;
   currentTurnSteerPump: Promise<void> | null;
   currentTurnSteerRequested: boolean;
   currentTurnSteerOptions: RichSteerDrainOptions | null;
@@ -1113,7 +1080,8 @@ interface CidState {
   skillImportPreviews?: Map<string, { sourcePath: string; fingerprint: string; expiresAt: number }>;
   // Read the existing public process trail only when a view is rebuilt. These
   // closures own no second event log and are released with their actor turn.
-  liveDisplays?: Map<string, () => GroupMessage[]>;
+  liveDisplays?: Map<string, { read: () => GroupMessage[]; afterMessageId?: string }>;
+  latestDisplayUserMessageId?: string;
   shuttingDown?: boolean;
   shutdownArchives?: Map<string, Promise<GroupMessage | null>>;
   displaySequence?: number;
@@ -1611,8 +1579,20 @@ function _emitTaskRunTerminalIfQuiescent(state: CidState, stateFile?: StateFile)
 }
 
 function emit(state: CidState, ev: GroupEvent, processItems?: ProcessItem[]): void {
+  if (ev.type === 'message' && ev.msg.from === USER_ID) {
+    state.latestDisplayUserMessageId = ev.msg.id;
+  }
   if (ev.type === 'process') {
     ev.display_seq = state.displaySequence = (state.displaySequence || 0) + 1;
+  }
+  // Preserve the user boundary crossed by visible output, including while the
+  // renderer is elsewhere. Message identity avoids second-resolution clock
+  // ties and never promotes old recovered content past a later user update.
+  if (ev.type === 'artifact_created' || (ev.type === 'process'
+    && (ev.data.type === 'event' || ev.data.type === 'commentary-finalized'
+      || ((ev.data.type === 'delta' || ev.data.type === 'progress') && ev.data.text)))) {
+    const display = ev.turn_id ? state.liveDisplays?.get(ev.turn_id) : null;
+    if (display) display.afterMessageId = state.latestDisplayUserMessageId;
   }
   // Single chokepoint feeding the `after` admission gate: every task
   // terminal — turn settlement, queue drops, per-task cancel, waiting_input
@@ -1719,6 +1699,18 @@ export function isQuiescent(uid: string, cid: string): boolean {
   return true;
 }
 
+/** Storage lifecycle boundary. Do not admit another turn while the app host
+ * holds its session binding; this only drains already-admitted writers. */
+export async function drainConversationWrites(uid: string, cid: string): Promise<boolean> {
+  if (!isQuiescent(uid, cid)) return false;
+  const state = _cids.get(cidKey(uid, cid));
+  while (state?.backgroundWrites.size) {
+    await Promise.all([...state.backgroundWrites]);
+    if (!isQuiescent(uid, cid)) return false;
+  }
+  return isQuiescent(uid, cid);
+}
+
 /** Main-process background admission signal. This is an in-memory O(active
  * conversation runtimes) check and performs no disk reads. */
 export function hasActiveWork(uid?: string): boolean {
@@ -1763,8 +1755,11 @@ export function liveDisplaySnapshot(uid: string, cid: string) {
     sequence: state?.displaySequence || 0,
     active_turns: activeTurns,
     turns: activeTurns.flatMap((turn) => {
-      const read = state?.liveDisplays?.get(turn.turn_id);
-      return read ? [{ ...turn, records: read() }] : [];
+      const display = state?.liveDisplays?.get(turn.turn_id);
+      return display ? [{ ...turn,
+        ...(display.afterMessageId ? { activity_after_message_id: display.afterMessageId } : {}),
+        records: display.read(),
+      }] : [];
     }),
   };
 }
@@ -2232,13 +2227,15 @@ async function buildGroupHistoryForTurn(params: {
 // ── enqueue ──────────────────────────────────────────────────────────────
 
 export interface EnqueueParams {
+  /** Trusted internal source metadata; public sends do not accept this field. */
+  orchestrationGoal?: string;
   uid: string;
   cid: string;
   fromActorId: string;
   text: string;
   /** Await host feature facts before publishing any recipient work. This
    * does not own runtime admission, sessions, or model lifecycle events. */
-  beforeDispatch?: () => Promise<void>;
+  beforeDispatch?: (run: { runId: string }) => Promise<void>;
   /** Native notification copy for the host-admitted run. */
   notificationKind?: 'task' | 'automation';
   commander_mention_display?: CommanderMentionDisplay;
@@ -2364,6 +2361,13 @@ export interface EnqueueParams {
  * publishing a message alone does not end the sender's running turn.
  */
 export async function enqueue(params: EnqueueParams): Promise<GroupMessage> {
+  const searchTurn = params.fromActorId === USER_ID
+    ? createTavilySearchTurn(params.uid, params.cid)
+    : currentTavilySearchTurn(params.uid, params.cid) || createTavilySearchTurn(params.uid, params.cid);
+  return withTavilySearchTurn(searchTurn, () => enqueueWithinSearchTurn(params));
+}
+
+async function enqueueWithinSearchTurn(params: EnqueueParams): Promise<GroupMessage> {
   const { uid, cid, fromActorId } = params;
   assertConversationRelocationReady(uid, cid);
   const rejectDuringShutdown = () => {
@@ -2785,6 +2789,8 @@ async function _enqueueBody(
       : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
+    ...(params.orchestrationGoal !== undefined
+      ? { orchestration_goal: boundOrchestrationGoal(params.orchestrationGoal) } : {}),
     ...(params.commanderRetryContinuation ? {
       commander_retry: {
         source_tool: 'dispatch_to' as const,
@@ -2865,7 +2871,7 @@ async function _enqueueBody(
   // Dispatch to non-user recipients.
   const refreshed = await readMembers(uid, cid);
   if (bubbleClock) bubbleClock.members = Date.now();
-  if (params.beforeDispatch) await params.beforeDispatch();
+  if (params.beforeDispatch) await params.beforeDispatch({ runId: state.taskRun?.runId || '' });
   // P3 true form resume: a user form submission targeted at an agent
   // RE-ENTERS its form-parked task (same task_id back to running) instead of
   // creating a new row. Decoded once; submissions are single-recipient.
@@ -2969,6 +2975,7 @@ async function _enqueueBody(
       turnId,
       msgId,
       fromActorId,
+      tavilySearchTurn: currentTavilySearchTurn(uid, cid),
       enqueueSeq: ++state.waitClock,
       ...(params.steerActiveTurn ? { steerActiveTurn: true } : {}),
       ...(deferBubble ? { deferredBubble: { persist: persistUserBubble } } : {}),
@@ -2977,6 +2984,7 @@ async function _enqueueBody(
       ...(deferBubble ? { sourceMessage: msg, sharedSourceMessage: to.length > 1 } : {}),
       sourceRecipients: msg.to.slice(),
       llmPayload: composeLlmTurnPayload(uid, fromActorId, msg),
+      ...(msg.orchestration_goal !== undefined ? { orchestrationGoal: msg.orchestration_goal } : {}),
       ...(continuedAssignment ? { assignmentContext: continuedAssignment } : {}),
       ...(pendingFormId ? { pendingFormId } : {}),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
@@ -3250,6 +3258,7 @@ function _referenceContextForModel(uid: string, references: readonly ChatMessage
 }
 
 type NestedDispatchSourceContext = {
+  orchestrationGoal?: string;
   originMessageId?: string;
   references?: ChatMessageReference[];
   /** Persisted only on the hidden `dispatch_to` source so a later manual
@@ -3394,6 +3403,10 @@ function _unwrapLlmTurnPayload(payload: string): string | null {
 
 function _clipForOrchestration(s: string, max = 6000): string {
   return String(s || '').replace(/\0/g, '').trim().slice(0, max);
+}
+
+function _orchestrationGoal(item: QueueItem | undefined, payload: string): string {
+  return boundOrchestrationGoal(item?.orchestrationGoal ?? (_unwrapLlmTurnPayload(payload) ?? payload));
 }
 
 function _buildOrchestrationStateBlock(ledger: NonNullable<StateFile['orchestration_ledger']> | undefined): string {
@@ -3637,7 +3650,8 @@ function _returnControlProtocol(stateFile: StateFile, agentId: string): string {
   ].join('\n');
 }
 
-/** Native production tools whose contract-2 results carry `outcome`. */
+const OWN_KEY_GENERATION_TOOLS = new Set(['generate_video', 'generate_image']);
+/** Native production tools whose current results carry `outcome`. */
 const USER_DECISION_TOOLS = new Set(['video_studio']);
 
 /** The turn's last native production result asked for the user's own
@@ -3661,13 +3675,29 @@ function _lastStudioOutcomeNeedsUser(items: readonly ProcessItem[]): boolean {
     try {
       const payload = JSON.parse(raw.split(/\n\n<file-renamed\b/i, 1)[0]) as Record<string, unknown> | null;
       return !!payload && typeof payload === 'object' && !Array.isArray(payload)
-        && payload.contract_version === 2 && payload.outcome === 'need_user';
+        && payload.contract_version === 3 && payload.outcome === 'need_user';
     } catch {
       return false;
     }
   }
   return false;
 }
+
+/** How many files this turn generated on the user's own service account, from the
+ *  start of the generation tools' own results. */
+function _ownKeyGenerationCount(items: readonly ProcessItem[]): number {
+  let count = 0;
+  for (const item of items) {
+    const event = processItemEvent(item);
+    if (event?.stream !== 'tool' || !event.data || typeof event.data !== 'object') continue;
+    const data = event.data as Record<string, unknown>;
+    if (data.phase !== 'end' || data.isError || !OWN_KEY_GENERATION_TOOLS.has(String(data.name || ''))) continue;
+    const raw = typeof data.output === 'string' && data.output ? data.output : String(data.result_preview || '');
+    if (raw.startsWith(OWN_KEY_RESULT_PREFIX)) count += 1;
+  }
+  return count;
+}
+
 
 /** Manual recipient provenance. Implicit completion preserves it; a recognized
  * explicit transfer may return it at the originating choice revision. */
@@ -3721,6 +3751,7 @@ async function _enqueueOrchestrationResumeFromAgent(params: {
       params.handbackReason,
       params.terminal,
     ),
+    orchestrationGoal: params.ledger.user_goal,
     forceTo: [COMMANDER_ID],
     dispatch: true,
   });
@@ -3892,6 +3923,7 @@ async function _enqueueCommanderFromDirectAgentHandback(params: {
     fromActorId: params.agentId,
     text: 'Agent returned the task to the commander.',
     model_text: _buildDirectAgentHandbackModelText(params),
+    orchestrationGoal: params.userGoal,
     forceTo: [COMMANDER_ID],
     dispatch: true,
     ...(params.attachments?.length ? { attachments: params.attachments.slice() } : {}),
@@ -4417,26 +4449,82 @@ async function _planAndQueueUserSend(state: CidState, input: {
     continuationContext?: string,
     /** A waiting row this item continues instead of creating a new one. */
     continued?: taskBoard.ConversationTask,
+    plannedTaskId?: string,
   ): Promise<string | undefined> => {
     if (stopped()) return undefined;
     const turnId = genId12();
-    let taskId: string | undefined = continued?.task_id;
+    const taskId = continued?.task_id || plannedTaskId || genId12();
+    const taskInput: taskBoard.CreateTaskInput & { taskId: string } = {
+      taskId,
+      admissionPending: true,
+      assignee: actor.id,
+      instruction,
+      createdBy: 'user',
+      ...(msg.attachments?.length ? { attachments: msg.attachments.slice() } : {}),
+      sourceMsgId: msgId,
+      turnId,
+      ...(after.length ? { after } : {}),
+      ...(continuationContext ? { assignmentContext: continuationContext } : {}),
+    };
     if (!continued) try {
-      const created = await taskBoard.createTask(uid, cid, {
-        admissionPending: true,
-        assignee: actor.id,
-        instruction,
-        createdBy: 'user',
-        ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
-        sourceMsgId: msgId,
-        turnId,
-        ...(after.length ? { after } : {}),
-        ...(continuationContext ? { assignmentContext: continuationContext } : {}),
-      });
-      taskId = created.task_id;
+      const created = await taskBoard.createTask(uid, cid, taskInput);
       emit(state, { type: 'task_created', cid, task: created });
     } catch (err) {
-      log.warn(`task-board create failed cid=${cid}: ${(err as Error).message}`);
+      log.warn('planned task admission failed', {
+        cid: maskId(cid), actor_id: maskId(actor.id), error: logErrorSummary(err),
+      });
+      if (stopped()) {
+        const cancelled = await taskBoard.cancelPending(uid, cid, taskId);
+        if (cancelled) emit(state, { type: 'task_state', cid, task: cancelled });
+        return taskId;
+      }
+      // The ID remains a failed predecessor even if recording the failure
+      // also fails. Never execute an untracked planned task or erase its edge.
+      state.settledTasks.set(taskId, 'failed');
+      // Like scheduled dispatch, retain an exact per-owner source for the
+      // existing retry entry. Retrying the whole multi-owner user message
+      // would repeat independent work that may already have completed.
+      const retrySource: GroupMessage = {
+        id: genId12(), ts: nowIso(), from: COMMANDER_ID, to: [actor.id],
+        text: instruction, dispatch: true, source_message_id: msgId,
+        ...(msg.attachments?.length ? { attachments: msg.attachments.slice() } : {}),
+        ...(msg.references?.length ? { references: msg.references.slice() } : {}),
+        ...(msg.use_selections?.length ? { use_selections: msg.use_selections.slice() } : {}),
+      };
+      let retrySourceId = msgId;
+      try {
+        await appendMain(uid, cid, retrySource, {
+          senderKind: 'commander', senderId: COMMANDER_ID, agentIds: [actor.id],
+        });
+        retrySourceId = retrySource.id;
+      } catch (sourceError) {
+        log.warn('planned task retry source failed', { error: logErrorSummary(sourceError) });
+      }
+      try {
+        const failed = await taskBoard.recordCreationFailure(uid, cid, { ...taskInput, sourceMsgId: retrySourceId });
+        if (failed) {
+          emit(state, { type: 'task_created', cid, task: failed });
+          emit(state, { type: 'task_state', cid, task: failed });
+        }
+      } catch (recordError) {
+        log.warn('planned task failure record failed', { error: logErrorSummary(recordError) });
+      }
+      // Without the scoped source, do not offer a retry of the whole request.
+      // The failed board row and blocked successors still preserve the work.
+      if (!stopped() && retrySourceId !== msgId) {
+        try {
+          await enqueue({
+            uid, cid, fromActorId: actor.id, forceTo: [USER_ID],
+            text: `<span style="color:var(--danger)">${escapeHtmlForBubble(t('chat.turn_failed_unexpected', undefined, language))}</span>`,
+            failure_kind: 'runtime', failure_code: 'task_creation_failed',
+            turn_end: true, turn_id: turnId, task_id: taskId,
+            source_message_id: retrySourceId,
+          });
+        } catch (replyError) {
+          log.warn('planned task failure reply failed', { error: logErrorSummary(replyError) });
+        }
+      }
+      return taskId;
     }
     // Stop can cross the asynchronous row creation before this item becomes
     // visible to abort's queue sweep. Cancel that row and never admit it.
@@ -4452,11 +4540,12 @@ async function _planAndQueueUserSend(state: CidState, input: {
       turnId,
       msgId,
       fromActorId,
+      tavilySearchTurn: currentTavilySearchTurn(uid, cid),
       enqueueSeq: ++state.waitClock,
       ...(taskId ? { taskId } : {}),
       ...(continued?.resume?.form_id ? { pendingFormId: continued.resume.form_id } : {}),
-      // Only dependencies that got a row can gate; a failed board write
-      // degrades to an earlier start rather than a task that never starts.
+      // Planned identities survive creation failures; their failed terminals
+      // park dependents through the ordinary admission gate.
       ...(after.length ? { afterTaskIds: after.slice() } : {}),
       // A continued row keeps the split note it was created with, exactly as
       // a direct reply does.
@@ -4492,18 +4581,18 @@ async function _planAndQueueUserSend(state: CidState, input: {
 
   const plan = result.plan;
   sourceRecipients = [...new Set([...msg.to, ...plan.tasks.map((task) => task.assignee)])];
-  const taskIds: Array<string | undefined> = [];
+  const taskIds = plan.tasks.map(() => genId12());
   let edges = 0;
   for (let i = 0; i < plan.tasks.length; i += 1) {
     const task = plan.tasks[i];
     const actor = actorFor(task.assignee);
-    const after = task.after.map((j) => taskIds[j]).filter((id): id is string => !!id);
+    const after = task.after.map((j) => taskIds[j]);
     edges += after.length;
     if (!actor) {
       // Validation only admits known candidates; a vanished actor keeps its
       // slot so later indices still line up.
       log.warn(`planned task assignee unresolved cid=${cid} assignee=${maskId(task.assignee)}`);
-      taskIds.push(undefined);
+      state.settledTasks.set(taskIds[i], 'failed');
       continue;
     }
     // A plan that gives the whole reply to an Agent waiting on the user is
@@ -4517,14 +4606,15 @@ async function _planAndQueueUserSend(state: CidState, input: {
         log.warn('reply-resume task lookup failed', { error: logErrorSummary(err) });
       }
     }
-    taskIds.push(await queueItem(
+    await queueItem(
       actor,
       task.part,
       buildAssignmentContext(plan, i, nameOf),
       after,
       buildAssignmentContext(plan, i, nameOf, true),
       continued,
-    ));
+      taskIds[i],
+    );
     if (stopped()) return [];
   }
   log.info(`planned dispatch cid=${cid} msg=${maskId(msgId)} tasks=${plan.tasks.length} edges=${edges} references=${plan.references.length}`);
@@ -4643,6 +4733,7 @@ function _startExecution(
   state: CidState,
   item: QueueItem,
 ): void {
+  const searchTurn = item.tavilySearchTurn ||= createTavilySearchTurn(state.uid, state.cid);
   const w: WorkerState = {
     uid: state.uid, cid: state.cid,
     actor: item.actor,
@@ -4705,7 +4796,7 @@ function _startExecution(
         'task-board lazy create',
       );
     }
-    w.done = (async () => {
+    w.done = withTavilySearchTurn(searchTurn, async () => {
     let releaseRuntimeContentTurn: (() => void) | null = null;
     try {
       // Runtime Agent/Skill publication may already have staged files, but its
@@ -4803,6 +4894,7 @@ function _startExecution(
             turn_end: true,
             turn_id: item.turnId,
             source_message_id: item.msgId,
+            ...(item.orchestrationGoal !== undefined ? { orchestrationGoal: item.orchestrationGoal } : {}),
             ...(item.taskId ? { task_id: item.taskId } : {}),
           });
           visibleTerminalDelivered = true;
@@ -4866,6 +4958,7 @@ function _startExecution(
       w.currentTurnStartedAtMs = null;
       w.currentTurnSteerable = false;
       w.currentTurnIngress = null;
+      w.readRunHealth = undefined;
       w.currentTurnSteerRequested = false;
       w.currentTurnSteerOptions = null;
       w.running = false;
@@ -4883,7 +4976,7 @@ function _startExecution(
       _scheduleAdmissions(state);
       if (isQuiescent(state.uid, state.cid)) state.turnsThisActivation = 0;
     }
-    })();
+    });
 }
 
 async function settleTurnInFlight(state: CidState, w: WorkerState): Promise<void> {
@@ -4912,6 +5005,8 @@ type RichSteerDrainOptions = {
   runtimeGrantedToolGroups?: string[];
   /** External CLI bridge tool names differ from CoreAgent's local meta tools. */
   connectorTools?: { list: string; call: string };
+  /** Approval source shared with this actor run; updated only after durable steer acknowledgement. */
+  currentUserMessage?: { text: string };
 };
 
 function _appendRuntimeRoot(target: string[], raw: string): void {
@@ -5064,7 +5159,13 @@ async function _prepareRichSteer(
     ...(historyResources.length ? { historyResources } : {}),
     onApplied: async () => {
       const index = w.queue.indexOf(item);
-      if (index >= 0) w.queue.splice(index, 1);
+      if (index >= 0) {
+        w.queue.splice(index, 1);
+        if (opts.currentUserMessage) opts.currentUserMessage.text = item.llmPayload;
+        if (actor.kind === 'commander' && w.item) {
+          w.item.orchestrationGoal = _orchestrationGoal(item, item.llmPayload);
+        }
+      }
       // A row created by an ordinary busy send already has a durable task.
       // Convert it only after the active runtime has committed the update;
       // preparation/transport failure therefore leaves the original queued
@@ -5683,14 +5784,15 @@ async function runActorTurn(
   w.pendingSavedTasks = undefined;
   if (item.actor.kind !== 'worker') {
     state.liveDisplays ||= new Map();
-    state.liveDisplays.set(item.turnId, () => [{
+    state.liveDisplays.set(item.turnId, { read: () => [{
       id: '', from: item.actor.id, to: [USER_ID], ts: localIsoAt(turnStartedAt), text: '',
       turn_id: item.turnId, source_message_id: item.msgId,
       ...(item.taskId ? { task_id: item.taskId } : {}),
-    }]);
+    }] });
   }
   try {
-    return await (() => runActorTurnWithDisplay(state, w, item, turnStartedAt))();
+    const searchTurn = item.tavilySearchTurn ||= createTavilySearchTurn(state.uid, state.cid);
+    return await withTavilySearchTurn(searchTurn, () => runActorTurnWithDisplay(state, w, item, turnStartedAt));
   } finally {
     // Retain the closure after an I/O failure so a subsequent quit can retry.
     if (state.shuttingDown && state.liveDisplays?.has(item.turnId)) {
@@ -5765,7 +5867,6 @@ async function runActorTurnWithDisplay(
     turnProjectScope = await projectsFeat.resolveProjectScope(uid, turnProjectId);
   }
   let turnToolExtraRoots: string[] = [];
-  let turnSyncConflictResolution: NonNullable<StateFile['sync_conflict_resolution']>['conflicts'] = [];
   let turnReturnControlProtocol = '';
   try {
     const stateFile = await readState(uid, cid);
@@ -5773,15 +5874,13 @@ async function runActorTurnWithDisplay(
     turnToolExtraRoots = Array.isArray(stateFile.tool_extra_roots)
       ? stateFile.tool_extra_roots.filter((r) => typeof r === 'string' && path.isAbsolute(r))
       : [];
-    turnSyncConflictResolution = Array.isArray(stateFile.sync_conflict_resolution?.conflicts)
-      ? stateFile.sync_conflict_resolution.conflicts
-      : [];
   } catch { /* no conversation-scoped extra roots */ }
   // Every named group actor rebases completed dialogue from the canonical
   // group log. Each actor still owns an independent model session (and its
   // existing compaction limits), but no actor's private transcript is a
   // conversation-fact source. CLI actors consume the same log through the
   // bounded recovery/delta compiler below instead of this model history path.
+  const currentUserMessage = { text: item.llmPayload };
   let messageText = item.llmPayload;
   // Planned-dispatch split note + dependency hand-off: anchor the admitted
   // task to its part of the plan and to its predecessors' results (which
@@ -6133,6 +6232,8 @@ async function runActorTurnWithDisplay(
     }
   }
 
+  if (!cliAgent) systemPrompt = withAppTaskExecution(systemPrompt, cid);
+
   // Streaming.
   const { streamChatWithModel } = await import('../../model/client');
   // Per-turn skill-attribution buffer. Records skill_advertised at runner
@@ -6162,7 +6263,7 @@ async function runActorTurnWithDisplay(
   const managedRoots: string[] = [];
   try {
     const userWorkspace = await import('../user_workspace');
-    managedRoots.push(userWorkspace.getWorkspacePath(uid, turnProjectId));
+    managedRoots.push(userWorkspace.getWorkspacePath(uid, turnProjectId, cid));
   } catch (err) {
     log.warn(`resolve workspace root for produced-file scope cid=${cid}: ${(err as Error).message}`);
   }
@@ -6178,13 +6279,16 @@ async function runActorTurnWithDisplay(
   // sets decide only what may be modified.
   const sourceTreePaths = new Set<string>();
   const preExistingPaths = new Set<string>();
-  const onFileWritten = async (absPath: string, info?: { preExisting?: boolean }) => {
+  // Speech carries billing as host metadata; image/video use their trusted result prefix.
+  const ownAccountFiles = new Set<string>();
+  const onFileWritten = async (absPath: string, info?: { preExisting?: boolean; billedToOwnAccount?: boolean }) => {
     // Registration only. Files can still be inputs to later tools in this
     // turn (generated shots -> composed video, source HTML -> exported PDF,
     // etc.), so mutating them here would bake presentation-only changes into
     // the eventual final result. Finalization happens only after the visible deliverable
     // selector has chosen the files attached to a user-facing message.
     const normalized = path.resolve(absPath);
+    if (info?.billedToOwnAccount) ownAccountFiles.add(normalized);
     // Only the first write decides ownership: a later edit_file pass over a
     // file this conversation created must not reclassify our own output as
     // the user's.
@@ -6223,8 +6327,25 @@ async function runActorTurnWithDisplay(
     return accepted;
   };
   const finalizeVisibleProducedFiles = async (paths: readonly string[], source: string) => {
-    for (const absPath of paths) {
-      if (!isPathAllowed(absPath, managedRoots)) continue;
+    const scopedPaths = paths.filter(absPath => isPathAllowed(absPath, managedRoots));
+    if (!scopedPaths.length) return;
+    let finalizable: string[];
+    try {
+      const { getSession } = await import('../../model/core-agent/session-store');
+      const session = await getSession(sessionId);
+      const resources = [
+        ...turnHistoryResources,
+        ...(session.getSerializedContextState()?.resources || []),
+      ];
+      finalizable = await excludeUnchangedInputs(scopedPaths, resources
+        .filter(resource => resource.kind === 'attachment' || resource.kind === 'explicit')
+        .map(resource => resource.path));
+    } catch (err) {
+      // Preserve bytes when input ownership cannot be verified. Publication still proceeds.
+      log.warn('output input-identity verification failed', { error: logErrorRef(err) });
+      return;
+    }
+    for (const absPath of finalizable) {
       try {
         await finalizeProducedFile(absPath, {
           userId: uid,
@@ -6290,7 +6411,7 @@ async function runActorTurnWithDisplay(
   const nativeDisplaySegments: GroupMessage[] = [];
   if (actor.kind !== 'worker') {
     state.liveDisplays ||= new Map();
-    state.liveDisplays.set(item.turnId, () => [
+    state.liveDisplays.set(item.turnId, { read: () => [
       ...nativeDisplaySegments,
       {
         id: '', from: actor.id, to: [USER_ID],
@@ -6303,7 +6424,7 @@ async function runActorTurnWithDisplay(
         ...(turnArtifacts.length ? { artifacts: turnArtifacts.map(a => ({ ...a, agent_id: actor.id })) } : {}),
         ...(item.taskId ? { task_id: item.taskId } : {}),
       },
-    ]);
+    ] });
   }
   let errText: string | null = null;
   // Shown beside errText to the user only; see TurnFinishedEvent.errDetail.
@@ -6335,7 +6456,7 @@ async function runActorTurnWithDisplay(
   // segment. With neither text nor public commentary there is no bubble, but
   // the text cursor advances so later synthesis cannot replay it. `forceTo:[user]` keeps the segment
   // from re-dispatching agents named in the prose.
-  segState.flush = async () => {
+  const flushCommanderSegment = async () => {
     const text = streamingText.slice(segState.segStart).trim();
     segState.segStart = streamingText.length;
     const hasCommentary = processItems.slice(segState.processStart).some((item) =>
@@ -6440,6 +6561,14 @@ async function runActorTurnWithDisplay(
       turn_id: item.turnId,
     });
   };
+  // Parallel dispatches share these persistence cursors. Serialize only their
+  // segment commits; the dispatched workers remain independently concurrent.
+  let segmentFlush: Promise<void> = Promise.resolve();
+  segState.flush = () => {
+    const flushing = segmentFlush.then(flushCommanderSegment);
+    segmentFlush = flushing.catch(() => {});
+    return flushing;
+  };
 
   // activityEvents = count of non-error, non-final, non-done events the
   // LLM stream emitted. Used by plan_executor.onTurnFinished to distinguish
@@ -6500,7 +6629,7 @@ async function runActorTurnWithDisplay(
     // `write_file` tool; CLI agents have their own product-side
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
-    const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId);
+    const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId, cid);
     // Coding agents initialise the per-conversation
     // `coding_project_dir` from the agent detail page's project-dir
     // setting. Missing setting = effective workspace. Once a
@@ -6513,7 +6642,7 @@ async function runActorTurnWithDisplay(
     // explicit directory-form submission recover the same conversation.
     let cliWorkingDir = wsRoot;
     let projectDirectoryIssue: ReturnType<typeof inspectCodingDirectory> | undefined;
-    if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
+    if (!appConversationOwner(cid) && agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
       const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId);
       cliWorkingDir = dirInfo.effective_path;
       await _initializeCodingProjectDir(uid, cid, dirInfo);
@@ -6566,6 +6695,9 @@ async function runActorTurnWithDisplay(
         ...(turnProjectId ? { projectId: turnProjectId } : {}),
         signal: w.abortController.signal,
         deadlineAt: executionDeadlineAt,
+        onDiagnostics: read => {
+          if (w.currentTurnId === item.turnId && w.running) w.readRunHealth = read ?? undefined;
+        },
         onAutoTaskSaved: (taskId, title) => stageSavedTask(w, item.turnId, {
           kind: 'automation', task_id: taskId, project_id: turnProjectId || '', title,
         }),
@@ -6737,6 +6869,7 @@ async function runActorTurnWithDisplay(
       const actorMaxToolLoops = maxToolLoopsForActorKind(actor.kind);
       for await (const ev of streamChatWithModel({
         userId: uid,
+        currentUserMessage,
         message: messageText,
         sessionId,
         systemPrompt,
@@ -6809,6 +6942,7 @@ async function runActorTurnWithDisplay(
           runtimeReadOnlyRoots,
           drainSteer: () => drainSteerInto(w, actor, {
             runtimeReadOnlyRoots,
+            currentUserMessage,
             runtimeSkillBindings,
             runtimeGrantedToolGroups,
             attachmentMetadata: turnAttachmentMetadata,
@@ -7036,13 +7170,6 @@ async function runActorTurnWithDisplay(
   }
 
   let workingText = finalText || '';
-  if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
-    const results = extractSyncConflictResults(workingText);
-    const allowedIds = new Set(turnSyncConflictResolution.map((item) => item.id));
-    for (const result of results) {
-      if (!allowedIds.has(result.conflictId)) continue;
-    }
-  }
 
   // ── Post-stream parsing (pure data extraction; no decisions) ──────────
   // Form / <agent> container extraction stays in bus because they're pure
@@ -7103,7 +7230,10 @@ async function runActorTurnWithDisplay(
       || (actor.kind === 'agent' && _lastStudioOutcomeNeedsUser(processItems)))
       && !errText && !turnFailureKind);
 
-  if (actor.kind === 'agent' && (workingText || cliCommanderHandoff)) {
+  // Host-owned billing facts must survive a model reply with no words.
+  const hostHasWordsOfItsOwn = () => !errText && !aborted
+    && _ownKeyGenerationCount(processItems) + ownAccountFiles.size > 0;
+  if (actor.kind === 'agent' && (workingText || cliCommanderHandoff || hostHasWordsOfItsOwn())) {
     // Parse both control blocks before changing floor / ledger state. A malformed
     // reply containing both is treated as a form pause: the user must be able to
     // answer the visible form without a simultaneous commander continuation.
@@ -7116,8 +7246,12 @@ async function runActorTurnWithDisplay(
     const hb = extractHandbackFromFinal(workingText);
     workingText = hb.cleanText;
     const r = extractFormFromFinal(workingText, actor.id);
+    if (r.form) workingText = r.cleanText;
+    const ownKeyGenerations = _ownKeyGenerationCount(processItems) + ownAccountFiles.size;
+    if (ownKeyGenerations) {
+      workingText = [workingText, t('video_budget.own_key_notice', { count: ownKeyGenerations }, turnLanguage)].filter(Boolean).join('\n\n');
+    }
     if (r.form) {
-      workingText = r.cleanText;
       const msgId = genId12();
       form = {
         form_id: computeFormId(cid, msgId, r.form.agent_id, r.form.fields),
@@ -7220,7 +7354,7 @@ async function runActorTurnWithDisplay(
             }
             directHandbackAfterTurn = {
               agentResult: handbackResult,
-              userGoal: _unwrapLlmTurnPayload(item.llmPayload) || item.llmPayload,
+              userGoal: _orchestrationGoal(item, item.llmPayload),
             };
           } else if (
             hb.handback
@@ -7905,11 +8039,19 @@ async function runActorTurnWithDisplay(
       filesToFinalize,
       reviewGateOpen ? 'group_chat.review_video' : 'group_chat.turn_final',
     );
+    // A notice describes retained attachments; it never changes status, routing or publication.
+    let deliveryNotice = '';
+    if ((aborted || errText || turnFailureKind || outcomeFailureKind) && outcome.produced?.length) {
+      try {
+        const { interruptedVideoDeliveryNotice } = await import('../video_delivery_notice');
+        deliveryNotice = await interruptedVideoDeliveryNotice({ produced: outcome.produced, allowedRoots: managedRoots, lang: turnLanguage });
+      } catch { log.warn('delivery notice unavailable'); }
+    }
     const tailProcessItems = processItems.slice(segState.processStart);
     persistedMsg = await enqueue({
       uid, cid,
       fromActorId: actor.id,
-      text: outcome.text,
+      text: deliveryNotice ? `${outcome.text}\n\n${deliveryNotice}` : outcome.text,
       // An abort settlement belongs to the user only. Process commentary or
       // status text must not enqueue fresh agent/commander work after Stop.
       ...(aborted ? { forceTo: [USER_ID] } : {}),
@@ -7949,6 +8091,7 @@ async function runActorTurnWithDisplay(
         ? { display_phase: 'final_answer' as const } : {}),
       turn_id: item.turnId,
       source_message_id: item.msgId,
+      ...(item.orchestrationGoal !== undefined ? { orchestrationGoal: item.orchestrationGoal } : {}),
       // The parsed prose marker must survive visible-reply classification;
       // otherwise task-run aggregation mistakes this waiting reply for success.
       ...(reviewGateOpen ? { waitingForInput: true } : {}),
@@ -8712,6 +8855,8 @@ async function runNestedDispatch(
         resume_instruction: sourceContext.commanderRetryResumeInstruction,
       },
     } : {}),
+    ...(sourceContext?.orchestrationGoal !== undefined
+      ? { orchestration_goal: boundOrchestrationGoal(sourceContext.orchestrationGoal) } : {}),
     ...(sourceContext?.originMessageId
       ? { source_message_id: sourceContext.originMessageId }
       : {}),
@@ -8724,6 +8869,7 @@ async function runNestedDispatch(
   const item: QueueItem = {
     actor,
     turnId: genId12(), msgId: dispatchMessage.id, fromActorId: COMMANDER_ID,
+    tavilySearchTurn: currentTavilySearchTurn(state.uid, state.cid),
     sourceRecipients: [actor.id],
     llmPayload: payload, nested: true, outputDelivery,
     ...(attachments && attachments.length ? { attachments } : {}),
@@ -8911,6 +9057,8 @@ async function runScheduledDispatch(
         resume_instruction: opts.sourceContext.commanderRetryResumeInstruction,
       },
     } : {}),
+    ...(opts.sourceContext?.orchestrationGoal !== undefined
+      ? { orchestration_goal: boundOrchestrationGoal(opts.sourceContext.orchestrationGoal) } : {}),
     ...(opts.sourceContext?.originMessageId
       ? { source_message_id: opts.sourceContext.originMessageId }
       : {}),
@@ -8961,6 +9109,7 @@ async function runScheduledDispatch(
     turnId,
     msgId: dispatchMessage.id,
     fromActorId: COMMANDER_ID,
+    tavilySearchTurn: currentTavilySearchTurn(state.uid, state.cid),
     taskId,
     commanderSubtask: true,
     ...(opts.floorChoiceRevision !== undefined ? { floorChoiceRevision: opts.floorChoiceRevision } : {}),
@@ -9300,7 +9449,18 @@ async function buildCommanderExtraTools(
   residentSkillRefs?: () => Iterable<string>,
 ): Promise<AgentTool[]> {
   const { uid, cid } = w;
-  const tools: AgentTool[] = [buildConversationBrowserTool(uid, cid)];
+  const catalogTurnId = w.currentTurnId;
+  const appTaskActive = () => getActiveUserId() === uid && w.running && !w.stopRequested && w.currentTurnId === catalogTurnId;
+  const tools: AgentTool[] = [buildConversationBrowserTool(uid, cid), buildListAppsTool(uid, {
+    isActive: appTaskActive,
+  }), buildSaveAppTool(async () => {
+    if (!appTaskActive()) return { userId: uid, cid, workspace: '', roots: [], isActive: appTaskActive };
+    const { getWorkspacePath } = await import('../user_workspace');
+    const { getConversationWorkspacePath } = await import('./conv_workspace');
+    const workspace = await getConversationWorkspacePath(uid, cid);
+    return { userId: uid, cid, workspace,
+      roots: [getWorkspacePath(uid, currentProjectId, cid), chatAttachmentDirForConversation(uid, cid)], isActive: appTaskActive };
+  })];
   const browserRunId = browserTaskRunId(uid, cid);
   const backlogTaskSchema = currentProjectId ? {
     todo_task_id: {
@@ -9779,6 +9939,7 @@ async function buildCommanderExtraTools(
       await onVisibleDispatch?.();
       const parentSignal = asynchronous ? (w.abortController?.signal || ctx?.signal) : ctx?.signal;
       const abortEpoch = state.abortEpoch;
+      const userGoal = _orchestrationGoal(w.item, currentTurnPayload);
       const executeDispatch = async (onScheduled?: (taskId: string) => void) => {
         const dispatchResult = await runScheduledDispatch(
           state, parentSignal, dispatchActor, message, {
@@ -9788,6 +9949,7 @@ async function buildCommanderExtraTools(
             attachments: currentTurnAttachments,
             sourceContext: {
               ...namedDispatchSourceContext,
+              orchestrationGoal: userGoal,
               commanderRetryResumeInstruction: resume
                 || _defaultResumeInstructionForRetriedDispatch(dispatchAgent?.name || resolvedId),
             },
@@ -9801,7 +9963,7 @@ async function buildCommanderExtraTools(
             result: dispatchResult,
             ownerAgentId: resolvedId,
             ownerAgentName: dispatchAgent?.name || resolvedId,
-            userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+            userGoal,
             agentTask: message,
             resume,
             sourceTool: 'dispatch_to',
@@ -9816,7 +9978,7 @@ async function buildCommanderExtraTools(
             result: dispatchResult,
             ownerAgentId: resolvedId,
             ownerAgentName: dispatchAgent?.name || resolvedId,
-            userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+            userGoal,
             agentTask: message,
             resume,
           });
@@ -9849,6 +10011,7 @@ async function buildCommanderExtraTools(
           uid, cid, fromActorId: resolvedId, forceTo: [COMMANDER_ID], dispatch: true,
           text: `Dispatch result from @${dispatchAgent?.name || resolvedId}.`,
           model_text: `<dispatch-result task_id="${escapeXmlAttr(result.taskId || '')}">\n${delivery.content}\n</dispatch-result>`,
+          orchestrationGoal: userGoal,
           dispatchSignal: parentSignal, dispatchEpoch: abortEpoch,
         });
       });
@@ -9908,6 +10071,7 @@ async function buildCommanderExtraTools(
       const backlog = await resolveBacklogTask(input?.todo_task_id);
       if (backlog.error) return _toolError(backlog.error);
       const handoffAgent = await agentsFeat.getAgent(resolvedId);
+      const userGoal = _orchestrationGoal(w.item, currentTurnPayload);
       const waitingRefusal = await _waitingAgentDelegationRefusal(
         state, resolvedId, handoffAgent?.name || resolvedId, w.item,
       );
@@ -9932,7 +10096,7 @@ async function buildCommanderExtraTools(
           ownerAgentName: handoffAgent?.name || resolvedId,
           claimFloor: (w.item?.sourceRecipients.length || 0) === 1 && !otherWaitingAgent,
           expectedChoiceRevision: w.item?.floorChoiceRevision ?? 0,
-          userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+          userGoal,
           handoffMessage: message,
           ...(resume ? { resumeInstruction: resume } : {}),
         });
@@ -9945,6 +10109,7 @@ async function buildCommanderExtraTools(
           forceTo: [resolvedId],
           dispatch: true,
           terminalHandoff: true,
+          orchestrationGoal: userGoal,
           dispatchSignal: ctx?.signal,
           ...(w.item?.taskId ? { parentTaskId: w.item.taskId } : {}),
           ...(currentTurnAttachments?.length ? { attachments: currentTurnAttachments.slice() } : {}),
@@ -10169,6 +10334,12 @@ async function buildCommanderExtraTools(
             processing: s.processing,
             in_flight_actor_count: s.inFlight.length,
             active_turn_count: s.activeTurns.length,
+            ...boundedRunHealth((function* () {
+              const state = _cids.get(cidKey(uid, cid));
+              if (state) for (const worker of state.executions.values()) {
+                if (worker.running) yield worker.readRunHealth;
+              }
+            })()),
           },
         };
       });
@@ -10185,7 +10356,7 @@ async function archiveInterruptedTurn(state: CidState, turnId: string): Promise<
   state.shutdownArchives ||= new Map();
   const previous = state.shutdownArchives.get(turnId);
   if (previous) return previous;
-  const tail = state.liveDisplays?.get(turnId)?.().find(row => !row.id);
+  const tail = state.liveDisplays?.get(turnId)?.read().find(row => !row.id);
   if (!tail) return null;
   const snapshot = structuredClone(tail);
   const process = snapshot.process || [];
@@ -10382,7 +10553,7 @@ export function cancelConversationTaskEdit(uid: string, cid: string, taskId: str
 export async function editConversationTask(
   uid: string, cid: string, taskId: string,
   instruction: string, expectedInstruction: string,
-  resources?: Pick<GroupMessage, 'attachments' | 'references' | 'use_selections'>,
+  resources?: Pick<GroupMessage, 'attachments' | 'references' | 'use_selections' | 'model_text'>,
 ): Promise<{ ok: boolean; error?: string; task?: taskBoard.ConversationTask }> {
   const state = _cids.get(cidKey(uid, cid));
   if (!state || state.terminating) return { ok: false, error: 'not_queued' };
@@ -10402,8 +10573,12 @@ export async function editConversationTask(
       to: [item.actor.id], text: instruction,
       ...(item.sharedSourceMessage ? { task_id: taskId } : {}),
     };
-    delete msg.model_text;
+    // Never retain stale hidden text after editing the visible requirement.
+    // The composer may rebuild the existing app-source context for this edit.
+    if (typeof resources?.model_text === 'string' && resources.model_text.trim()) msg.model_text = resources.model_text;
+    else delete msg.model_text;
     delete msg.display_text;
+    delete msg.orchestration_goal;
     delete msg.unknown_mentions;
     delete msg.mentions;
     msg.use_selections = _normalizeUseSelections(msg.use_selections);
@@ -10416,6 +10591,7 @@ export async function editConversationTask(
     item.sourceMessage = msg;
     item.sharedSourceMessage = false;
     item.llmPayload = payload;
+    delete item.orchestrationGoal;
     item.attachments = msg.attachments?.slice();
     item.references = msg.references?.slice();
     item.useSelections = _normalizeUseSelections(msg.use_selections);
@@ -10943,6 +11119,7 @@ async function _runCliAgentTurn(opts: {
   signal: AbortSignal;
   deadlineAt?: number;
   onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
+  onDiagnostics?: (read: RunHealthReader | null) => void;
   onProcess: (data: Record<string, unknown>) => void;
   onNativeMessage: (text: string, meta: { startedAtMs: number }) => Promise<void>;
   onAutoTaskSaved?: (taskId: string, title: string) => void;
@@ -11128,7 +11305,7 @@ async function _runCliAgentTurn(opts: {
   // Native shell commands (scripts, screenshots, exports) write files without
   // a Write/Edit tool event. An explicit declaration may adopt such a file
   // only when it was created during this run, never an existing workspace file.
-  const cliRunStartedAtMs = Date.now();
+  const cliCreationFence = await captureFileCreationFence(opts.workingDir, opts.signal);
   let declaredOutputs: string[] | undefined;
   const inlineGeneratedImages = new Set<string>();
   const inlineRemoteMedia = new Map<string, {
@@ -11165,6 +11342,7 @@ async function _runCliAgentTurn(opts: {
     signal: opts.signal,
     deadlineAt: opts.deadlineAt,
     onActiveRunIngress: opts.onActiveRunIngress,
+    onDiagnostics: opts.onDiagnostics,
     saveUserInput: async (text, inputId) => {
       await saveCliUserAnswer(opts.uid, opts.cid, opts.actor.id, text, inputId);
     },
@@ -11174,7 +11352,7 @@ async function _runCliAgentTurn(opts: {
     onTodoTaskDeleted: opts.onTodoTaskDeleted,
     onOutputsPublished: (paths) => {
       declaredOutputs = paths.filter((p) => (produced.has(p) && isExistingProducedFile(p))
-        || isFileCreatedSince(p, cliRunStartedAtMs));
+        || isFileCreatedAfterFence(p, cliCreationFence));
       for (const p of declaredOutputs) produced.add(p);
       return [...declaredOutputs];
     },
@@ -11788,6 +11966,7 @@ async function _buildCliContextPlan(
   const cliWorkflow = [
     String(agent.workflow || '').trim(),
     runtimeGuidance === '(none)' ? '' : runtimeGuidance,
+    appTaskExecutionGuidance(cid),
   ].filter(Boolean).join('\n\n');
   const durableInstructions = buildCliDurableInstructions({
     agentName: agent.name || agent.agent_id,

@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BrowserWindow as ElectronBrowserWindow } from 'electron';
 import { isPathAllowed } from '../util/path-sandbox';
 import { hardenedWebPreferences, safeExternalHttpUrl } from '../util/window-security';
@@ -353,7 +354,7 @@ function clampRect(rect: ProductCaptureRect, pageHeight: number): ProductCapture
 /** Load the page, following a redirect the page itself starts while loading
  * (language or region routing). Chromium rejects the first load with
  * ERR_ABORTED in that case; the capture continues on the page it chose. */
-async function loadPage(win: ElectronBrowserWindow, url: string): Promise<void> {
+async function loadPage(win: ElectronBrowserWindow, url: string, allowed: (url: string) => boolean): Promise<void> {
   const wc = win.webContents;
   try {
     await win.loadURL(url);
@@ -362,7 +363,7 @@ async function loadPage(win: ElectronBrowserWindow, url: string): Promise<void> 
     if ((err as { code?: string }).code !== 'ERR_ABORTED' || wc.isDestroyed()) throw err;
   }
   if (wc.isLoading()) await new Promise<void>((resolve) => wc.once('did-stop-loading', () => resolve()));
-  if (!safeExternalHttpUrl(wc.getURL())) throw new Error('the page navigated to a non-web address');
+  if (!allowed(wc.getURL())) throw new Error('the page navigated outside the capture scope');
 }
 
 /** `rect` is in page CSS pixels. A rect inside the current viewport is taken
@@ -454,7 +455,9 @@ async function writeOverviewSheet(
  * own words, and a model-visible overview. No user session, cookie, download,
  * permission or popup reaches the page. */
 export async function captureProductSource(input: {
-  url: string;
+  url?: string;
+  inputAbsPath?: string;
+  readRoots?: readonly string[];
   compositionDirAbs: string;
   writeRoots: readonly string[];
   clips?: ProductCaptureClip[];
@@ -463,8 +466,33 @@ export async function captureProductSource(input: {
 }): Promise<VideoStudioResult> {
   const op = 'product.capture' as const;
   const fail = (errorCode: string, message: string): VideoStudioResult => ({ ok: false, op, errorCode, message });
-  const url = normalizeProductCaptureUrl(input.url);
-  if (!url) return fail('E_PRODUCT_CAPTURE_URL', 'url must be a credential-free http(s) address.');
+  let url = normalizeProductCaptureUrl(input.url);
+  let entryRoot: string | undefined;
+  if (input.inputAbsPath) {
+    if (input.url?.trim()) return fail('E_PRODUCT_CAPTURE_INPUT', 'Choose either url or input_path, not both.');
+    if (!isPathAllowed(input.inputAbsPath, input.readRoots || [])) {
+      return fail('E_PATH_OUT_OF_SCOPE', 'The HTML entry must be inside the readable workspace or current attachments.');
+    }
+    if (!/\.html?$/i.test(input.inputAbsPath)) {
+      return fail('E_PRODUCT_CAPTURE_INPUT', 'input_path must be an HTML page (.html or .htm). Import images, videos or audio with video.import paths.');
+    }
+    try {
+      const entry = await fs.realpath(input.inputAbsPath);
+      if (!isPathAllowed(entry, input.readRoots || [])) return fail('E_PATH_OUT_OF_SCOPE', 'The HTML entry is outside the readable scope.');
+      const stat = await fs.stat(entry);
+      if (!stat.isFile() || stat.size > 8 * 1024 * 1024) return fail('E_PRODUCT_CAPTURE_INPUT', 'Choose a regular HTML file no larger than 8 MiB.');
+      entryRoot = path.dirname(entry);
+      url = pathToFileURL(entry).href;
+    } catch {
+      return fail('E_PRODUCT_CAPTURE_INPUT', 'The HTML entry could not be read. Choose an existing readable HTML file.');
+    }
+  }
+  if (!url) return fail('E_PRODUCT_CAPTURE_URL', 'url must be a credential-free http(s) address, or use input_path for a local HTML page.');
+  const localFileAllowed = (raw: string): boolean => {
+    if (!entryRoot || !raw.startsWith('file:')) return false;
+    try { return isPathAllowed(fileURLToPath(raw), [entryRoot]); } catch { return false; }
+  };
+  const navigationAllowed = (raw: string) => !!safeExternalHttpUrl(raw) || localFileAllowed(raw);
   const productRoot = path.join(input.compositionDirAbs, 'assets', 'product');
   if (!isPathAllowed(productRoot, input.writeRoots)) {
     return fail('E_PATH_OUT_OF_SCOPE', 'Product captures must be written inside the writable workspace.');
@@ -483,6 +511,12 @@ export async function captureProductSource(input: {
   ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
   ses.setPermissionCheckHandler(() => false);
   ses.on('will-download', (event) => event.preventDefault());
+  // Same canonical-path isolation as html_preview: only a local entry's
+  // directory supplies file assets. URL-only captures have no file access.
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    const raw = String(details.url || '');
+    callback({ cancel: !(navigationAllowed(raw) || /^(?:wss?|data|blob|about):/i.test(raw)) });
+  });
   const win = new BrowserWindow({
     show: false,
     width: PRODUCT_CAPTURE_VIEWPORT.width,
@@ -492,7 +526,8 @@ export async function captureProductSource(input: {
     webPreferences: hardenedWebPreferences({ session: ses, offscreen: true }),
   });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  win.webContents.on('will-navigate', (event, target) => { if (!safeExternalHttpUrl(target)) event.preventDefault(); });
+  win.webContents.on('will-navigate', (event, target) => { if (!navigationAllowed(target)) event.preventDefault(); });
+  win.webContents.on('will-redirect', (event, target) => { if (!navigationAllowed(target)) event.preventDefault(); });
   win.webContents.setAudioMuted(true);
   const abort = () => { try { win.destroy(); } catch { /* best effort */ } };
   input.signal?.addEventListener('abort', abort, { once: true });
@@ -500,7 +535,7 @@ export async function captureProductSource(input: {
   try {
     return await withTimeout((async () => {
       win.setContentSize(PRODUCT_CAPTURE_VIEWPORT.width, PRODUCT_CAPTURE_VIEWPORT.height);
-      await withTimeout(loadPage(win, url), LOAD_TIMEOUT_MS, 'E_PRODUCT_CAPTURE_LOAD_TIMEOUT', 'The page did not finish loading in time.')
+      await withTimeout(loadPage(win, url, navigationAllowed), LOAD_TIMEOUT_MS, 'E_PRODUCT_CAPTURE_LOAD_TIMEOUT', 'The page did not finish loading in time.')
         .catch((err: unknown) => {
           if (err instanceof CaptureError) throw err;
           throw new CaptureError('E_PRODUCT_CAPTURE_LOAD', 'The page could not be loaded.');
@@ -571,7 +606,7 @@ export async function captureProductSource(input: {
         });
       }
 
-      const finalUrl = safeExternalHttpUrl(wc.getURL()) || url;
+      const finalUrl = navigationAllowed(wc.getURL()) ? wc.getURL() : url;
       const capturedAt = new Date().toISOString();
       const textPath = path.join(dirAbs, 'page-text.md');
       const headingLines = (facts.headings || []).map(h => `${'#'.repeat(Math.min(3, Math.max(1, h.level)))} ${h.text}`);

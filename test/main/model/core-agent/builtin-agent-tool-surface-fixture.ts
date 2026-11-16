@@ -45,18 +45,19 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
   {
     agentId: '173d4235a431',
     name: 'ContentWriter',
-    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web'],
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command', 'web', 'connectors'],
     groupRequirements: [
       { group: 'workspace.read', outcome: 'inspect supplied source packs', witnessTools: ['list_files'] },
       { group: 'workspace.write.output', outcome: 'persist evidence and requested editorial files', witnessTools: ['write_file'] },
       { group: 'workspace.execute.command', outcome: 'run deterministic content gates', witnessTools: ['bash', 'process_session'] },
       { group: 'web', outcome: 'research current or externally sourced claims', witnessTools: ['web_search', 'web_fetch'] },
+      { group: 'connectors', outcome: 'prepare explicitly requested platform drafts through available connectors', witnessTools: ['list_connector_tools', 'call_connector_tool'] },
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
     ],
-    requiredTools: ['read_files', 'list_files', 'write_file', 'bash', 'process_session', 'web_search', 'web_fetch'],
+    requiredTools: ['read_files', 'list_files', 'write_file', 'bash', 'process_session', 'web_search', 'web_fetch', 'list_connector_tools', 'call_connector_tool'],
     forbiddenTools: [
       'edit_file', 'delete_file', 'workspace_diff', 'interactive_cli',
       'library', 'create_pptx', 'create_artifact', 'generate_image',
@@ -89,15 +90,15 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
     groupRequirements: [
       { group: 'workspace.read', outcome: 'inspect supplied media and durable manifests', witnessTools: ['list_files'] },
       { group: 'workspace.write', outcome: 'create manifests and repair existing candidates', witnessTools: ['write_file', 'edit_file'] },
-      { group: 'workspace.execute.command', outcome: 'run deterministic media scripts and checks', witnessTools: ['bash'] },
-      { group: 'media', outcome: 'generate stills and narration, and run VideoStudio', witnessTools: ['generate_image', 'generate_speech', 'video_studio'] },
+      { group: 'workspace.execute.command', outcome: 'run deterministic media scripts and checks', witnessTools: ['bash', 'process_session'] },
+      { group: 'media', outcome: 'generate stills, video, narration, and run VideoStudio', witnessTools: ['generate_image', 'generate_video', 'generate_speech', 'video_studio'] },
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
     ],
     requiredTools: [
-      'list_files', 'write_file', 'edit_file', 'bash',
-      'generate_image', 'generate_speech', 'video_studio',
+      'list_files', 'write_file', 'edit_file', 'bash', 'process_session',
+      'generate_image', 'generate_video', 'generate_speech', 'video_studio',
     ],
     forbiddenTools: ['interactive_cli', 'create_pptx', 'create_artifact', 'image_studio'],
   },
@@ -129,12 +130,12 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
     ],
     overbroadReplacements: [
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
-      { narrowGroup: 'media.image', broadGroup: 'media', newlyExposedTool: 'generate_speech' },
+      { narrowGroup: 'media.image', broadGroup: 'media', newlyExposedTool: 'generate_video' },
     ],
     requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'generate_image', 'image_studio'],
     forbiddenTools: [
       'list_files', 'interactive_cli',
-      'generate_speech', 'create_pptx', 'create_artifact', 'video_studio',
+      'generate_video', 'generate_speech', 'create_pptx', 'create_artifact', 'video_studio',
     ],
   },
   {
@@ -285,6 +286,15 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
     requiredTools: ['read_files', 'write_file', 'list_connector_tools', 'call_connector_tool'],
     forbiddenTools: ['edit_file', 'bash', 'process_session', 'web_search', 'generate_image'],
   },
+] as const;
+
+/**
+ * Reviewed fixed capability decisions for the Resource marketplace Agents.
+ * These packages are installed into the same platform marketplace root as the
+ * built-ins, so they must obey the same runtime boundary without relying on a
+ * Skill being installed to supply native tools.
+ */
+export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceCase[] = [
   {
     agentId: 'fa3e1f2f9e07',
     name: 'ECommerceWriter',
@@ -302,15 +312,6 @@ export const BUILTIN_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceC
     requiredTools: ['read_files', 'write_file', 'bash', 'process_session', 'web_search'],
     forbiddenTools: ['edit_file', 'create_xlsx', 'generate_image', 'list_connector_tools'],
   },
-] as const;
-
-/**
- * Reviewed fixed capability decisions for the Resource marketplace Agents.
- * These packages are installed into the same platform marketplace root as the
- * built-ins, so they must obey the same runtime boundary without relying on a
- * Skill being installed to supply native tools.
- */
-export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurfaceCase[] = [
   {
     agentId: '14ba06897645',
     name: 'StudyTutor',
@@ -393,16 +394,18 @@ export const RESOURCE_AGENT_TOOL_SURFACE_CASES: readonly BuiltinAgentToolSurface
   {
     agentId: '54fc8129a8c4',
     name: 'LearningTutor',
-    configuredGroups: ['workspace.read', 'workspace.execute.command'],
+    configuredGroups: ['workspace.read', 'workspace.write.output', 'workspace.execute.command'],
     groupRequirements: [
       { group: 'workspace.read', outcome: 'inspect learner-provided readings and problem files', witnessTools: ['list_files'] },
+      { group: 'workspace.write.output', outcome: 'preserve requested study-plan and knowledge-map outputs', witnessTools: ['write_file'] },
       { group: 'workspace.execute.command', outcome: 'run transparent calculation checks when needed', witnessTools: ['bash', 'process_session'] },
     ],
     overbroadReplacements: [
+      { narrowGroup: 'workspace.write.output', broadGroup: 'workspace.write', newlyExposedTool: 'edit_file' },
       { narrowGroup: 'workspace.execute.command', broadGroup: 'workspace.execute', newlyExposedTool: 'interactive_cli' },
     ],
-    requiredTools: ['read_files', 'bash', 'process_session'],
-    forbiddenTools: ['write_file', 'web_search', 'create_docx', 'generate_image', 'list_connector_tools'],
+    requiredTools: ['read_files', 'write_file', 'bash', 'process_session'],
+    forbiddenTools: ['edit_file', 'web_search', 'create_docx', 'generate_image', 'list_connector_tools'],
   },
   {
     agentId: '5dd962efb425',

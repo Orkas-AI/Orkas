@@ -890,8 +890,6 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
 
 describe('skills › listSkills', () => {
   it.each([
-    ['custom', 'definition', 'EACCES'], ['marketplace', 'definition', 'EACCES'],
-    ['custom', 'definition', 'EIO'], ['marketplace', 'definition', 'EIO'],
     ['custom', 'stamp', 'EPERM'], ['marketplace', 'stamp', 'EIO'],
     ['custom', 'enumerate', 'EACCES'], ['marketplace', 'enumerate', 'EBUSY'],
   ] as const)('does not publish or cache unknown private ownership after %s/%s %s and recovers', async (source, stage, code) => {
@@ -907,24 +905,25 @@ describe('skills › listSkills', () => {
     const paths = await import('../../../src/main/paths');
     const cache = paths.userSkillCatalogCacheFile(TEST_UID);
     const nativeFs = createRequire(import.meta.url)('node:fs');
-    const method = stage === 'definition' ? 'readFileSync' : stage === 'stamp' ? 'statSync' : 'readdirSync';
+    const method = stage === 'stamp' ? 'statSync' : 'readdirSync';
     const original = nativeFs[method].bind(nativeFs);
     const fault = Object.assign(new Error('private-error-canary'), { code, path: file });
     const spy = vi.spyOn(nativeFs, method).mockImplementation((...args: any[]) => {
-      if (args[0] === (stage === 'definition' ? file : root)) throw fault;
+      if (args[0] === root) throw fault;
       return original(...args);
     });
     syncBuiltinESMExports();
     const warn = vi.spyOn(console, 'warn');
     expectTestLog({ level: 'warn', message: /skill catalog read failed/ });
     try {
+      // An unreadable root hides a whole source, so the catalog is unknown.
       await expect(s.listSkills()).rejects.toThrow('Skill catalog unavailable');
       await expect(s.listAgentPrivateSkills()).rejects.toThrow('Skill catalog unavailable');
       expect(fs.existsSync(cache)).toBe(false);
       const receipts = warn.mock.calls.filter((call) => call[1] === 'skill catalog read failed');
       expect(receipts).toHaveLength(1);
       // Enumeration is first encountered while checking catalog freshness.
-      expect(receipts[0][2]).toEqual({ source, stage: stage === 'enumerate' ? 'stamp' : stage, error_code: code });
+      expect(receipts[0][2]).toEqual({ source, stage: 'stamp', error_code: code });
       expect(JSON.stringify(receipts)).not.toMatch(/canary|Private|SKILL\.md/);
     } finally {
       warn.mockRestore();
@@ -941,6 +940,128 @@ describe('skills › listSkills', () => {
     (await import('../../../src/main/features/users')).activateUser(TEST_UID);
     expect((await (await loadSkills()).listSkills()).map((row) => row.id)).toEqual(['a-healthy']);
     expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
+  it.each([
+    ['custom', 'read', 'EACCES'], ['marketplace', 'read', 'EIO'],
+    ['custom', 'stat', 'EPERM'], ['marketplace', 'stat', 'EACCES'],
+  ] as const)('skips one unreadable %s Skill (%s %s) and keeps every other Skill available', async (source, op, code) => {
+    const root = source === 'custom' ? customSkillsDir() : builtinSkillsDir();
+    const file = path.join(root, 'z-private-canary', 'SKILL.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const bytes = Buffer.from('---\nname: Private canary\ndescription: Private description\nownerAgent: owner-canary\n---\nPrivate body\n');
+    fs.writeFileSync(file, bytes);
+    writeCustomSkill('a-healthy');
+    writeMarketplaceSkill('aabbccddeeff', 'Healthy platform');
+    const healthyFile = path.join(customSkillsDir(), 'a-healthy', 'SKILL.md');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'z-private-canary', false);
+    const s = await loadSkills();
+    const paths = await import('../../../src/main/paths');
+    const cache = paths.userSkillCatalogCacheFile(TEST_UID);
+    const nativeFs = createRequire(import.meta.url)('node:fs');
+    const fault = Object.assign(new Error('private-error-canary'), { code, path: file });
+    const read = nativeFs.readFileSync.bind(nativeFs);
+    const stat = nativeFs.statSync.bind(nativeFs);
+    const readSpy = vi.spyOn(nativeFs, 'readFileSync').mockImplementation((...args: any[]) => {
+      if (op === 'read' && args[0] === file) throw fault;
+      return read(...args);
+    });
+    const statSpy = vi.spyOn(nativeFs, 'statSync').mockImplementation((...args: any[]) => {
+      if (op === 'stat' && args[0] === file) throw fault;
+      return stat(...args);
+    });
+    syncBuiltinESMExports();
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const warn = vi.spyOn(console, 'warn');
+    expectTestLog({ level: 'warn', message: /skill catalog read failed/ });
+    const receipts = () => warn.mock.calls.filter((call) => call[1] === 'skill catalog read failed');
+    // Every full scan reads each healthy SKILL.md once.
+    const scans = () => readSpy.mock.calls.filter(([target]) => target === healthyFile).length;
+    const ids = (rows: Array<{ id: string }>) => rows.map((row) => row.id).sort();
+    try {
+      for (let i = 0; i < 5; i++) expect(ids(await s.listSkills())).toEqual(['a-healthy', 'aabbccddeeff']);
+      // The unreadable agent-private Skill is hidden, never published as public.
+      expect(await s.listAgentPrivateSkills()).toEqual([]);
+      // The partial scan is reused within its retry window instead of rescanning per call.
+      expect(scans()).toBe(1);
+      expect(fs.existsSync(cache)).toBe(false);
+      expect(receipts()).toHaveLength(1);
+      expect(receipts()[0][2]).toEqual({ source, stage: 'definition', error_code: code });
+      now += 2_001;
+      expect(ids(await s.listSkills())).toEqual(['a-healthy', 'aabbccddeeff']);
+      expect(scans()).toBe(2);
+      expect(receipts()).toHaveLength(1);
+      expect(fs.existsSync(cache)).toBe(false);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/canary|Private|SKILL\.md/);
+    } finally {
+      clock.mockRestore();
+      warn.mockRestore();
+      readSpy.mockRestore();
+      statSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    // The mocked clock ran ahead; returning to real time is a backwards jump
+    // that must expire the partial scan rather than extend it.
+    expect(ids(await s.listSkills())).toEqual(['a-healthy', 'aabbccddeeff']);
+    expect(await s.listAgentPrivateSkills()).toMatchObject([{
+      id: 'z-private-canary', source, ownerAgent: 'owner-canary', enabled: false,
+    }]);
+    expect(fs.existsSync(cache)).toBe(true);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
+  it('keeps an unreadable platform Skill id reserved instead of surfacing a same-id custom copy', async () => {
+    writeMarketplaceSkill('shadowed', 'Platform copy');
+    writeCustomSkill('shadowed', 'name: "Custom copy"\ndescription: "x"');
+    writeCustomSkill('other');
+    const file = path.join(builtinSkillsDir(), 'shadowed', 'SKILL.md');
+    const s = await loadSkills();
+    const nativeFs = createRequire(import.meta.url)('node:fs');
+    const read = nativeFs.readFileSync.bind(nativeFs);
+    const spy = vi.spyOn(nativeFs, 'readFileSync').mockImplementation((...args: any[]) => {
+      if (args[0] === file) throw Object.assign(new Error('denied'), { code: 'EIO' });
+      return read(...args);
+    });
+    syncBuiltinESMExports();
+    expectTestLog({ level: 'warn', message: /skill catalog read failed/ });
+    expectTestLog({ level: 'warn', message: /id conflict/ });
+    try {
+      expect((await s.listSkills()).map((row) => row.id)).toEqual(['other']);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+
+  it('defers the legacy enabled-state repair while a Skill is unreadable', async () => {
+    writeMarketplaceSkill('74e05fe08cc5', 'agent-browser');
+    writeCustomSkill('agent-browser');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'agent-browser', false);
+    const file = path.join(customSkillsDir(), 'agent-browser', 'SKILL.md');
+    const s = await loadSkills();
+    const nativeFs = createRequire(import.meta.url)('node:fs');
+    const read = nativeFs.readFileSync.bind(nativeFs);
+    const spy = vi.spyOn(nativeFs, 'readFileSync').mockImplementation((...args: any[]) => {
+      if (args[0] === file) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return read(...args);
+    });
+    syncBuiltinESMExports();
+    expectTestLog({ level: 'warn', message: /skill catalog read failed/ });
+    try {
+      // The unreadable custom Skill still owns the legacy key; an incomplete
+      // list must not move it onto the same-name platform Skill.
+      expect((await s.listSkills()).map((row) => [row.id, row.enabled])).toEqual([['74e05fe08cc5', true]]);
+      await expect(s.repairLegacySkillEnabledIdsForActiveUser()).rejects.toThrow('Skill catalog incomplete');
+      expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({ 'agent-browser': false });
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2_001);
+    try {
+      const rows = await s.listSkills();
+      expect(rows.find((row) => row.id === 'agent-browser')?.enabled).toBe(false);
+      expect(rows.find((row) => row.id === '74e05fe08cc5')?.enabled).toBe(true);
+      expect(await s.repairLegacySkillEnabledIdsForActiveUser()).toBe(0);
+    } finally { clock.mockRestore(); }
+    expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({ 'agent-browser': false });
   });
 
   it.each(['custom', 'marketplace'])('rebuilds legacy fallback projections before publishing %s private entries', async (source) => {

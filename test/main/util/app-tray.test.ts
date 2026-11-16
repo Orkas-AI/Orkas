@@ -46,29 +46,51 @@ describe('optional desktop tray', () => {
   });
 
   const quit = vi.fn();
-  let labels = { open: '打开', quit: '退出' };
+  let labels = { open: '打开 Orkas', quit: '退出 Orkas' };
   const create = (platform: NodeJS.Platform = 'win32', onActivate = vi.fn(), warn = vi.fn()) =>
     createOptionalTray({ platform, iconPath: '/app/icon.ico', displayName: 'Orkas', onActivate, onQuit: quit, labels: () => labels, warn });
 
   it.each(['darwin', 'win32'] as const)('offers exactly Open and Quit for left and right clicks on %s; opening never quits', platform => {
-    labels = { open: '打开', quit: '退出' };
+    labels = { open: '打开 Orkas', quit: '退出 Orkas' };
     const onActivate = vi.fn(); expect(create(platform, onActivate)).not.toBeNull();
     for (const event of ['click', 'right-click']) {
       trayMock.events[event]();
       const menu = trayMock.popUpContextMenu.mock.calls.at(-1)![0];
-      expect(menu.items.map(item => item.label)).toEqual(['打开', '退出']);
+      expect(menu.items.map(item => item.label.trimEnd())).toEqual(['打开 Orkas', '退出 Orkas']);
+      expect(menu.items.every(item => item.icon && !item.icon.isEmpty())).toBe(true);
       expect(onActivate).not.toHaveBeenCalled(); expect(quit).not.toHaveBeenCalled();
       menu.items[0].click(); expect(onActivate).toHaveBeenCalledOnce(); onActivate.mockClear();
     }
-    labels = { open: 'Open', quit: 'Quit' }; trayMock.events.click();
+    labels = { open: 'Open Orkas', quit: 'Quit Orkas' }; trayMock.events.click();
     const menu = trayMock.popUpContextMenu.mock.calls.at(-1)![0];
-    expect(menu.items.map(item => item.label)).toEqual(['Open', 'Quit']);
+    expect(menu.items.map(item => item.label.trimEnd())).toEqual(['Open Orkas', 'Quit Orkas']);
     menu.items[1].click(); expect(quit).toHaveBeenCalledOnce(); expect(onActivate).not.toHaveBeenCalled();
   });
 
   it('uses a template image only for the macOS menu bar', () => {
     expect(create('darwin')).not.toBeNull();
     expect(trayMock.setTemplateImage).toHaveBeenCalledWith(true);
+  });
+
+  it.each(['empty', 'throws'])('keeps Open and Quit usable when a menu icon %s', failure => {
+    const warn = vi.fn(), activate = vi.fn();
+    const image = { isEmpty: () => false, setTemplateImage: vi.fn() };
+    trayMock.createFromPath.mockReturnValue(image)
+      .mockReturnValueOnce(image)
+      .mockImplementationOnce(() => {
+        if (failure === 'throws') throw new Error('controlled icon failure');
+        return { isEmpty: () => true };
+      });
+    expect(create('win32', activate, warn)).not.toBeNull();
+    trayMock.events.click();
+    const menu = trayMock.popUpContextMenu.mock.calls.at(-1)![0];
+    expect(menu.items).toHaveLength(2);
+    expect(menu.items[0].icon).toBeUndefined();
+    expect(menu.items[1].icon).toBeDefined();
+    expect(activate).not.toHaveBeenCalled(); expect(quit).not.toHaveBeenCalled();
+    menu.items[0].click(); menu.items[1].click();
+    expect(activate).toHaveBeenCalledOnce(); expect(quit).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledExactlyOnceWith('tray menu icon unavailable');
   });
 
   it('leaves unsupported platforms alone', () => {

@@ -9,6 +9,19 @@ function risk(id: string, name: string, extra: Partial<ToolSchema> = {}, custom 
 
 describe('connector operation classification', () => {
   it.each([
+    ['gmail', 'GMAIL_GET_ATTACHMENT', 'R'],
+    ['m365-mail', 'OUTLOOK_DOWNLOAD_OUTLOOK_ATTACHMENT', 'R'],
+    ['m365-mail', 'OUTLOOK_ADD_MAIL_ATTACHMENT', 'W'],
+    ['gdrive', 'GOOGLEDRIVE_UPLOAD_FILE', 'W'],
+    ['gsheets', 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1', 'W'],
+    ['gsheets', 'GOOGLESHEETS_INSERT_DIMENSION', 'W'],
+  ])('supports the approved core operation without trusting custom look-alikes: %s / %s', (id, name, expected) => {
+    expect(risk(id, name).risk).toBe(expected);
+    expect(risk('custom-' + id, name, { annotations: { readOnlyHint: true } }, true).risk).toBe('H');
+    expect(risk(id, name + '_ADMIN').risk).toBe('H');
+  });
+
+  it.each([
     ['gmail', 'GMAIL_FETCH_EMAILS', 'R'], ['gmail', 'GMAIL_CREATE_EMAIL_DRAFT', 'W'],
     ['gmail', 'GMAIL_SEND_EMAIL', 'H'], ['gmail', 'GMAIL_FORWARD_MESSAGE', 'H'],
     ['gdrive', 'GOOGLEDRIVE_DOWNLOAD_FILE', 'R'], ['gdrive', 'GOOGLEDRIVE_TRASH_FILE', 'D'],

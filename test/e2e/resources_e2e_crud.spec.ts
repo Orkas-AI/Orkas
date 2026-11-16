@@ -1,4 +1,5 @@
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
+import { reopenCompletedConversation } from './fixtures/conversation-completion';
 import commanderProfile from '../../src/main/data/commander.json';
 
 type AgentSummary = { agent_id: string; name: string; enabled?: boolean };
@@ -158,6 +159,9 @@ test.describe('agents and skills', () => {
     expect(dependencyDirectory).toContain('workspace.read');
     expect(dependencyDirectory).not.toContain('add_custom_connector');
     expect(fieldContract).toContain("This is the Agent's default capability boundary");
+    await reopenCompletedConversation(page);
+    await expect(page.locator('.chat-msg-created-agent-chip', { hasText: 'CommanderWebResearcher' })).toHaveCount(1);
+    expect(modelOrkas.modelRequests).toHaveLength(3);
   });
 
   test('completes one staged Agent through its edit conversation with a fixed tool list', async ({ modelOrkas }) => {

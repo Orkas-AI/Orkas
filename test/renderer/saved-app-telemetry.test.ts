@@ -455,3 +455,12 @@ describe('Save-as-App failure alerts', () => {
     expect(JSON.stringify(warnings)).not.toContain('/Users/');
   });
 });
+
+
+it('retains structured artifact-save failure codes without copying private error prose', () => {
+  const classify = vm.runInNewContext(extractFunction(artifactSource, '_artifactSaveFailure') + '\n_artifactSaveFailure;', {});
+  for (const code of ['app_type_mismatch', 'app_edit_conflict', 'app_edit_target_missing', 'app_edit_data_migration']) {
+    expect(classify({code, error:'/Users/test/private/secret'})).toEqual({error_type:'operation',error_code:code});
+  }
+  expect(classify({code:'unexpected-private-code',error:'Unknown private detail'}).error_code).toBe('artifact_save_failed');
+});

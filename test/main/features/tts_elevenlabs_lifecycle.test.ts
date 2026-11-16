@@ -20,7 +20,8 @@ beforeEach(() => {
   delete process.env.ORKAS_TTS_BASE_URL;
   const preset = listTtsProviderPresets().find(p => p.id === 'elevenlabs')!;
   fixture.profiles = [{ id: 'saved-elevenlabs', provider: preset.id, baseUrl: preset.baseUrl,
-    model: preset.defaultModel, apiKey: 'fixture-key', voice: 'JBFqnCBsd6RMkjVDRZzb', label: 'ElevenLabs', createdAt: 1 }];
+    // A saved legacy profile keeps its model when the new-config preset advances.
+    model: 'eleven_multilingual_v2', apiKey: 'fixture-key', voice: 'JBFqnCBsd6RMkjVDRZzb', label: 'ElevenLabs', createdAt: 1 }];
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -105,4 +106,33 @@ it('keeps an explicit custom gateway on the OpenAI-compatible protocol', async (
   const fetch = vi.fn(async () => new Response(Buffer.from('audio'))); vi.stubGlobal('fetch', fetch);
   expect(await request()).toMatchObject({ ok: true, backend: 'openai-compatible' });
   expect(fetch.mock.calls[0][0]).toBe('https://api.elevenlabs.io/v1/audio/speech');
+});
+
+it('uses Eleven v4 native speech with neutral speed omitted from unsupported voice settings', async () => {
+  fixture.profiles[0].model = 'eleven_v4';
+  const fetch = vi.fn(async () => new Response(Buffer.from('audio'))); vi.stubGlobal('fetch', fetch);
+  expect(await request('mp3', 1)).toMatchObject({ ok: true, backend: 'elevenlabs' });
+  const [url, init] = fetch.mock.calls[0] as any;
+  expect(url).toContain('/text-to-speech/');
+  expect(JSON.parse(init.body)).toEqual({ text: 'A clear release update.', model_id: 'eleven_v4' });
+  expect((await listTtsCapabilities())[0].supports.speed).toBe(false);
+});
+
+it('rejects unsupported Eleven v4 speed before synthesizing', async () => {
+  fixture.profiles[0].model = 'eleven_v4';
+  const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+  expect(await request('mp3', 1.1)).toMatchObject({ ok: false, chargeStatus: 'not_charged' });
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('uses the native OpenAI Speech API for the selected GPT-4o mini TTS model', async () => {
+  fixture.profiles[0] = { ...fixture.profiles[0], provider: 'openai', model: 'gpt-4o-mini-tts',
+    baseUrl: 'https://api.openai.com/v1', voice: 'alloy' };
+  const fetch = vi.fn(async () => new Response(Buffer.from('audio'))); vi.stubGlobal('fetch', fetch);
+  expect(await request('mp3', 1.1)).toMatchObject({ ok: true, backend: 'openai-compatible' });
+  const [url, init] = fetch.mock.calls[0] as any;
+  expect(url).toBe('https://api.openai.com/v1/audio/speech');
+  expect(init.headers).toMatchObject({ Authorization: 'Bearer fixture-key' });
+  expect(JSON.parse(init.body)).toEqual({ model: 'gpt-4o-mini-tts', input: 'A clear release update.',
+    voice: 'alloy', response_format: 'mp3', speed: 1.1 });
 });

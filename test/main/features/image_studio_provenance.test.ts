@@ -1,12 +1,10 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { createRequire } from 'node:module';
-import sharp from 'sharp';
+import { spawnSync } from 'node:child_process';
+import sharp from '../../helpers/fixture-sharp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { imageStudioFileHash, isImageStudioGeneration } from '../../../src/main/features/image_studio_provenance';
-const require = createRequire(import.meta.url);
-const imageAsset = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js');
 let root: string;
 let outputs: Array<{ output_path: string; output_sha256: string }>;
 beforeEach(async () => {
@@ -18,7 +16,22 @@ afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 const verify = (name: string) => isImageStudioGeneration({ projectDirAbs: root, rasterAbsPath: path.join(root, name), outputs });
 async function processAsset(request: Record<string, unknown>) {
   fs.writeFileSync(path.join(root, 'request.json'), JSON.stringify({ op: 'process', input_path: 'provider.png', ...request }));
-  return imageAsset({ args: ['--project', root, '--request', 'request.json'] });
+  // The Skill is a stock-Node program in production; never load its native
+  // image library into the Electron test host.
+  if (!process.env.ORKAS_TEST_NODE) throw new Error('Missing stock Node test runtime');
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const child = spawnSync(process.env.ORKAS_TEST_NODE, ['-e', `
+    const imageAsset = require(process.argv[1]);
+    Promise.resolve(imageAsset({ args: ['--project', process.argv[2], '--request', 'request.json'] }))
+      .then(result => process.stdout.write(JSON.stringify(result)))
+      .catch(error => { console.error(error); process.exitCode = 1; });
+  `, path.resolve(__dirname, '../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js'), root],
+  { cwd: path.resolve(__dirname, '../../..'), env, windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
+  expect(child.error).toBeUndefined();
+  expect(child.stderr.toString()).toBe('');
+  expect(child.status).toBe(0);
+  return JSON.parse(child.stdout.toString());
 }
 describe('generation artifact provenance', () => {
   it('binds exemption to recorded provider bytes rather than the output path alone', async () => {

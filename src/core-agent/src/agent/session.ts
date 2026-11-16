@@ -55,6 +55,8 @@ export const IMAGE_BLOCK_ESTIMATE_TOKENS = 1_600;
  * again. Two rounds let the model compare a change against the previous
  * capture without keeping every capture of the turn resident. */
 export const ACTIVE_TURN_IMAGE_RETENTION_ROUNDS = 2;
+/** Images an active-turn result may carry, and the active-turn sets keep in all. */
+export const ACTIVE_TURN_IMAGE_LIMIT = 6;
 export const ACTIVE_TURN_IMAGE_OMITTED_MARKER =
   `[image omitted after ${ACTIVE_TURN_IMAGE_RETENTION_ROUNDS} rounds; re-read the file if exact pixels are needed]`;
 
@@ -696,6 +698,10 @@ export class Session {
   private messages: Message[] = [];
   private readonly maxHistoryTurns: number;
   private turnState: TurnTrackingState | null = null;
+  /** Identity of recoverable state, independent of append-only transcript growth.
+   * Every owning mutation invalidates it; false invalidations only lose reuse. */
+  protected contextPersistenceToken: object = {};
+  private invalidateContextSnapshot(): void { this.contextPersistenceToken = {}; }
   private providerTurnContext: { turnId: number; key: object } | undefined;
   private toolSurfaceState: ToolSurfaceState | undefined;
   /** Bumped by every rewrite of model-visible content (folds, archives,
@@ -746,6 +752,7 @@ export class Session {
     if (isPositiveInteger(message.turnId) && message.turnId !== active.id) return;
     const text = this.executionPlanContextText(active.id);
     if (!text) return;
+    this.invalidateContextSnapshot();
     (active.steerPlanAnchors ??= []).push({ messageIndex: index, text });
   }
 
@@ -759,6 +766,7 @@ export class Session {
     if (state.activeTurn) {
       this.completeActiveTurn("Previous run ended before a normal final response.");
     }
+    this.invalidateContextSnapshot();
     const id = state.nextTurnId++;
     const index = this.messages.length;
     this.messages.push({ role: "user", content, turnId: id });
@@ -791,6 +799,7 @@ export class Session {
   }
 
   setToolSurfaceState(state: ToolSurfaceState | undefined): void {
+    this.invalidateContextSnapshot();
     this.toolSurfaceState = state
       ? { ...state, loadedGroups: [...state.loadedGroups] }
       : undefined;
@@ -826,6 +835,7 @@ export class Session {
     if (!state || !active) return;
     // Completion swaps the turn's raw tool process for the condensed pair in
     // the model view — a rewrite, not growth.
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
 
     const endIndex = Math.max(active.startIndex, this.messages.length - 1);
@@ -862,6 +872,7 @@ export class Session {
   addHistoryResource(resource: HistoryResource): void {
     if (!resource.path) return;
     const state = this.ensureTurnTracking();
+    this.invalidateContextSnapshot();
     this.historyResourceRevision++;
     const normalized = {
       ...resource,
@@ -883,6 +894,7 @@ export class Session {
     if (!active) return undefined;
     const normalized = normalizeCompletedWorkInput(input);
     if (!normalized) return undefined;
+    this.invalidateContextSnapshot();
     const duplicate = [...state.completedWork].reverse().find((entry) =>
       entry.turnId === active.id
       && entry.tool === normalized.tool
@@ -938,6 +950,7 @@ export class Session {
       tool: input.tool,
       observations: input.observations,
     });
+    if (entry) this.invalidateContextSnapshot();
     if (entry && !input.toolCallId) this.appendWorkspaceObservation(entry);
     return entry;
   }
@@ -954,7 +967,10 @@ export class Session {
     const entry = reconcileWorkspaceObservations(state.workspaceObservations, {
       turnId: active.id,
     });
-    if (entry) this.appendWorkspaceObservation(entry);
+    if (entry) {
+      this.invalidateContextSnapshot();
+      this.appendWorkspaceObservation(entry);
+    }
     return entry;
   }
 
@@ -1035,6 +1051,7 @@ export class Session {
     const source = this.latestUserTextInActiveTurn();
     if (!active || !source) throw new Error("execution plan anchor requires an active user turn");
     const captured = captureExecutionObjective(source.text);
+    this.invalidateContextSnapshot();
     state.executionPlan = {
       version: 1,
       objective: captured.text,
@@ -1150,6 +1167,7 @@ export class Session {
       nextStepId: reconciled.nextStepId,
       updatedAt: Date.now(),
     };
+    this.invalidateContextSnapshot();
     state.executionPlan = plan;
     appendExecutionPlanAudit(state.executionPlanAudit, plan, "update");
     return cloneExecutionPlan(plan)!;
@@ -1170,6 +1188,7 @@ export class Session {
         );
       }
     }
+    this.invalidateContextSnapshot();
     appendExecutionPlanAudit(state.executionPlanAudit, plan, "clear");
     state.executionPlan = undefined;
   }
@@ -1193,7 +1212,7 @@ export class Session {
       isError,
       ...(uniqueAddedToolNames.length ? { addedToolNames: uniqueAddedToolNames } : {}),
       ...(imageRetention === "active_turn" ? { imageRetention } : {}),
-      images: (imageRetention === "active_turn" ? (images ?? []).slice(0, 6) : images ?? []).map((img): ImageContent => ({
+      images: (imageRetention === "active_turn" ? (images ?? []).slice(0, ACTIVE_TURN_IMAGE_LIMIT) : images ?? []).map((img): ImageContent => ({
         type: "image", data: img.data, mediaType: img.mediaType as ImageContent["mediaType"],
         ...(img.analysisMode ? { analysisMode: img.analysisMode } : {}),
       })),
@@ -1230,6 +1249,7 @@ export class Session {
     if (!normalizedSource) {
       throw new Error("conversation history source is required");
     }
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
 
     const previous = this.turnState;
@@ -1405,7 +1425,7 @@ export class Session {
 
     const active = state.activeTurn;
     if (active) {
-      const reference = activeAuthoringImages(this.messages, active.userMessageIndex + 1);
+      const retained = activeAuthoringImages(this.messages, active.userMessageIndex + 1);
       const user = this.messages[active.userMessageIndex];
       if (user) {
         const cloned = cloneMessage(user);
@@ -1440,8 +1460,7 @@ export class Session {
               + (opts?.includeExecutionPlan !== false && active.continuationContext
                 ? `\n\n[Runtime state captured at checkpoint creation; includes retained recent results below]\n${active.continuationContext}` : ""),
             ),
-          }, ...(reference && reference.index <= (active.checkpointThroughMessageIndex ?? active.userMessageIndex)
-            ? reference.images : [])],
+          }, ...archivedAuthoringImages(retained, active.checkpointThroughMessageIndex ?? active.userMessageIndex)],
         });
       }
       const checkpointThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
@@ -1452,7 +1471,7 @@ export class Session {
         // must survive verbatim as a user directive.
         if (i <= checkpointThrough && !isInterruptSteerMessage(this.messages[i])) continue;
         const raw = this.messages[i];
-        const cloned = elideStaleActiveImages(cloneMessage(raw), roundsAfter[i], isPositiveInteger(raw.turnId), reference?.toolUseId);
+        const cloned = elideStaleActiveImages(cloneMessage(raw), roundsAfter[i], isPositiveInteger(raw.turnId), retained);
         const anchor = i > checkpointThrough && opts?.includeExecutionPlan !== false
           ? active.steerPlanAnchors?.find((entry) => entry.messageIndex === i)
           : undefined;
@@ -1485,6 +1504,7 @@ export class Session {
     const previous = active.historyBudget;
     if (previous && previous.usableInputTokens <= usableInputTokens) return false;
     const room = Math.max(0, requestCeilingTokens - fixedOverheadTokens - this.estimateResidentStateTokens());
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
     active.historyBudget = {
       usableInputTokens,
@@ -1635,6 +1655,7 @@ export class Session {
     this.providerTurnContext = undefined;
     this.toolSurfaceState = undefined;
     this.estimatorCalibrationRatio = 1;
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
     this.historyWindowMemo = undefined;
   }
@@ -1654,6 +1675,7 @@ export class Session {
     if (!state) return;
     const archived = new Set(turnIds);
     if (!archived.size) return;
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
     for (const turn of state.completedTurns) {
       if (archived.has(turn.id)) turn.archived = true;
@@ -1687,6 +1709,7 @@ export class Session {
   applyPersistentBlockShrink(newSummaryText: string): void {
     const state = this.turnState;
     if (!state || !newSummaryText.trim()) return;
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
     const split = splitHistorySummary(newSummaryText);
     state.historySummary = split.summary;
@@ -1773,14 +1796,13 @@ export class Session {
     // shrink.
     const checkpointThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
     let total = estimateTextTokens(active.checkpointSummary || "");
-    const reference = activeAuthoringImages(this.messages, active.userMessageIndex + 1);
-    if (reference && reference.index <= checkpointThrough) {
-      total += sumMessageTokens([{ role: "user", content: reference.images }]);
-    }
+    const retained = activeAuthoringImages(this.messages, active.userMessageIndex + 1);
+    const archived = archivedAuthoringImages(retained, checkpointThrough);
+    if (archived.length) total += sumMessageTokens([{ role: "user", content: archived }]);
     const roundsAfter = assistantRoundsAfter(this.messages, checkpointThrough + 1);
     for (let i = checkpointThrough + 1; i < this.messages.length; i++) {
       const raw = this.messages[i];
-      total += sumMessageTokens([elideStaleActiveImages(raw, roundsAfter[i], isPositiveInteger(raw.turnId), reference?.toolUseId)]);
+      total += sumMessageTokens([elideStaleActiveImages(raw, roundsAfter[i], isPositiveInteger(raw.turnId), retained)]);
     }
     return total;
   }
@@ -1839,6 +1861,7 @@ export class Session {
   applyEmergencyHistoryFold(_notice: string, turnIds: readonly number[]): void {
     const ids = new Set(turnIds);
     if (!this.turnState || !ids.size) return;
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
     this.turnState.summaryThroughTurnId = Math.max(this.turnState.summaryThroughTurnId ?? 0, ...turnIds);
     this.turnState.completedTurns = this.turnState.completedTurns.filter((turn) => !ids.has(turn.id));
@@ -1989,6 +2012,7 @@ export class Session {
   ): string {
     const active = this.turnState?.activeTurn;
     if (!active) return summary;
+    this.invalidateContextSnapshot();
     this.contentRewriteEpoch++;
     const prevThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
     const merged = mergeCheckpointExactFacts(active.checkpointSummary, summary);
@@ -2067,14 +2091,14 @@ export class Session {
   private pruneArchivedActiveProcess(fromThroughExclusive: number, throughInclusive: number): void {
     const start = Math.max(0, fromThroughExclusive + 1);
     const end = Math.min(this.messages.length - 1, throughInclusive);
-    const reference = activeAuthoringImages(this.messages, (this.turnState?.activeTurn?.userMessageIndex ?? -1) + 1);
+    const retained = activeAuthoringImages(this.messages, (this.turnState?.activeTurn?.userMessageIndex ?? -1) + 1);
     for (let i = start; i <= end; i++) {
       const msg = this.messages[i];
       let changed = false;
       const content = msg.content.map((c) => {
         if (c.type === "tool_result" && c.images?.length) {
           changed = true;
-          return { ...c, images: c.toolUseId === reference?.toolUseId ? reference.images : [],
+          return { ...c, images: retained.get(c.toolUseId)?.images ?? [],
             content: c.content.length > ARCHIVED_TOOL_RESULT_PRUNE_MIN_CHARS ? ARCHIVED_TOOL_RESULT_MARKER : c.content };
         }
         if (
@@ -2113,7 +2137,7 @@ export class Session {
       summaryVersion: state.summaryVersion || undefined,
       summaryThroughTurnId: state.summaryThroughTurnId,
       completedTurns: state.completedTurns.map((t) => ({ ...t })),
-      activeTurn: state.activeTurn ? { ...state.activeTurn } : undefined,
+      activeTurn: state.activeTurn ? cloneActiveTurn(state.activeTurn) : undefined,
       resources: state.resources.map((r) => ({ ...r })),
       executionPlan: cloneExecutionPlan(state.executionPlan),
       completedWork: state.completedWork.map(cloneCompletedWorkEntry),
@@ -2125,6 +2149,7 @@ export class Session {
   }
 
   restoreContextState(raw: SerializedSessionContextState | null | undefined): boolean {
+    this.invalidateContextSnapshot();
     this.providerTurnContext = undefined;
     if (!raw || raw.version !== 1) {
       this.turnState = null;
@@ -2174,7 +2199,7 @@ export class Session {
             .map((t) => ({ ...t }))
         : [],
       activeTurn: raw.activeTurn && Number.isFinite(raw.activeTurn.id)
-        ? { ...raw.activeTurn }
+        ? cloneActiveTurn(raw.activeTurn)
         : undefined,
       resources: Array.isArray(raw.resources)
         ? raw.resources.filter((r) => typeof r.path === "string" && r.path).map((r) => ({ ...r }))
@@ -2242,6 +2267,7 @@ export class Session {
 
   private ensureTurnTracking(): TurnTrackingState {
     if (this.turnState) return this.turnState;
+    this.invalidateContextSnapshot();
     this.turnState = this.rebuildTurnStateFromMessages();
     return this.turnState;
   }
@@ -2258,6 +2284,7 @@ export class Session {
    * or remove turns, so re-deriving indices keeps summaryThroughTurnId aligned.
    */
   protected replaceMessagesPreservingContext(messages: Message[]): void {
+    this.invalidateContextSnapshot();
     const prev = this.turnState;
     this.messages = messages.slice();
     this.turnState = prev
@@ -2850,6 +2877,7 @@ export class Session {
   }
 
   private shiftTurnMetadata(start: number): void {
+    this.invalidateContextSnapshot();
     const state = this.turnState;
     if (!state) return;
     const shiftTurn = (turn: CompletedTurnRecord): CompletedTurnRecord | null => {
@@ -3310,6 +3338,15 @@ function cloneMessage(msg: Message): Message {
   return { role: msg.role, content: [...msg.content] };
 }
 
+/** Recovery snapshots must not expose nested mutable active-turn state. */
+function cloneActiveTurn(active: ActiveTurnRecord): ActiveTurnRecord {
+  return {
+    ...active,
+    ...(active.historyBudget ? { historyBudget: { ...active.historyBudget } } : {}),
+    ...(Array.isArray(active.steerPlanAnchors) ? { steerPlanAnchors: active.steerPlanAnchors.map(anchor => ({ ...anchor })) } : {}),
+  };
+}
+
 function cloneStoredMessage(msg: Message): Message {
   return {
     role: msg.role,
@@ -3366,18 +3403,31 @@ function assistantRoundsAfter(messages: readonly Message[], start: number): numb
   return rounds;
 }
 
-/** The latest explicitly supplied authoring set replaces earlier sets, including
- * an empty set. Selection is host metadata, independent of tool names/prose. */
-function activeAuthoringImages(messages: readonly Message[], start: number): { index: number; toolUseId: string; images: ImageContent[] } | undefined {
+type RetainedImageSets = ReadonlyMap<string, { index: number; images: ImageContent[] }>;
+
+/** The newest whole authoring sets, by tool use id, while their images total at
+ * most ACTIVE_TURN_IMAGE_LIMIT; an empty set clears every set before it. Parallel
+ * siblings and earlier sources stay beside later captures. Selection is host
+ * metadata, independent of tool names/prose. */
+function activeAuthoringImages(messages: readonly Message[], start: number): RetainedImageSets {
+  const retained = new Map<string, { index: number; images: ImageContent[] }>();
+  let count = 0;
   for (let i = messages.length - 1; i >= start; i--) {
     for (let j = messages[i].content.length - 1; j >= 0; j--) {
       const c = messages[i].content[j];
-      if (c.type === "tool_result" && c.imageRetention === "active_turn") {
-        return { index: i, toolUseId: c.toolUseId, images: (c.images ?? []).slice(0, 6) };
-      }
+      if (c.type !== "tool_result" || c.imageRetention !== "active_turn") continue;
+      const images = (c.images ?? []).slice(0, ACTIVE_TURN_IMAGE_LIMIT);
+      if (!images.length || count + images.length > ACTIVE_TURN_IMAGE_LIMIT) return retained;
+      retained.set(c.toolUseId, { index: i, images });
+      count += images.length;
     }
   }
-  return undefined;
+  return retained;
+}
+
+/** Retained images whose receipts a checkpoint archived, oldest first. */
+function archivedAuthoringImages(retained: RetainedImageSets, checkpointThrough: number): ImageContent[] {
+  return [...retained.values()].filter(set => set.index <= checkpointThrough).reverse().flatMap(set => set.images);
 }
 
 /** Active-turn image policy: a tool capture stays visible for
@@ -3385,14 +3435,13 @@ function activeAuthoringImages(messages: readonly Message[], start: number): { i
  * replaced by the fixed marker exactly once. Receipts keep their text, JSON
  * receipts gain a structural key, and the message is otherwise byte-identical
  * on every later request. A tagged user image is real input and is never
- * elided; only untagged legacy tool trailers are treated as captures. The latest
- * authoring set remains visible until the active user turn completes. */
-function elideStaleActiveImages(msg: Message, roundsAfter: number, userImagesAreInput: boolean, referenceToolUseId?: string): Message {
+ * elided; only untagged legacy tool trailers are treated as captures. The retained
+ * authoring sets remain visible until the active user turn completes. */
+function elideStaleActiveImages(msg: Message, roundsAfter: number, userImagesAreInput: boolean, retained: RetainedImageSets): Message {
   const content = msg.content.map((c): MessageContent => {
     if (c.type === "tool_result" && c.images?.length) {
-      if (c.imageRetention === "active_turn" && c.toolUseId === referenceToolUseId) {
-        return { ...c, images: c.images.slice(0, 6) };
-      }
+      const kept = c.imageRetention === "active_turn" ? retained.get(c.toolUseId) : undefined;
+      if (kept) return { ...c, images: kept.images };
       if (c.imageRetention !== "active_turn" && roundsAfter < ACTIVE_TURN_IMAGE_RETENTION_ROUNDS) return c;
       return { ...c, images: [], content: withImageOmittedMarker(c.content) };
     }

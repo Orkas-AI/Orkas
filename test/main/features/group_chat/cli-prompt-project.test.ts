@@ -83,6 +83,17 @@ async function seedConversation(rows: any[]) {
   fs.writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
 }
 
+it.each(['once', 'retain'])('keeps CLI authored workflow intact and scopes application guidance (%s)', async mode => {
+  const users = await import('../../../../src/main/features/users'); users.activateUser(TEST_UID);
+  const cid = `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`;
+  await (await import('../../../../src/main/features/chats')).createAppConversation(TEST_UID, 'a'.repeat(64), 'CLI fixture', mode === 'retain', cid);
+  const bus = await import('../../../../src/main/features/group_chat/bus');
+  const plan = await bus._buildCliContextPlanForTest(TEST_UID, cid, AGENT, ITEM, []);
+  expect(plan.durableInstructions).toContain(AGENT.workflow);
+  expect(plan.durableInstructions.includes('## Application direct delivery')).toBe(mode === 'once');
+  expect(plan.turnPrompt).toContain('查一下');
+});
+
 async function makeProject(instructions?: string): Promise<string> {
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);

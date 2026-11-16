@@ -83,6 +83,33 @@ describe('task_board › planned split note (D29)', () => {
 });
 
 describe('task_board › lifecycle', () => {
+  it.each([false, true])('records a never-started creation failure without duplicating a partial row (%s)', async (partial) => {
+    const tb = await board();
+    const input = { taskId: 'failed-admission', assignee: 'agent-a', instruction: 'Write the draft',
+      createdBy: 'user' as const, sourceMsgId: 'original', turnId: 'turn-a',
+      after: ['upstream'], admissionPending: true, assignmentContext: 'Existing split context' };
+    if (partial) await tb.createTask(TEST_UID, TEST_CID, input);
+    const failed = await tb.recordCreationFailure(TEST_UID, TEST_CID, { ...input, sourceMsgId: 'scoped-retry-source' });
+    expect(failed).toMatchObject({ task_id: input.taskId, status: 'failed', source_msg_id: 'scoped-retry-source', after: ['upstream'] });
+    expect(failed?.started_at).toBeUndefined();
+    expect(failed?.admission_pending).toBeUndefined();
+    expect(failed?.ended_at).toBeTruthy();
+    expect(await tb.recordCreationFailure(TEST_UID, TEST_CID, input)).toBeNull();
+    const snapshot = await readSnapshot();
+    expect(snapshot).toHaveLength(1);
+    tb._resetForTest();
+    expect(await tb.listTasks(TEST_UID, TEST_CID)).toEqual(snapshot);
+  });
+
+  it.each(['running', 'done'] as const)('does not overwrite a %s task with a late creation failure', async (status) => {
+    const tb = await board();
+    const input = { taskId: 'existing-task', assignee: 'agent-a', instruction: 'Draft', createdBy: 'user' as const, running: true };
+    await tb.createTask(TEST_UID, TEST_CID, input);
+    if (status === 'done') await tb.finishTask(TEST_UID, TEST_CID, input.taskId, 'done');
+    expect(await tb.recordCreationFailure(TEST_UID, TEST_CID, input)).toBeNull();
+    expect((await readSnapshot())[0].status).toBe(status);
+  });
+
   it('persists sent-message state without claiming execution and retains it on reload', async () => {
     const tb = await board();
     const task = await tb.createTask(TEST_UID, TEST_CID, {

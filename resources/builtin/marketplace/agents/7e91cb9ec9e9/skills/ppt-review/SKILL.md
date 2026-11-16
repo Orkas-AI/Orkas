@@ -134,57 +134,43 @@ quality record are complete. If any edit or render-based review happens after
 publication, treat the published result as stale and publish the validated
 candidate again only after all gates pass.
 
-### Prepare the complete handoff before publication
+### Reconcile working records before publication
 
-Assemble the complete handoff below from current structural checks, per-page
-observations, repairs, and the whole-deck review, whether or not an earlier audit
-table exists. Reuse available current evidence; do not depend on intermediate
-notes already having the final format. If a required record is missing, first
-reconcile the retained observations and current file, then verify only the
-missing evidence. Never default an unassessed dimension to PASS. When visual
-evidence is unavailable, disclose `not_run` rather than claiming a review.
-An omitted text record alone does not justify rerendering an unchanged revision.
+Assemble the current quality record from structural checks, per-page observations,
+repairs, and the whole-deck review, whether or not an earlier audit table exists.
+Reuse available current evidence. If a record is missing, reconcile observations
+and verify only the missing evidence. Never default an unassessed dimension to
+PASS; unavailable checks remain `not_run`. Missing text alone does not justify
+rerendering an unchanged revision.
 
-For a generated deck, fill one slide-map entry and one Content/Design/Coherence
-row per slide. Use `PASS`, `WARNING`, or `BLOCKER` for assessed findings, with
-concrete evidence; unavailable checks remain `not_run`. Every non-pass result
-retains its repair or retain decision. Complete the whole-deck review before
-finalizing Coherence. A positive summary or slide map cannot replace these rows.
-Count the rows against the actual generated slide count and check that every
-page number appears exactly once. Missing, duplicate, or deck-level-only audit
-evidence blocks publication. EDIT keeps its required review scope; disclose
-which pages were inspected rather than claiming unreviewed pages passed.
-
-Use this single handoff structure in the user's language, replacing every
-bracket with actual evidence. Include the slide map and page rows for generated
-decks, and the source ledger when supplied files or data ground the deck:
+Keep these as working records, separate from the customer handoff. For a generated
+deck, retain one slide-map entry and one Content/Design/Coherence row per slide,
+with concrete evidence and each warning's repair or retain decision. For example:
 
 ```text
-交付：[最终 PPTX 路径]；[页数与制作或修改范围]。
-内容：目标动作是 [受众需要做出的决策或行动]；[实际页面覆盖与叙事路径]；结论式标题例如 [P2 实际标题] / [P5 实际标题]；[证据边界]；结构检查 [已检查/总页数] 页通过。
-设计：[已渲染/总页数] 页已逐页审阅；视觉来源为 [自主设计 / 文字方向 / 参考图 / 参考 PPT]；视觉系统为 [艺术方向、颜色、字体层级、画布/背景和图片或图表处理]；最弱页面为 [P# 与比较其他页面后的具体观察]；定向修复：[修复页面、问题与复验结果，或无需修复]；[原生可编辑元素的实际覆盖]；剩余提示：[具体非阻塞问题或有证据支持的无]。
-连贯性：[重复、变化、信息密度和章节节奏如何服务叙事]；[参考一致性或自主设计一致性]。
-逐页内容与视觉重点（生成的每一页各一项）：
-P# — [实际主结论] | [实际视觉重点]
-逐页审阅（生成的每一页各一行）：
 P1 | Content: PASS — evidence | Design: WARNING — evidence | Coherence: PASS — evidence
-来源事实（有来源文件或数据时）：[每个来源文件；数值序列及期间或地区、单位、实际/目标状态；沿用的重要非数值约束或风险]。
-交付边界：[来源限制、不支持的 PowerPoint 特性、未执行检查与仍需在目标查看器核验的内容；没有时说明无]。
 ```
 
-For a generated product deck, include at least two actual conclusion-title
-examples from the current file. Repair bare topic titles only when the user did
-not fix their visible wording; never rewrite a contracted title for this format.
-Use concrete render observations, not vague praise.
-Explain the actual visual source, art direction, palette behavior, type hierarchy,
-background/canvas language and image/chart treatment; exact token values are
-useful only when they explain the result, not a fixed release gate. Do not include numeric aesthetic scores.
-Keep the labels `Content`, `Design`, and `Coherence`; unlabeled adjectives do not
-replace status fields. The source ledger reports supplied facts, not permission
-to add or reinterpret them.
+Count the rows against the actual generated slide count and check that every
+page number appears exactly once. Missing, duplicate, or deck-level-only audit
+evidence blocks publication. Complete the whole-deck review before finalizing
+Coherence. EDIT keeps its required review scope; do not claim unreviewed pages
+passed. Retain supplied facts, units, periods, status labels and risks in the
+working source ledger, not an obligatory copy of every value in the final reply.
+Do not include numeric aesthetic scores.
 
-Once this complete handoff and all gates are satisfied, call `publish_outputs`
-with only the final `.pptx`, then send the prepared handoff with the returned file
-path. Preserve its page records, weakest-page finding, repairs and remaining
-warnings rather than shortening it to a success summary. The handoff provides a
-plain-language content/design/flow result and checks actually run. Do not expose the internal route or depth codes.
+### Customer handoff
+
+For CREATE and EDIT, prepare a concise reply with the final file, page count or
+change scope, verification scope, supplied-source scope and material limitations,
+including remaining warnings, unavailable checks and target-viewer follow-up.
+After the delivery gate passes, call `publish_outputs` with only the final PPTX
+and use its returned file path. Keep the detailed audit and design explanation
+available in working records; include them in the reply when requested. Do not
+repeat the slide map, every status row, source values or weakest-page discussion
+in an ordinary file delivery. Never shorten away a blocker or claim an unrun
+check passed. Do not expose private route or depth codes.
+
+For REVIEW, deliver the independently actionable report defined above, including
+Content, Design and Coherence evidence; concise file-delivery guidance does not
+replace that report or authorize mutation or publication.

@@ -98,6 +98,7 @@ function evidenceRowKey(line: string): string | null {
 
 function normalizeSourceUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl);
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new TypeError('Invalid web source protocol');
   parsed.hash = '';
   return parsed.toString();
 }
@@ -120,12 +121,14 @@ export function captureDeepResearchWebFetchEvidence(
   const content = String(result.content || '');
   if (result.isError || !content) return { captured: false, reason: 'not_web_source' };
   if (CACHE_REPLAY_RE.test(content)) return { captured: false, reason: 'cache_replay' };
-  const match = SOURCE_URL_RE.exec(content);
-  if (!match) return { captured: false, reason: 'not_web_source' };
+  // Prefer the fetcher's authoritative response identity. Legacy HTML/GitHub
+  // snapshots still carry the same source in their existing header.
+  const sourceUrl = result.webSourceUrl ?? SOURCE_URL_RE.exec(content)?.[1];
+  if (!sourceUrl) return { captured: false, reason: 'not_web_source' };
 
   let canonicalUrl = '';
   try {
-    canonicalUrl = normalizeSourceUrl(match[1]);
+    canonicalUrl = normalizeSourceUrl(sourceUrl);
   } catch {
     return { captured: false, reason: 'not_web_source' };
   }

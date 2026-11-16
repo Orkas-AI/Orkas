@@ -47,10 +47,9 @@ import { performance } from 'node:perf_hooks';
 import {
   classifyTransientNetworkErrorForDisplay,
   isStorageFullError,
-  isProviderSafetyError,
 } from '../../../core-agent/src/shared/errors';
-import { classifyKeyFailure, type KeyFailureKind } from './auth-error';
-import { providerCredentialFailure, providerErrorFacts } from '../../../core-agent/src/shared/provider-error-facts';
+import { formatUserVisibleModelError } from './user-visible-errors';
+import { providerCredentialFailure } from '../../../core-agent/src/shared/provider-error-facts';
 import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
 import { redactPaths } from '../../util/redact';
 
@@ -505,42 +504,10 @@ function localizeKnownRunnerError(error: AgentErrorMeta, providerId?: string): s
   const raw = error.message || 'unknown error';
   const known = localizeKnownRunnerText(raw, error.code);
   if (known !== raw) return known;
-  const code = String(error.code || '').trim().toUpperCase();
-  if (code === 'PROVIDER_CANDIDATES_UNAVAILABLE') return t('errors.model_temporarily_unavailable');
-  const explicitKind: KeyFailureKind | null = /BALANCE|QUOTA|CREDIT|FUNDS|PAYMENT/.test(code)
-    ? 'balance'
-    : error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED'
-    ? 'auth'
-    : code === 'PROVIDER_PERMISSION_EXHAUSTED'
-      ? 'permission'
-      : error.kind === 'rate_limit' || code === 'PROVIDER_RATE_LIMIT_EXHAUSTED'
-        ? 'rate_limit'
-        : code === 'PROVIDER_BALANCE_EXHAUSTED'
-          ? 'balance'
-          : code === 'PROVIDER_NETWORK_EXHAUSTED'
-            ? 'network'
-            : classifyKeyFailure({ message: raw, code: error.code, statusCode: error.statusCode });
-  if (explicitKind === 'auth') return t('errors.model_auth_unavailable');
-  if (explicitKind === 'permission') return t('errors.model_permission_unavailable');
-  if (explicitKind === 'rate_limit') return t('errors.model_rate_limited');
-  if (explicitKind === 'balance') {
-    return providerId
-      ? t('errors.model_provider_balance_insufficient_named', { provider: providerLabel(providerId) })
-      : t('errors.model_provider_balance_insufficient');
-  }
-  if (explicitKind === 'network') return t('errors.model_network_unavailable');
-  // Unknown HTTP bodies can expose upstream route names and request details.
-  // Display only the structured status; keep provider safety refusals intact.
-  const status = providerErrorFacts(error).status;
-  if (status === 400 && !isProviderSafetyError(error)) return t('errors.model_request_rejected');
-  if (status === 404 || status === 410 || (status !== undefined && status >= 500 && status <= 599)) {
-    return t('errors.model_temporarily_unavailable');
-  }
-  const transientKind = classifyTransientNetworkErrorForDisplay(error);
-  if (transientKind === 'connection_dropped' || transientKind === 'timeout' || transientKind === 'network') {
-    return t('errors.model_network_unavailable');
-  }
-  return raw.replace(/^Error:\s*/i, '').replace(/\s+/g, ' ').trim() || 'unknown error';
+  return formatUserVisibleModelError(
+    { message: raw, code: error.code, statusCode: error.statusCode },
+    { ...(providerId ? { providerLabel: providerLabel(providerId) } : {}) },
+  );
 }
 
 function toolInputPath(input: unknown): string {
@@ -1247,7 +1214,9 @@ export async function* mapCoreAgentEvents(
         yield {
           type: 'progress',
           text: t(
-            ev.reason === 'no_first_event_timeout' ? 'model.timeout_fallback' : 'model.credential_fallback',
+            ev.reason === 'no_first_event_timeout' ? 'model.timeout_fallback'
+              : ev.reason === 'balance' ? 'model.balance_fallback'
+                : ev.reason === 'auth' ? 'model.credential_fallback' : 'model.provider_unavailable_fallback',
             { provider: providerLabel(ev.providerId) },
           ),
           event: {
@@ -1256,6 +1225,10 @@ export async function* mapCoreAgentEvents(
               phase: 'fallback',
               reason: ev.reason,
               provider_id: ev.providerId,
+              ...(ev.toProviderId ? { to_provider_id: ev.toProviderId } : {}),
+              ...(ev.skipped ? { skipped: true } : {}),
+              ...(ev.fromModel ? { from_model: ev.fromModel } : {}),
+              ...(ev.toModel ? { to_model: ev.toModel } : {}),
               ...(ev.candidateIndex !== undefined
                 ? { candidate_index: Math.max(1, Math.round(ev.candidateIndex)) }
                 : {}),

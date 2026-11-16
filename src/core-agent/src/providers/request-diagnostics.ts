@@ -1,3 +1,5 @@
+import { responsesRejectedInput, type ResponsesRejectedInput } from './responses-status-diagnostics.js';
+import { toolArgumentsFailure, type ToolArgumentsFailure } from './tool-input-diagnostics.js';
 import { providerErrorFacts } from '../shared/provider-error-facts.js';
 
 /** Metadata only: this observer never changes errors used by retry policy. */
@@ -10,13 +12,13 @@ export interface ProviderRequestFailure {
   source: ProviderFailureSource;
   lastEvent: string;
   requestSequence?: number;
-  /** Opaque transport correlation; restricted diagnostics only. */
-  requestRef?: string;
   contextWindow?: number;
   outputLimit?: number;
   budgetObserved?: boolean;
   contextBudget?: Record<string, number | string>;
   responsesStatus?: Record<string, unknown>;
+  /** Local failure evidence only; never a retry or telemetry dimension. */
+  toolArguments?: ToolArgumentsFailure;
 }
 
 /** Existing runner observations, never a second scan of request content. */
@@ -64,12 +66,23 @@ const DIAGNOSTIC_CODES = new Set([
   'invalid_value', 'upstream_error',
 ]);
 
+// Chromium exposes these native transport tokens as Error.message, without a
+// structured code. Accept only complete tokens at the fetch rejection boundary;
+// provider bodies, payload hooks and display prose never use this projection.
+const CHROMIUM_TRANSPORT_CODES = new Set([
+  'net::ERR_EMPTY_RESPONSE', 'net::ERR_SSL_PROTOCOL_ERROR', 'net::ERR_CONNECTION_CLOSED',
+  'net::ERR_CONNECTION_RESET', 'net::ERR_CONNECTION_REFUSED', 'net::ERR_CONNECTION_TIMED_OUT',
+  'net::ERR_TIMED_OUT', 'net::ERR_NAME_NOT_RESOLVED', 'net::ERR_INTERNET_DISCONNECTED',
+  'net::ERR_NETWORK_CHANGED', 'net::ERR_PROXY_CONNECTION_FAILED', 'net::ERR_TUNNEL_CONNECTION_FAILED',
+  'net::ERR_CERT_AUTHORITY_INVALID', 'net::ERR_CERT_DATE_INVALID', 'net::ERR_CERT_COMMON_NAME_INVALID',
+]);
+
 function safeCode(error: unknown): string {
   // Bound traversal even for cyclic causes. Never inspect messages or bodies.
   try {
     for (let itemError = error, depth = 0; itemError && typeof itemError === 'object' && depth < 8; depth++) {
       const item = itemError as { code?: unknown; cause?: unknown };
-      if (typeof item.code === 'string' && DIAGNOSTIC_CODES.has(item.code)) return item.code;
+      if (typeof item.code === 'string' && item.code.length <= 128 && DIAGNOSTIC_CODES.has(item.code)) return item.code;
       if (itemError instanceof ReferenceError) return 'REFERENCE_ERROR';
       itemError = item.cause;
     }
@@ -80,13 +93,23 @@ function safeCode(error: unknown): string {
   return 'unknown';
 }
 
+function safeTransportCode(error: unknown): string {
+  const structured = safeCode(error);
+  if (structured !== 'unknown') return structured;
+  try {
+    if (error instanceof Error && error.name === 'Error'
+      && typeof error.message === 'string' && error.message.length <= 64
+      && CHROMIUM_TRANSPORT_CODES.has(error.message)) return error.message.slice(5);
+  } catch { /* Untrusted exception accessors cannot replace the failure. */ }
+  return 'unknown';
+}
+
 /** Request-local hooks supported by pi-ai. Observe headers without cloning,
  * buffering or wrapping the response body. The adapter supplies its existing
  * captured cause; unavailable causes remain unknown instead of guessed prose. */
 export function createRequestDiagnostics(
   signal?: AbortSignal,
   onFailure?: (failure: ProviderRequestFailure) => void,
-  requestRef?: unknown,
   contextBudget?: unknown,
 ) {
   const started = performance.now();
@@ -102,6 +125,10 @@ export function createRequestDiagnostics(
   let contextWindow: number | undefined;
   let outputLimit: number | undefined;
   let budgetObserved = false;
+  let toolArguments: ToolArgumentsFailure | undefined;
+  let streamErrorObserved = false;
+  let streamErrorCode = 'unknown';
+  let rejectedInput: ResponsesRejectedInput | undefined;
   const onResponse = (response: { status: number }) => {
     phase = 'after_response';
     status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
@@ -112,12 +139,15 @@ export function createRequestDiagnostics(
     status = undefined;
     code = 'unknown';
     source = 'unknown';
+    streamErrorObserved = false;
+    streamErrorCode = 'unknown';
+    rejectedInput = undefined;
     try {
       const response = await globalThis.fetch(input, init);
       onResponse(response);
       return response;
     } catch (error) {
-      code = safeCode(error);
+      code = safeTransportCode(error);
       source = 'transport';
       throw error;
     }
@@ -125,7 +155,29 @@ export function createRequestDiagnostics(
   return {
     get sequence(): number | undefined { return requestSequence; },
     get observed(): boolean { return observed; },
+    get rejectedInput(): ResponsesRejectedInput | undefined { return signal?.aborted ? undefined : rejectedInput; },
     onResponse,
+    observeInvalidToolArguments(input: unknown, api: string, stopReason: string): void {
+      if (signal?.aborted || toolArguments) return;
+      toolArguments = toolArgumentsFailure(input, api, stopReason);
+    },
+
+    /** SDK-native Codex envelopes, before string flattening. Metadata only:
+     * never attach these facts to the delivered error or retry classifier. */
+    observeProviderStreamEvent(value: unknown): void {
+      if (streamErrorObserved || signal?.aborted || !value || typeof value !== 'object' || Array.isArray(value)) return;
+      try {
+        const event = value as Record<string, unknown>;
+        let error: unknown;
+        if (event.type === 'error') error = event;
+        else if (event.type === 'response.failed') error = (event.response as { error?: unknown } | undefined)?.error;
+        if (!error || typeof error !== 'object' || Array.isArray(error)) return;
+        streamErrorObserved = true;
+        streamErrorCode = safeCode(error);
+        const detail = error as { param?: unknown; error?: { param?: unknown } };
+        rejectedInput = responsesRejectedInput(detail.param ?? detail.error?.param);
+      } catch { /* Diagnostic accessors cannot change SDK delivery. */ }
+    },
     observeBudget(payload: unknown, window: unknown): void {
       // O(1) observation of the final adapter payload. Never estimate tokens here.
       try {
@@ -157,15 +209,16 @@ export function createRequestDiagnostics(
     report(error: unknown, aborted = false, boundary: ProviderFailureSource = 'unknown', responsesStatus?: Record<string, unknown>): ProviderRequestFailure | undefined {
       if (reported) return undefined;
       reported = true;
+      const existingCode = code === 'unknown' ? safeCode(error) : code;
       const failure: ProviderRequestFailure = {
         phase,
         ...(!aborted && !signal?.aborted && responsesStatus ? { responsesStatus } : {}),
+        ...(!aborted && !signal?.aborted && toolArguments ? { toolArguments } : {}),
         ...(budgetObserved ? { budgetObserved, contextWindow, outputLimit } : {}),
-        ...(typeof requestRef === 'string' && /^(?:[a-f0-9]{12}|[a-f0-9]{32})$/.test(requestRef) ? { requestRef } : {}),
         source: source !== 'unknown' ? source : status !== undefined && status >= 400 ? 'http' : boundary,
         lastEvent,
         ...(requestSequence === undefined ? {} : { requestSequence }),
-        code: code === 'unknown' ? safeCode(error) : code,
+        code: existingCode === 'unknown' && !aborted && !signal?.aborted ? streamErrorCode : existingCode,
         ...(status === undefined ? {} : { httpStatus: status }),
         elapsedMs: Math.min(1_000_000_000, Math.max(0, Math.round(performance.now() - started))),
         aborted: aborted || signal?.aborted === true,

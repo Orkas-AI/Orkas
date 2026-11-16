@@ -43,6 +43,85 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 describe('Web host reuses owning services', () => {
+  it('opens the Agent picker while unrelated skill metadata is still loading and reflects enablement changes', async () => {
+    for (const [id, name] of [['writer', 'Writer'], ['reviewer', 'Reviewer']]) {
+      const dir = path.join(root, uid, 'cloud/agents', id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({ agent_id: id, name, workflow: 'Fixture workflow' }));
+    }
+    const agents = await import('../../../src/main/features/agents');
+    agents.setAgentEnabledForActiveUser('reviewer', false);
+    let entered!: () => void, release!: () => void;
+    const loading = new Promise<'blocked'>(resolve => { entered = () => resolve('blocked'); });
+    const metadata = vi.spyOn(await import('../../../src/main/model/core-agent/skill-registry'), 'listSkillSpecsForAgentMetadata')
+      .mockImplementation(() => { entered(); return new Promise(resolve => { release = () => resolve([]); }); });
+    const { appTaskCall } = await import('../../../src/main/features/web_apps/task-host');
+    const signal = new AbortController().signal;
+    const listing = appTaskCall(uid, 'fixture', 'tasks.agents', {}, signal);
+    try {
+      expect(await Promise.race([listing, loading])).toEqual({ agents: [
+        { id: 'commander', name: 'Commander' }, { id: 'writer', name: 'Writer' },
+      ] });
+      agents.setAgentEnabledForActiveUser('reviewer', true);
+      expect(await appTaskCall(uid, 'fixture', 'tasks.agents', {}, signal)).toEqual({ agents: [
+        { id: 'commander', name: 'Commander' }, { id: 'reviewer', name: 'Reviewer' }, { id: 'writer', name: 'Writer' },
+      ] });
+    } finally {
+      release?.();
+      try { await listing; } finally { metadata.mockRestore(); }
+    }
+  });
+  it.each(['builtin-content-workbench','builtin-product-listing'])('retains trusted built-in identity for %s, serves a fork and rejects a damaged manifest',async id=>{
+    const oldBuiltin=process.env.ORKAS_BUILTIN_ROOT;
+    process.env.ORKAS_BUILTIN_ROOT=path.join(root,'packaged');
+    try{
+      const source=path.join(root,'packaged/apps',id);fs.mkdirSync(path.dirname(source),{recursive:true});fs.cpSync(path.resolve('resources/builtin/apps',id),source,{recursive:true});
+      if(id==='builtin-product-listing')fs.cpSync(path.resolve('resources/builtin/apps/builtin-content-workbench'),path.join(root,'packaged/apps/builtin-content-workbench'),{recursive:true});
+      const apps=await import('../../../src/main/features/builtin_apps');await apps.syncBuiltinApps(uid);
+      const host=await import('../../../src/main/features/web_apps/host');const opened=await host.openApp(uid,1,{appId:id});
+      const sdk=await host.appResource(new Request(opened.url.replace('index.html','__orkas/sdk.js')));
+      expect(sdk?.body).toContain('orkasApp');host.runtime.closeOwner(1);
+      const custom=path.join(root,uid,'cloud/saved_apps/custom-copy');fs.mkdirSync(custom,{recursive:true});fs.cpSync(apps.builtinAppRoot(uid,id)!,custom,{recursive:true});
+      const found=await host.resolveBundle(uid,{appId:'custom-copy'});expect(found.bundle?.builtinApp).toBeUndefined();
+      if(id==='builtin-product-listing'){
+        const copy=await host.openApp(uid,2,{appId:'custom-copy'});
+        const creator=await host.appResource(new Request(copy.url.replace('index.html','creator/index.html')));
+        expect(creator?.status).toBe(200);const html=fs.readFileSync((creator as any).file,'utf8');expect(html).toContain('../creator.js');expect(html).not.toContain('/__orkas/sdk.js');
+        const shared=await host.appResource(new Request(copy.url.replace('index.html','creator/app.js')));expect(shared?.status).toBe(200);expect(fs.readFileSync((shared as any).file,'utf8')).toContain('ContentWorkspaceExtension');host.runtime.closeOwner(2);
+      }
+      fs.writeFileSync(path.join(apps.builtinAppRoot(uid,id)!,'orkas-app.json'),'{invalid');
+      await expect(host.openApp(uid,1,{appId:id})).rejects.toMatchObject({code:'E_MANIFEST'});
+      fs.unlinkSync(path.join(apps.builtinAppRoot(uid,id)!,'orkas-app.json'));
+      await expect(host.openApp(uid,1,{appId:id})).rejects.toMatchObject({code:'E_MANIFEST'});
+    }finally{if(oldBuiltin===undefined)delete process.env.ORKAS_BUILTIN_ROOT;else process.env.ORKAS_BUILTIN_ROOT=oldBuiltin;}
+  });
+  it('keeps an open built-in app on its running version and activates the upgrade after close', async () => {
+    const previousBuiltin=process.env.ORKAS_BUILTIN_ROOT;
+    process.env.ORKAS_BUILTIN_ROOT=path.join(root,'packaged');
+    try {
+      const apps=await import('../../../src/main/features/builtin_apps');
+      const host=await import('../../../src/main/features/web_apps/host');
+      const source=path.join(root,'packaged','apps','builtin-test-seed');fs.mkdirSync(source,{recursive:true});
+      const write=(version:string,html:string)=>{
+        fs.writeFileSync(path.join(source,'__orkas-meta.json'),JSON.stringify({version,title:'Timer',appType:'local'}));
+        fs.writeFileSync(path.join(source,'index.html'),html);
+        fs.writeFileSync(path.join(source,'orkas-app.json'),JSON.stringify({sdkVersion:1,capabilities:[]}));
+      };
+      write('1.0.0','<h1>Original</h1>');await apps.syncBuiltinApps(uid);
+      const opened=await host.openApp(uid,7,{appId:'builtin-test-seed'});
+      write('2.0.0','<h1>Updated</h1>');
+      expect(await apps.syncBuiltinApps(uid)).toEqual({changed:0,deferred:1});
+      const resource=await host.appResource(new Request(opened.url));
+      expect(resource?.status).toBe(200);
+      expect(fs.readFileSync((resource as any).file,'utf8')).toContain('Original');
+      host.runtime.closeOwner(7);await apps.syncBuiltinApps(uid);
+      const reopened=await host.openApp(uid,7,{appId:'builtin-test-seed'});
+      const updated=await host.appResource(new Request(reopened.url));
+      expect(fs.readFileSync((updated as any).file,'utf8')).toContain('Updated');
+    } finally {
+      if(previousBuiltin===undefined)delete process.env.ORKAS_BUILTIN_ROOT;else process.env.ORKAS_BUILTIN_ROOT=previousBuiltin;
+    }
+  });
   it('exposes bounded connector search through the existing Web tool adapter and rechecks visibility', async () => {
     const tools = Array.from({ length: 100 }, (_, i) => ({ name: `read_${i}`, description: 'Read ordinary entry', input_schema: { type: 'object' } }));
     const target = { name: 'find_invoice', description: 'Find overdue invoices', input_schema: { type: 'object', properties: { invoice_id: { type: 'string' } } } };

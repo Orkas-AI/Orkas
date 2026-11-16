@@ -1,4 +1,5 @@
-import { providerErrorFacts } from '../shared/provider-error-facts.js';
+import { providerErrorFacts, providerRetryAfterMs } from '../shared/provider-error-facts.js';
+import { responsesRejectedInput, type ResponsesRejectedInput } from './responses-status-diagnostics.js';
 
 function rejectionHasOutput(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;
@@ -13,13 +14,14 @@ function rejectionHasOutput(value: unknown): boolean {
 
 /** pi-ai flattens SDK errors into display strings. Retain request-local facts
  * before that boundary. Never retain bodies in diagnostics or shared state. */
-export function createProviderErrorCapture(streamProtocol?: 'openai-responses' | 'openai-completions') {
+export function createProviderErrorCapture(streamProtocol?: 'openai-responses' | 'openai-completions', onStreamError?: (error: object) => void) {
   let original: unknown;
   let responseFacts: Error | undefined;
-  let rejectedInputIndex: number | undefined;
+  let rejectedInput: ResponsesRejectedInput | undefined;
   let owner: object;
   return {
-    get rejectedInputIndex(): number | undefined { return rejectedInputIndex; },
+    get rejectedInputIndex(): number | undefined { return rejectedInput?.index; },
+    get rejectedInput(): ResponsesRejectedInput | undefined { return rejectedInput; },
     rethrow(error: unknown): never {
       original = error;
       throw error;
@@ -29,21 +31,22 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
         const requestOwner = owner = {};
         original = undefined;
         responseFacts = undefined;
-        rejectedInputIndex = undefined;
+        rejectedInput = undefined;
         try {
           const response = await next(input, init);
           if (response.status >= 400) {
-            responseFacts = Object.assign(new Error('Provider HTTP error'), { status: response.status, providerRequestRejected: true });
-            const detail = await readErrorBody(response, init?.signal, index => { rejectedInputIndex = index; });
+            responseFacts = Object.assign(new Error('Provider HTTP error'), { status: response.status, retryAfterMs: providerRetryAfterMs({ headers: response.headers }), providerRequestRejected: true });
+            const detail = await readErrorBody(response, init?.signal, input => { rejectedInput = input; });
             if (detail) Object.assign(responseFacts, { error: detail });
           } else if (streamProtocol && response.body && response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) {
             return observeStreamErrors(response, streamProtocol, error => {
               if (owner !== requestOwner) return;
+              try { onStreamError?.(error); } catch { /* Diagnostics cannot replace delivery. */ }
               const facts = providerErrorFacts(error, false);
               if (facts.status === undefined && !facts.codes.length) return;
               let cause: object = {};
               for (const code of facts.codes.reverse()) cause = { code, cause };
-              responseFacts = Object.assign(new Error('Provider stream error'), { status: facts.status, cause, providerRequestRejected: true });
+              responseFacts = Object.assign(new Error('Provider stream error'), { status: facts.status, cause, retryAfterMs: providerRetryAfterMs(error) ?? providerRetryAfterMs({ headers: response.headers }), providerRequestRejected: true });
             }, error => {
               // Fetch has already resolved here; retain body-read causes before
               // SDK flattening without replacing an earlier protocol rejection.
@@ -74,7 +77,7 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
 }
 
 /** Bounded inspection of rejected HTTP JSON. */
-async function readErrorBody(response: Response, signal?: AbortSignal | null, observeIndex?: (index: number) => void): Promise<object | undefined> {
+async function readErrorBody(response: Response, signal?: AbortSignal | null, observeInput?: (input: ResponsesRejectedInput) => void): Promise<object | undefined> {
   const limit = 16 * 1024;
   if (signal?.aborted || !response.headers.get('content-type')?.toLowerCase().includes('application/json')
     || Number(response.headers.get('content-length')) > limit) return;
@@ -105,11 +108,11 @@ async function readErrorBody(response: Response, signal?: AbortSignal | null, ob
     // nested serialized envelope and cannot override the actual HTTP status.
     const error = body && typeof body === 'object' ? (body as { error?: unknown }).error : undefined;
     const param = error && typeof error === 'object' ? (error as { param?: unknown }).param : undefined;
-    const rejected = typeof param === 'string' && param.length <= 32 ? /^input\[(\d{1,6})\]\.status$/.exec(param) : null;
-    if (rejected) observeIndex?.(Number(rejected[1]));
+    const rejected = responsesRejectedInput(param);
+    if (rejected) observeInput?.(rejected);
     const { codes } = providerErrorFacts(body, false);
     if (rejectionHasOutput(body)) codes.push('PROVIDER_OUTPUT_UNCERTAIN');
-    let detail: object = {};
+    let detail: object = { retryAfterMs: providerRetryAfterMs(body) };
     for (const code of codes.reverse()) detail = { code, cause: detail };
     return detail;
   } catch { return; }

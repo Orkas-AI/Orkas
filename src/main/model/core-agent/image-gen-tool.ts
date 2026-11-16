@@ -1,3 +1,5 @@
+import { appTaskMediaRoute } from '../../features/app_media_route';
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 /**
  * `generate_image` tool — produces an image with whatever image-gen-capable
  * api_key entry sits highest in the user's auth-profiles priority list.
@@ -36,13 +38,7 @@ import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import { versionedChatMediaLocalUrl } from '../../util/chat-media-url';
-import {
-  beginVideoProductionGeneration,
-  finishVideoProductionGeneration,
-  releaseVideoProductionGeneration,
-  videoProductionControlStatePath,
-  type VideoProductionGenerationTransaction,
-} from '../../features/video_production_control';
+import type { TimelineSpend } from '../../features/video_production_spend';
 import {
   beginImageStudioGeneration,
   findReusableImageStudioGeneration,
@@ -51,9 +47,9 @@ import {
   type ImageGenerationTransaction,
 } from '../../features/image_production_control';
 import {
-  estimateImageProductionCredits,
-  type ImageProductionCreditQuote,
-} from '../../features/image_production_credits';
+  checkImageProductionServices,
+  type ImageProductionServiceAvailability,
+} from '../../features/image_production_services';
 import { IMAGE_STUDIO_AGENT_ID, VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
 
 const log = createLogger('image-gen-tool');
@@ -84,7 +80,7 @@ export interface ImageGenToolOpts {
 function allowedRoots(opts: ImageGenToolOpts): string[] {
   const roots: string[] = [];
   try {
-    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
     if (ws) roots.push(ws);
   } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
@@ -104,6 +100,16 @@ function possibleImageOutputPaths(p: string): string[] {
     return [p];
   }
   return [`${p}.png`, `${p}.jpg`, `${p}.webp`];
+}
+
+/** Keep every possible provider-selected extension clear of existing output. */
+function unusedImagePath(requestedAbs: string): string {
+  const { dir, name, ext } = path.parse(requestedAbs);
+  for (let n = 1; n < 10000; n += 1) {
+    const candidate = n === 1 ? requestedAbs : path.join(dir, `${name}-${n}${ext}`);
+    if (!possibleImageOutputPaths(candidate).some((p) => fs.existsSync(p))) return candidate;
+  }
+  throw new Error(`no unused image path under ${dir}`);
 }
 
 export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
@@ -159,14 +165,14 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
           description:
             'Flash/Pro: 1K/1.5K/2K(default) or WIDTHxHEIGHT (921600-4624220 pixels, aspect 1:16-16:1). Lite: 2K/3K/4K. Gemini: auto(default) or exact table size. OpenAI: supported size, default 1024x1024.',
         },
-        production_plan_path: {
-          type: 'string',
-          description: 'VideoStudio only: approved project/plan.json that owns this billable segment.',
-        },
-        production_segment_id: {
-          type: 'string',
-          description: 'VideoStudio only: approved image-generate segment id in production_plan_path.',
-        },
+        ...(opts.agentId === VIDEO_STUDIO_AGENT_ID ? {
+          production_dir: {
+            type: 'string',
+            description: 'The production this image belongs to. Required. It holds your asset ledger.',
+          },
+          shot: { type: 'string', description: 'Groups retries of one shot in the ledger.' },
+          label: { type: 'string', description: 'Short name for this image, for the user.' },
+        } : {}),
         image_project_path: {
           type: 'string',
           description: 'ImageStudio only: image project directory whose image-manifest.json owns the route and durable per-turn generation budget.',
@@ -181,8 +187,8 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
     async execute(input, ctx) {
       const prompt = String(input.prompt ?? '').trim();
       const outputPathRaw = String(input.output_path ?? '').trim();
-      if (!prompt)         return { content: 'prompt is required', isError: true } as ToolResult;
-      if (!outputPathRaw)  return { content: 'output_path is required', isError: true } as ToolResult;
+      if (!prompt)         return parameterError('prompt is required', ['prompt'], 'required');
+      if (!outputPathRaw)  return parameterError('output_path is required', ['output_path'], 'required');
 
       // Resolve the requested path, then run conflict-uniquify against
       // the caller's `hasProducedPath` predicate (if any). Done before
@@ -195,7 +201,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
       const videoStudioControlled = opts.agentId === VIDEO_STUDIO_AGENT_ID;
       const imageStudioControlled = opts.agentId === IMAGE_STUDIO_AGENT_ID;
       const unique = videoStudioControlled
-        ? { finalPath: requestedAbs, renamed: false }
+        ? { finalPath: unusedImagePath(requestedAbs), renamed: false }
         : await uniquifyPath(requestedAbs, isMine);
       const { finalPath: outputAbs, renamed } = unique;
       const roots = allowedRoots(opts);
@@ -220,7 +226,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         ? (input.reference_image_urls as unknown[]).map(String).map((s) => s.trim()).filter(Boolean)
         : [];
       if (referenceImages.length + referenceImageUrls.length > 4) {
-        return { content: 'reference_images: at most 4 entries allowed', isError: true } as ToolResult;
+        return parameterError('reference_images: at most 4 entries allowed', ['reference_images'], 'too_big');
       }
       const refAbs: string[] = [];
       for (const r of referenceImages) {
@@ -243,69 +249,55 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         referenceBindings = normalizeImageReferenceBindings(input.reference_bindings, refAbs.length + referenceImageUrls.length);
         negativePrompt = normalizeImageStringList(input.negative_prompt, 'negative_prompt');
       } catch (error) {
-        return { content: (error as Error).message, isError: true } as ToolResult;
+        return parameterError((error as Error).message);
       }
       const providerPrompt = compileImagePromptContract(prompt, referenceBindings, negativePrompt);
 
       const sizeRaw = typeof input.size === 'string' ? input.size : undefined;
 
-      let productionPlanAbs = '';
-      let productionStatePath = '';
-      let productionTransaction: VideoProductionGenerationTransaction | undefined;
+      let imageProfileId:string|undefined;
+      try{imageProfileId=await appTaskMediaRoute(opts.userId,opts.cid,'image',ctx.signal);}catch{return{content:'E_UNAVAILABLE',isError:true} as ToolResult;}
+      let timelineSpend: TimelineSpend | undefined;
       if (videoStudioControlled) {
-        const planRaw = String(input.production_plan_path ?? '').trim();
-        const segmentId = String(input.production_segment_id ?? '').trim();
-        if (!planRaw || !segmentId) {
-          return {
-            content: 'E_VIDEO_PRODUCTION_CONTEXT_REQUIRED: VideoStudio generate_image requires production_plan_path and production_segment_id.',
-            isError: true,
-          } as ToolResult;
+        const productionRaw = String(input.production_dir ?? '').trim();
+        if (!productionRaw) {
+          return parameterError('E_PRODUCTION_DIR: production_dir is required: the folder holding this production.', ['production_dir'], 'required', {}, 'E_PRODUCTION_DIR');
         }
-        productionPlanAbs = resolveAbs(ctx, planRaw);
-        if (!isPathAllowed(productionPlanAbs, roots)) {
-          return { content: `E_PATH_OUT_OF_SCOPE: production_plan_path is outside scope: ${productionPlanAbs}`, isError: true } as ToolResult;
-        }
-        if (!fs.statSync(productionPlanAbs, { throwIfNoEntry: false })?.isFile()) {
-          return { content: 'E_VIDEO_PRODUCTION_PLAN_MISSING: production_plan_path is not a file', isError: true } as ToolResult;
-        }
-        productionStatePath = videoProductionControlStatePath({
+        // Check configured services and reserve the exact local request identity.
+        const { beginTimelineGeneration } = await import('../../features/video_production_spend');
+        const productionDirAbs = resolveAbs(ctx, productionRaw);
+        const started = await beginTimelineGeneration({
           userId: opts.userId,
-          ...(opts.projectId ? { projectId: opts.projectId } : {}),
-          planPath: productionPlanAbs,
-        });
-        try {
-          const begun = await beginVideoProductionGeneration({
-            statePath: productionStatePath,
-            planPath: productionPlanAbs,
-            segmentId,
+          scope: opts.cid || productionDirAbs,
+          productionDirAbs,
+          allowedRoots: roots,
+          kind: 'image',
+          requestedAbs,
+          ...(typeof input.shot === 'string' ? { shot: input.shot } : {}),
+          request: { ...(imageProfileId?{app_media_route:imageProfileId}:{}), prompt: providerPrompt, reference_images: refAbs, reference_image_urls: referenceImageUrls, size: sizeRaw },
+          referenceFiles: refAbs,
+          intent: {
+            segment_id: 'request',
             kind: 'image',
-            outputPath: outputAbs,
-            candidateOutputPaths: possibleImageOutputPaths(outputAbs),
-            request: {
-              prompt: providerPrompt,
-              reference_images: referenceImages,
-              reference_image_urls: referenceImageUrls,
-              ...(referenceBindings.length ? { reference_bindings: referenceBindings } : {}),
-              ...(negativePrompt.length ? { negative_prompt: negativePrompt } : {}),
-              ...(sizeRaw ? { size: sizeRaw } : {}),
-            },
-          });
-          if (begun.status === 'reused') {
-            if (opts.onFileWritten) await opts.onFileWritten(begun.transaction.output_path);
-            return {
-              content: `VideoStudio reused the completed billable transaction for segment ${segmentId}: ${begun.transaction.output_path}. Show it with: ![generated image](${versionedChatMediaLocalUrl(begun.transaction.output_path)})`,
-            } as ToolResult;
-          }
-          productionTransaction = begun.transaction;
-        } catch (err) {
-          return { content: (err as Error).message, isError: true } as ToolResult;
+            prompt: providerPrompt,
+            reference_images: refAbs,
+            reference_image_urls: referenceImageUrls,
+            ...(sizeRaw ? { size: sizeRaw } : {}),
+          },
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        if ('refusal' in started) return started.refusal as ToolResult;
+        if (started.reusedPath) {
+          if (opts.onFileWritten) await opts.onFileWritten(started.reusedPath);
+          return { content: `This exact request already finished: ${started.reusedPath}. Show it with: ![generated image](${versionedChatMediaLocalUrl(started.reusedPath)})` } as ToolResult;
         }
+        timelineSpend = started.spend;
       }
 
       let imageProjectAbs = '';
       let imageStatePath = '';
       let imageTransaction: ImageGenerationTransaction | undefined;
-      let imageCreditQuote: ImageProductionCreditQuote | undefined;
+      let imageServiceAvailability: ImageProductionServiceAvailability | undefined;
       if (imageStudioControlled) {
         const projectRaw = String(input.image_project_path ?? '').trim();
         const requestId = String(input.image_request_id ?? '').trim();
@@ -331,12 +323,13 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
               content: `ImageStudio reused completed generation ${requestId}: ${reusable.output_path}. Show it with: ![generated image](${versionedChatMediaLocalUrl(reusable.output_path)})`,
             } as ToolResult;
           }
-          imageCreditQuote = await estimateImageProductionCredits({
+          imageServiceAvailability = await checkImageProductionServices({
             requestId,
+            ...(imageProfileId ? { profileId: imageProfileId } : {}),
             ...(sizeRaw ? { size: sizeRaw } : {}),
             referenceCount: refAbs.length + referenceImageUrls.length,
           }, ctx.signal);
-          if (imageCreditQuote.unavailable_segment_ids.length) {
+          if (imageServiceAvailability.unavailable_segment_ids.length) {
             return {
               content: `E_IMAGE_PRODUCTION_PROVIDER_UNAVAILABLE: no configured image-generation provider for request ${requestId}. No generation transaction was started.`,
               isError: true,
@@ -366,6 +359,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
       try {
         result = await generateImage({
           prompt: providerPrompt,
+          ...(imageProfileId ? { profileId: imageProfileId } : {}),
           outputAbsPath: outputAbs,
           ...(refAbs.length ? { referenceImagePaths: refAbs } : {}),
           ...(referenceImageUrls.length ? { referenceImageUrls } : {}),
@@ -384,9 +378,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         });
       } catch (err) {
         return {
-          content: productionTransaction
-            ? `E_VIDEO_PRODUCTION_GENERATION_UNCERTAIN: provider dispatch ended without a terminal result (${(err as Error).message || String(err)}); keep the pending transaction and do not retry without a new explicit Gate C approval.`
-            : imageTransaction
+          content: imageTransaction
               ? `E_IMAGE_GENERATION_UNCERTAIN: provider dispatch ended without a terminal result (${(err as Error).message || String(err)}); the request remains pending and still counts toward the current turn's project budget.`
             : `[PROVIDER_EXCEPTION] ${(err as Error).message || String(err)}`,
           isError: true,
@@ -395,31 +387,9 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
 
       if (result.ok === false) {
         const notDispatched = result.dispatched === false;
-        if (productionTransaction) {
-          try {
-            if (notDispatched) {
-              await releaseVideoProductionGeneration({
-                statePath: productionStatePath,
-                planPath: productionPlanAbs,
-                transactionId: productionTransaction.transaction_id,
-                segmentId: productionTransaction.segment_id,
-                kind: 'image',
-                errorCode: result.errorCode,
-              });
-            } else {
-              await finishVideoProductionGeneration({
-                statePath: productionStatePath,
-                planPath: productionPlanAbs,
-                transactionId: productionTransaction.transaction_id,
-                segmentId: productionTransaction.segment_id,
-                kind: 'image',
-                ok: false,
-                errorCode: result.errorCode,
-              });
-            }
-          } catch (err) {
-            return { content: `${(err as Error).message}; provider error=[${result.errorCode}] ${result.message}`, isError: true } as ToolResult;
-          }
+        if (timelineSpend && notDispatched && timelineSpend.heldNow) {
+          const { releaseProductionSpend } = await import('../../features/video_production_spend');
+          await releaseProductionSpend({ userId: opts.userId, scope: timelineSpend.scope, fingerprint: timelineSpend.fingerprint });
         }
         if (imageTransaction) {
           try {
@@ -437,21 +407,6 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         return { content: `[${result.errorCode}] ${result.message}`, isError: true } as ToolResult;
       }
 
-      if (productionTransaction) {
-        try {
-          await finishVideoProductionGeneration({
-            statePath: productionStatePath,
-            planPath: productionPlanAbs,
-            transactionId: productionTransaction.transaction_id,
-            segmentId: productionTransaction.segment_id,
-            kind: 'image',
-            ok: true,
-            outputPath: result.path,
-          });
-        } catch (err) {
-          return { content: (err as Error).message, isError: true } as ToolResult;
-        }
-      }
       if (imageTransaction) {
         try {
           await finishImageStudioGeneration({
@@ -470,6 +425,30 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(result.path), error: logErrorRef(err) }); }
       }
 
+      if (timelineSpend) {
+        const { finishTimelineGeneration } = await import('../../features/video_production_spend');
+        const { previewPng: _unused, ...facts } = await finishTimelineGeneration({
+          spend: timelineSpend,
+          userId: opts.userId,
+          kind: 'image',
+          fileAbs: result.path,
+          prompt,
+          model: `${result.provider}/${result.model}`,
+          referenceFiles: refAbs,
+          request: input,
+          ...(typeof input.shot === 'string' ? { shot: input.shot } : {}),
+          ...(typeof input.label === 'string' ? { label: input.label } : {}),
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        return {
+          content: [
+            JSON.stringify(facts),
+            `Image written to ${result.path} (${result.width}x${result.height}).`,
+            `Show it to the user with: ![<alt>](${versionedChatMediaLocalUrl(result.path)})`,
+          ].join('\n'),
+        } as ToolResult;
+      }
+
       // Soft guard: count (re)generations of THIS requested deliverable and
       // surface a one-line warning past the threshold — billable, never blocked.
       const guardNote = regenerationWarning(noteGeneration(opts.cid, requestedAbs), 'image');
@@ -478,7 +457,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
         + `(${result.width}x${result.height}, ${result.bytes} bytes, ${result.provider}/${result.model}). `
         + (result.sourceUrl ? `Source URL: ${result.sourceUrl}. ` : '')
         + `Show it to the user with: ![<alt>](${versionedChatMediaLocalUrl(result.path)})`
-        + (imageCreditQuote ? `\nImageStudio local provider availability before dispatch: ${JSON.stringify(imageCreditQuote)}` : '')
+        + (imageServiceAvailability ? `\nImageStudio local provider availability before dispatch: ${JSON.stringify(imageServiceAvailability)}` : '')
         + (guardNote ? `\n${guardNote}` : '');
       const content = renamed ? `${summary}${renderRenameSignal(requestedAbs, result.path)}` : summary;
       return { content } as ToolResult;

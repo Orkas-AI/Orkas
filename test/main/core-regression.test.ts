@@ -47,10 +47,6 @@ vi.mock('../../src/main/features/search', () => ({
   invalidateChatDisplayCatalog: vi.fn(),
 }));
 
-vi.mock('../../src/main/features/sync', () => ({
-  markDirty: vi.fn(),
-}));
-
 vi.mock('../../src/main/features/file_indexer', () => ({
   invalidateFileCache: vi.fn(),
   purgeFileCacheByCid: vi.fn(async () => 0),
@@ -463,3 +459,47 @@ describe('PC core regression unit coverage', () => {
     auto.stopScheduler();
   });
 });
+
+it('[PC-TTS] validates native and custom TTS profiles and encrypts the token', async () => {
+    const ttsAuth = await import('../../src/main/features/tts_auth');
+    const paths = await import('../../src/main/paths');
+
+    // Doubao V3 needs only an API key; voice (speaker) + resource id default.
+    expect(ttsAuth.addTtsProfile({ provider: 'doubao', apiKey: '' }).ok)
+      .toBe(false); // missing API key
+    expect(ttsAuth.addTtsProfile({ provider: 'doubao', apiKey: 'doubao-key-secret' }).ok)
+      .toBe(true); // voice + resource id default
+    expect(ttsAuth.addTtsProfile({
+      provider: 'doubao', apiKey: 'doubao-key-secret', voice: 'zh_male_x_bigtts',
+    }).ok).toBe(true); // an explicit voice is honored
+
+    // Custom gateways still require an explicit URL; native OpenAI supplies its preset URL.
+    expect(ttsAuth.addTtsProfile({ provider: 'custom', model: 'tts-1', voice: 'alloy', apiKey: 'sk-tts' }).ok).toBe(false);
+    expect(ttsAuth.addTtsProfile({
+      provider: 'openai', model: 'tts-1', apiKey: 'sk-tts-native-default', label: 'native-default',
+    }).ok).toBe(true);
+    expect(ttsAuth.addTtsProfile({
+      provider: 'openai', baseUrl: 'https://api.openai.com/v1', model: 'tts-1', apiKey: 'sk-tts-secret',
+    }).ok).toBe(true);
+
+    // Reload runs the provider-aware parser: doubao keeps baseUrl, empty model
+    // survives, resourceId is NOT stored (derived from the voice at call time),
+    // and an unset voice fell back to the default speaker.
+    const list = ttsAuth.listTtsProfiles();
+    const doubao = list.find((p) => p.provider === 'doubao');
+    expect(doubao?.resourceId).toBeUndefined();
+    expect(doubao?.baseUrl).toBe('https://openspeech.bytedance.com');
+    expect(doubao?.voice).toBe('zh_male_x_bigtts');
+    expect(doubao?.model).toBe('');
+    expect(list.some((p) => p.provider === 'doubao' && p.voice === 'zh_female_vv_uranus_bigtts')).toBe(true);
+    expect(list.some((p) => p.provider === 'openai' && p.model === 'tts-1')).toBe(true);
+    expect(list.find((p) => p.label === 'native-default')?.baseUrl).toBe('https://api.openai.com/v1');
+    const orderedIds = list.map((p) => p.id);
+    expect(ttsAuth.reorderTtsProfiles([...orderedIds].reverse()).ok).toBe(true);
+    expect(ttsAuth.listTtsProfiles().map((p) => p.id)).toEqual([...orderedIds].reverse());
+
+    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
+    expect(raw).not.toContain('doubao-key-secret');
+    expect(raw).not.toContain('sk-tts-secret');
+    expect(raw).not.toContain('sk-tts-native-default');
+  });

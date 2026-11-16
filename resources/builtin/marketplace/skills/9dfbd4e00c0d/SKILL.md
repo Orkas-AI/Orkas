@@ -1,12 +1,12 @@
 ---
 name: content-writer
-description_zh: "规划、研究、撰写、改写、自然化、适配或审核社媒帖子与长篇内容，交付保留作者声音、证据与引用的渠道适配稿件或审核结论。"
-description_en: "Plan, research, draft, revise, humanize, adapt or audit social posts and long-form content, delivering channel-ready writing or reviews with preserved voice, evidence and citations."
+description_zh: "策划、研究、撰写、改写、去 AI 味、适配和审校文案，覆盖社媒、长文、商品文案、内容日历及评论回应；保留作者声音、来源与事实边界，不执行平台操作。"
+description_en: "Plan, research, draft, revise, humanize, adapt and audit copy, including social posts, long-form and product copy, calendars and replies; preserve voice and evidence without operating platforms."
 ---
 
 # Content Writer
 
-Turn a goal, source pack, or draft into defensible, channel-ready content. Keep research, evidence, composition, and editing distinct.
+Turn a goal, source pack, or draft into defensible, channel-ready copy. All formats use the same brief, evidence policy, composition and editing pipeline; platform conventions change the artifact, not its factual standard.
 
 ## Route the work
 
@@ -21,8 +21,12 @@ Use the smallest useful sequence. Do not force the user through every mode.
 | `humanize` | remove stiff, generic, or model-like prose | voice-matched rewrite and risk notes |
 | `audit` | verify claims, citations, links, disclosures, or readiness | prioritized audit with publication decision |
 | `adapt` | reshape existing content for another channel or placement | channel-specific version without new unsupported claims |
+| `calendar` | organize a series of content pieces | dated topics, hooks, formats and production needs |
+| `respond` | reply to a comment, complaint or public issue | response copy with proportionate risk and approval notes |
 
-Use this skill for individual social posts. Do not use it for social calendars, account operation, automatic publishing, campaign analytics, or final professional legal, medical, or financial advice.
+Use this skill for individual social posts and content series. New social copy uses `draft`; social optimization uses `revise`, with `humanize`, `adapt` or `audit` only when needed. Do not create a separate social writing process.
+
+For `calendar` or `respond`, read [content-programs.md](references/content-programs.md) for the planning or response decisions; use the shared evidence and editing rules below for its copy. Do not use this skill for account operation, automatic publishing, campaign analytics, or final professional legal, medical, or financial advice.
 
 ## Build the working brief
 
@@ -30,11 +34,13 @@ Identify objective/action, reader/context, promise/thesis/angle, format/language
 
 In plan, label Reader, Objective/action, Promise, Thesis/angle, Format/type, Tone, Working assumptions, and unsupplied premises or none.
 
-Platform is optional; never ask for it or offer choices.
+For ordinary social or editorial drafting, platform is optional; never ask for it or offer choices. Apply a named platform through the format reference.
+
+For product-commerce, resolve the product/variant and requested placement from supplied context. Use the selected domain guidance for claims, platform fields and creative formats within these same modes. Ask only when a missing platform changes a required field or constraint; otherwise draft at the supported scope and mark unverified channel requirements. For mixed requests, apply the format and domain rules to each artifact separately; a product mention alone does not make an editorial article a listing. Do not impose social-post headlines, length, tags or engagement CTAs on product fields.
 
 Ask one question only if its answer changes the result; otherwise default conservatively. Never re-ask supplied information.
 
-For an unlisted format, infer from placement, reader, job, and action; deliver directly, never a generic topic summary.
+For an unlisted copy format within the caller's scope, infer from placement, reader, job, and action; deliver directly, never a generic topic summary.
 
 ## Choose the evidence policy
 
@@ -117,9 +123,6 @@ snippets as discovery only, not evidence.
   coverage checkpoint, not a citation whitelist: if later retrieval changes
   family coverage, update the ledger and rerun the gate before claiming
   completion. Then draft section by section from the evidence-backed outline.
-- For short social input, skip `manage_execution_plan`, infer audience/angle/length, and deliver the finished post. Make the first non-empty line a distinct headline, use concrete reader situations, and end with one explicit low-friction action or decision prompt. Do not substitute slogans, tags, feature lists, or a vague rhetorical question for developed copy.
-- For workplace-productivity posts, include at least two qualitative input-to-output mini-examples (for example, scattered notes to decisions/owners/deadlines; blank brief to audience/questions/outline). Never invent time saved or outcome metrics. Add one copy-ready prompt using `[输入材料]`, `[输出格式]`, `[读者]`, and `[待核验项]`. Make `[输出格式]` a per-scenario placeholder for meetings, writing, or information compression, not fixed meeting fields, so only that value needs editing.
-- For short social copy, end the main post with an explicit interaction CTA (comment, save, share, or try), then append a compact block with two alternate headlines, one alternate CTA, and editable hashtags. Localize its heading: `可替换选项` in Chinese; `Replaceable options` in English.
 - When no evidence is supplied, exact percentages, amounts, rankings, adoption counts, before/after durations, and quantified performance or outcome claims are unsupported even as hooks. Replace them with qualitative reader situations rather than presenting invented proof.
 - In `adapt` mode, change shape/phrasing only. Preserve supplied claim set, citations, and disclosures; add no interpretation, implication, bridge claim, or broader conclusion. A headline is also a claim: restate only an explicit source proposition; add no comparison, surprise, trend, prevalence, urgency, or popularity. Newsletter: make the first line `主题：...`; if `/report` is supplied, make the only CTA `[阅读全文](/report)`.
 - For any unfamiliar channel, choose title/lead, order, detail, rhythm, and close around the reader's job; do not stretch it into an article or generic promo.

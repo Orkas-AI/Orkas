@@ -17,6 +17,7 @@
  * recovery inside one tool call instead of asking the model to retry.
  */
 import * as fs from "node:fs";
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 import * as path from "node:path";
 import * as os from "node:os";
 import { defineTool, type AgentTool, type ToolResult } from "./base.js";
@@ -519,8 +520,36 @@ function saveCache(state: CacheState): void {
 
 // ─── Search execution ─────────────────────────────────────────────────────
 
-type ProviderRunSuccess = { ok: true; results: SearchResult[] };
-type ProviderRunFailure = { ok: false; reason: "unreachable" | "http"; detail: string };
+type ResponseContentType = "text/html" | "application/xhtml+xml" | "text/plain"
+  | "application/json" | "application/xml" | "text/xml" | "application/rss+xml"
+  | "other" | "unknown";
+
+// Host-only facts. Never include queries, URLs, response text, statusText or raw errors.
+type ProviderDiagnostics = {
+  failure_stage: "transport" | "http" | "body_read" | "parse" | "empty_results" | null;
+  attempts: number;
+  http_status: number | null;
+  content_type: ResponseContentType;
+  decoded_body_bytes: number | null;
+  parsed_results: number | null;
+  elapsed_ms: number;
+};
+
+function responseContentType(response: Response): ResponseContentType {
+  const header = response.headers.get("content-type");
+  if (!header) return "unknown";
+  // Inspect only a bounded prefix and emit only known MIME types, never header values.
+  const mime = header.slice(0, 128).split(";", 1)[0].trim().toLowerCase();
+  switch (mime) {
+    case "text/html": case "application/xhtml+xml": case "text/plain":
+    case "application/json": case "application/xml": case "text/xml": case "application/rss+xml":
+      return mime;
+    default: return "other";
+  }
+}
+
+type ProviderRunSuccess = { ok: true; results: SearchResult[]; diagnostics: ProviderDiagnostics };
+type ProviderRunFailure = { ok: false; reason: "unreachable" | "http"; detail: string; diagnostics: ProviderDiagnostics };
 type ProviderRunResult = ProviderRunSuccess | ProviderRunFailure;
 
 type SearchRuntimeState = {
@@ -573,11 +602,21 @@ async function runProviderSearch(
   config: ProviderConfig,
   query: string,
 ): Promise<ProviderRunResult> {
+  const started = performance.now();
+  const diagnostics: ProviderDiagnostics = {
+    failure_stage: "transport", attempts: 0, http_status: null, content_type: "unknown",
+    decoded_body_bytes: null, parsed_results: null, elapsed_ms: 0,
+  };
+  let html: string | undefined;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
   try {
     const maxAttempts = config.id === "yahoo" ? 2 : 1;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      diagnostics.attempts = attempt + 1;
+      diagnostics.failure_stage = "transport";
+      diagnostics.http_status = null;
+      diagnostics.content_type = "unknown";
       const resp = await fetch(config.buildSearchUrl(query), {
         method: "GET",
         headers: {
@@ -588,31 +627,51 @@ async function runProviderSearch(
         signal: controller.signal,
         redirect: "follow",
       });
+      diagnostics.http_status = resp.status;
+      diagnostics.content_type = responseContentType(resp);
       if (!resp.ok) {
+        diagnostics.failure_stage = "http";
         if (config.id === "yahoo" && resp.status === 500 && attempt === 0) {
+          log.warn("provider request retry", {
+            provider: config.id, next_provider: config.id, ...diagnostics,
+            elapsed_ms: Math.round(performance.now() - started),
+          });
           continue;
         }
         return {
           ok: false,
           reason: "http",
           detail: `HTTP ${resp.status} ${resp.statusText}`,
+          diagnostics,
         };
       }
-      const html = await resp.text();
-      return { ok: true, results: config.parse(html) };
+      diagnostics.failure_stage = "body_read";
+      html = await resp.text();
+      diagnostics.failure_stage = "parse";
+      const results = config.parse(html);
+      diagnostics.parsed_results = results.length;
+      diagnostics.failure_stage = results.length ? null : "empty_results";
+      // Size the already-read decoded body only on failure; do not read error bodies
+      // or add another full-body scan to successful searches. This is not wire size.
+      if (!results.length) diagnostics.decoded_body_bytes = Buffer.byteLength(html, "utf8");
+      return { ok: true, results, diagnostics };
     }
     return {
       ok: false,
       reason: "http",
       detail: "HTTP 500 after retry",
+      diagnostics,
     };
   } catch (err) {
+    if (html !== undefined) diagnostics.decoded_body_bytes = Buffer.byteLength(html, "utf8");
     return {
       ok: false,
       reason: "unreachable",
       detail: err instanceof Error ? err.message : String(err),
+      diagnostics,
     };
   } finally {
+    diagnostics.elapsed_ms = Math.round(performance.now() - started);
     clearTimeout(timer);
   }
 }
@@ -653,7 +712,7 @@ export async function runBuiltinWebSearch(
 ): Promise<ToolResult> {
   const q = (query || "").trim();
   const n = Math.min(count, MAX_COUNT);
-  if (!q) return { content: "Error: query is required", isError: true };
+  if (!q) return parameterError("Error: query is required", ['query'], 'required');
   return runWebSearchInternal(q, n);
 }
 
@@ -679,7 +738,7 @@ export const webSearchTool: AgentTool = defineTool({
       (input.count as number | undefined) ?? DEFAULT_COUNT,
       MAX_COUNT,
     );
-    if (!query) return { content: "Error: query is required", isError: true };
+    if (!query) return parameterError("Error: query is required", ['query'], 'required');
     return runWebSearchInternal(query, count);
   },
 });
@@ -733,11 +792,11 @@ async function runSerializedWebSearch(
     failures.push({ provider, detail });
     markProviderFailure(state, provider);
     const next = order[failures.length];
-    if (next) {
-      log.warn(
-        `provider request failed: ${provider} (${detail}); trying ${next}`,
-      );
-    }
+    // One bounded record per failed provider, including the last one. Yahoo's
+    // existing single 500 retry adds at most one record: seven per tool call.
+    log.warn("provider request failed", {
+      provider, next_provider: next ?? null, ...result.diagnostics,
+    });
   }
 
   return {

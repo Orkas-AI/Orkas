@@ -1,4 +1,5 @@
 import { defineTool, type AgentTool } from "../tools/base.js";
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 import { createLogger } from "../shared/logger.js";
 import type { SkillStore } from "./skill-store.js";
 
@@ -83,16 +84,13 @@ export function createSkillManageTool(
       const action = input.action as SkillManageAction;
 
       if (!(["create", "read", "patch", "list", "delete"] as const).includes(action)) {
-        return { content: `Unknown action: ${String(action)}`, isError: true };
+        return parameterError(`Unknown action: ${String(action)}`, ['action'], 'invalid_value');
       }
       const unexpected = Object.keys(input)
         .filter((key) => !actionFields[action].has(key))
         .sort();
       if (unexpected.length) {
-        return {
-          content: `Error: skill_manage(${action}) does not accept: ${unexpected.join(", ")}`,
-          isError: true,
-        };
+        return parameterError(`Error: skill_manage(${action}) does not accept: ${unexpected.join(", ")}`, unexpected, 'unsupported_field');
       }
 
       try {
@@ -111,7 +109,7 @@ export function createSkillManageTool(
 
           case "read": {
             const id = input.id as string;
-            if (!id) return { content: "Error: 'id' is required for read action.", isError: true };
+            if (!id) return parameterError("Error: 'id' is required for read action.", ['id'], 'required');
             const skill = await store.read(id);
             if (!skill) return { content: `Skill not found: ${id}`, isError: true };
             await store.touch(id).catch(() => {});
@@ -137,10 +135,8 @@ export function createSkillManageTool(
             const tags = input.tags as string[] | undefined;
 
             if (!id || !name || !description || !body) {
-              return {
-                content: "Error: 'id', 'name', 'description', and 'body' are required for create action.",
-                isError: true,
-              };
+              return parameterError("Error: 'id', 'name', 'description', and 'body' are required for create action.",
+                ['id', 'name', 'description', 'body'].filter(field => !input[field]), 'required');
             }
 
             const skill = await store.create({ id, name, description, body, tags });
@@ -160,10 +156,8 @@ export function createSkillManageTool(
             const replaceAll = (input.replace_all as boolean) ?? false;
 
             if (!id || !oldStr || !newStr) {
-              return {
-                content: "Error: 'id', 'old_string', and 'new_string' are required for patch action.",
-                isError: true,
-              };
+              return parameterError("Error: 'id', 'old_string', and 'new_string' are required for patch action.",
+                ['id', 'old_string', 'new_string'].filter(field => !input[field]), 'required');
             }
 
             const skill = await store.patch(id, oldStr, newStr, replaceAll);
@@ -174,7 +168,7 @@ export function createSkillManageTool(
 
           case "delete": {
             const id = input.id as string;
-            if (!id) return { content: "Error: 'id' is required for delete action.", isError: true };
+            if (!id) return parameterError("Error: 'id' is required for delete action.", ['id'], 'required');
             const deleted = await store.delete(id);
             return {
               content: deleted ? `Skill deleted: ${id}` : `Skill not found: ${id}`,
@@ -183,7 +177,7 @@ export function createSkillManageTool(
           }
 
           default:
-            return { content: `Unknown action: ${action}`, isError: true };
+            return parameterError(`Unknown action: ${action}`, ['action'], 'invalid_value');
         }
       } catch (err) {
         return { content: `Error: ${(err as Error).message}`, isError: true };

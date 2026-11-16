@@ -620,6 +620,128 @@ describe('builtin marketplace seed', () => {
     ]);
   });
 
+  it.each([
+    ['a marketplace install', true],
+    ['an older builtin seed with no file list', false],
+  ] as const)('removes Agent Skills left by %s that the newer package no longer ships', async (_kind, fromMarketplace) => {
+    // A newer builtin kept every Skill file it had not listed itself. After VideoStudio 2.0
+    // overlaid a 1.6 marketplace install on 2026-11-08, its Agent still read eight retired Skills.
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      version: '2.0.0',
+      name: 'Writer',
+      category: 'general',
+      workflow: 'Use the current stages.',
+      skill_list: ['current-stage'],
+    });
+    writeBuiltinAgentSkill(TEST_AGENT_ID, 'current-stage');
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const origin = fromMarketplace
+      ? { published_at: 10, agent_json_url: 'https://cdn.test/writer.json', agent_skills_bundle_url: 'https://cdn.test/writer-skills.zip' }
+      : { published_at: 0, agent_json_url: '', agent_skills_bundle_url: '', seed_source: 'builtin' };
+    await installs.addAgentInstall('u1', { id: TEST_AGENT_ID, version: '1.6.0', create_uid: '0', default_install: true, ...origin });
+    const localRoot = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    const writeLocal = (rel: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(localRoot, rel)), { recursive: true });
+      fs.writeFileSync(path.join(localRoot, rel), text, 'utf8');
+    };
+    writeLocal('agent.json', JSON.stringify({ agent_id: TEST_AGENT_ID, version: '1.6.0', name: 'Writer', workflow: 'Use the old stages.' }));
+    writeLocal('skills/current-stage/SKILL.md', '---\nname: current-stage\ndescription: old\n---\n\nold body\n');
+    writeLocal('skills/current-stage/references/retired-step.md', 'old reference\n');
+    writeLocal('skills/retired-stage/SKILL.md', '---\nname: retired-stage\ndescription: retired\n---\n\nretired body\n');
+    writeLocal('skills/retired-stage/scripts/lib/core.cjs', 'module.exports = {};\n');
+    writeLocal('runtime-note.txt', 'preserve local runtime data\n');
+    writeLocal('_install.json', JSON.stringify({ version: '1.6.0', installed_at: 12, create_uid: '0', default_install: true, ...origin }));
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({ seeded_agents: 1 });
+
+    expect(fs.existsSync(path.join(localRoot, 'skills', 'retired-stage'))).toBe(false);
+    expect(fs.existsSync(path.join(localRoot, 'skills', 'current-stage', 'references'))).toBe(false);
+    expect(fs.readFileSync(path.join(localRoot, 'skills', 'current-stage', 'SKILL.md'), 'utf8')).toContain('private body');
+    expect(fs.readFileSync(path.join(localRoot, 'runtime-note.txt'), 'utf8')).toBe('preserve local runtime data\n');
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('u1');
+    const registry = await import('../../../src/main/model/core-agent/skill-registry');
+    const ownerBlock = await registry.getSystemPromptBlock({ agentId: TEST_AGENT_ID });
+    expect(ownerBlock).toContain('**current-stage**');
+    expect(ownerBlock).not.toContain('retired-stage');
+  });
+
+  it.each(['root', 'child'] as const)('does not mutate foreign files through an installed Skill %s symlink during upgrade', async location => {
+    writeBuiltinAgent(TEST_AGENT_ID, { version: '2.0.0', name: 'Writer', category: 'general' });
+    writeBuiltinAgentSkill(TEST_AGENT_ID, 'current-stage');
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', { id: TEST_AGENT_ID, version: '1.0.0', create_uid: '0', default_install: true,
+      published_at: 0, agent_json_url: '', agent_skills_bundle_url: '', seed_source: 'builtin' });
+    const local = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.mkdirSync(local, { recursive: true });
+    const oldAgent = JSON.stringify({ agent_id: TEST_AGENT_ID, version: '1.0.0', name: 'Old Writer' });
+    fs.writeFileSync(path.join(local, 'agent.json'), oldAgent);
+    fs.writeFileSync(path.join(local, '_install.json'), JSON.stringify({ version: '1.0.0', seed_source: 'builtin' }));
+    const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-builtin-foreign-'));
+    const link = location === 'root' ? path.join(local, 'skills') : path.join(local, 'skills/current-stage');
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    const current = location === 'root' ? path.join(foreign, 'current-stage/SKILL.md') : path.join(foreign, 'SKILL.md');
+    const retired = location === 'root' ? path.join(foreign, 'retired-stage/SKILL.md') : path.join(foreign, 'retired-reference.md');
+    for (const file of [current, retired]) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'foreign-owned bytes'); }
+    fs.symlinkSync(foreign, link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      const outcome = await seed.seedBuiltinMarketplaceForUser('u1').then(value => ({ value }), error => ({ error }));
+      expect(fs.readFileSync(current, 'utf8')).toBe('foreign-owned bytes');
+      expect(fs.readFileSync(retired, 'utf8')).toBe('foreign-owned bytes');
+      expect(outcome).toMatchObject({ error: { code: 'E_PATH_OUT_OF_SCOPE' } });
+      expect(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).toBe(oldAgent);
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      expect((await installs.readInstalls('u1')).agents.find(row => row.id === TEST_AGENT_ID)?.version).toBe('1.0.0');
+      expect(fs.readdirSync(path.dirname(local)).filter(name => name.startsWith('.' + TEST_AGENT_ID + '.install-'))).toEqual([]);
+      fs.unlinkSync(link);
+      const retried = await seed.seedBuiltinMarketplaceForUser('u1');
+      expect(retried.seeded_agents).toBe(1);
+      expect(JSON.parse(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).version).toBe('2.0.0');
+      expect(fs.readFileSync(current, 'utf8')).toBe('foreign-owned bytes');
+    } finally { fs.rmSync(foreign, { recursive: true, force: true }); }
+  });
+
+  it.each(['ancestor', 'leaf'] as const)('protects foreign bytes when pruning a stale managed %s link', async location => {
+    writeBuiltinAgent(TEST_AGENT_ID, { version: '2.0.0', name: 'Writer', category: 'general' });
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', { id: TEST_AGENT_ID, version: '1.0.0', create_uid: '0', default_install: true,
+      published_at: 0, agent_json_url: '', agent_skills_bundle_url: '', seed_source: 'builtin' });
+    const local = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.mkdirSync(path.join(local, 'skills'), { recursive: true });
+    const oldAgent = JSON.stringify({ agent_id: TEST_AGENT_ID, version: '1.0.0', name: 'Old Writer' });
+    fs.writeFileSync(path.join(local, 'agent.json'), oldAgent);
+    fs.writeFileSync(path.join(local, '_install.json'), JSON.stringify({ version: '1.0.0', seed_source: 'builtin',
+      builtin_files: ['agent.json', 'skills/retired/SKILL.md'] }));
+    const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-prune-foreign-'));
+    const outside = path.join(foreign, 'SKILL.md');
+    fs.writeFileSync(outside, 'foreign-owned bytes');
+    const link = path.join(local, 'skills/retired');
+    if (location === 'ancestor') fs.symlinkSync(foreign, link, process.platform === 'win32' ? 'junction' : 'dir');
+    else {
+      fs.mkdirSync(link); fs.symlinkSync(outside, path.join(link, 'SKILL.md'));
+    }
+    try {
+      const outcome = await seed.seedBuiltinMarketplaceForUser('u1').then(value => ({ value }), error => ({ error }));
+      expect(fs.readFileSync(outside, 'utf8')).toBe('foreign-owned bytes');
+      if (location === 'ancestor') {
+        expect(outcome).toMatchObject({ error: { code: 'E_PATH_OUT_OF_SCOPE' } });
+        expect(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).toBe(oldAgent);
+        expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      } else {
+        expect(outcome).toMatchObject({ value: { seeded_agents: 1 } });
+        expect(fs.existsSync(link)).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(local, 'agent.json'), 'utf8')).version).toBe('2.0.0');
+      }
+    } finally { fs.rmSync(foreign, { recursive: true, force: true }); }
+  });
+
   it('refreshes builtin skill content without replacing local-only files', async () => {
     writeBuiltinSkill('ee99fbb42964', 'deep-research');
     writeBuiltinSkillMeta('ee99fbb42964', {

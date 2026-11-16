@@ -1,3 +1,6 @@
+import { extractOffice } from './office-extract';
+export { DOCX_EXTRACTION_VERSION } from './docx-numbering';
+
 /**
  * .docx → markdown. Pure function, reusable anywhere in main/.
  *
@@ -5,44 +8,16 @@
  * (more useful for downstream organizer than raw text).
  */
 
-let _mammothPromise: Promise<any> | null = null;
-function loadMammoth(): Promise<any> {
-  if (!_mammothPromise) _mammothPromise = import('mammoth' as any);
-  return _mammothPromise;
-}
-
+/** Conversion and numbering run in the existing bounded Office worker pool. */
 export async function docxBufferToMarkdown(buf: Buffer): Promise<string> {
-  if (!buf || !(buf instanceof Buffer) || buf.length === 0) {
-    throw new Error('docxBufferToMarkdown: empty or invalid buffer');
-  }
-  const mammoth: any = await loadMammoth();
-  const fn = mammoth.convertToMarkdown ?? mammoth.default?.convertToMarkdown;
-  if (typeof fn !== 'function') throw new Error('mammoth.convertToMarkdown unavailable');
-  const result = await fn({ buffer: buf });
-  // mammoth returns { value, messages }; messages are warnings about unrecognized
-  // styles — non-fatal, drop them. Caller can re-extract if needed.
-  return String(result?.value ?? '').trim();
+  if (!Buffer.isBuffer(buf) || buf.length === 0) throw new Error('docxBufferToMarkdown: empty or invalid buffer');
+  return extractOffice('docx-markdown', buf);
 }
 
-/**
- * .docx → HTML for inline preview in the KB viewer. Uses mammoth's HTML
- * converter which preserves headings, lists, bold/italic, tables, and
- * inlines images as base64 data URLs. Loses fine-grained font/page
- * layout (that's inherent to HTML), but good enough for reading prose.
- *
- * Size warning: documents with many images balloon because base64 is ~33%
- * larger than raw bytes. A 10MB docx with embedded photos can become
- * 15-20MB of HTML — caller should budget for that.
- */
+/** Read-only HTML preview; source layout remains approximate. */
 export async function docxBufferToHtml(buf: Buffer): Promise<string> {
-  if (!buf || !(buf instanceof Buffer) || buf.length === 0) {
-    throw new Error('docxBufferToHtml: empty or invalid buffer');
-  }
-  const mammoth: any = await loadMammoth();
-  const fn = mammoth.convertToHtml ?? mammoth.default?.convertToHtml;
-  if (typeof fn !== 'function') throw new Error('mammoth.convertToHtml unavailable');
-  const result = await fn({ buffer: buf });
-  return String(result?.value ?? '').trim();
+  if (!Buffer.isBuffer(buf) || buf.length === 0) throw new Error('docxBufferToHtml: empty or invalid buffer');
+  return extractOffice('docx-html', buf);
 }
 
 export interface DocxChunkOpts {

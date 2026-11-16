@@ -1,0 +1,245 @@
+/* Generated from desktop dialog, form, button and menu styles; run node scripts/update-builtin-app-controls.cjs. */
+:root{--radius-sm: 10px;--radius-lg: 20px;}
+
+.chat-attach-btn {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-attach-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.modal {
+  background: #fff;
+  border-radius: var(--radius-lg);
+  padding: 28px;
+  min-width: 400px;
+  max-width: 520px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.12);
+}
+
+.modal h3 { margin: 0; font-size: 16px; line-height: 1.4; font-weight: 600; }
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 32px;
+  margin-bottom: 16px;
+}
+.modal-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+.modal > .modal-title,
+.modal > .ui-dialog-title {
+  margin-bottom: 16px;
+}
+.modal-standard {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.modal-body {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.modal-close-btn {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted, #6b7280);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s, color .15s;
+}
+.modal-close-btn:hover:not(:disabled) {
+  background: var(--surface-2, #f1f5f9);
+  color: var(--text, #111827);
+}
+.modal-close-btn:focus-visible {
+  outline: 2px solid var(--primary, #2563eb);
+  outline-offset: 2px;
+}
+.modal-close-btn:disabled {
+  cursor: default;
+  opacity: .45;
+}
+.modal-close-icon {
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+
+.form-row { margin-bottom: 14px; }
+.form-row label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+
+
+.form-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  transition: border-color .15s, box-shadow .15s;
+  box-sizing: border-box;
+}
+.form-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(91, 87, 214, 0.18);
+}
+
+
+.modal-actions {
+  display: flex;
+  /* `min-width` below replaces the flex default `min-width: auto`, so without
+     wrapping a row of several buttons shrinks every label into a narrow
+     column. Wrap instead: each action keeps its own width and moves to the
+     next line when the row is full. */
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+.modal-actions .btn,
+.memory-modal-foot .btn {
+  min-width: 76px;
+  min-height: 36px;
+  max-width: 100%;
+  padding: 0 16px;
+  font-size: 13px;
+  line-height: 34px;
+  /* A label longer than the dialog (a branch or file name) breaks instead of
+     spilling out of its button. */
+  overflow-wrap: anywhere;
+}
+
+.btn {
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+
+.btn:hover { background: #f1f5f9; }
+
+.btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.btn:disabled:hover { background: #fff; }
+
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-primary:disabled,
+.btn-primary:disabled:hover {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: rgba(220, 38, 38, 0.3);
+}
+
+.btn-danger:hover { background: rgba(220, 38, 38, 0.06); }
+.btn-danger:disabled:hover { background: #fff; }
+
+
+
+.context-menu {
+  position: fixed;
+  --orkas-ui-layer: overlay;
+  z-index: 9999;
+  min-width: 160px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+}
+.context-menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-2);
+  flex: 0 0 auto;
+}
+.context-menu-icon .ui-icon { width: 16px; height: 16px; }
+
+.context-menu-item:hover,
+.context-menu-item.is-active,
+.context-menu-item:focus-visible { background: var(--primary-soft); }
+
+.context-menu-item:focus-visible { background: var(--primary-soft); }

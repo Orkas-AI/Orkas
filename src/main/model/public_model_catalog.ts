@@ -47,6 +47,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
   anthropic: [
     { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', maxInputImages: 20 },
     { id: 'claude-opus-5', name: 'Claude Opus 5', maxInputImages: 20 },
+    { id: 'claude-fable-5-2', name: 'Claude Fable 5.2', maxInputImages: 20 },
     { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', maxInputImages: 20 },
     { id: 'claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
     { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
@@ -136,6 +137,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     // also accepts a user-entered model id.
     { id: 'anthropic/claude-opus-5.5', name: 'Claude Opus 5.5', maxInputImages: 20 },
     { id: 'anthropic/claude-opus-5', name: 'Claude Opus 5', maxInputImages: 20 },
+    { id: 'anthropic/claude-fable-5.2', name: 'Claude Fable 5.2', maxInputImages: 20 },
     { id: 'anthropic/claude-fable-5.1', name: 'Claude Fable 5.1', maxInputImages: 20 },
     { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
     { id: 'anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
@@ -169,7 +171,8 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'z-ai/glm-5.2', name: 'GLM-5.2', maxTokens: 131072 },
     { id: 'z-ai/glm-5.1', name: 'GLM-5.1' },
     { id: 'minimax/minimax-m3', name: 'MiniMax 3', maxTokens: 131072 },
-    { id: 'minimax/minimax-m2.7', name: 'MiniMax 2.7' },
+    // Keep the host reservation when the SDK raises the vendor's ceiling.
+    { id: 'minimax/minimax-m2.7', name: 'MiniMax 2.7', maxTokens: 131072 },
     { id: 'xiaomi/mimo-v2.5-pro', name: 'Xiaomi MiMo V2.5 Pro', maxTokens: 131072 },
     { id: 'xiaomi/mimo-v2.5', name: 'Xiaomi MiMo V2.5', maxTokens: 65536 },
     { id: 'x-ai/grok-4.20', name: 'Grok 4.20', maxTokens: 131072, maxInputImages: 20 },

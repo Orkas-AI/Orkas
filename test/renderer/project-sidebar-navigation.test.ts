@@ -72,6 +72,33 @@ function mount({ cached = true, collapsed = false, previous = '' } = {}) {
 }
 
 describe('project navigation follows the destination in the sidebar', () => {
+  it.each([false, true])('opens a resolved project only for the user who requested it (switch user=%s)', async switchUser => {
+    const h = mount();
+    let resolveList!: (value: any) => void;
+    const response = new Promise(resolve => { resolveList = resolve; });
+    h.context.orkas.invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'projects.list') return response;
+      throw new Error(`Unexpected channel: ${channel}`);
+    });
+    const pending = h.context.openProjectsSurface({ action: 'configure', target_id: 'beta' });
+    if (switchUser) h.context.currentUserId = 'another-local-user';
+    resolveList({ ok: true, projects: h.projects });
+    expect(await pending).toBe(!switchUser);
+    expect(h.context.currentView).toBe(switchUser ? 'settings' : 'project');
+    expect(h.selected()).toEqual(switchUser ? [] : ['beta']);
+  });
+
+  it('shows the source folder state when a local project is expanded or collapsed', () => {
+    const h = mount();
+    h.context.uiIconHtml = (name: string) => `<svg data-icon="${name}"></svg>`;
+    const row = () => h.context._renderProjectRow(h.projects[0], []);
+    expect(row()).toContain('data-icon="folder"');
+    vm.runInContext('_projectsExpanded.alpha = true', h.context);
+    expect(row()).toContain('data-icon="folder-open"');
+    vm.runInContext('_projectsExpanded.alpha = false', h.context);
+    expect(row()).toContain('data-icon="folder"');
+  });
+
   it('updates the open detail immediately after a sidebar rename, preserving drafts while the list refresh waits', async () => {
     const h = mount({ previous: 'alpha' });
     h.context.currentView = 'project';

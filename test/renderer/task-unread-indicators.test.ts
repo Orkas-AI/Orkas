@@ -143,6 +143,51 @@ function loadUnreadRenderer(
 }
 
 describe('unread task reply indicators', () => {
+  it.each(['once', 'retain'])('never marks private app %s runs unread, including before account initialization', mode => {
+    const persisted = new Map<string, string>();
+    const context = loadUnreadRenderer(persisted);
+    const cid = `app_${'a'.repeat(64)}_${mode}_${'b'.repeat(32)}`;
+    context.currentUserId = '';
+    for (const status of ['completed', 'failed', 'stopped', 'waiting_input']) {
+      expect(context._handleTaskTerminalUnread({
+        type: 'terminal', conversation_id: cid, status, finished_at_ms: 100,
+      })).toBe(false);
+    }
+    context.currentUserId = 'u1';
+    context._restoreUnreadTaskState();
+    expect(context.window.TaskUnread.list()).toEqual([]);
+    expect(context._markConversationUnread(cid, { finishedAt: 200 })).toBe(false);
+    expect(context._isConversationUnread(cid)).toBe(false);
+    expect(context.__dots['tasks-unread-dot'].hidden).toBe(true);
+    expect(persisted.size).toBe(0);
+    // Similar ordinary identities must keep their attention cue.
+    expect(context._markConversationUnread('app_notes', { finishedAt: 300 })).toBe(true);
+    expect(context._isConversationUnread('app_notes')).toBe(true);
+  });
+
+  it.each(['legacy', 'current'])('removes stale app reminders durably from %s storage without touching ordinary tasks or another account', format => {
+    const once = `app_${'a'.repeat(64)}_once_${'b'.repeat(32)}`;
+    const retain = `app_${'c'.repeat(64)}_retain_${'d'.repeat(32)}`;
+    const ordinary = { cid: 'ordinary-task', projectId: '', finishedAt: 100 };
+    const read = { cid: 'read-task', readAt: 200 };
+    const persisted = new Map([
+      ['task_unread_v1_u1', JSON.stringify(format === 'legacy'
+        ? [once, ordinary.cid, retain]
+        : { unread: [{ cid: once }, ordinary, { cid: retain }], read: [{ cid: once, readAt: 50 }, read] })],
+      ['task_unread_v1_u2', 'untouched'],
+    ]);
+    const context = loadUnreadRenderer(persisted);
+    context._restoreUnreadTaskState();
+    expect(context.window.TaskUnread.list().map((row: any) => row.cid)).toEqual([ordinary.cid]);
+    const saved = JSON.parse(persisted.get('task_unread_v1_u1')!);
+    expect(saved.unread.map((row: any) => row.cid)).toEqual([ordinary.cid]);
+    expect(saved.read).toEqual(format === 'legacy' ? [] : [read]);
+    expect(persisted.get('task_unread_v1_u2')).toBe('untouched');
+    const reopened = loadUnreadRenderer(persisted);
+    reopened._restoreUnreadTaskState();
+    expect(reopened.window.TaskUnread.list().map((row: any) => row.cid)).toEqual([ordinary.cid]);
+  });
+
   it('keeps persisted sidebar unread state without repopulating the menu bar', async () => {
     const invoke = vi.fn(async () => ({ ok: true }));
     const persisted = new Map([['task_unread_v1_u1', JSON.stringify({

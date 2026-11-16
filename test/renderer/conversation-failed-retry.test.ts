@@ -228,7 +228,7 @@ describe('conversation failed assistant retry actions', () => {
     const interruptedActionsBody = extractFunction('_attachInterruptedAssistantActions');
     expect(interruptedActionsBody).toContain("msgDiv.dataset.interrupted = '1';");
     expect(interruptedActionsBody).toContain('retry: true');
-    expect(interruptedActionsBody).toContain('report: true');
+    expect(interruptedActionsBody).not.toContain('report: true');
     expect(source).toContain("else if (role === 'assistant' && interruptedAssistant)");
     expect(source).toContain('} else if (interruptedAssistant) {');
     expect(extractFunction('_streamingMarkAborted')).toContain('_attachInterruptedAssistantActions(');
@@ -315,4 +315,16 @@ describe('conversation busy-path send with a deduped retry', () => {
     expect(rendered).toEqual([]);
     expect(warnings).toEqual(['busy direct send failed']);
   });
+});
+
+
+it('keeps failed Agent and Skill edits in their compact recovery mode', () => {
+  const selections: any[] = [];
+  const apply = vm.runInNewContext(extractFunction('_attachFailedAssistantActions') + '\n_attachFailedAssistantActions;', {
+    _attachBubbleActions: (_message: unknown, _content: unknown, options: unknown) => selections.push(options), window: {},
+  });
+  apply({dataset:{messageActions:'errors-only'}}, () => '');
+  apply({dataset:{}}, () => '');
+  expect(selections[0]).toMatchObject({retry:true, archive:false, compact:true});
+  expect(selections[1].compact).not.toBe(true);
 });

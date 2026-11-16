@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "version": "0.22.3",
+  "source": {
+    "name": "LibRaw-0.22.3.tar.gz",
+    "url": "https://www.libraw.org/data/LibRaw-0.22.3.tar.gz",
+    "bytes": 1689119,
+    "sha256": "789f3c33466210a1a0907f747a97c715d21bbf4af712f257fcbbd90111b227e4"
+  },
+  "licenses": {
+    "LICENSE.CDDL": {
+      "archivePath": "LibRaw-0.22.3/LICENSE.CDDL",
+      "bytes": 16906,
+      "sha256": "0e3098d2d54a12434715f6679ea408d57da5e8d613c385c58ecc6fe5d30cc81f"
+    },
+    "LICENSE.LGPL": {
+      "archivePath": "LibRaw-0.22.3/LICENSE.LGPL",
+      "bytes": 24389,
+      "sha256": "eea173a556abac0370461e57e12aab266894ea6be3874c2be05fd87871f75449"
+    },
+    "COPYRIGHT": {
+      "archivePath": "LibRaw-0.22.3/COPYRIGHT",
+      "bytes": 1153,
+      "sha256": "574c88f5dd59414cfc896293a63defbc2d525a418ed413d7ab7dcc43cf79c509"
+    }
+  },
+  "targets": {
+    "darwin-arm64": {
+      "archive": {
+        "name": "LibRaw-0.22.3-macOS.zip",
+        "url": "https://www.libraw.org/data/LibRaw-0.22.3-macOS.zip",
+        "bytes": 13212263,
+        "sha256": "1edd33c66be1cfdc74e0a471c4143d25f0172234a46a44dce5511a396a35af55"
+      },
+      "files": {
+        "bin/dcraw_emu": {
+          "archivePath": "LibRaw-0.22.3/bin/dcraw_emu",
+          "bytes": 2511752,
+          "sha256": "c31c1962625642c7a1960fc2ede265e81bf267d16ed0046f12a7e7cf0c947264",
+          "executable": true
+        }
+      },
+      "vcFiles": []
+    },
+    "darwin-x64": {
+      "archive": {
+        "name": "LibRaw-0.22.3-macOS.zip",
+        "url": "https://www.libraw.org/data/LibRaw-0.22.3-macOS.zip",
+        "bytes": 13212263,
+        "sha256": "1edd33c66be1cfdc74e0a471c4143d25f0172234a46a44dce5511a396a35af55"
+      },
+      "files": {
+        "bin/dcraw_emu": {
+          "archivePath": "LibRaw-0.22.3/bin/dcraw_emu",
+          "bytes": 2511752,
+          "sha256": "c31c1962625642c7a1960fc2ede265e81bf267d16ed0046f12a7e7cf0c947264",
+          "executable": true
+        }
+      },
+      "vcFiles": []
+    },
+    "win32-x64": {
+      "archive": {
+        "name": "LibRaw-0.22.3-Win64.zip",
+        "url": "https://www.libraw.org/data/LibRaw-0.22.3-Win64.zip",
+        "bytes": 3503107,
+        "sha256": "4e2213a0b10e32199a30b9114a61376cdb40f94df861262b4a6dca659701276b"
+      },
+      "files": {
+        "bin/dcraw_emu.exe": {
+          "archivePath": "LibRaw-0.22.3/bin/dcraw_emu.exe",
+          "bytes": 25088,
+          "sha256": "86f27d677339a440aba61d5de793a21e2e4fa2dde9c3edc8306d20bac5ace2c9",
+          "executable": true
+        },
+        "bin/libraw.dll": {
+          "archivePath": "LibRaw-0.22.3/bin/libraw.dll",
+          "bytes": 1154048,
+          "sha256": "2c4df36d9011267fd3ffd5c23e80d69d5f42c3d503f03ac02448f5c8a7fe0fa2",
+          "executable": true
+        }
+      },
+      "vcFiles": [
+        "msvcp140.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll"
+      ]
+    }
+  }
+}

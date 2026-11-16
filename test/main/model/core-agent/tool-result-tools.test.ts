@@ -614,6 +614,18 @@ describe('persisted tool-result retrieval', () => {
     expect(invalid.content).toContain('E_BAD_INPUT');
   });
 
+  it('reports actual action-specific fields while preserving ignored compatibility fields', async () => {
+    const tool = getTool(tools, 'tool_result');
+    const bad = await tool.execute({ action: 'search', requests: [{ ref, query: 'fixture', operation: 'count', limit: 5 }] }, ctx);
+    expect(bad.isError).toBe(true);
+    expect(JSON.parse(bad.content)).toMatchObject({ code: 'E_BAD_INPUT', issues: [
+      { field: 'requests[0].limit', reason: 'unsupported_field', expected: expect.stringContaining('ref, query') },
+      { field: 'requests[0].operation', reason: 'unsupported_field', expected: expect.any(String) },
+    ] });
+    const compatible = await tool.execute({ action: 'search', requests: [{ ref, query: 'fixture', cursor: 'unused', max_tokens: false }] }, ctx);
+    expect(compatible.isError).not.toBe(true);
+  });
+
   it('materializes exact session-scoped copies and charges only the delivered receipt', async () => {
     const originalPath = resolveToolResultRef(dir, ref);
     if (!originalPath.ok) throw new Error(originalPath.message);

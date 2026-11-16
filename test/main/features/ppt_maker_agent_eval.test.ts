@@ -88,8 +88,9 @@ describe('PptMaker built-in agent evaluation', () => {
     const planner = readSkill('ppt-planner');
 
     expect(agent.workflow).toContain('Read `ppt-router` first');
-    expect(agent.workflow).toContain('CREATE, EDIT, REVIEW, or OUTLINE');
-    expect(agent.workflow).toContain('QUICK or STANDARD');
+    for (const route of ['CREATE', 'EDIT', 'REVIEW', 'OUTLINE']) expect(router).toContain(`\`${route}\``);
+    expect(router).toContain('QUICK');
+    expect(router).toContain('STANDARD');
     expect(router).toContain('An explicit review gate is part of the lock');
     expect(router).toContain('do not stop merely to ask approval for an internal outline or visual direction');
     expect(router).toContain('do not create a separate runtime execution plan');
@@ -152,8 +153,8 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(router).toContain('正在梳理内容结构');
     expect(router).toContain('正在制作幻灯片');
     expect(router).toContain('正在逐页检查内容和版式');
-    expect(review).toContain('plain-language content/design/flow result');
-    expect(review).toContain('Do not expose the internal route or depth codes');
+    expect(review).toMatch(/concise reply[\s\S]*verification scope/i);
+    expect(review).toMatch(/Do not expose[^.]*route or depth codes/i);
   });
 
   it('creates one editable native deck and protects existing sources', () => {
@@ -173,8 +174,11 @@ describe('PptMaker built-in agent evaluation', () => {
     ]) {
       expect(combined).toContain(`\`${tool}\``);
     }
-    expect(craft).toMatch(/Call it exactly once with the complete slide array/i);
-    expect(craft).toContain('issue a second create call for the same deck');
+    expect(craft).toContain('retry_available:true');
+    expect(craft).toContain('retry once');
+    expect(craft).toContain('deleted successful artifact');
+    expect(craft).toContain('do not change filenames');
+    expect(craft).toContain('After successful construction, use `office_read` and `edit_office`');
     expect(craft).toContain('complete slide array and `preview:false`');
     expect(craft).toMatch(/read `ppt-review` before the first output quality review/i);
     expect(readSkill('ppt-review')).toContain('`action:"check_and_render"`');
@@ -316,9 +320,6 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(review).not.toContain('hard render-call budget');
     expect(review).toContain('do not publish the deck as complete');
     expect(review).toContain('Do not call `publish_outputs` until the last current-render review');
-    expect(review).toContain('目标动作是');
-    expect(review).toContain('[P2 实际标题] / [P5 实际标题]');
-    expect(review).toContain('visual source, art direction, palette behavior, type hierarchy');
     expect(review).toContain('reference_fit');
     expect(review).toContain('Checklist results are diagnostic evidence');
     expect(review).toContain('Do not include numeric aesthetic scores');
@@ -326,30 +327,36 @@ describe('PptMaker built-in agent evaluation', () => {
     expect(combined).toContain('invalid OpenXML');
     expect(review).toContain('Publish only when:');
     expect(review).toContain('no blocker remains');
-    expect(review).toContain('仍需在目标查看器核验的内容');
+    expect(review).toMatch(/target.viewer/i);
   });
 
-  it('assembles the complete handoff independently of intermediate note formatting', () => {
+  it('retains every-page evidence while keeping ordinary file delivery concise', () => {
     const review = readSkill('ppt-review');
-    const evidence = review.split('## Evidence set')[1].split('## Two review layers')[0];
     const delivery = review.split('## Delivery gate')[1];
-    // The final contract still requires every page; an absent early table must
-    // trigger evidence reconciliation rather than silently dropping the audit.
-    expect(evidence).not.toContain('P1 | Content:');
-    expect(evidence).not.toMatch(/one concise audit row per reviewed page/i);
-    expect(delivery).toMatch(/whether or not[^.]*earlier audit\s+table/is);
-    expect(delivery).toMatch(/Reuse available[^.]*evidence/is);
-    expect(delivery).toMatch(/missing[^.]*verify only[^.]*missing evidence/is);
-    expect(delivery).toMatch(/never default[^.]*PASS/is);
-    expect(delivery).toMatch(/every\s+page number appears exactly once/is);
-    expect(delivery).toMatch(/Missing, duplicate, or deck-level-only audit\s+evidence blocks publication/is);
-    const template = delivery.split('```text')[1].split('```')[0];
-    for (const field of ['内容：', '设计：', '连贯性：', '最弱页面', '定向修复', '剩余', 'P# —', 'Content:', 'Design:', 'Coherence:', '来源事实']) {
-      expect(template, `handoff field: ${field}`).toContain(field);
-    }
-    // Preserve the read-only route and the visual-unavailability boundary.
+    const records = delivery.split('### Customer handoff')[0];
+    const handoff = delivery.split('### Customer handoff')[1];
+    expect(records).toMatch(/working records/i);
+    expect(records).toMatch(/every\s+page number appears exactly once/is);
+    expect(records).toMatch(/Missing, duplicate, or deck-level-only audit\s+evidence blocks publication/is);
+    expect(records).toMatch(/never default[^.]*PASS/is);
+    expect(records).toMatch(/verify only[^.]*missing evidence/is);
+    expect(handoff).toMatch(/concise/i);
+    expect(handoff).toMatch(/verification scope[\s\S]*limitations/i);
+    expect(handoff).toMatch(/detailed audit[\s\S]*when requested/i);
+    expect(handoff).not.toContain('P1 | Content:');
     expect(delivery).toContain('leave the source byte-identical');
     expect(review).toContain('mark visual checks `not_run`');
-    expect(delivery).not.toMatch(/Then reuse the latest audit rows/i);
+    expect(review).toMatch(/review-only request[\s\S]*report independently actionable/i);
+  });
+
+  it('leaves route-specific skill selection with the router instead of replanning every edit', () => {
+    const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'));
+    const router = readSkill('ppt-router');
+    expect(agent.workflow).toMatch(/ppt-router/);
+    expect(agent.workflow).not.toMatch(/For CREATE or EDIT, read `ppt-planner`/);
+    const edit = router.split('- `EDIT`: shared')[1].split('\n')[0];
+    expect(edit).toContain('ppt-craft');
+    expect(edit).toContain('ppt-review');
+    expect(edit).not.toContain('ppt-planner');
   });
 });

@@ -36,10 +36,6 @@ import {
   BUILTIN_AGENT_TOOL_SURFACE_CASES,
 } from './builtin-agent-tool-surface-fixture';
 
-const OPEN_SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS = new Set([
-  'generate_image:/inputSchema/properties/output_path',
-]);
-
 function walkSchemaDescriptions(
   schema: unknown,
   visit: (path: string, description: string) => void,
@@ -304,6 +300,13 @@ describe('tool-catalog', () => {
     expect(TOOL_CATALOG.find((entry) => entry.name === 'project_setup')?.programmatic).toBeUndefined();
     expect(toolNamesForGroups(['management.automation'])).toEqual(['auto_tasks']);
     expect(toolNamesForGroups(['management.app'])).toEqual(['open_app_view', 'app_health']);
+    expect(toolNamesForGroups(['apps'])).toEqual(['list_apps', 'save_app']);
+    expect(LOADABLE_TOOL_GROUP_IDS).toContain('apps');
+    expect(AGENT_DEPENDENCY_TOOL_GROUP_IDS).not.toContain('apps');
+    expect(isToolVisibleToAgent('save_app', 'named-agent')).toBe(false);
+    expect(TOOL_CATALOG.find(entry => entry.name === 'save_app')?.programmatic).toBeUndefined();
+    expect(isToolVisibleToAgent('list_apps', 'named-agent')).toBe(false);
+    expect(TOOL_CATALOG.find(entry => entry.name === 'list_apps')?.programmatic).toBeUndefined();
     // Keep the broad parent as an explicit compatibility alias while new
     // runtime calls can load only the focused child they need.
     expect(expandToolGroups(['management'])).toEqual([
@@ -396,7 +399,8 @@ describe('tool-catalog', () => {
       purpose: 'runtime',
     });
     const todoLine = directory.split('\n').find((line) => line.includes('`todo_tasks`')) || '';
-    expect(todoLine).toMatch(/global to-do list/);
+    expect(todoLine).toContain('global to-dos');
+    expect(todoLine).toContain('Commander can also use the project it just created here');
     expect(todoLine).toMatch(/project/);
     expect(directory).toContain('`management.todos` — To-dos.');
     // Inside a project the tool is resident, so the directory stops describing it.
@@ -607,7 +611,7 @@ describe('tool-catalog', () => {
     delete listFiles.properties.path.minLength;
     // 2026-10-21, requester-confirmed: corrections retain the app identity.
     const artifact = schemas.find(tool => tool.name === 'create_artifact')!.inputSchema as any;
-    expect(artifact.properties.artifact_id).toEqual({ type: 'string' });
+    expect(artifact.properties.artifact_id).toEqual({ type: ['string', 'null'] });
     delete artifact.properties.artifact_id;
     // 2026-10-20, requester-confirmed: preview accepts path XOR artifact_id.
     // Undo only that exact delta to keep the preceding corpus pinned.
@@ -616,6 +620,68 @@ describe('tool-catalog', () => {
     expect(preview.required).toEqual([]);
     delete preview.properties.artifact_id;
     preview.required = ['path'];
+    // Requester-confirmed native PSD (06e4fe22b3) and optional PDF delivery add
+    // these exact formats. Pin them, then compare the preceding corpus unchanged;
+    // do not replace the fingerprint to accept unrelated schema drift.
+    const imageStudio = schemas.find(tool => tool.name === 'image_studio')!.inputSchema as any;
+    expect(imageStudio.properties.format.enum).toEqual(['png', 'jpeg', 'psd', 'pdf']);
+    imageStudio.properties.format.enum = ['png', 'jpeg'];
+    expect(imageStudio.properties.page_id).toEqual({ type: 'string' });
+    expect(imageStudio.required).not.toContain('page_id');
+    delete imageStudio.properties.page_id;
+    // 2026-11-10, requester-confirmed: generate_video adds the optional first_frame and
+    // last_frame strings. Pin them, then compare the preceding corpus unchanged; video_gen and
+    // video-gen-tool cases pin each provider's request and the refusals.
+    const videos = schemas.filter(tool => tool.name === 'generate_video').map(tool => tool.inputSchema as any);
+    expect(videos.length).toBeGreaterThan(0);
+    for (const video of videos) {
+      expect(video.properties.first_frame).toEqual({ type: 'string' });
+      expect(video.properties.last_frame).toEqual({ type: 'string' });
+      delete video.properties.first_frame;
+      delete video.properties.last_frame;
+    }
+    // 2026-11-13, requester-confirmed (fb14a75f3e, eaeabc8f24): create_pptx adds the optional
+    // canvas and theme, per-slide native Mermaid diagrams and title/body placeholder styles. Pin
+    // them, then compare the preceding corpus unchanged; office-tools cases own their validation.
+    const pptxSchema = schemas.find(tool => tool.name === 'create_pptx')!.inputSchema as any;
+    const pptxSlide = pptxSchema.properties.slides.items.properties;
+    expect(pptxSchema.properties.canvas).toEqual({
+      type: 'object', additionalProperties: false,
+      properties: { size: { type: 'string', enum: ['widescreen', 'standard', '16:10'] }, width: { type: 'string' }, height: { type: 'string' } },
+    });
+    expect(pptxSchema.properties.theme).toEqual({
+      type: 'object', additionalProperties: false,
+      properties: Object.fromEntries([
+        'headingFont', 'bodyFont', 'headingFont.ea', 'bodyFont.ea', 'headingFont.cs', 'bodyFont.cs',
+        'dk1', 'lt1', 'dk2', 'lt2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6',
+      ].map(key => [key, { type: 'string' }])),
+    });
+    expect(pptxSlide.diagrams).toEqual({
+      type: 'array', maxItems: 16,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          mermaid: { type: 'string', minLength: 1, maxLength: 16000 },
+          x: { type: 'string' }, y: { type: 'string' }, width: { type: 'string' }, height: { type: 'string' },
+        },
+        required: ['mermaid', 'x', 'y', 'width', 'height'],
+      },
+    });
+    expect(pptxSlide.titleStyle).toEqual({ type: 'object' });
+    expect(pptxSlide.bodyStyle).toEqual({ type: 'object' });
+    delete pptxSchema.properties.canvas;
+    delete pptxSchema.properties.theme;
+    delete pptxSlide.diagrams;
+    delete pptxSlide.titleStyle;
+    delete pptxSlide.bodyStyle;
+    // Requester-confirmed Office recovery (cf5313b86c) adds an optional
+    // retry identity, not a new create operation. Pin all three operands,
+    // and include them in the independently source-derived public corpus below.
+    for (const name of ['create_docx', 'create_xlsx', 'create_pptx']) {
+      const schema = schemas.find(tool => tool.name === name)!.inputSchema as any;
+      expect(schema.properties.retry_of).toEqual({ type: 'string' });
+      expect(schema.required).not.toContain('retry_of');
+    }
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
       .digest('hex');
@@ -668,12 +734,45 @@ describe('tool-catalog', () => {
     // expected_revision and bounded closed operations; no new tool or scope.
     // 2026-10-31, requester-approved: retire model-call input formats and aliases;
     // append_file requires base_revision and drops expected_size. Data readers stay.
+    // 2026-11-04, requester-approved (b4b842): generate_* retire the old plan
+    // bindings; Image/VideoStudio use production_dir, shot and label instead.
     // 2026-11-03, requester-approved: read_files path items add a nonempty optional
     // encoding label; file-tools and file_indexer cases pin decoding and refusals.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('900cb57814dcdfea27e83df1f02a5cd35f414323c3acc257f9a84cc6fb960051');
+    // Frozen source2c0759 independently enumerates source fingerprint7468f189.
+    // Project only excluded managed music/separation actions and their five fields;
+    // retain approved Office retry_of and the Nov4 plan-binding removal (b4b842).
+    // This yields a4d774a9. Re-inserting only the six retired plan fields and
+    // removing the three Office retry fields recovers the original900cb578.
+    // Exact proof and all source/public schemas are in the sync review archive.
+    ).toBe('a4d774a9afc3ee550cc69117cc8b3c7d63e164493b145cf8e25ea097700f25bf');
+  });
+
+  it('keeps approved Studio bindings separate from ordinary generation and retired plans', async () => {
+    const { createImageGenTool } = await import('../../../../src/main/model/core-agent/image-gen-tool');
+    const { createVideoGenTool } = await import('../../../../src/main/model/core-agent/video-gen-tool');
+    const agentId = '79df9cc89f5f';
+    for (const factory of [createImageGenTool, createVideoGenTool]) {
+      const ordinary = withoutDescriptions(factory({ userId: 'schema-probe' }).inputSchema) as any;
+      const studio = withoutDescriptions(factory({ userId: 'schema-probe', agentId }).inputSchema) as any;
+      for (const key of ['production_dir', 'shot', 'label']) {
+        expect(ordinary.properties, key).not.toHaveProperty(key);
+        expect(studio.properties[key], key).toEqual({ type: 'string' });
+      }
+      expect(ordinary.required).toEqual(['prompt', 'output_path']);
+      expect(studio.required).toEqual(['prompt', 'output_path']);
+      for (const key of ['production_plan_path', 'production_segment_id']) {
+        expect(ordinary.properties, key).not.toHaveProperty(key);
+        expect(studio.properties, key).not.toHaveProperty(key);
+      }
+    }
+    const speech = withoutDescriptions(toolByName('generate_speech').inputSchema) as any;
+    expect(speech.properties.action.enum).toEqual(['generate', 'capabilities']);
+    for (const key of ['production_plan_path', 'narration_segment_index']) {
+      expect(speech.properties, key).not.toHaveProperty(key);
+    }
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -693,10 +792,10 @@ describe('tool-catalog', () => {
       walkSchemaDescriptions(tool.inputSchema, (path, description) => {
         if (tool.name === 'read_files' && path === '/inputSchema/properties/raw_text'
             && normalizedDescription(description) === approvedRawText) return;
-        if (
-          estimateTextTokens(normalizedDescription(description)) > SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS
-          && !OPEN_SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS.has(`${tool.name}:${path}`)
-        ) {
+        if (process.platform === 'win32' && tool.name === 'bash'
+            && path === '/inputSchema/properties/command'
+            && normalizedDescription(description) === approvedWindowsCommand) return;
+        if (estimateTextTokens(normalizedDescription(description)) > SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS) {
           overBudget.push(`${tool.name}:${path}.description=${estimateTextTokens(normalizedDescription(description))} tokens`);
         }
       });
@@ -755,6 +854,11 @@ describe('tool-catalog', () => {
     const image = toolByName('generate_image');
     expect(image.description).not.toContain('reference images');
     expect(propertyDescription(image, 'reference_images')).toContain('editing/variations');
+    expect(propertyDescription(image, 'reference_bindings')).toContain('role contract');
+
+    const video = toolByName('generate_video');
+    expect(video.description).not.toContain('operation="edit"');
+    expect(propertyDescription(video, 'operation')).toContain('edit requires a reference video');
 
     const speech = toolByName('generate_speech');
     expect(speech.description).not.toContain('target_duration');
@@ -811,8 +915,20 @@ describe('tool-catalog', () => {
 
     const pptx = toolByName('create_pptx');
     expect(pptx.description).not.toContain('Positions and sizes use');
-    const slides = ((pptx.inputSchema as any).properties.slides.items.properties);
-    expect(slides.shapes.items.properties.x.description).toContain('unit');
+    // Shared by every positioned element, so the slides parameter states it once. The
+    // requester-confirmed consolidation of 2026-11-13 (fb14a75f3e) keeps each rule: a length
+    // carries a unit or is EMU, a bare decimal is refused, rotation is clockwise, opacity 0-100.
+    const slides = propertyDescription(pptx, 'slides');
+    expect(slides).toContain('Lengths: units');
+    expect(slides).toContain('units (0.8in/24pt)');
+    expect(slides).toContain('integer/scientific EMU');
+    expect(slides).toContain('bare decimals invalid');
+    expect(slides).toContain('rotation: clockwise');
+    expect(slides).toContain('0-100');
+    const charts = (pptx.inputSchema as any).properties.slides.items.properties.charts;
+    expect(charts.items.properties.gridlines.type).toBe('string');
+    // The same consolidation moved the chart grammar onto the charts array.
+    expect(charts.description).toContain('gridlines: hex color');
   });
 
   it('critical tools keep enough provider-visible guidance to choose and call them', () => {
@@ -838,6 +954,7 @@ describe('tool-catalog', () => {
       inner_browser: ['task browser tabs', 'observe', 'page_id', 'element_ref', 'untrusted', 'user'],
       office_review: ['validate', 'render', 'check_and_render', 'pages'],
       generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
+      generate_video: ['generate', 'edit', 'mp4', 'prompt', 'output_path', 'operation'],
       generate_speech: ['narration', 'text', 'output_path', 'target_duration'],
       create_docx: ['paragraphs', 'tables', 'images', 'path'],
       create_xlsx: ['rows', 'sheets', 'formula', 'path', 'native', 'chart'],
@@ -867,6 +984,8 @@ describe('tool-catalog', () => {
 describe('isToolVisibleToAgent (ownerAgent gate)', () => {
   it('un-owned catalog tools are visible to every actor', () => {
     expect(isToolVisibleToAgent('read_files', '')).toBe(true);
+    expect(isToolVisibleToAgent('generate_video', 'video-studio')).toBe(true);
+    expect(isToolVisibleToAgent('generate_video', 'anything')).toBe(true);
     expect(isToolVisibleToAgent('generate_speech', '')).toBe(true);
     expect(isToolVisibleToAgent('generate_speech', 'video-studio')).toBe(true);
     expect(isToolVisibleToAgent('generate_speech', 'some-other-agent')).toBe(true);

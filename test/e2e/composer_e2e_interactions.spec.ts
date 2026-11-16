@@ -764,7 +764,7 @@ test.describe('new chat composer', () => {
         id: 'video',
         agentId: '79df9cc89f5f',
         agentName: 'VideoStudio',
-        prompt: 'Create a roughly 45-second AI trends explainer video for a general audience.',
+        prompt: 'Make a 20-second vertical TikTok sales video for this portable blender: 380 mL, USB-C charging, $29.',
       },
       {
         id: 'ui_design',
@@ -1376,3 +1376,96 @@ test.describe('attachment adoption recovery', () => {
     });
   }
 });
+
+  test('rejects bare Agent mentions and delivers explicit quotes to single and planned recipients through send and reload', async ({ modelOrkas }) => {
+    const page = modelOrkas.page!;
+    const { agent } = await modelOrkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'QuoteReceiver', description: 'Quote routing fixture',
+    });
+    await page.evaluate(async () => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+    });
+    const draft = page.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+    const requestsBefore = modelOrkas.modelRequests.length;
+    const conversationsBefore = await modelOrkas.invoke('conversations.list', {});
+    await draft.fill('@QuoteReceiver');
+    await page.locator('#new-chat-send-btn').click();
+    await expectComposerText(page.locator('#new-chat-input'), '@QuoteReceiver');
+    expect(await modelOrkas.invoke('conversations.list', {})).toEqual(conversationsBefore);
+    expect(modelOrkas.modelRequests).toHaveLength(requestsBefore);
+
+    const sourceText = 'Explain the cause and solution for QUOTE_ROUTING_SOURCE_71.';
+    await draft.fill(sourceText);
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    const cid = await page.evaluate<string>('currentCid');
+    const readHistory = async () => (await modelOrkas.invoke<{ history: any[] }>(
+      'conversations.history', { cid, limit: 30 },
+    )).history;
+    await expect.poll(async () => (await modelOrkas.invoke<{ processing: boolean }>('groupChat.runtimeStatus', { cid })).processing)
+      .toBe(false);
+    const editor = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+    await editor.fill('@QuoteReceiver');
+    await editor.press('Enter');
+    await expectComposerText(page.locator('#chat-input'), '@QuoteReceiver');
+    expect((await readHistory()).filter((row) => row.from === 'user')).toHaveLength(1);
+    const callsBeforeQuote = modelOrkas.modelRequests.length;
+    await page.locator('#chat-history .chat-message.user .chat-bubble').first().hover();
+    await page.locator('#chat-history .chat-message.user .bubble-quote-btn').first().click();
+    await editor.press('Enter');
+    await expect.poll(async () => (await readHistory()).filter((row) => row.from === agent.agent_id).length).toBe(1);
+    const forwarded = (await readHistory()).filter((row) => row.from === 'user')[1];
+    expect(forwarded.to).toEqual([agent.agent_id]);
+    expect(forwarded.references).toHaveLength(1);
+    expect(forwarded.references[0].text).toBe(sourceText);
+    expect(modelOrkas.modelRequests).toHaveLength(callsBeforeQuote + 1);
+    expect(currentTurnSnapshots(lastUserRequestText(modelOrkas.modelRequests.at(-1)!)).map((row) => row.text))
+      .toEqual([sourceText]);
+
+    const secondSourceText = 'Also preserve the recovery steps from QUOTE_ROUTING_FOOTNOTE_29.';
+    await editor.fill(secondSourceText);
+    await editor.press('Enter');
+    await expect.poll(async () => (await readHistory()).filter((row) => row.from === agent.agent_id).length).toBe(2);
+
+    const { agent: reviewer } = await modelOrkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'QuoteReviewer', description: 'Quote fan-out fixture',
+    });
+    await page.evaluate(async () => { await (window as any).loadAgents(true, { summary: true }); });
+    modelOrkas.setDispatchPlanReplies([JSON.stringify({
+      tasks: [
+        { key: 't1', assignee: 'a1', part: 'Explain the quoted cause and solution', after: [] },
+        { key: 't2', assignee: 'a2', part: 'Explain the quoted cause and solution', after: [] },
+      ], references: [], question: null,
+    })]);
+    const callsBeforeMultiQuote = modelOrkas.modelRequests.length;
+    const plansBeforeMultiQuote = modelOrkas.dispatchPlannerRequests.length;
+    await page.locator('#chat-history .chat-message.user .chat-bubble').first().hover();
+    await page.locator('#chat-history .chat-message.user .bubble-quote-btn').first().click();
+    // Re-selecting one source must not duplicate it in the shared receipt.
+    await page.locator('#chat-history .chat-message.user .bubble-quote-btn').first().click();
+    const footnote = page.locator('#chat-history .chat-message.user').filter({ hasText: secondSourceText });
+    await footnote.locator('.chat-bubble').hover();
+    await footnote.locator('.bubble-quote-btn').click();
+    await editor.fill('@QuoteReceiver @QuoteReviewer');
+    await editor.press('Enter');
+    await expect.poll(async () => (await readHistory()).filter((row) => row.from === reviewer.agent_id).length).toBe(1);
+    await expect.poll(async () => (await readHistory()).filter((row) => row.from === agent.agent_id).length).toBe(3);
+    expect(modelOrkas.dispatchPlannerRequests).toHaveLength(plansBeforeMultiQuote + 1);
+    const expectedQuoteTexts = [sourceText, secondSourceText];
+    expect(quotedSnapshots(lastUserRequestText(modelOrkas.dispatchPlannerRequests.at(-1)!)).map((row) => row.text))
+      .toEqual(expectedQuoteTexts);
+    const recipientRequests = modelOrkas.modelRequests.slice(callsBeforeMultiQuote);
+    expect(recipientRequests).toHaveLength(2);
+    for (const request of recipientRequests) {
+      expect(currentTurnSnapshots(lastUserRequestText(request)).map((row) => row.text)).toEqual(expectedQuoteTexts);
+    }
+    const multiForwarded = (await readHistory()).filter((row) => row.from === 'user')[3];
+    expect(multiForwarded.to).toEqual([agent.agent_id, reviewer.agent_id]);
+    expect(multiForwarded.references.map((row: any) => row.text)).toEqual(expectedQuoteTexts);
+    await page.reload();
+    await expect(page.locator('#chat-history .chat-message.user').last()).toContainText(sourceText);
+    expect((await readHistory()).filter((row) => row.from === 'user')[1].references[0].text).toBe(sourceText);
+    expect((await readHistory()).filter((row) => row.from === 'user')[3].references.map((row: any) => row.text))
+      .toEqual(expectedQuoteTexts);
+  });

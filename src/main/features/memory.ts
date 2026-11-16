@@ -137,29 +137,6 @@ function entryLimitForTarget(target: MemoryScope): number {
   return AGENT_ENTRY_LIMIT;
 }
 
-function syncRelForTarget(target: MemoryScope): string {
-  if (target === 'user') return 'cloud/memory/USER.md';
-  if (target === 'memory') return 'cloud/memory/MEMORY.md';
-  if (isProjectScope(target)) return `cloud/projects/${target.project}/MEMORY.md`;
-  return `cloud/memory/agents/${target.agent}/MEMORY.md`;
-}
-
-function notifyMemoryDirty(target: MemoryScope): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('memory', syncRelForTarget(target));
-  } catch { /* features/sync stripped */ }
-}
-
-function notifyLegacyAgentMemoryDirty(agentId: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('agents', `cloud/agents/${agentId}/memory/MEMORY.md`);
-  } catch { /* features/sync stripped */ }
-}
-
 /** Load §-separated entries from a markdown file. */
 export function loadEntries(filePath: string): MemoryEntry[] {
   let raw: string;
@@ -268,7 +245,6 @@ function commitTexts(userId: string, target: MemoryScope, before: readonly strin
   const full = capacityError(target, before, after);
   if (full) return buildResult(userId, target, false, full);
   saveEntries(fileForTarget(userId, target), after.map(text => ({ text })));
-  notifyMemoryDirty(target);
   return buildResult(userId, target, true, undefined, true);
 }
 
@@ -315,8 +291,6 @@ function migrateLegacyAgentMemoryOnce(userId: string, agentId: string): void {
       ]);
       saveEntries(canonicalPath, merged);
       writeTextAtomicSync(legacyPath, '');
-      notifyMemoryDirty({ agent: agentId });
-      notifyLegacyAgentMemoryDirty(agentId);
     }
     migratedLegacyAgentMemory.add(key);
   } catch (err) {
@@ -448,7 +422,6 @@ export function applyMemoryBatch(
     }
     if (!writeTextAtomicGuardedSync(file, after.join(ENTRY_SEPARATOR), guard)) return fail(refusal);
   } catch { return fail('memory could not be saved; no batch changes saved'); }
-  notifyMemoryDirty(target);
   return resultForEntries(userId, target, after, true, undefined, true);
 }
 
@@ -504,7 +477,6 @@ export function clearMemory(userId: string, target: MemoryScope): void {
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     writeTextAtomicSync(filePath, '');
-    notifyMemoryDirty(target);
   } catch (err) {
     log.warn(`clearMemory failed: ${(err as Error).message}`);
   }

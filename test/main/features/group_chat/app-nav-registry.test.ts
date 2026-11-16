@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
+import { SUPPORTED_LANGS } from '../../../../src/main/i18n';
 
 import {
   APP_NAV_ACTIONS,
@@ -93,6 +94,7 @@ function rendererNavHarness(failingFeature = '') {
   const context: any = {
     calls,
     currentCid: 'conversation-1',
+    currentUserId: 'account-a',
     setView: (view: string) => calls.push(`view:${view}`),
     loadRendererFeature: async (feature: string) => {
       calls.push(`load:${feature}`);
@@ -108,14 +110,13 @@ function rendererNavHarness(failingFeature = '') {
       getElementById: (id: string) => ({ click: () => calls.push(`click:${id}`) }),
     },
     window: {
-      openCreditsUsage: (returnView: string, returnCid: string) => {
-        calls.push(`credits:${returnView}:${returnCid}`);
-      },
       openAgentModal: () => calls.push('agent:create'),
       openAgentDetail: async (id: string) => { calls.push(`agent:configure:${id}`); return id !== 'missing'; },
       openSkillModal: () => calls.push('skill:create'),
       openAutoTaskDialog: () => calls.push('auto:create'),
       openAutoTaskById: async (id: string) => { calls.push(`auto:configure:${id}`); return id !== 'missing'; },
+      openSavedAppById: async (id: string) => { calls.push(`app:open:${id}`); return id !== 'missing'; },
+      loadSavedAppNavTarget: async (id: string) => id === 'builtin-product-listing' ? { name: 'Commerce workspace' } : null,
       openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
       focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
       openProjectsSurface: async (request: Record<string, string>) => {
@@ -164,7 +165,7 @@ function rendererMountHarness(failingFeature = '', lookups: NavTargetLookups = {
     private text = '';
 
     // Like the DOM, assigning text replaces every child node.
-    get textContent() { return this.text; }
+    get textContent(): string { return this.text + this.children.map((child) => child.textContent).join(''); }
     set textContent(value: string) { this.text = value; this.children = []; }
     private listeners = new Map<string, Array<() => void>>();
 
@@ -198,6 +199,7 @@ function rendererMountHarness(failingFeature = '', lookups: NavTargetLookups = {
 
   const host = new FakeElement();
   const context = {
+    currentUserId: 'account-a',
     CSS: { escape: (value: string) => value },
     document: {
       createElement: () => new FakeElement(),
@@ -216,6 +218,8 @@ function rendererMountHarness(failingFeature = '', lookups: NavTargetLookups = {
         return lookups.connectors?.[id] ?? null;
       },
       loadConnectorNavTarget: async (id: string) => lookups.lateConnectors?.[id] ?? null,
+      openSavedAppById: async (id: string) => { calls.push(`app:open:${id}`); return id !== 'missing'; },
+      loadSavedAppNavTarget: async (id: string) => id === 'builtin-product-listing' ? { name: 'Commerce workspace' } : null,
       openConnectorSetupById: async (id: string) => { calls.push(`connector:guided:${id}`); return id !== 'missing'; },
       focusConnectorById: async (id: string) => { calls.push(`connector:configure:${id}`); return id !== 'missing'; },
       openAgentModal: () => calls.push('agent:create'),
@@ -259,6 +263,52 @@ function rendererMountHarness(failingFeature = '', lookups: NavTargetLookups = {
 }
 
 describe('group_chat app_nav registry', () => {
+  it('stages an Apps list or a specific saved/bundled app without an implicit target action', () => {
+    expect(validateAppNavRequest({ surface_id: 'apps' })).toMatchObject({ ok: true, request: { action: 'open' } });
+    for (const target_id of ['builtin-product-listing', 'saved_app-123', '电商工作台', 'x'.repeat(160)]) {
+      expect(validateAppNavRequest({ surface_id: 'apps', action: 'configure', target_id }))
+        .toMatchObject({ ok: true, request: { surface_id: 'apps', action: 'configure', target_id } });
+    }
+    for (const target_id of ['', 'bad\nidentifier', 'x'.repeat(161)]) {
+      expect(validateAppNavRequest({ surface_id: 'apps', action: 'configure', target_id })).toMatchObject({ ok: false });
+    }
+    expect(validateAppNavRequest({ surface_id: 'apps', target_id: 'builtin-product-listing' })).toMatchObject({ ok: false });
+  });
+
+  it('opens a specific app through its cold-loaded owner only after clicking and reports unavailable apps', async () => {
+    const { calls, host, mount, toasts } = rendererMountHarness();
+    mount(host, { app_nav_requests: [
+      { surface_id: 'apps', action: 'open' },
+      { surface_id: 'apps', action: 'configure', target_id: 'builtin-product-listing' },
+      { surface_id: 'apps', action: 'configure', target_id: 'missing' },
+    ] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const row = host.querySelector('.chat-app-nav-row')!;
+    expect(row.children).toHaveLength(3);
+    expect(calls.some(call => call.startsWith('app:open:'))).toBe(false);
+    row.children[0].click();
+    row.children[1].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(calls).toContain('view:apps');
+    expect(calls).toContain('app:open:builtin-product-listing');
+    expect(row.children[1].textContent).toBe('chat.app_nav_open_app:Commerce workspace');
+    row.children[2].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(toasts).toEqual([{ message: 'chat.app_nav_failed:', variant: 'error' }]);
+    expect(row.children[2].disabled).toBe(false);
+  });
+
+  it('restricts staged navigation to the complete public destination set', () => {
+    expect(APP_NAV_SURFACES.map(surface => surface.id).sort()).toEqual([
+      'settings.models', 'settings.general', 'settings.data', 'connectors',
+      'library', 'projects', 'agents', 'skills', 'auto', 'apps', 'marketplace',
+    ].sort());
+    for (const surface_id of ['settings.account', 'credits']) {
+      expect(findAppNavSurface(surface_id)).toBeNull();
+      expect(validateAppNavRequest({ surface_id })).toMatchObject({ ok: false });
+    }
+  });
+
   it('declares unique surface ids with model-facing summaries', () => {
     const ids = APP_NAV_SURFACES.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
@@ -295,29 +345,32 @@ describe('group_chat app_nav registry', () => {
   });
 
   it('labels the default open action as page navigation in every supported locale', () => {
-    const expected = {
+    const expected: Record<string, string> = {
       en: 'Open page: {name}',
       zh: '打开页面：{name}',
       ja: 'ページを開く：{name}',
       pt: 'Abrir página: {name}',
     };
-    for (const [locale, copy] of Object.entries(expected)) {
+    for (const locale of SUPPORTED_LANGS) {
       const table = JSON.parse(fs.readFileSync(
         path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales', `${locale}.json`),
         'utf8',
       ));
-      expect(table['chat.app_nav_open'], locale).toBe(copy);
+      expect(table['chat.app_nav_open'], locale).toBeTruthy();
+      expect(table['chat.app_nav_open'], locale).toContain('{name}');
+      if (expected[locale]) expect(table['chat.app_nav_open'], locale).toBe(expected[locale]);
     }
   });
 
   it('localizes navigation failure recovery in every supported locale', () => {
-    for (const locale of ['en', 'zh', 'ja', 'pt']) {
+    for (const locale of SUPPORTED_LANGS) {
       const table = JSON.parse(fs.readFileSync(
         path.join(path.dirname(RENDERER_CONVERSATION), '..', 'locales', `${locale}.json`),
         'utf8',
       ));
       expect(table['chat.app_nav_failed'], locale).toBeTruthy();
       expect(table['chat.app_nav_failed'], locale).not.toBe('chat.app_nav_failed');
+      expect(table['chat.app_nav_open_app'], locale).toContain('{target}');
     }
   });
 

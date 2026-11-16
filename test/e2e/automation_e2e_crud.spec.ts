@@ -56,6 +56,61 @@ test.describe('automation', () => {
     timeout: process.platform === 'win32' ? 120_000 : 60_000,
   });
 
+  test('keeps the task form compact and its controls reachable in short windows', async ({ orkas }, testInfo) => {
+    const project = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'Release readiness and recurring maintenance project',
+    });
+    const page = await orkas.relaunch();
+    await openAutomation(page);
+    await page.locator('#auto-add-btn').click();
+    await expect(page.locator('#auto-row-run-device')).toBeHidden();
+    await page.locator('#auto-dialog-cancel-btn').click();
+
+    // A remote task exposes both destination selectors; no task is executed or saved.
+    await page.evaluate(projectId => (window as any).openAutoTaskDialog({ task: {
+      id: 'compact-layout-preview', project_id: projectId,
+      title: 'Review recurring release readiness and update the maintenance checklist',
+      content: 'Review the release checklist and summarize outstanding maintenance work.',
+      enabled: true, schedule: { type: 'daily', hour: 8, minute: 0 },
+      device_id: 'other-device', device_name: 'Release-review-Mac-mini-with-a-long-device-name',
+    } }), project.project.project_id);
+    await expect(page.locator('#auto-row-run-device')).toBeVisible();
+
+    for (const lang of ['en', 'zh']) {
+      await page.evaluate(value => (window as any).setLang(value), lang);
+      await page.setViewportSize({ width: 1280, height: 800 });
+      const rect = (selector: string) => page.locator(selector).boundingBox();
+      const [frequency, end, projectBox, device, dialog] = await Promise.all([
+        rect('#auto-freq-select'), rect('#auto-end-select'), rect('#auto-row-project'),
+        rect('#auto-row-run-device'), rect('.auto-task-dialog'),
+      ]);
+      expect(Math.abs(frequency!.y - end!.y)).toBeLessThan(2);
+      expect(Math.abs(projectBox!.y - device!.y)).toBeLessThan(2);
+      expect(device!.x).toBeGreaterThanOrEqual(projectBox!.x + projectBox!.width);
+      expect(dialog!.height).toBeLessThan(560);
+      await page.locator('#auto-task-dialog-overlay').screenshot({ path: testInfo.outputPath(`compact-form-${lang}.png`) });
+
+      await page.setViewportSize({ width: 800, height: 600 });
+      await selectAiOption(page, '#auto-freq-select', lang === 'zh' ? '每月' : 'Monthly');
+      await page.locator('#auto-end-select .ai-select-trigger').click();
+      await page.locator('#auto-end-select-listbox [data-value="date"]').click();
+      await page.locator('#auto-end-date-input').fill('2099-12-31');
+      await expect(page.locator('#auto-row-end-date')).toBeVisible();
+      const overflow = await page.locator('.auto-task-dialog').evaluate(el => el.scrollWidth > el.clientWidth);
+      expect(overflow).toBe(false);
+      await page.locator('#auto-submit-btn').scrollIntoViewIfNeeded();
+      await expect(page.locator('#auto-submit-btn')).toBeInViewport();
+      await page.locator('#auto-task-dialog-overlay').screenshot({ path: testInfo.outputPath(`compact-form-short-${lang}.png`) });
+      await page.locator('#auto-freq-select .ai-select-trigger').click();
+      await page.locator('#auto-freq-select-listbox [data-value="daily"]').click();
+      await page.locator('#auto-end-select .ai-select-trigger').click();
+      await page.locator('#auto-end-select-listbox [data-value="none"]').click();
+    }
+    await page.locator('#auto-dialog-cancel-btn').click();
+    await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+    expect((await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list')).tasks).toHaveLength(0);
+  });
+
   test.describe('personal project Agent persistence', () => {
     test('saves and edits a selected personal project Agent across relaunch', async ({ orkas }) => {
       const project = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
@@ -459,6 +514,49 @@ test.describe('automation', () => {
       schedule: { type: 'one_time', at: '2099-12-31T09:00:00.000Z' },
     });
     expect(listed.tasks[0].last_run_at).toBeUndefined();
+  });
+
+  test('keeps a later Run now in the conversation the first run opened', async ({ modelOrkas }) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = modelOrkas.page;
+    const created = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      content: 'Collect the overnight replies',
+      title: 'E2E Continued Run',
+      enabled: false,
+      schedule: { type: 'one_time', at: '2099-12-31T09:00:00.000Z' },
+    });
+    const taskId = created.task.id;
+    type RunFacts = AutoTask & { run_count?: number; last_run?: { cid: string; status: string } };
+    const saved = async () => (await modelOrkas.invoke<{ tasks: RunFacts[] }>('autoTasks.list'))
+      .tasks.find((task) => task.id === taskId);
+    const runFromMenu = async () => {
+      await openAutomation(page);
+      const row = page.locator('.auto-row', { hasText: 'Collect the overnight replies' });
+      await row.hover();
+      await row.locator('.auto-row-more').click();
+      await page.locator('.auto-row-menu .auto-row-menu-item[data-action="run-now"]').click();
+      await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    };
+
+    await runFromMenu();
+    const userMessages = page.locator('#chat-history .chat-message.user', { hasText: 'Collect the overnight replies' });
+    await expect(userMessages).toHaveCount(1);
+    const cid = (await saved())?.last_run?.cid || '';
+    expect(cid).not.toBe('');
+    await expect.poll(async () => (await saved())?.last_run?.status, { timeout: 30_000 }).not.toBe('running');
+
+    await runFromMenu();
+    await expect(userMessages).toHaveCount(2);
+    expect(await saved()).toMatchObject({ run_count: 2, last_run: { cid } });
+    const listed = await modelOrkas.invoke<{ conversations: Array<{ origin_auto_task_id?: string }> }>('conversations.list');
+    expect(listed.conversations.filter((item) => item.origin_auto_task_id === taskId)).toHaveLength(1);
+
+    // Its runs list shows that one conversation.
+    await openAutomation(page);
+    const row = page.locator('.auto-row', { hasText: 'Collect the overnight replies' });
+    await row.click();
+    await expect(row.locator('.auto-row-convs-head')).toHaveText('Runs (1)');
+    await expect(row.locator(`.conv-item[data-cid="${cid}"]`)).toHaveCount(1);
   });
 
   test('keeps the first-message @Agent target through follow-ups, relaunch, and an explicit Commander reset', async ({ cliModelOrkas: cliOrkas }) => {

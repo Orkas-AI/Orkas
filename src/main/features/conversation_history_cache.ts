@@ -14,12 +14,12 @@
 
 import * as fs from 'node:fs';
 import { isMainThread } from 'node:worker_threads';
-import { historyRequest, liveHistoryRequest, conversationHistoryLifetime } from './conversation-history-client';
+import { historyRequest, liveHistoryRequest, conversationHistoryLifetime, ConversationHistoryClosedError } from './conversation-history-client';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
-import { userConversationHistoryCacheDir } from '../paths';
+import { userConversationHistoryCacheDir, appConversationForPath, appConversationRoot, appLocalConversationRoot } from '../paths';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef } from '../util/log-redact';
 import { persistToolResult, TOOL_RESULT_REF_HASH_HEX } from '../util/tool-result-cap';
@@ -120,7 +120,11 @@ function isLatestPageCache(value: unknown): value is LatestPageCache {
 
 function cachePaths(userId: string, sourceFile: string): CachePaths {
   const key = createHash('sha256').update(path.resolve(sourceFile)).digest('hex').slice(0, 32);
-  const entryDir = path.join(userConversationHistoryCacheDir(userId), key);
+  const cid = appConversationForPath(userId, sourceFile);
+  const canonicalRoot = cid ? appConversationRoot(userId, cid) : null;
+  const localRoot = cid && canonicalRoot && path.resolve(sourceFile) === path.join(canonicalRoot, 'messages.jsonl')
+    ? appLocalConversationRoot(userId, cid) : null;
+  const entryDir = path.join(localRoot ? path.join(localRoot, 'history-cache') : userConversationHistoryCacheDir(userId), key);
   return {
     entryDir,
     // Never parse an older, potentially hundreds-of-megabytes projection just
@@ -291,7 +295,7 @@ function projectProcessItem(item: unknown, toolResultsDir: string): unknown | nu
     : null;
 
   // These streams do not produce a renderer process-rail line. The canonical
-  // JSONL and devtools archive remain lossless for diagnostics.
+  // JSONL remains lossless for diagnostics.
   if (stream === 'command_output' || stream === 'usage' || stream === 'item') return null;
   if (stream === 'cli' && dataRecord) {
     const cliType = String(dataRecord.type || '').toLowerCase();
@@ -726,7 +730,7 @@ export async function purgeConversationHistoryCache(
     const previous = purgeBarriers.get(key);
     const pending = Promise.resolve(previous).catch(() => {}).then(async () => {
       await Promise.allSettled(admitted);
-      if (generation !== conversationHistoryLifetime()) throw new Error('Conversation history worker stopped');
+      if (generation !== conversationHistoryLifetime()) throw new ConversationHistoryClosedError();
       await historyRequest({ kind: 'purge', userId, sourceFile });
     });
     purgeBarriers.set(key, pending);
@@ -772,11 +776,11 @@ export async function projectLiveConversationHistoryRecords(
   // A clear owns the same source across both worker lanes. Later reads may
   // refill it, but an earlier projection must not recreate files after clear.
   while (purgeBarriers.has(key)) await purgeBarriers.get(key)!.catch(() => {});
-  if (generation !== conversationHistoryLifetime()) throw new Error('Conversation history worker stopped');
+  if (generation !== conversationHistoryLifetime()) throw new ConversationHistoryClosedError();
   const pending = (async () => {
     const projected: GroupMessage[] = [];
     for (const record of records) {
-      if (generation !== conversationHistoryLifetime()) throw new Error('Conversation history worker stopped');
+      if (generation !== conversationHistoryLifetime()) throw new ConversationHistoryClosedError();
       projected.push(...await liveHistoryRequest<GroupMessage[]>({ kind: 'project', userId, sourceFile, records: [record] }));
     }
     return projected;

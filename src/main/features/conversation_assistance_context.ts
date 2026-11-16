@@ -242,10 +242,9 @@ async function readNoteHead(notePath: string): Promise<{
   }
 }
 
-/** What an automation run cannot see from its own fresh conversation: which
- *  run it is, how the run before it ended, and the handoff note the task
- *  keeps between runs. Only the conversation the run on record opened gets
- *  it; reopening an older run's conversation later is ordinary chat. */
+/** Run facts and handoff state beyond this conversation's visible history.
+ *  Only the current recorded run's conversation receives them; reopening an
+ *  older run's conversation is ordinary chat. */
 async function automationRunGuidance(userId: string, cid: string, taskId: string): Promise<{
   guidance: string; readSeed?: ReadSeed;
 }> {
@@ -261,11 +260,12 @@ async function automationRunGuidance(userId: string, cid: string, taskId: string
     return { guidance: '' };
   }
   const previous = task.previous_run;
+  const previousEnd = previous?.status === 'running' ? 'did not finish' : `ended with status ${previous?.status}`;
   const previousRunFacts = !previous
     ? 'This is its first run.'
-    : `The previous run started ${previous.started_at} and `
-      + `${previous.status === 'running' ? 'did not finish' : `ended with status ${previous.status}`}; `
-      + `its conversation id is ${previous.cid}.`;
+    : previous.cid === cid
+      ? `The previous run started ${previous.started_at} in this conversation and ${previousEnd}.`
+      : `The previous run started ${previous.started_at} and ${previousEnd}; its conversation id is ${previous.cid}.`;
   let noteState = ' and holds nothing yet.';
   let noteBlock = '';
   let readSeed: ReadSeed | undefined;
@@ -316,27 +316,29 @@ export async function resolveConversationAssistanceForTurn(
   const entryGuidance = assistance?.kind === 'app_creation'
     ? prompts.load('app_creation_guidance').trim()
     : formatConnectorSetupAssistance(assistance);
+  let automationTaskId = '';
+  try { automationTaskId = (await import('./auto_tasks')).activeRunTaskId(userId, cid); }
+  catch (err) { log.warn('automation run state unavailable for turn guidance', { error: logErrorSummary(err) }); }
+  automationTaskId ||= conversation.origin_auto_task_id || '';
   // The actor delivering an automation run's result learns which run this
   // is, how the previous one ended and what the task's handoff note holds.
-  const automation = conversation.origin_auto_task_id && finalDelivery
-    ? await automationRunGuidance(userId, cid, conversation.origin_auto_task_id)
+  const automation = automationTaskId && finalDelivery
+    ? await automationRunGuidance(userId, cid, automationTaskId)
     : { guidance: '' };
   const automationRun = automation.guidance;
   // A conversation an automation created already recurs and has no one to
   // accept an offer, so it gets neither offer block.
-  const followUp = finalDelivery && !conversation.origin_auto_task_id
+  const followUp = finalDelivery && !automationTaskId
     ? prompts.load('followup_offer_guidance').trim()
     : '';
   // Project membership gates only the new-project offer. Recurring work and
   // its consent rules also apply inside a project or during relocation. Only
   // the Commander holds the project executor, so only it is told to offer one.
-  const projectOffer = commander && finalDelivery && !conversation.origin_auto_task_id
+  const projectOffer = commander && finalDelivery && !automationTaskId
     && !conversation.project_id && !hasPendingConversationFiling(userId, cid)
     ? prompts.load('project_offer_guidance').trim()
     : '';
-  // A brand-new account's finished one-off task gives no reason to return, so
-  // every final deliverer, the welcome conversation included, may suggest one
-  // next use. An automation's own conversation has no one to read it.
+  // Publish the host scope fact before any global backlog tool selection.
   const todoScope = finalDelivery && !conversation.project_id
     ? prompts.load('global_todo_scope').trim()
     : '';
@@ -345,7 +347,7 @@ export async function resolveConversationAssistanceForTurn(
   // automation created runs one scheduled job and gets no snapshot. The
   // snapshot carries this conversation's own to-dos, so the plain facts block
   // remains only where the snapshot is absent.
-  const openWork = commander && finalDelivery && !conversation.origin_auto_task_id
+  const openWork = commander && finalDelivery && !automationTaskId
     ? (conversation.project_id
       ? await projectOpenWorkGuidance(userId, cid, conversation.project_id)
       : await accountOpenWorkGuidance(userId, cid))

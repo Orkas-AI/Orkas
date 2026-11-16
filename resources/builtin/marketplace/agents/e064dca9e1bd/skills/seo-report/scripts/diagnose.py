@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 from urllib.parse import urlsplit
 
+from report import build_page_evidence
+
 
 SKILLS_ROOT = Path(__file__).resolve().parents[2]
 MAX_SAMPLE_URLS = 5
@@ -126,12 +128,13 @@ def _run_samples(urls: list[str], out_dir: Path) -> list[dict]:
             _run_script("seo-tech-audit", "audit", ["--input", str(crawl_path), "--out", str(tech_path)])
             _run_script("geo-score", "geo_score", ["--input", str(crawl_path), "--out", str(geo_path)])
             with crawl_path.open(encoding="utf-8") as handle:
-                page = (_data(json.load(handle)).get("pages") or [{}])[0]
+                crawl = json.load(handle)
+                page = (_data(crawl).get("pages") or [{}])[0]
             with tech_path.open(encoding="utf-8") as handle:
                 tech = _data(json.load(handle))
             with geo_path.open(encoding="utf-8") as handle:
                 geo = _data(json.load(handle))
-            rows.append({
+            row = {
                 "url": url,
                 "status_code": page.get("status_code"),
                 "title": page.get("title"),
@@ -140,7 +143,11 @@ def _run_samples(urls: list[str], out_dir: Path) -> list[dict]:
                 "critical": (tech.get("summary") or {}).get("critical", 0),
                 "high": (tech.get("summary") or {}).get("high", 0),
                 "ok": True,
-            })
+            }
+            evidence = build_page_evidence(crawl)
+            if evidence is not None:
+                row['page_evidence'] = evidence
+            rows.append(row)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             rows.append({"url": url, "ok": False, "error": str(exc)})
     return rows

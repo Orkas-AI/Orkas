@@ -222,7 +222,7 @@ describe('kb-tools › library(search)', () => {
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/temporarily unavailable/i);
     expect(r.content).toMatch(/try again/i);
-    expect(r.content).not.toContain('/Users/alice');
+    expect(r.content).not.toContain('/Users/test');
     expect(r.content).not.toContain('secret-value');
   });
 
@@ -394,7 +394,7 @@ describe('kb-tools › library(read)', () => {
     expect(read.content).toMatch(/status=failed/);
     expect(read.content).toMatch(/reprocess/i);
     for (const result of [listed, read]) {
-      expect(result.content).not.toContain('/Users/alice');
+      expect(result.content).not.toContain('/Users/test');
       expect(result.content).not.toContain('secret-value');
       expect(result.content).not.toContain('customer-plan.md');
     }
@@ -483,6 +483,32 @@ describe('kb-tools › shape', () => {
     expect(library.name).toBe('library');
     expect((library.inputSchema.properties as any).action.enum).toEqual(['list', 'search', 'read']);
     expect(library.inputSchema.required).toEqual(['action']);
+  });
+
+  it.each([
+    { name: 'missing action', input: {}, field: 'action', reason: 'invalid_value' },
+    { name: 'missing query', input: { action: 'search' }, field: 'query', reason: 'required' },
+    { name: 'missing path', input: { action: 'read' }, field: 'path', reason: 'required' },
+    { name: 'unsupported field', input: { action: 'list', unsupported_tag: 'must-not-leak-values' }, field: '$', reason: 'invalid_arguments' },
+  ])('returns canonical parameter facts for $name before Library effects', async ({ input, field, reason }) => {
+    const kb = await import('../../../../src/main/features/kb_vector');
+    const list = vi.spyOn(kb, 'listFiles');
+    const read = vi.spyOn(kb, 'getFileByPath');
+    try {
+      const library = await createLibrary();
+      const result = await library.execute(input, ctxFor());
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content)).toMatchObject({
+        code: 'E_BAD_INPUT', message: expect.any(String),
+        issues: [{ field, reason, expected: expect.any(String) }],
+      });
+      expect(result.content).not.toContain('must-not-leak-values');
+      expect(embedQueryMock).not.toHaveBeenCalled();
+      expect(list).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+      const { formatParameterError } = await import('../../../../bin/tool-parameter-errors.cjs');
+      expect(formatParameterError(result.content, true)).toBe(result.content);
+    } finally { list.mockRestore(); read.mockRestore(); }
   });
 
   it('advertises one portable schema while enforcing action-specific fields', async () => {

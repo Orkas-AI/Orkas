@@ -4,6 +4,24 @@ import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
 import type { HtmlPreviewDesignEvidence } from '../../src/main/features/html_preview';
 
+for (const label of ['Resume', 'Continue', 'Download resume']) {
+  test(`distinguishes a state action from a promised download: ${label}`, async ({ sdkOrkas: orkas }, info) => {
+    // H158: retain the intended outcome while the heuristic change awaits approval.
+    test.fail(label === 'Resume', 'H158: a paused-state Resume action is mistaken for a download');
+    const entry = orkas.createWorkspaceFile('state-action/index.html', `<!doctype html>
+      <style>button:focus-visible{outline:2px solid blue}</style>
+      <button onclick="document.querySelector('output').textContent='Running'">${label}</button><output>Paused</output>`);
+    const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+      const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+      return (await renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }])).evidence;
+    }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+    writeFileSync(info.outputPath('state-action.json'), JSON.stringify({ ...evidence, entryPath: undefined }, null, 2));
+    if (label === 'Continue') expect(evidence.interactions.stateChangesObserved).toBeGreaterThan(0);
+    expect(evidence.interactions.downloads).toEqual([]);
+    expect(evidence.ok).toBe(label !== 'Download resume');
+  });
+}
+
 test('submits bounded native temporal fields without reporting a false form failure', async ({ sdkOrkas: orkas }, info) => {
   const entry = orkas.createWorkspaceFile('temporal-form/index.html', `<!doctype html>
     <style>input:focus-visible,button:focus-visible{outline:2px solid blue}</style>

@@ -13,7 +13,7 @@ import {
   userMarketplaceSkillsDir,
   userSystemSkillsDir,
 } from '../../../src/main/paths';
-import { setCurrentLang } from '../../../src/main/i18n';
+import { setCurrentLang, t } from '../../../src/main/i18n';
 import {
   ALL_CONFIGURED_RATE_LIMITED_MESSAGE,
 } from '../../../src/main/model/core-agent/rotating-provider';
@@ -503,7 +503,7 @@ it('redacts and single-lines reasoning detail without truncating it', () => {
   const sensitive = sanitizePublicReasoningSummary(
     'Inspect /Users/test/Secret/plan.md then api_key=private-token\nContinue safely',
   );
-  expect(sensitive).not.toContain('/Users/alice');
+  expect(sensitive).not.toContain('/Users/test');
   expect(sensitive).not.toContain('private-token');
   expect(sensitive).not.toContain('\n');
 
@@ -548,7 +548,7 @@ it('sanitizes sensitive reasoning assembled across provider-delta boundaries', a
 
   expect(summaries).toHaveLength(2);
   for (const summary of summaries) {
-    expect(summary).not.toContain('/Users/alice');
+    expect(summary).not.toContain('/Users/test');
     expect(summary).not.toContain('private-token');
     expect(summary).not.toContain('\n');
   }
@@ -797,16 +797,16 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
 
   it('tool_progress → single structured progress event with message', async () => {
     const out = await collect([
-      { type: 'tool_start', name: 'generate_image', id: 'c-image', input: { output_path: 'out.png' } },
-      { type: 'tool_progress', name: 'generate_image', id: 'c-image', phase: 'poll', message: 'Waiting for image task (30s)', data: { elapsedMs: 30000 } },
-      { type: 'tool_end', name: 'generate_image', id: 'c-image', result: 'Image written to out.png' },
+      { type: 'tool_start', name: 'generate_video', id: 'c-video', input: { output_path: 'out.mp4' } },
+      { type: 'tool_progress', name: 'generate_video', id: 'c-video', phase: 'poll', message: 'Waiting for video task (30s)', data: { elapsedMs: 30000 } },
+      { type: 'tool_end', name: 'generate_video', id: 'c-video', result: 'Video written to out.mp4' },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
 
     const progressEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'progress');
     expect(progressEvent.event.stream).toBe('tool');
-    expect(progressEvent.event.data.name).toBe('generate_image');
-    expect(progressEvent.event.data.message).toBe('Waiting for image task (30s)');
+    expect(progressEvent.event.data.name).toBe('generate_video');
+    expect(progressEvent.event.data.message).toBe('Waiting for video task (30s)');
     expect(progressEvent.event.data.progress_phase).toBe('poll');
     expect(progressEvent.event.data.progress_data).toEqual({ elapsedMs: 30000 });
   });
@@ -2510,7 +2510,7 @@ describe('rejected requests', () => {
       text: 'The model service rejected this request (HTTP 400).', detail: `Provider said: ${detail}` });
   });
 
-  it('adds nothing when the provider gave no explanation or the route is the official model', async () => {
+  it('adds nothing when the configured provider gave no explanation', async () => {
     setCurrentLang('en');
     expect((await rejected('400 status code (no body)'))[0]).not.toHaveProperty('detail');
   });
@@ -2518,7 +2518,7 @@ describe('rejected requests', () => {
   it('redacts paths and secrets from the explanation and bounds it', async () => {
     setCurrentLang('en');
     const [out] = await rejected(`400 cannot read /Users/test/private/plan.md with api_key=sk-proj-local-agent-secret-123456789 ${'x'.repeat(600)}`);
-    expect(out.detail).not.toContain('/Users/alice');
+    expect(out.detail).not.toContain('/Users/test');
     expect(out.detail).not.toContain('sk-proj-local-agent-secret-123456789');
     expect(out.detail.length).toBeLessThanOrEqual('Provider said: '.length + 241);
   });
@@ -2537,4 +2537,64 @@ describe('rejected requests', () => {
     await collect([{ type: 'done', result: { text: 'ok', meta: { provider: 'custom' } } } as any], { failureTrackingScope: scope });
     expect((await rejected('400 bad request', 'custom', scope))[0].text).not.toContain(advice);
   });
+});
+
+
+it.each(['en', 'zh'] as const)('describes public provider balance fallback using its actual cause (%s)', async language => {
+  setCurrentLang(language);
+  try {
+    const out = await collect([
+      { type: 'provider_fallback', reason: 'balance', providerId: 'openai', candidateIndex: 1, candidateCount: 2 },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { isDev: false });
+    const progress = out.filter(event => event.type === 'progress');
+    expect(progress.map(event => event.text)).toEqual([t('model.balance_fallback', { provider: 'OpenAI' })]);
+    expect(progress[0].event).toEqual({ stream: 'provider', data: {
+      phase: 'fallback', reason: 'balance', provider_id: 'openai', candidate_index: 1, candidate_count: 2,
+    } });
+  } finally { setCurrentLang('en'); }
+});
+
+it.each(['permission', 'rate_limit', 'unavailable'] as const)(
+  'gives a configured-provider %s fallback its actual unavailable guidance and keeps route identity', async reason => {
+    for (const language of ['en', 'zh'] as const) {
+      setCurrentLang(language);
+      try {
+        const out = await collect([
+          { type: 'provider_fallback', reason, providerId: 'openai', toProviderId: 'deepseek',
+            fromModel: 'configured-source', toModel: 'configured-fallback', skipped: true },
+          { type: 'done', result: { text: 'Completed.', meta: { error: null } } },
+        ], { isDev: false });
+        const progress = out.find(event => event.type === 'progress');
+        expect(progress?.text).toBe(t('model.provider_unavailable_fallback', {provider: 'OpenAI'}));
+        expect(progress?.event).toEqual({stream: 'provider', data: {phase: 'fallback', reason,
+          provider_id: 'openai', to_provider_id: 'deepseek', from_model: 'configured-source',
+          to_model: 'configured-fallback', skipped: true}});
+        expect(out.at(-1)).toMatchObject({type: 'final', text: 'Completed.'});
+      } finally { setCurrentLang('en'); }
+    }
+  },
+);
+
+it.each([
+  [451, 'errors.model_request_rejected_no_retry'],
+  [413, 'errors.request_too_large'],
+] as const)('uses the common display formatter for structured HTTP %s failures', async (statusCode, key) => {
+  setCurrentLang('en');
+  const out = await collect([{type: 'done', result: {text: '', meta: {provider: 'custom',
+    error: {kind: 'provider_error', message: statusCode === 413 ? '413 Payload Too Large' : 'unavailable', statusCode}}}}]);
+  expect(out.find(event => event.type === 'error')?.text).toBe(t(key));
+});
+
+
+it('attributes a terminal balance error to the configured candidate that actually failed', async () => {
+  setCurrentLang('zh');
+  try {
+    const out = await collect([{type: 'done', result: {text: '', meta: {provider: 'openai',
+      error: {kind: 'provider_error', message: 'payment required', code: 'PROVIDER_BALANCE_EXHAUSTED', statusCode: 402}}}}],
+      {outcomeProviderId: () => 'deepseek'});
+    expect(out).toEqual([expect.objectContaining({type: 'error', failureCode: 'provider_balance'})]);
+    expect(out[0].text).toContain('DeepSeek');
+    expect(out[0].text).not.toContain('OpenAI');
+  } finally { setCurrentLang('en'); }
 });

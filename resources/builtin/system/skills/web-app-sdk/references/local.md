@@ -4,18 +4,15 @@ Read [the local API contract](api.json) and [starter](../assets/starter/index.ht
 
 ## Capability boundaries
 
-- **Storage:** JSON values private to this account and app source. Set
-  `scope: "cloud"` for business data to participate in the account's existing
-  cloud sync; use `scope: "local"` for caches. Omitted scope remains local for
-  old apps. There is no automatic migration from local or browser storage.
+- **Storage:** JSON values private to this local user and app source. The
+  `local` and `cloud` scope names select separate local stores; neither uploads
+  or synchronizes data. Omitted scope remains local for old apps.
 - **App files:** declare `appFiles` for relative-path text/binary files in the
-  app's private sandbox. Its default scope is cloud; choose local for caches.
+  app's private sandbox. Its default scope is cloud; both scopes stay local.
   Read/write/list/remove affect only this app. Source code is separate.
-  Reopening keeps data; copied/re-saved apps have independent sandboxes. Cloud
-  sync requires the same account and sync enabled on each device. Saved means
-  persisted on this device, not uploaded. Conflicts use Orkas Settings; there
-  is no SDK sync-status API. Keep explicit export for important data.
-  Preview redirects both scopes to disposable storage; it cannot prove sync.
+  Reopening keeps data; copied/re-saved apps have independent sandboxes.
+  Keep explicit export for important data. Preview redirects both scopes to
+  disposable storage and cannot prove persistence.
 - **Files:** native selection returns an opaque handle to a read-only snapshot,
   not a path or permission to edit the original. Release handles after reading.
   Picker/save cancellation returns `null`. Text export creates a new file; an
@@ -40,12 +37,13 @@ method or manifest capability is needed. Browser CORS, mixed-content and endpoin
 authentication still apply. External scripts run with the app's declared SDK
 abilities. Handle failures and cancellation without replaying uncertain writes.
 Automated `html_preview` allows Web
-resources but isolates storage and disables account services; verify business
+resources but isolates storage and disables host services; verify business
 actions in the running app.
 
 Read `unsupported` in the reference for excluded families and reasons. Shell,
-task/Agent execution, Skill execution, project/history/
-memory access, media generation and editing selected original files have no v1 adapter.
+Skill execution, project/history/memory access and editing selected original
+files have no v1 adapter. Declared tasks run a private app-owned Studio session,
+with its existing plan and spending gates.
 
 ## Failure and lifecycle
 
@@ -54,7 +52,7 @@ must leave the UI usable for an explicit retry. Never automatically replay AI or
 tool calls after uncertain failure: spending or a remote write may already have
 occurred. Aborting does not undo a completed external action.
 
-Close, navigation away from the app, account switch, source change and `permissions.revoke()`
+Close, navigation away from the app, local user switch, source change and `permissions.revoke()`
 invalidate the instance. Reopen for fresh grants. Do not persist file handles.
 When the host/model is unavailable, explain how to reopen in Orkas or configure
 a model; do not substitute fabricated results or direct provider requests.

@@ -39,6 +39,21 @@ function loadIcons() {
 }
 
 describe('icons.js', () => {
+  it('represents media aspect ratios with proportional frames and an unconstrained outline', () => {
+    const { uiIconHtml } = loadIcons();
+    for (const ratio of ['1:1', '4:5', '9:16', '16:9', '3:2']) {
+      const html = uiIconHtml('aspect-' + ratio.replace(':', '-'));
+      const frame = /<rect\b[^>]*>/.exec(html)?.[0] || '';
+      const width = Number(/\bwidth="([\d.]+)"/.exec(frame)?.[1]);
+      const height = Number(/\bheight="([\d.]+)"/.exec(frame)?.[1]);
+      const [w, h] = ratio.split(':').map(Number);
+      expect(width / height, ratio).toBeCloseTo(w / h, 3);
+      expect(html).toContain('aria-hidden="true"');
+      expect(html).not.toContain('stroke-dasharray');
+    }
+    expect(uiIconHtml('aspect-any')).toContain('stroke-dasharray');
+  });
+
   it('renders a real presentation icon instead of the info fallback', () => {
     const { uiIconHtml } = loadIcons();
     const html = uiIconHtml('presentation', 'oss-card-icon');

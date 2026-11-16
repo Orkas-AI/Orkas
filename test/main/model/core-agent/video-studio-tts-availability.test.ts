@@ -145,39 +145,14 @@ describe('VideoStudio speech availability', () => {
     expect(speechRuntime.generateSpeech).not.toHaveBeenCalled();
   });
 
-  it('blocks a narrated composition doctor check with an actionable setup reason', async () => {
-    const { createVideoStudioTool } = await import('../../../../src/main/model/core-agent/video-studio-tool');
-    const tool = createVideoStudioTool({ userId: UID, turnId: 'disabled-voice-doctor' });
-
-    const result = await tool.execute({
-      op: 'composition.doctor',
-      composition_dir: 'project/composition',
-    }, { workingDir: workspace, state: {} } as any);
-    const payload = JSON.parse(result.content);
-
+  it('stops direct speech generation without a configured provider before filesystem or service effects', async () => {
+    const { createGenerateSpeechTool } = await import('../../../../src/main/model/core-agent/generate-speech-tool');
+    const tool = createGenerateSpeechTool({ userId: UID });
+    const result = await tool.execute({ text: 'This request must remain local.', output_path: 'project/audio/unavailable.mp3' }, { workingDir: workspace } as any);
     expect(result.isError).toBe(true);
-    expect(payload).toMatchObject({
-      ok: false,
-      status: 'blocked',
-      narration_required: true,
-      blocking_capabilities: expect.arrayContaining(['tts_provider', 'tts_selection']),
-      checks: {
-        tts_provider: {
-          ok: false,
-          required: true,
-          availability: 'not_configured',
-          error_code: 'E_TTS_NOT_CONFIGURED',
-          next_action: 'ask_user_to_configure_a_speech_provider',
-        },
-        tts_selection: {
-          ok: false,
-          required: true,
-          error_code: 'E_TTS_NOT_CONFIGURED',
-        },
-      },
-    });
-    expect(payload.checks.tts_provider.message).toContain('Settings > Credentials');
-    expect(payload.checks.tts_selection.message).toContain('add a text-to-speech service');
+    expect(result.content).toContain('[E_TTS_NOT_CONFIGURED]');
+    expect(result.content).toContain('No text-to-speech service is configured');
     expect(speechRuntime.generateSpeech).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(workspace,'project/audio/unavailable.mp3'))).toBe(false);
   });
 });

@@ -132,17 +132,32 @@ export async function readIndexedJsonlRecords<T>(file: string, index: IndexedJso
   const handle = await fs.open(file, 'r');
   try {
     const records: T[] = [];
-    for (const entry of entries) {
+    for (let start = 0; start < entries.length;) {
       if (signal?.aborted) throw new Error('History read cancelled');
-      const bytes = Buffer.allocUnsafe(entry.bytes);
-      let read = 0;
-      while (read < bytes.length) {
-        if (signal?.aborted) throw new Error('History read cancelled');
-        const result = await handle.read(bytes, read, bytes.length - read, entry.offset + read);
-        if (!result.bytesRead) throw new Error('Conversation record is incomplete; retry the history lookup.');
-        read += result.bytesRead;
+      const first = entries[start];
+      let end = start + 1, limit = first.offset + first.bytes;
+      // Coalesce contiguous rows, not a sparse range or a whole transcript.
+      // Bound both the read buffer and parsing work between asynchronous reads;
+      // an individual large record retains its existing allocation contract.
+      while (end < entries.length && end - start < 128
+        && entries[end].offset === limit + 1
+        && entries[end].offset + entries[end].bytes - first.offset <= 64 * 1024) {
+        limit = entries[end].offset + entries[end].bytes;
+        end++;
       }
-      records.push(project(JSON.parse(bytes.toString('utf8')), entry.index));
+      const bytes = Buffer.allocUnsafe(limit - first.offset);
+      let read = 0;
+      for (; start < end; start++) {
+        if (signal?.aborted) throw new Error('History read cancelled');
+        const entry = entries[start], offset = entry.offset - first.offset;
+        while (read < offset + entry.bytes) {
+          if (signal?.aborted) throw new Error('History read cancelled');
+          const result = await handle.read(bytes, read, bytes.length - read, first.offset + read);
+          if (!result.bytesRead) throw new Error('Conversation record is incomplete; retry the history lookup.');
+          read += result.bytesRead;
+        }
+        records.push(project(JSON.parse(bytes.subarray(offset, offset + entry.bytes).toString('utf8')), entry.index));
+      }
     }
     if (await indexedJsonlStamp(file) !== index.stamp) throw new Error('Conversation changed; retry the history lookup.');
     return records;

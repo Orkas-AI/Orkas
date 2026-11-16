@@ -47,9 +47,11 @@ import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
  * workspace, exposed to scripts as `ORKAS_OUTPUT_DIR`.
  */
 
+import { isUtf8 } from 'node:buffer';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { outputPublicationReceipt } from '../../util/output-publication';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 // Electron boots main/ through tsx/cjs. Keep #core-agent type-only here:
@@ -141,7 +143,7 @@ import {
   requestConfirmation as requestDeleteConfirmation,
   waitForConfirmationVisible as waitForDeleteConfirmationVisible,
 } from './delete-file-confirm';
-import { fileEditLock } from '../../util/locks';
+import { acquireWithAbort, fileEditLock } from '../../util/locks';
 import { fileFailure, type FileFailureDiagnostic } from '../../../core-agent/src/tools/file-diagnostics';
 import { lookupSkillRuntimeRef } from './skill-runtime-ref';
 import { firstMatchOffsets, matchRecoveryContext } from '../../../core-agent/src/tools/match-context';
@@ -190,6 +192,8 @@ export interface ArtifactInteractionSmokeResult {
 export interface ProducedFileWriteInfo {
   /** The path already existed before this write. */
   preExisting?: boolean;
+  /** Generation billed to the configured service account. */
+  billedToOwnAccount?: boolean;
 }
 
 export interface LocalToolsOpts {
@@ -1491,7 +1495,7 @@ function workspaceScopedRootsFor(opts: LocalToolsOpts): string[] {
   const roots: string[] = [];
   if (!opts.userId) return roots;
   try {
-    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
     if (ws) roots.push(ws);
   } catch (err) { log.warn('edit_file resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
@@ -2846,7 +2850,7 @@ function bashDestructiveRiskIsOnlyWorkspaceFileDeletion(
 ): boolean {
   if (!opts.userId) return false;
   let workspaceRoot = '';
-  try { workspaceRoot = getWorkspacePath(opts.userId, opts.projectId); }
+  try { workspaceRoot = getWorkspacePath(opts.userId, opts.projectId, opts.cid); }
   catch { return false; }
   if (!workspaceRoot) return false;
   return bashDestructiveRiskIsOnlyAcceptedFileDeletion(
@@ -4117,81 +4121,6 @@ function guardUnsupportedAuthCodeFlow(command: string): string | null {
   );
 }
 
-const GOOGLE_CLOUD_SDK_OAUTH_CLIENT_IDS = [
-  '32555940559.apps.googleusercontent.com',
-  '764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com',
-];
-
-const GOOGLE_WORKSPACE_SCOPE_RE =
-  /https?:\/\/(?:www\.)?googleapis\.com\/auth\/(?:gmail(?:[.\s/&?]|$)|drive(?:[.\s/&?]|$)|documents(?:[\s/&?]|$)|spreadsheets(?:[\s/&?]|$)|calendar(?:[.\s/&?]|$)|contacts(?:[.\s/&?]|$)|tasks(?:[\s/&?]|$))/i;
-
-function decodedOAuthText(input: string): string {
-  const raw = String(input || '');
-  let decoded = raw.replace(/\+/g, ' ');
-  for (let i = 0; i < 3; i++) {
-    try {
-      const next = decodeURIComponent(decoded).replace(/\+/g, ' ');
-      if (next === decoded) break;
-      decoded = next;
-    } catch {
-      break;
-    }
-  }
-  return `${raw}\n${decoded}`;
-}
-
-function containsCloudSdkClientWithWorkspaceScope(input: string): boolean {
-  const haystack = decodedOAuthText(input);
-  return GOOGLE_CLOUD_SDK_OAUTH_CLIENT_IDS.some((clientId) => haystack.includes(clientId))
-    && GOOGLE_WORKSPACE_SCOPE_RE.test(haystack);
-}
-
-function googleWorkspaceOauthClientScopeMismatchErr(): string {
-  return errText(
-    'E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH',
-    'Google Cloud SDK OAuth client IDs cannot be reused with Gmail, Drive, Docs, Sheets, Calendar, Contacts, or Tasks scopes. '
-    + 'Do not synthesize Google OAuth URLs or scripts with Cloud SDK client IDs. Use an Orkas connector OAuth flow or stop and explain that Google Workspace access needs a product-managed Google connector.',
-  );
-}
-
-function guardGoogleWorkspaceOauthClientMismatchText(input: string): string | null {
-  return containsCloudSdkClientWithWorkspaceScope(input)
-    ? googleWorkspaceOauthClientScopeMismatchErr()
-    : null;
-}
-
-function unquoteShellToken(token: string): string {
-  const s = String(token || '').trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    return s.slice(1, -1);
-  }
-  return s;
-}
-
-function guardGoogleWorkspaceOauthClientMismatchCommand(command: string, cwd?: string): string | null {
-  const directErr = guardGoogleWorkspaceOauthClientMismatchText(command);
-  if (directErr) return directErr;
-
-  const re = /\b(?:python3?|node|bash|sh|zsh)\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) {
-    const scriptRef = unquoteShellToken(m[1]);
-    if (!scriptRef || scriptRef.startsWith('-')) continue;
-    const abs = path.isAbsolute(scriptRef)
-      ? scriptRef
-      : path.resolve(cwd || process.cwd(), scriptRef);
-    try {
-      const st = fs.statSync(abs);
-      if (!st.isFile() || st.size > 512 * 1024) continue;
-      const fileErr = guardGoogleWorkspaceOauthClientMismatchText(fs.readFileSync(abs, 'utf8'));
-      if (fileErr) return fileErr;
-    } catch {
-      // Missing/unreadable script paths should fail naturally when the command runs.
-    }
-  }
-  return null;
-}
-
 function guardInteractiveNoBrowserAuthFlow(command: string, allowNoBrowserAuth: boolean): string | null {
   if (allowNoBrowserAuth || !commandStartsNoBrowserAuthLogin(command)) return null;
   return errText(
@@ -4314,14 +4243,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           content: protectedWriteError(protectedMention, protectedMention),
           isError: true,
         };
-      }
-      const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchCommand(command, ctx.workingDir);
-      if (oauthClientMismatchErr) {
-        log.warn('bash google oauth client/scope mismatch reject', {
-          user_id: maskId(opts.userId),
-          command_chars: command.length,
-        });
-        return { content: oauthClientMismatchErr, isError: true };
       }
       const unsupportedAuthErr = guardUnsupportedAuthCodeFlow(command);
       if (unsupportedAuthErr) {
@@ -4489,14 +4410,6 @@ async function gateInteractiveCliStart(
       content: protectedWriteError(protectedMention, protectedMention),
       isError: true,
     };
-  }
-  const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchCommand(command, settings?.workingDir);
-  if (oauthClientMismatchErr) {
-    log.warn('interactive_cli_start google oauth client/scope mismatch reject', {
-      user_id: maskId(opts.userId),
-      command_chars: command.length,
-    });
-    return { content: oauthClientMismatchErr, isError: true };
   }
   const unsupportedNoBrowserAuthErr = guardInteractiveNoBrowserAuthFlow(
     command,
@@ -4980,11 +4893,6 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
       'Create a UTF-8 text file in the workspace, including parent directories, and return its final path and revision. Foreign path collisions are auto-suffixed. Use edit_file or apply_patch for existing files, or append_file to continue a long new file.',
     inputSchema: coreWriteFileTool.inputSchema,
     async execute(input, ctx) {
-      const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(String(input.content ?? ''));
-      if (oauthClientMismatchErr) {
-        log.warn('write_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId) });
-        return { content: oauthClientMismatchErr, isError: true };
-      }
       const inputPath = String(input.path ?? '');
       if (!inputPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const inputAbs = resolveAbs(ctx, inputPath);
@@ -5016,28 +4924,26 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         ? { ...input, path: finalPath }
         : input;
       if (!result.isError) {
+        const written = Buffer.from(String(rewritten.content ?? ''), 'utf8');
+        const fileHash = fileBufferHash(written);
         // Stamp the just-written bytes so a follow-up edit_file accepts an edit
         // without an intervening read_files call (the model already knows the content
         // it wrote), and so OCC compares against this write, not a stale read.
-        recordRead(ctx, finalPath);
-      }
-      if (!result.isError && opts.onFileWritten) {
-        try {
-          // A uniquified path is new by construction, and overwriting our own
-          // earlier output is still production. Only an in-place write over a
-          // target the user already had keeps their file.
-          await opts.onFileWritten(finalPath, {
-            preExisting: finalPath === inputAbs
-              && targetExistedBeforeWrite
-              && !isMineFor(opts)(finalPath),
-          });
-        } catch (err) {
-          log.warn('onFileWritten callback failed', { error: logErrorRef(err) });
+        recordRead(ctx, finalPath, undefined, fileHash);
+        if (opts.onFileWritten) {
+          try {
+            // A uniquified path is new by construction, and overwriting our own
+            // earlier output is still production. Only an in-place write over a
+            // target the user already had keeps their file.
+            await opts.onFileWritten(finalPath, {
+              preExisting: finalPath === inputAbs
+                && targetExistedBeforeWrite
+                && !isMineFor(opts)(finalPath),
+            });
+          } catch (err) {
+            log.warn('onFileWritten callback failed', { error: logErrorRef(err) });
+          }
         }
-      }
-      if (!result.isError) {
-        const written = Buffer.from(String(rewritten.content ?? ''), 'utf8');
-        const fileHash = fileBufferHash(written);
         const revision = issueFileRevision(ctx, finalPath, written.length, fileHash);
         const receipt = `<file path="${finalPath}" total_bytes="${written.length}" file_hash="${fileHash}" revision="${revision}"/>`;
         return {
@@ -5069,6 +4975,18 @@ function appendFileReceipt(
   replayed: boolean,
 ): string {
   return `<file path="${abs}" appended_bytes="${appendedBytes}" total_bytes="${totalBytes}" file_hash="${fileHash}" revision="${revision}" replayed="${replayed}"/>`;
+}
+
+/** Admit timers and cancellation before reading a version or holding a file
+ * transaction. Once admitted, freshness, write and receipt state stay in the
+ * existing synchronous critical section. Cancelling a queued caller returns
+ * its eventual lease through the shared lock helper without starting a write. */
+async function acquireFileEditLock(abs: string, ctx: ToolContext): Promise<() => void> {
+  ctx.signal?.throwIfAborted();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  return ctx.signal
+    ? acquireWithAbort(() => fileEditLock(abs).acquire(), ctx.signal)
+    : fileEditLock(abs).acquire();
 }
 
 /** Append one complete text chunk with revision-first OCC and replay idempotency. */
@@ -5121,8 +5039,9 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         return { content: scopeErr, isError: true };
       }
 
-      const release = await fileEditLock(abs).acquire();
+      const release = await acquireFileEditLock(abs, ctx);
       try {
+        ctx.signal?.throwIfAborted();
         let st: fs.Stats;
         try { st = fs.lstatSync(abs); }
         catch (err) {
@@ -5144,12 +5063,13 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         catch (err) {
           return { content: errText('E_APPEND_FAILED', `${abs}: read failed: ${(err as Error).message}`), isError: true };
         }
-        const beforeText = before.toString('utf8');
-        if (!Buffer.from(beforeText, 'utf8').equals(before)) {
+        if (!isUtf8(before)) {
           return { content: errText('E_NOT_EDITABLE', `${abs}: file is not valid UTF-8 text`), isError: true };
         }
         const chunk = Buffer.from(content, 'utf8');
-        const currentHash = fileBufferHash(before);
+        // Keep only this call's verified snapshot state for the post-append hash.
+        const appendHash = crypto.createHash('sha256').update(before);
+        const currentHash = `sha256:${appendHash.copy().digest('hex')}`;
         const currentRevision = issueFileRevision(ctx, abs, before.length, currentHash);
         const chunkHash = fileBufferHash(chunk);
         const revisionRecord = resolveFileRevision(ctx, baseRevision);
@@ -5199,22 +5119,15 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
 
-        const afterText = beforeText + content;
-        const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(afterText);
-        if (oauthClientMismatchErr) {
-          log.warn('append_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-          return { content: oauthClientMismatchErr, isError: true };
-        }
         try { fs.appendFileSync(abs, chunk); }
         catch (err) {
           return { content: errText('E_APPEND_FAILED', `${abs}: write failed: ${(err as Error).message}`), isError: true };
         }
 
-        // The freshness check already hashed this immutable snapshot. Hash the
-        // exact concatenated bytes without allocating another full-file buffer.
+        // Continue the same snapshot hash without scanning the old bytes twice.
         const beforeHash = currentHash;
         const afterBytes = before.length + chunk.length;
-        const afterHash = fileBufferHash(before, chunk);
+        const afterHash = `sha256:${appendHash.update(chunk).digest('hex')}`;
         const nextStat = fs.statSync(abs);
         recordRead(ctx, abs, nextStat, afterHash);
         const nextRevision = issueFileRevision(ctx, abs, afterBytes, afterHash);
@@ -5308,10 +5221,6 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
         isError: true,
         observations: fileFailure(freshness.code, freshness.code === 'E_NOT_READ' ? 'not_read' : 'file_changed', { stage: 'freshness', ...baseline }),
       };
-    },
-    validateContent(check) {
-      const oauthErr = guardGoogleWorkspaceOauthClientMismatchText(check.content);
-      return oauthErr ? { content: oauthErr, isError: true } : undefined;
     },
     async onCommitted(file: ApplyPatchCommittedFile, ctx) {
       if (file.operation === 'delete' || file.destinationPath !== file.sourcePath) {
@@ -5412,8 +5321,9 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
       // Serialize the read-modify-write per file: parallel workers share this
       // process + filesystem, so two concurrent edits of the same file must not
       // interleave stat→read→write (lost update). Distinct files never contend.
-      const release = await fileEditLock(abs).acquire();
+      const release = await acquireFileEditLock(abs, ctx);
       try {
+        ctx.signal?.throwIfAborted();
         let st: fs.Stats;
         try { st = fs.statSync(abs); }
         catch (err) {
@@ -5509,12 +5419,6 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         }
 
         const next = replaceAll ? body.split(matchText).join(newStr) : body.replace(matchText, () => newStr);
-        const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(next);
-        if (oauthClientMismatchErr) {
-          log.warn('edit_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-          return { content: oauthClientMismatchErr, isError: true };
-        }
-
         try {
           fs.writeFileSync(abs, next, 'utf8');
         } catch (err) {
@@ -5610,10 +5514,8 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
       }
       try {
         const accepted = await opts.onOutputsPublished(normalized);
-        const acceptedSet = new Set(Array.isArray(accepted) ? accepted.map((p) => path.resolve(p)) : []);
-        const acceptedCount = normalized.filter((p) => acceptedSet.has(p)).length;
         return {
-          content: JSON.stringify({ published: acceptedCount, requested: normalized.length }),
+          content: JSON.stringify(outputPublicationReceipt(normalized, Array.isArray(accepted) ? accepted : [])),
         };
       } catch (err) {
         return {
@@ -6142,12 +6044,12 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        artifact_id: { type: 'string', description: 'For a correction, an app ID returned to this creator in the current conversation. Replaces that app with the complete files array, retaining its identity; omit only to create a separate app.' },
+        artifact_id: { type: ['string', 'null'], description: 'For a correction, an app ID returned to this creator in the current conversation. Replaces that app with the complete files array, retaining its identity. Omitted, null or blank allocates a new app ID.' },
         title: { type: 'string', description: 'Short title above the embedded app. Omit to retain a revised app title; new apps default to "Interactive app".' },
         appType: {type:'string',enum:opts.lockedAppType?[opts.lockedAppType]:['local','web'],description:'Omit to retain the revised app type or inherit the selected task/editing source; otherwise defaults to local. Web apps use browser and common data interfaces only; read web-app-sdk for the matching contract.'},
         files: {
           type: 'array',
-          description: 'Relative app files with a top-level index.html. Local apps may load __orkas/bridge.js for send and resize.',
+          description: 'Relative files with top-level index.html. Local apps receive __orkas/bridge.js for send and resize unless provided or self-sizing. If supplying a CSP, allow that same-origin script in the effective script-src/script-src-elem directive while retaining other restrictions.',
           items: {
             type: 'object',
             properties: {
@@ -6241,7 +6143,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       const web=chatArtifacts.readArtifactMeta(uid,cid,r.artifactId)?.appType==='web';
       return {
         content:
-          `Artifact "${r.title}" ${(input as { artifact_id?: unknown }).artifact_id !== undefined ? 'updated' : 'created'} (id ${r.artifactId}); revision ${r.revision}; preview ${smoke.ok ? 'completed' : 'reported issues'} ` +
+          `Artifact "${r.title}" ${r.revision > 1 ? 'updated' : 'created'} (id ${r.artifactId}); revision ${r.revision}; preview ${smoke.ok ? 'completed' : 'reported issues'} ` +
           `(${smoke.controlsExercised ?? 0} control(s), ${smoke.observableEffects ?? 0} observable effect(s)) ` +
           `at desktop, chat-embed, and mobile viewports. This bounded preview is not a full functional verification. ` +
           (sdkObservations.length ? `SDK observations (temporary preview data): ${sdkObservations.slice(0, 12).join(' | ')}${sdkObservations.length > 12 ? ` | ${sdkObservations.length - 12} more observation(s)` : ''}. ` : '') +

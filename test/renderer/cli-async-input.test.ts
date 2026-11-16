@@ -37,14 +37,15 @@ afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 function load(expiresAt?: number) {
   const invoke = vi.fn(async (_channel: string, payload: any) => ({ ok: true, message: { from: 'user', cli_answer: { message_id: payload.message_id, answers: payload.answers } } }));
   const dock = new Element();
-  const context: any = { Date, setTimeout, clearTimeout, window: { orkas: { invoke }, addEventListener() {} }, document: { getElementById: () => dock, createElement: (tag: string) => new Element(tag), addEventListener() {} }, t: (key: string) => key };
+  const changed = vi.fn();
+  const context: any = { Date, setTimeout, clearTimeout, CustomEvent: class { constructor(public type: string) {} }, window: { orkas: { invoke }, dispatchEvent: changed, addEventListener() {} }, document: { getElementById: () => dock, createElement: (tag: string) => new Element(tag), addEventListener() {} }, t: (key: string) => key };
   vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, '../../src/renderer/modules/cli_async_input.js'), 'utf8'), context);
   const message = { id: 'question-1', from: 'agent', turn_id: 'turn-1', cli_question: { expires_at_ms: expiresAt, questions: [{ title: 'Which scope?', options: ['Current', 'All'] }] } };
   const api = context.window.CliAsyncInput;
   const host = new Element();
   const onAnswer = vi.fn();
   api.mount(host, message, { cid: 'chat-1', onAnswer });
-  return { invoke, api, host, message, onAnswer, dock };
+  return { invoke, api, host, message, onAnswer, dock, changed };
 }
 const send = (host: Element) => host.all('button').find(el => el.textContent === 'chat.cli_question.send')!;
 
@@ -52,8 +53,8 @@ const send = (host: Element) => host.all('button').find(el => el.textContent ===
 function loadRequest(questions: any[], overrides: Record<string, any> = {}) {
   const dock = new Element();
   const context: any = {
-    Date, setTimeout, clearTimeout,
-    window: { orkas: { invoke: vi.fn() }, addEventListener() {} },
+    Date, setTimeout, clearTimeout, CustomEvent: class { constructor(public type: string) {} },
+    window: { orkas: { invoke: vi.fn() }, dispatchEvent: vi.fn(), addEventListener() {} },
     document: { getElementById: () => dock, createElement: (tag: string) => new Element(tag), addEventListener() {} },
     t: (key: string) => key,
   };
@@ -72,6 +73,104 @@ function loadRequest(questions: any[], overrides: Record<string, any> = {}) {
 }
 const cardButton = (host: Element, text: string) => host.all('button').find(el => el.textContent === text)!;
 const cardInputs = (host: Element) => host.all('textarea');
+
+describe('sidebar CLI answer attention lifecycle', () => {
+  const live = [{ actor: 'agent', turn_id: 'turn-1', steerable: true }];
+
+  it('does not flag historical questions until their exact actor and turn are live and steerable', () => {
+    const h = load();
+    expect([...h.api.waitingCids()]).toEqual([]);
+    for (const turns of [[], [{ ...live[0], actor: 'other' }], [{ ...live[0], turn_id: 'other' }], [{ ...live[0], steerable: false }]]) {
+      h.api.setActiveTurns('chat-1', turns);
+      expect([...h.api.waitingCids()]).toEqual([]);
+    }
+    h.api.setActiveTurns('chat-1', live);
+    expect([...h.api.waitingCids()]).toEqual(['chat-1']);
+    h.api.showConversation('other-chat');
+    expect(h.api.waitingCount('chat-1')).toBe(1);
+    expect(h.changed).toHaveBeenCalledOnce();
+    expect(h.changed.mock.calls[0][0].type).toBe('cli-waiting-changed');
+    h.api.setActiveTurns('chat-1', []);
+    expect([...h.api.waitingCids()]).toEqual([]);
+  });
+
+  it('counts background requests once and handles out-of-order answers, withdrawal and deletion independently', () => {
+    const h = load();
+    h.api.setActiveTurns('background', live);
+    const question = { ...h.message, id: 'background-1' };
+    h.api.observe('background', question);
+    h.api.observe('background', question);
+    h.api.observe('background', { ...question, id: 'background-2' });
+    expect(h.api.waitingCount('background')).toBe(2);
+    h.api.observe('background', { cli_answer: { message_id: 'background-1', answers: ['Yes'] } });
+    h.api.observe('background', question);
+    expect(h.api.waitingCount('background')).toBe(1);
+    h.api.observe('background', { ...question, id: 'background-2', cli_question: { cancelled: true } });
+    expect(h.api.waitingCount('background')).toBe(0);
+    h.api.observe('background', { cli_answer: { message_id: 'answered-before-question', answers: ['Yes'] } });
+    h.api.observe('background', { ...question, id: 'answered-before-question' });
+    expect(h.api.waitingCount('background')).toBe(0);
+    h.api.setActiveTurns('chat-1', live);
+    h.api.observe('background', { ...question, id: 'background-3' });
+    h.api.forget('background');
+    expect([...h.api.waitingCids()]).toEqual(['chat-1']);
+    h.api.setActiveTurns('background', live);
+    expect(h.api.waitingCount('background')).toBe(0);
+  });
+
+  it('retains attention during delivery and save failure, then clears on successful retry', async () => {
+    const h = load();
+    h.api.setActiveTurns('chat-1', live);
+    await h.host.all('button')[0].fire('click');
+    let finish!: (value: any) => void;
+    h.invoke.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const pending = send(h.host).fire('click');
+    expect(h.api.waitingCount('chat-1')).toBe(1);
+    finish({ ok: false, error: 'save_failed' });
+    await pending;
+    expect(h.api.waitingCount('chat-1')).toBe(1);
+    await send(h.host).fire('click');
+    expect(h.api.waitingCount('chat-1')).toBe(0);
+  });
+
+  it('clears an expired request when delivery discovers the turn has ended', async () => {
+    const h = load();
+    h.api.setActiveTurns('chat-1', live);
+    await h.host.all('button')[0].fire('click');
+    h.invoke.mockResolvedValueOnce({ ok: false, error: 'expired' } as any);
+    await send(h.host).fire('click');
+    expect(h.api.waitingCount('chat-1')).toBe(0);
+    h.api.observe('chat-1', h.message);
+    expect(h.api.waitingCount('chat-1')).toBe(0);
+  });
+
+  it('keeps multiple blocking requests visible to the sidebar until delivery or explicit closure', async () => {
+    const h = loadRequest([{ id: 'q', question: 'Which scope?' }]);
+    const closeOther = h.api.showCliInputRequest({ requestId: 'other', cid: 'chat-1',
+      questions: [{ id: 'q', question: 'Which branch?' }], submit: vi.fn(), cancel: vi.fn() });
+    expect(h.api.waitingCount('chat-1')).toBe(2);
+    h.api.showConversation('chat-2');
+    closeOther();
+    expect(h.api.waitingCount('chat-1')).toBe(1);
+    h.submit.mockResolvedValueOnce(false);
+    cardInputs(h.host)[0].value = 'Current';
+    await cardInputs(h.host)[0].fire('input');
+    await cardButton(h.host, 'chat.cli_question.send').fire('click');
+    expect(h.api.waitingCount('chat-1')).toBe(1);
+    await cardButton(h.host, 'chat.cli_question.send').fire('click');
+    expect([...h.api.waitingCids()]).toEqual([]);
+  });
+
+  it.each(['stop', 'delete'])('clears blocking attention on %s and ignores a late closer', action => {
+    const h = loadRequest([{ id: 'q', question: 'Which scope?' }]);
+    if (action === 'stop') h.api.setActiveTurns('chat-1', []);
+    else h.api.forget('chat-1');
+    expect([...h.api.waitingCids()]).toEqual([]);
+    expect(h.dock.children).toHaveLength(0);
+    h.close();
+    expect(h.onClosed).toHaveBeenCalledOnce();
+  });
+});
 
 describe.each(['blocking', 'async'])('%s question keyboard answers', kind => {
   it('sends a typed answer once with Enter, preserves IME and Shift+Enter, and allows retry after failure', async () => {

@@ -7,101 +7,54 @@ description_en: Turns reference images, videos, screenshots and brand guides int
 
 # design-system-importer
 
-Use this when COMPOSE or an AUTO compose segment has any external reference media or style source: a reference image, reference video, `DESIGN.md`, brand guide, screenshot, a website the user asks to match, design notes, or an explicit named visual direction.
+Use this when a video has an external reference or style source: a reference image or video, `DESIGN.md`, brand guide, screenshot, a website the user asks to match, design notes, or an explicit named visual direction.
 
-Do not use it for ordinary editing, TTS, shot generation, or clip selection. Do not introduce a new user Gate. The output is an internal style extraction that feeds `project/composition/composition-manifest.json::art_direction` and the model-authored `project/composition/index.html`.
+Do not use it for ordinary editing, narration, shot generation, or clip selection. Do not ask the user to approve the result. Do not use it for vague adjectives like "modern", "clean", "premium", or "more polished" when no source is named; in those cases, let `frontend-design` choose the look from the brief.
 
-Do not use it for vague adjectives like "modern", "clean", "premium", "dynamic", or "more polished" when no source is named. In those cases, let `frontend-design` choose the aesthetic thesis directly from the video brief.
+## Reference intent before technique
 
-## Reference Intent Before Input Technique
-
-For reference-led reconstruction, first read [reference-recreation.md](../video-craft/references/reference-recreation.md) for content, motion, timing and audio evidence. Map its observations into the executable design contract below; token extraction alone does not reproduce a video's behavior.
+To rebuild a reference, first read [reference-recreation.md](@skill/video-craft/references/reference-recreation.md) for content, motion, timing and audio evidence. Token extraction alone does not reproduce a look.
 
 For every supplied image or video, first classify what the user wants from it. Explicit user requirements always override defaults; infer only when the user is silent:
 
-- `reproduce`: preserve the declared content, identity, composition, structure, style, motion, timing, or audio axes.
-- `edit`: use the media as the original, protect all declared unaffected axes, and change only `may_change`.
-- `guide`: borrow only the declared roles and do not imply exact fidelity. This is the safe default for an otherwise unspecified reference.
+- `reproduce`: preserve the content, identity, composition, structure, style, motion, timing, or audio the user named.
+- `edit`: use the media as the original, protect everything unaffected, and change only what was asked.
+- `guide`: borrow only selected roles and do not imply exact fidelity. This is the safe default for an otherwise unspecified reference.
 
-Record `intent_basis:"user"` for an explicit requirement and `intent_basis:"inferred"` for a fallback. A request to change the supplied original implies edit; an explicit restore/recreate/match request implies reproduce; otherwise default to guide. Mixed instructions keep their operational intent while the user's exact protected and changeable axes remain authoritative. This classification is independent of origin. A screenshot, exported frame, camera photo, generated image, HTML capture, design-tool export, uploaded MP4, or generated video receives the same contract when the requested intent and roles are the same.
+A request to change the supplied original implies edit; an explicit restore, recreate or match request implies reproduce; otherwise default to guide.
 
-Keep every exact inspected media file in `project/composition/assets/references/` before authoring and record that composition-local path. For video, reuse the frozen copy and `reference_path` returned by `reference.inspect`; no second shell copy is needed. Do not rely on a chat thumbnail, stale temporary path, or prose description after the source has been supplied.
+Keep each inspected media file inside the video folder, under `assets/references/`. For video, `reference.inspect` with `video_dir` keeps a frozen copy and returns its path, so no second copy is needed.
 
-## Source Access Is An Optimization, Not A Different Contract
+## Source access is an optimization
 
-If the user owns reusable source code, vectors, layers, or assets, use them when that is the safest way to satisfy the same reference contract. If only pixels are available, derive the same spatial/temporal anchors from pixels. Availability of HTML, an ImageStudio project, or another authoring format must not change the requested intent, roles, fidelity floor, or review rubric.
+If the user owns reusable source code, vectors, layers, or assets, use them when that is the safest way to get the same result. If only pixels are available, derive the same spatial and temporal anchors from pixels.
 
-Keep extraction small enough to fit inside the manifest art direction. Do not load or recreate an entire external design system.
+Do not load or recreate an entire external design system.
 
-## Extract Compact Tokens
+## Extract compact tokens
 
-Write a `style_source` object under `art_direction` in `project/composition/composition-manifest.json`:
+Put these straight into the page's CSS and motion; do not write a design document:
 
-```json
-{
-  "art_direction": {
-    "style_source": {
-      "source_type": "brand_system | design_notes | reference_media | existing_product | named_reference",
-      "source_basis": "file path, user note, or inspected artifact",
-      "adaptation_boundary": "what the user wants preserved vs changed",
-      "confidence": "high | medium | low",
-      "fidelity_mode": "exact | close | adapt"
-    }
-  }
-}
-```
+- Colours: background, surface, text, muted, primary accent, optional secondary accent, with the intended contrast.
+- Type: display, body, data or label, caption roles; scale and weight intent. Do not rely on fonts that are not available.
+- Shape: radius, stroke, shadow, divider, border, and density.
+- Layout: grid, editorial, cinematic, dashboard, diagrammatic, poster, product demo, or another concrete grammar.
+- Motion: entrance, emphasis, data build and exit patterns, compatible with a seekable GSAP timeline.
+- Assets: what images, icons and marks are allowed, need replacing, or must be avoided.
 
-Then normalize the source into sibling fields in `manifest.art_direction` that model-authored HTML/CSS/SVG can consume:
+Keep it small. If more than 6 chromatic colours or 3 font roles are needed, pick the smallest faithful subset.
 
-- `color_tokens`: background, surface, text, muted, primary accent, optional secondary accent, plus intended contrast relationship.
-- `typography_tokens`: display, body, data/label, caption roles; scale and weight intent; avoid relying on fonts that are not available.
-- `shape_tokens`: radius, stroke, shadow, divider, border, and density.
-- `layout_language`: grid, editorial, cinematic, dashboard, diagrammatic, poster, product-demo, or another concrete grammar.
-- `motion_language`: entrance, transition, emphasis, data-build, and exit patterns; keep it compatible with GSAP timeline seeking.
-- `asset_rules`: what images/icons/marks are allowed, need replacement, or must be avoided.
-- `do_not_copy`: only elements the user explicitly excludes; leave empty when none are excluded.
+## Fidelity
 
-Keep the imported style small. If more than 6 chromatic colors or 3 font roles are needed, summarize the conflict and pick the smallest faithful subset.
+Choose from user intent, not convenience:
 
-## Write An Executable Media Contract
+- Exact: the user asks to reproduce or continue the supplied design. Preserve at least three named aspects.
+- Close: keep its recognizable system and spatial grammar while adapting content, shape and motion.
+- Adapt: borrow selected tokens or a visual principle; do not claim pixel fidelity.
 
-For every concrete image or video, write `art_direction.references`; then write the shared `art_direction.reference_fidelity` policy:
+For a video used to reproduce, edit, or control motion or timing, map source time ranges to target scenes, and be able to say which source moment each scene follows.
 
-```json
-{
-  "references": [{
-    "id": "reference-1",
-    "media_type": "image | video",
-    "path": "assets/references/reference.mp4",
-    "intent": "reproduce | edit | guide",
-    "roles": ["content", "identity", "composition", "structure", "style", "motion", "timing", "audio"],
-    "required": true,
-    "preserve": ["subject identity", "camera path", "beat timing"],
-    "may_change": ["copy"],
-    "target_scene_ids": ["scene-1"],
-    "temporal_anchors": [
-      { "source_start_sec": 0, "source_end_sec": 3.2, "target_scene_id": "scene-1" }
-    ]
-  }],
-  "reference_fidelity": {
-    "mode": "exact | close | adapt",
-    "preserve": ["composition", "identity", "motion"],
-    "may_change": ["copy", "aspect-safe reflow"],
-    "layout_anchors": [{ "id": "hero", "role": "hero", "bounds": { "x": 0.08, "y": 0.12, "width": 0.5, "height": 0.7 } }],
-    "verification": { "compare_frames": ["first-frame", "scene-1-mid"] }
-  }
-}
-```
-
-Choose the mode from user intent, not convenience:
-
-- `exact`: the user asks to reproduce/continue the supplied design. Preserve at least three named axes.
-- `close`: keep its recognizable system and spatial grammar while adapting content/aspect/motion.
-- `adapt`: borrow selected tokens or a visual principle; do not claim pixel fidelity.
-
-`preserve` names the kept signature elements from [reference-recreation.md](../video-craft/references/reference-recreation.md), not only abstract layout traits. Map image composition/structure into normalized layout anchors, not only adjectives. For a video used to reproduce, edit, control motion, or control timing, map source time ranges to target scenes with temporal anchors. The model must be able to answer what stays, what changes, where it appears, and when each preserved beat happens.
-
-## Map To Video
+## Map to video
 
 Web and brand systems are not videos. Convert them for motion:
 
@@ -109,15 +62,8 @@ Web and brand systems are not videos. Convert them for motion:
 - Safe zones: enlarge type and spacing beyond web density.
 - Scene variation: turn repeated web sections into distinct beats.
 - Motion: make the brand grammar move with purpose; do not animate every component.
-- Captions: keep ordinary subtitles in `tracks.captions.lines`, not in the style system.
+- Captions: keep them as captions, not as part of the style system.
 
 ## Output
 
-After extraction, `manifest.art_direction` must state:
-
-- What source was used.
-- Which tokens were adopted.
-- Which tokens were deliberately simplified.
-- Which elements the user explicitly excludes.
-- Which observed visual signature is retained under `preserve` and adapted under `may_change`.
-- Which image/video reference intent and roles, preserve/may-change rules, target scenes and layout/temporal anchors apply.
+In your final reply, say in a line or two what source was used, what was kept, what was simplified, and anything the user excluded.

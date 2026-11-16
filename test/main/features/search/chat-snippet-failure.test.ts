@@ -1,12 +1,12 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
-const state = vi.hoisted(() => ({ workers: [] as any[], warn: vi.fn() }));
+const state = vi.hoisted(() => ({ workers: [] as any[], warn: vi.fn(), holdReady: false }));
 vi.mock('../../../../src/main/logger', () => ({ createLogger: () => ({ warn: state.warn }) }));
 vi.mock('node:worker_threads', () => ({
   Worker: class extends EventEmitter {
     commands: any[] = [];
-    constructor() { super(); state.workers.push(this); }
+    constructor() { super(); state.workers.push(this); queueMicrotask(() => { if (!state.holdReady) this.emit('message', { ready: true }); }); }
     ref() {}
     unref() {}
     postMessage(command: unknown) { this.commands.push(command); }
@@ -15,8 +15,42 @@ vi.mock('node:worker_threads', () => ({
 }));
 
 afterEach(async () => {
+  state.holdReady = false;
   await (await import('../../../../src/main/features/search/chat-snippets')).closeChatSnippetReader();
+  state.workers = [];
+  state.warn.mockClear();
   vi.restoreAllMocks();
+});
+
+it.each([false, true])('cancels without terminating bootstrap, but still interrupts an initialized parser (ready=%s)', async ready => {
+  const { readChatSnippets } = await import('../../../../src/main/features/search/chat-snippets');
+  state.holdReady = true;
+  const before = state.workers.length;
+  const controller = new AbortController();
+  const cancelled = readChatSnippets('cancelled-source', new Set([0]), ['old'], controller.signal);
+  void cancelled.catch(() => {});
+  await vi.waitFor(() => expect(state.workers).toHaveLength(before + 1));
+  const worker = state.workers[before];
+  const terminate = vi.spyOn(worker, 'terminate');
+  if (ready) worker.emit('message', { ready: true });
+  expect(worker.commands).toHaveLength(ready ? 1 : 0);
+  controller.abort();
+  expect((await cancelled).size).toBe(0);
+  expect(terminate).toHaveBeenCalledTimes(ready ? 1 : 0);
+
+  const indexes = new Set([1]), tokens = ['replacement'];
+  const replacement = readChatSnippets('cancelled-source', indexes, tokens);
+  void replacement.catch(() => {});
+  await vi.waitFor(() => expect(state.workers).toHaveLength(before + (ready ? 2 : 1)));
+  await new Promise(resolve => setImmediate(resolve));
+  indexes.add(2); tokens[0] = 'later query';
+  const owner = state.workers.at(-1);
+  owner.emit('message', { ready: true });
+  await vi.waitFor(() => expect(owner.commands.at(-1)?.tokens).toEqual(['replacement']));
+  expect(owner.commands.at(-1).indexes).toEqual([1]);
+  const command = owner.commands.at(-1);
+  owner.emit('message', { id: command.id, rows: [[1, { snippet: 'replacement', visible: true }]] });
+  expect((await replacement).get(1)?.snippet).toBe('replacement');
 });
 
 it('fails pending and queued reads on worker failure without leaking source details or causing a restart storm', async () => {

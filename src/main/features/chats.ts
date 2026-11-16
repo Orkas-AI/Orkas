@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import { turnIndexRequest } from './conversation-history-client';
 
 import {
+  appConversationOwner, appConversationRoot,
   userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile, userProjectsDir,
   WS_ROOT, userCloudRoot, projectMetaFile,
   localCliDirectoryFile,
@@ -138,10 +139,21 @@ export function normalizeConnectorSetupAssistance(raw: unknown): ConnectorSetupA
   return { kind: 'connector_setup', connector_id: value.connector_id };
 }
 
-export type ConversationAssistance = ConnectorSetupAssistance | { kind: 'app_creation'; appType?: 'local' | 'web' };
+export type ConversationAssistance = ConnectorSetupAssistance | { kind: 'app_creation'; appType?: 'local' | 'web' }
+  | { kind: 'app_editing'; title: string; sourceFileName: string };
 
 /** Persist only known entry metadata, never caller-authored model instructions. */
 export function normalizeConversationAssistance(raw: unknown): ConversationAssistance | undefined {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const value = raw as Record<string, unknown>;
+    if (value.kind === 'app_editing') {
+      if (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 1024
+        || typeof value.sourceFileName !== 'string' || !/^[A-Za-z0-9_.-]{1,255}$/.test(value.sourceFileName)
+        || value.sourceFileName === '.' || value.sourceFileName === '..') return undefined;
+      return { kind: 'app_editing', title: value.title, sourceFileName: value.sourceFileName };
+    }
+  }
+
   if (raw && typeof raw === 'object' && !Array.isArray(raw)
     && (raw as Record<string, unknown>).kind === 'app_creation') {
     const suppliedType=(raw as Record<string,unknown>).appType;
@@ -177,6 +189,8 @@ export interface Conversation {
    *  to the title and to group the conv under its originating task in the
    *  auto-tab expand panel. Stable id; survives task deletion. */
   origin_auto_task_id?: string;
+  /** Ephemeral navigation projection; never persisted in conversation metadata. */
+  task_links?: import('./chat_task_references').ConversationTaskLink[];
   /** Optional sidebar pin timestamp. Pinned conversations sort to the top of
    *  whichever sidebar list currently contains them (project or unprojected). */
   pinned_at?: string;
@@ -729,6 +743,7 @@ export async function retainedConversationIdsForEditCleanup(uid: string): Promis
 
 export interface ConversationDisplayRow {
   deleted: boolean;
+  hidden?: boolean;
   conversation_id: string;
   title: string;
   project_id: string;
@@ -749,13 +764,14 @@ export async function listConversationDeletionRows(userId: string, projectId: st
 /** Compact search/display catalog. Reuses the central parsed index snapshot
  * and deliberately excludes runtime, participants, history, and metadata. */
 export async function listConversationDisplayRows(
-  userId: string, options: { includeDeleted?: boolean } = {},
+  userId: string, options: { includeDeleted?: boolean; includeHidden?: boolean } = {},
 ): Promise<ConversationDisplayRow[]> {
   const { items } = _mergeNormalizedConversationRows(await _readIndexConversations(userId));
   return items
-    .filter((row) => options.includeDeleted || !isDeletedConversation(row))
+    .filter((row) => (options.includeHidden || row.kind !== 'app_task') && (options.includeDeleted || !isDeletedConversation(row)))
     .map((row) => ({
       deleted: isDeletedConversation(row),
+      ...(row.kind === 'app_task' ? { hidden: true } : {}),
       conversation_id: row.conversation_id,
       title: row.title || '',
       project_id: typeof row.project_id === 'string' ? row.project_id : '',
@@ -911,6 +927,10 @@ async function _readTargetRawConversation(
   cid: string,
   projectIdHint?: string | null,
 ): Promise<Conversation[]> {
+  if (appConversationRoot(userId, cid)) {
+    const value = await readJson<Conversation>(conversationLayout(userId, cid).metaFile);
+    return value?.conversation_id === cid && value.kind === 'app_task' ? [value] : [];
+  }
   const cached = _conversationIndexCache.get(userId);
   if (cached && cached.expiresAt > Date.now()) {
     const matches = _cloneConversationList(cached.items)
@@ -1317,12 +1337,13 @@ async function _listConversationsUncached(
   readRawItems: () => Promise<Conversation[]> = () => (
     _readRawConversations(userId, { discoverUnindexedMetas: false })
   ),
+  includeAppTasks = false,
 ): Promise<Conversation[]> {
   // First paint trusts aggregate indexes and directly opens recovery metadata
   // only for revisionless legacy rows. Directory/JSONL discovery is deferred
   // to `repairConversationIndex` outside the startup interaction window.
   const rawItems = (await readRawItems())
-    .filter((c) => !isDeletedConversation(c));
+    .filter((c) => !isDeletedConversation(c) && (includeAppTasks || c.kind !== 'app_task'));
   const items = selectItems ? selectItems(rawItems) : rawItems;
   if (!items.length) return items;
   // Derive `processing` from each cid's state.json AND the bus's in-memory
@@ -1557,7 +1578,7 @@ async function _enrichConversationPage(
 ): Promise<ConversationPage> {
   const start = _pageOffset(offset);
   const sorted = rows
-    .filter((c) => !isDeletedConversation(c))
+    .filter((c) => !isDeletedConversation(c) && c.kind !== 'app_task')
     .sort(_compareConversationIndexRows);
   const pageRows = sorted.slice(start, start + CONVERSATION_LIST_PAGE_SIZE);
   const conversations = await _listConversationsUncached(
@@ -1687,20 +1708,24 @@ export async function listAutoTaskConversationPage(
   userId: string,
   taskId: string,
   offset = 0,
+  /** The task's run conversation, listed even when the task did not create it. */
+  runConversationId = '',
 ): Promise<ConversationPage> {
   if (!safeId(taskId)) return { conversations: [], total: 0, next_offset: null };
   const rows = (await _readRawConversations(userId, { discoverUnindexedMetas: false }))
-    .filter((c) => c.origin_auto_task_id === taskId);
+    .filter((c) => c.origin_auto_task_id === taskId
+      || (!!runConversationId && c.conversation_id === runConversationId && !isDeletedConversation(c)));
   return _enrichConversationPage(userId, rows, offset);
 }
 
 /** Count execution conversations for many automation tasks with one index
  * scan. The task list uses this before rendering so its labels show the real
  * total instead of the number currently present in the bounded sidebar
- * cache. */
+ * cache. A task's run conversation counts once, whoever created it. */
 export async function countAutoTaskConversations(
   userId: string,
   taskIds: string[],
+  runConversationIds: Record<string, string> = {},
 ): Promise<Record<string, number>> {
   const ids = Array.from(new Set(
     (Array.isArray(taskIds) ? taskIds : [])
@@ -1710,11 +1735,23 @@ export async function countAutoTaskConversations(
   const counts: Record<string, number> = Object.fromEntries(ids.map((id) => [id, 0]));
   if (!ids.length) return counts;
   const wanted = new Set(ids);
+  const tasksByRunConversation = new Map<string, string[]>();
+  for (const id of ids) {
+    const cid = runConversationIds[id];
+    if (typeof cid === 'string' && safeId(cid)) {
+      const tasks = tasksByRunConversation.get(cid) || [];
+      tasks.push(id);
+      tasksByRunConversation.set(cid, tasks);
+    }
+  }
   const rows = await _readRawConversations(userId, { discoverUnindexedMetas: false });
   for (const row of rows) {
     if (isDeletedConversation(row)) continue;
     const taskId = row.origin_auto_task_id || '';
     if (wanted.has(taskId)) counts[taskId] += 1;
+    for (const runTaskId of tasksByRunConversation.get(row.conversation_id) || []) {
+      if (runTaskId !== taskId) counts[runTaskId] += 1;
+    }
   }
   return counts;
 }
@@ -1793,6 +1830,10 @@ class ConversationIndexStore {
     projectIdHint?: string | null,
     fallbackAcrossRoots = true,
   ): Promise<ConversationIndexTarget | null> {
+    if (appConversationRoot(this.userId, cid)) {
+      const rows = await _readTargetRawConversation(this.userId, cid);
+      return rows[0] ? { rootKey: '', rows, index: 0, conversation: rows[0] } : null;
+    }
     if (projectIdHint === null || (typeof projectIdHint === 'string' && safeId(projectIdHint))) {
       const hinted = await this.targetInRoot(_conversationRootKey(projectIdHint), cid);
       if (hinted) return hinted;
@@ -1825,6 +1866,12 @@ class ConversationIndexStore {
   }
 
   async persistTarget(target: ConversationIndexTarget, next: Conversation): Promise<void> {
+    if (appConversationRoot(this.userId, next.conversation_id)) {
+      delete next.project_id;
+      next.kind = 'app_task';
+      await writeJson(conversationLayout(this.userId, next.conversation_id).metaFile, next);
+      return;
+    }
     const oldRoot = target.rootKey;
     // Project deletion retains its child tombstones in the existing global
     // catalog. Acknowledging them must not recreate a removed project tree.
@@ -2065,6 +2112,7 @@ export async function getConversation(
   projectIdHint?: string | null,
 ): Promise<Conversation | null> {
   if (!safeId(cid)) return null;
+  if (appConversationRoot(userId, cid)) return getConversationMetadata(userId, cid);
   // Preserve the short-lived enriched-list fast path when the sidebar just
   // loaded, but never construct that full list merely to resolve one cid.
   const cached = _conversationListCache.get(userId);
@@ -2072,7 +2120,7 @@ export async function getConversation(
     const found = cached.items.find((c) => c.conversation_id === cid);
     const hintMatches = projectIdHint === undefined
       || (projectIdHint === null ? !found?.project_id : found?.project_id === projectIdHint);
-    if (!found || hintMatches) return found ? _cloneConversationList([found])[0] : null;
+    if (found && hintMatches) return _cloneConversationList([found])[0];
   }
   const metadata = await getConversationMetadata(userId, cid, projectIdHint);
   if (!metadata) return null;
@@ -2081,6 +2129,7 @@ export async function getConversation(
     () => false,
     undefined,
     () => Promise.resolve([metadata]),
+    true,
   );
   return target.find((c) => c.conversation_id === cid) || null;
 }
@@ -2099,7 +2148,7 @@ export async function getConversationMetadata(
     const found = cached.items.find((c) => c.conversation_id === cid);
     const hintMatches = projectIdHint === undefined
       || (projectIdHint === null ? !found?.project_id : found?.project_id === projectIdHint);
-    if (!found || hintMatches) return found ? _cloneConversationList([found])[0] : null;
+    if (found && hintMatches) return _cloneConversationList([found])[0];
   }
   const target = await _readTargetRawConversation(userId, cid, projectIdHint);
   const found = target.find((c) => (
@@ -2135,10 +2184,26 @@ function normaliseConversationTitle(raw: unknown): string {
   return title || t('chat.default_title');
 }
 
+/** Internal canonical conversation facade, deliberately absent from every
+ * ordinary index. Only the SDK task host admits this owner namespace. */
+export async function createAppConversation(userId: string, key: string, title: string, keepSession = false, reservedCid?: string): Promise<Conversation> {
+  const cid = reservedCid || `app_${key}_${keepSession ? 'retain' : 'once'}_${randomUUID().replace(/-/g, '')}`;
+  const owner = appConversationOwner(cid);
+  if (!safeId(userId) || !owner || owner.key !== key || owner.keepSession !== keepSession) throw new Error('invalid app execution owner');
+  const now = nowIso();
+  const conv: Conversation = { conversation_id: cid, title: normaliseConversationTitle(title), kind: 'app_task',
+    agent_id: '', skill_id: '', session_id: buildConversationSessionId(cid), created_at: now, updated_at: now };
+  const layout = conversationLayout(userId, cid);
+  await writeJson(layout.metaFile, conv);
+  await fsp.writeFile(layout.messageFile, '', { flag: 'wx' });
+  return conv;
+}
+
 export async function createConversation(userId: string, {
   kind = 'normal', agentId = '', skillId = '', title = '', projectId = '', conversationId = '', originAutoTaskId = '', assistance: rawAssistance,
 }: CreateConversationOptions = {}): Promise<Conversation> {
   const assistance = normalizeConversationAssistance(rawAssistance);
+  if (conversationId.startsWith('app_')) throw new Error('reserved conversation identity');
   const explicitCid = conversationId && safeId(conversationId) ? conversationId : '';
   const outcome = await _withConversationIndexStore(userId, async (store) => {
     if (explicitCid) {

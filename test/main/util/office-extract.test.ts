@@ -70,3 +70,22 @@ it('keeps the main event loop responsive while preserving a complete large sprea
     outputBytes: Buffer.byteLength(candidate.text), baseline: { ...baseline, text: undefined },
     candidate: { ...candidate, text: undefined } }));
 }, 15000);
+
+it('keeps numbered Word conversion responsive and isolates failures from queued spreadsheets', async () => {
+  const { makeNumberedDocx, numberedParagraph } = await import('../../fixtures/make-numbered-docx');
+  const doc = makeNumberedDocx(Array.from({ length: 2000 }, (_, i) => numberedParagraph(`Clause ${i}`)).join(''));
+  const before = Buffer.from(doc);
+  let ticks = 0; const timer = setInterval(() => { ticks++; }, 2);
+  try {
+    const results = await Promise.allSettled([
+      extractOffice('docx-markdown', doc), extractOffice('docx-html', Buffer.from('invalid DOCX')),
+      extractOffice('xlsx-markdown', makeSparseXlsx()),
+    ]);
+    expect(results[0].status).toBe('fulfilled');
+    const text = (results[0] as PromiseFulfilledResult<string>).value.replace(/\\\./g, '.');
+    expect(text).toContain('7. Clause 0'); expect(text).toContain('2006. Clause 1999');
+    expect(results[1].status).toBe('rejected');
+    expect((results[2] as PromiseFulfilledResult<string>).value).toContain('Left\t\tRight');
+    expect(ticks).toBeGreaterThan(0); expect(doc).toEqual(before);
+  } finally { clearInterval(timer); }
+});

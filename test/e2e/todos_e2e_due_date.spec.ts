@@ -23,11 +23,65 @@ const test = base.extend({
         const analysis = analyzeWebAppLogs(readFileSync(log!, 'utf8'));
         writeFileSync(info.outputPath('log-analysis.json'), JSON.stringify(analysis, null, 2));
         expect(analysis.passed, 'Review log-analysis.json for errors or incomplete coverage').toBe(true);
-        if (analysis.requiresReview) console.warn('Due date E2E log warnings:', JSON.stringify(analysis.findings));
+        if (analysis.requiresReview) console.log('Warning: Due date E2E log warnings:', JSON.stringify(analysis.findings));
       }
     }
   },
 });
+
+for (const language of ['zh', 'en']) {
+  test(`keeps due-day attention visible until completion or rescheduling across entry points (${language})`, async ({ orkas }, info) => {
+    const page = orkas.page!;
+    await page.evaluate(lang => (window as any).setLang(lang), language);
+    await page.setViewportSize({ width: language === 'zh' ? 1024 : 1440, height: language === 'zh' ? 720 : 900 });
+    const dates = await page.evaluate(() => {
+      const day = (offset: number) => {
+        const date = new Date();
+        date.setDate(date.getDate() + offset);
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      };
+      return { today: day(0), tomorrow: day(1) };
+    });
+    const { project } = await orkas.invoke<any>('projects.create', { name: 'Due-day checks' });
+    const pid = project.project_id;
+    // Direct IPC setup bypasses the Create project's sidebar refresh.
+    await page.evaluate(async () => (window as any).loadProjects(true));
+    const { task } = await orkas.invoke<any>('projects.tasks.create', { projectId: pid,
+      content: language === 'zh' ? '今天到期的待办，核对发布材料与附件，保留完整标题及操作入口。'.repeat(4)
+        : 'Due today: review the launch materials and attachments while preserving readable actions. '.repeat(4), due_at: dates.today });
+    const { task: global } = await orkas.invoke<any>('projects.tasks.create', {
+      content: 'Future responsibility', due_at: dates.tomorrow });
+    await expect(page.locator('#todos-due-dot')).toBeVisible();
+    await openSidebarEntry(page, '#new-chat-btn');
+    const homeRow = page.locator(`[data-home-todo="${task.id}"]`);
+    await expect(homeRow.locator('.todo-due-dot')).toBeVisible();
+    await expect(homeRow).not.toContainText(language === 'zh' ? '已逾期' : 'Overdue');
+    await page.screenshot({ path: info.outputPath(`due-home-${language}.png`) });
+    await openSidebarEntry(page, '#todos-btn');
+    const chip = page.locator(`.todo-scope-chip[data-pid="${pid}"]`);
+    await expect(chip.locator('.todo-due-dot')).toBeVisible();
+    await chip.click();
+    const card = page.locator(`#todos-content [data-tid="${task.id}"]`);
+    await expect(card.locator('.todo-due-dot')).toBeVisible();
+    await page.screenshot({ path: info.outputPath(`due-board-${language}.png`) });
+    // Reading is not acknowledgement of an unfinished deadline.
+    await expect(page.locator('#todos-due-dot')).toBeVisible();
+    await page.evaluate(async id => (window as any).setView('project', id), pid);
+    await page.locator('[data-project-tab="todo"]').click();
+    await expect(page.locator('#project-todo-due-dot')).toBeVisible();
+    await expect(page.locator(`[data-project-unread-dot="${pid}"]`)).toBeVisible();
+    await expect(page.locator(`#project-todo-list [data-tid="${task.id}"] .todo-due-dot`)).toBeVisible();
+    await page.screenshot({ path: info.outputPath(`due-project-${language}.png`) });
+    await orkas.invoke('projects.tasks.update', { projectId: pid, taskId: task.id, status: 'done' });
+    await expect(page.locator('#todos-due-dot')).toBeHidden();
+    await expect(page.locator('#project-todo-due-dot')).toBeHidden();
+    await expect(page.locator(`[data-project-unread-dot="${pid}"]`)).toBeHidden();
+    await orkas.invoke('projects.tasks.update', { taskId: global.id, due_at: dates.today });
+    await expect(page.locator('#todos-due-dot')).toBeVisible();
+    await orkas.invoke('projects.tasks.update', { taskId: global.id, due_at: dates.tomorrow });
+    await expect(page.locator('#todos-due-dot')).toBeHidden();
+  });
+}
 
 for (const scope of ['global', 'project'] as const) {
   test(`enters, picks, reopens and clears a due day from a fresh ${scope} entry`, async ({ orkas }, info) => {

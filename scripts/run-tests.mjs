@@ -8,7 +8,10 @@
  */
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
+import { mkdtempSync, readFileSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createStderrReceipt } from './test-stderr-receipt.mjs';
 import { fileURLToPath } from 'node:url';
 import { withTestPython, withWindowsGitOnPath, withWindowsPowerShellModules } from './test-runtime-env.mjs';
 import { formatDriftReport, installedDependencyDrift } from './check-installed-dependencies.mjs';
@@ -28,6 +31,7 @@ const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
 const testEnvironment = withTestPython(withWindowsPowerShellModules(withWindowsGitOnPath(process.env)));
 // Nested launcher calls must not overwrite their parent's checkpoint report.
 delete testEnvironment.ORKAS_TEST_BATCH_REPORT;
+delete testEnvironment.ORKAS_TEST_PROCESS_REPORT;
 
 // npm appends arguments to the final shell command of a compound script.
 // Own the suite here so filters reach Vitest without first running every JS
@@ -61,6 +65,8 @@ const commands = [{
     ORKAS_TEST_NODE: process.execPath,
   },
   checkpoint,
+  auditStderr: (suiteMode || args[0] === 'run')
+    && !args.some(arg => ['--help', '-h', '--version', '-v'].includes(arg)),
 }];
 if (suiteMode && args.length === 0) {
   commands.push({
@@ -120,22 +126,79 @@ async function runNext() {
     }
     return runNext();
   }
-  child = spawn(command.executable, command.args, { stdio: 'inherit', env: command.env });
+  // The worker tap cannot see native writes to FD2 or inherited child FDs.
+  // Reconcile the entire process stream with its attributed receipt; do not
+  // guess severity/intent from native text or buffer unrestricted raw logs.
+  const directory = command.auditStderr ? mkdtempSync(join(tmpdir(), 'orkas-test-stderr-')) : null;
+  const reportFile = directory && join(directory, 'receipt.json');
+  const receipt = directory && createStderrReceipt();
+  const env = reportFile ? { ...command.env, ORKAS_TEST_PROCESS_REPORT: reportFile } : command.env;
+  child = spawn(command.executable, command.args, {
+    stdio: receipt ? ['inherit', 'inherit', 'pipe'] : 'inherit', env,
+  });
+  if (receipt) {
+    child.stderr.on('data', chunk => receipt.ingest(chunk));
+    child.stderr.pipe(process.stderr, { end: false });
+  }
   child.once('error', (error) => {
     removeSignalHandlers();
     console.error(`[run-tests] failed to start test runtime: ${error.message}`);
     process.exitCode = 1;
   });
-  child.once('exit', (code, signal) => {
+  // A leaked descendant can retain FD2 after Vitest exits. Bound that drain
+  // wait and fail coverage instead of hanging or certifying truncated output.
+  let drainTimer;
+  let drainTimedOut = false;
+  child.once('exit', () => {
+    if (receipt && !child.stderr.destroyed) drainTimer = setTimeout(() => {
+      drainTimedOut = true;
+      child.stderr.destroy();
+    }, 5000);
+  });
+  // close follows exit and stderr EOF, including diagnostics during teardown.
+  child.once('close', (code, signal) => {
+    clearTimeout(drainTimer);
+    let stderrGap = false;
+    let stderrAudit;
+    if (receipt) {
+      const actual = receipt.finish();
+      let expected = null;
+      let expectedStatus = 'missing';
+      try {
+        if (statSync(reportFile).size > 4096) expectedStatus = 'oversized';
+        else {
+          expectedStatus = 'invalid';
+          const candidate = JSON.parse(readFileSync(reportFile, 'utf8')).stderr;
+          if (candidate?.valid === true && Number.isSafeInteger(candidate.bytes) && candidate.bytes >= 0
+            && Number.isSafeInteger(candidate.lines) && candidate.lines >= 0
+            && typeof candidate.digest === 'string' && /^[a-f0-9]{64}$/.test(candidate.digest)) {
+            expected = { valid: true, bytes: candidate.bytes, lines: candidate.lines, digest: candidate.digest };
+            expectedStatus = 'valid';
+          }
+        }
+      } catch { /* Missing/corrupt receipt is incomplete coverage, even at zero bytes. */ }
+      stderrGap = drainTimedOut || !actual.valid || expected?.valid !== true || actual.bytes !== expected.bytes
+        || actual.lines !== expected.lines || actual.digest !== expected.digest;
+      // Retain bounded counters/digests before deleting the transient receipt.
+      // Never print reporter-controlled extra fields, raw diagnostics or paths.
+      stderrAudit = { schema: 1, expectedStatus, drainTimedOut, actual, expected };
+      rmSync(directory, { recursive: true, force: true });
+    }
     const terminalSignal = forwardedSignal || signal;
     if (terminalSignal) {
       removeSignalHandlers();
       process.kill(process.pid, terminalSignal);
       return;
     }
-    if (code !== 0) {
+    if (drainTimedOut) process.stdout.write('[test-process-log-analysis] stderr drain timed out after runtime exit\n');
+    if (stderrGap) {
+      process.stdout.write('[test-process-log-analysis] FAIL unattributed stderr or missing receipt\n');
+      process.stdout.write(`[test-process-log-analysis] receipt ${JSON.stringify(stderrAudit)}\n`);
+    }
+    if (code !== 0 || stderrGap) {
       removeSignalHandlers();
-      process.exit(code ?? 1);
+      process.exitCode = code || 1;
+      return;
     }
     runNext();
   });

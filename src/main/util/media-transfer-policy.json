@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "connect_seconds": 30,
+  "control_seconds": 60,
+  "transfer_seconds": 600,
+  "poll_seconds": 20,
+  "preparation_seconds": 1800,
+  "upload_signature_seconds": 900,
+  "reference_url_seconds": 21600,
+  "temp_retention_days": 1,
+  "legacy_create_seconds": 130
+}

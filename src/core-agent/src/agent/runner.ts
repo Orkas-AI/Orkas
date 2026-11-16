@@ -1,3 +1,5 @@
+import { formatParameterError } from "../../../../bin/tool-parameter-errors.cjs";
+import { providerRetryAfterMs } from "../shared/provider-error-facts.js";
 import { completedRepeatKey } from "./repeat-evidence.js";
 import { projectToolInput, appendInputReceipt } from "../../../../bin/tool-input-compat.cjs";
 import { fileFailureForLog } from "../tools/file-diagnostics.js";
@@ -14,6 +16,8 @@ import type {
 } from "../shared/types.js";
 import {
   AuthError,
+  COMMITTED_STREAM_RATE_LIMIT_CODE,
+  isTerminalRecoveryError,
   ContextOverflowError,
   ProviderCandidateChangedError,
   classifyRetryableError,
@@ -31,6 +35,7 @@ import type { CoreAgentConfig } from "../config/schema.js";
 import type { EvolutionConfig } from "../evolution/types.js";
 import type {
   LLMProvider,
+  ProviderContextBudget,
   CompletionParams,
   CompletionResult,
   ToolDefinition,
@@ -126,6 +131,8 @@ const log = createLogger("agent-runner");
 const RETRY_BASE_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 30_000;
 const RETRY_JITTER_RATIO = 0.2;
+const COMMITTED_RATE_LIMIT_RETRIES = 3;
+const COMMITTED_RATE_LIMIT_WAIT_MS = 60_000;
 const TOOL_HEARTBEAT_TIMEOUT_GRACE_MS = 30_000;
 const LEGACY_COMPACTED_TOOL_USE_INPUT_KEY = "__orkas_compacted_tool_use";
 const TOOL_LOOP_CHECKPOINT_INTERVAL = 100;
@@ -1721,6 +1728,8 @@ export class AgentRunner {
       retryWaitMs: 0,
     };
     let activeProviderStartedAt: number | undefined;
+    let committedRateLimitRecovery = false;
+    let recoveryWaitMs = 0;
     const compactionControl: CompactionControl = {
       attemptedFingerprints: new Set<string>(),
       attempts: 0,
@@ -1894,8 +1903,9 @@ export class AgentRunner {
         // A provider that knows its next candidate names it, so a run that had
         // to use a larger fallback once compacts back onto the earlier model
         // instead of staying on the fallback for every later round.
-        const callBudgetModel = provider.contextBudgetModel?.() ?? servedModelId;
-        const historyModel = this.modelCatalogEntry(modelId, callBudgetModel);
+        const candidateBudget = provider.contextBudget?.();
+        const callBudgetModel = candidateBudget?.model ?? provider.contextBudgetModel?.() ?? servedModelId;
+        const historyModel = candidateBudget ?? this.modelCatalogEntry(modelId, callBudgetModel);
         if (historyModel?.contextWindow && Number.isFinite(historyModel.contextWindow)) {
           const usable = historyModel.contextWindow - (historyModel.maxOutputTokens ?? 8_192);
           this.session.configureHistoryBudget(usable, Math.floor(usable * CONTEXT_COMPACTION_TRIGGER_RATIO),
@@ -1912,8 +1922,9 @@ export class AgentRunner {
           toolDefs,
           budgetEphemeral || undefined,
           callBudgetModel,
+          candidateBudget,
         );
-        const callUsableInputTokens = this.resolveUsableInputTokens(modelId, callBudgetModel);
+        const callUsableInputTokens = this.resolveUsableInputTokens(modelId, callBudgetModel, candidateBudget);
         // In-memory scalar evidence only; the provider emits it on failure.
         const contextBudgetDiagnostics: Record<string, number | string> = {
           version: 1,
@@ -2049,12 +2060,14 @@ export class AgentRunner {
           systemPrompt,
           tools: completionParams.tools,
           ...preparedTokens,
+          ...(candidateBudget ? { budget: candidateBudget } : {}),
         };
         const streamIter = provider.stream(completionParams);
 
         let streamText = "";
         let streamContent: import("../shared/types.js").MessageContent[] | undefined;
         let streamStopReason: import("../shared/types.js").StopReason = "end_turn";
+        let streamIncompleteToolCall = false;
         let streamUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 } as import("../shared/types.js").Usage;
         let streamModel = modelId;
         let streamEffectiveMaxTokens: number | undefined;
@@ -2153,9 +2166,11 @@ export class AgentRunner {
             };
           } else if (ev.type === "message_end") {
             streamStopReason = ev.stopReason;
+            streamIncompleteToolCall = ev.stopReason === "max_tokens" && ev.incompleteToolCall === true;
             providerOutput.terminalSeen = true;
             providerOutput.stopReason = ev.stopReason;
             if (ev.content) {
+              const proposedToolCalls = providerOutput.toolCalls;
               providerOutput.textChars = 0;
               providerOutput.thinkingChars = 0;
               providerOutput.toolCalls = 0;
@@ -2164,6 +2179,8 @@ export class AgentRunner {
                 else if (block.type === "thinking") providerOutput.thinkingChars += block.thinking.length;
                 else if (block.type === "tool_use") providerOutput.toolCalls += 1;
               }
+              // The adapter discarded arguments, not the observed proposals.
+              if (streamIncompleteToolCall) providerOutput.toolCalls = Math.max(providerOutput.toolCalls, proposedToolCalls);
             }
             if (ev.usage) {
               streamUsage = {
@@ -2189,6 +2206,8 @@ export class AgentRunner {
             throw ev.error;
           }
         }
+        committedRateLimitRecovery = false;
+        recoveryWaitMs = 0;
         const providerCallDurationMs = Math.max(0, Date.now() - activeProviderStartedAt);
         timings.providerMs += providerCallDurationMs;
         activeProviderStartedAt = undefined;
@@ -2244,7 +2263,7 @@ export class AgentRunner {
 
         const responseContent = result.content;
         let recoveryReplayToCommit: MessageContent[][] | undefined;
-        const containsToolCall = result.content.some((item) => item.type === "tool_use");
+        const containsToolCall = streamIncompleteToolCall || result.content.some((item) => item.type === "tool_use");
         const truncated = result.stopReason === "max_tokens";
         // No calls from a truncated response have run. Keep prose and original
         // portable reasoning, never arguments or opaque/native replay that
@@ -2633,7 +2652,7 @@ export class AgentRunner {
         // The final host transformer claims capacity synchronously, so concurrent
         // results cannot together exhaust the next request's available headroom.
         const contextModelId = streamModel || modelId;
-        const usableInputTokens = this.resolveUsableInputTokens(modelId, streamModel);
+        const usableInputTokens = this.resolveUsableInputTokens(modelId, streamModel, provider.contextBudget?.("served"));
         const requestTokensBeforeToolResults = anchoredRequestTokens(
           requestTokenAnchor,
           estimateRequestInputTokens(
@@ -3254,6 +3273,7 @@ export class AgentRunner {
         attempt = -1;
         continue;
       } catch (err) {
+        const failedMainCall = activeProviderStartedAt !== undefined;
         if (activeProviderStartedAt !== undefined) {
           const providerCallDurationMs = Math.max(0, Date.now() - activeProviderStartedAt);
           timings.providerMs += providerCallDurationMs;
@@ -3311,12 +3331,11 @@ export class AgentRunner {
           return;
         }
 
-        if (err instanceof ContextOverflowError
-          || (err instanceof Error && err.name === "ContextOverflowError")) {
+        if (err instanceof ContextOverflowError) {
           // Candidate admission already checked the unchanged request against
           // every available window. This is not an upstream estimation miss:
           // folding Session or retrying would defeat the read-only skip contract.
-          if ((err as ContextOverflowError).admissionChecked) {
+          if (err.admissionChecked) {
             const e = this.errorResult(startTime, modelId, provider.id, {
               kind: "context_overflow", message: err.message, code: "CONTEXT_CAPACITY_INSUFFICIENT",
             }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings), convergenceSignals());
@@ -3427,18 +3446,25 @@ export class AgentRunner {
           continue;
         }
 
-        const retryKind = classifyRetryableError(err);
-        if (retryKind && attempt < maxRetries) {
-          const waitMs = retryDelayMs(attempt);
+        if (failedMainCall && errorCodeForMeta(err) === COMMITTED_STREAM_RATE_LIMIT_CODE
+          && !isTerminalRecoveryError(err)) committedRateLimitRecovery = true;
+        const retryKind = committedRateLimitRecovery && isProviderRateLimitError(err)
+          && !isTerminalRecoveryError(err) ? "rate_limit" : classifyRetryableError(err);
+        const waitMs = !retryKind ? 0 : retryKind === "rate_limit"
+          ? (providerRetryAfterMs(err) ?? retryDelayMs(attempt)) : retryDelayMs(attempt);
+        const retryLimit = committedRateLimitRecovery ? Math.min(maxRetries, COMMITTED_RATE_LIMIT_RETRIES) : maxRetries;
+        if (retryKind && attempt < retryLimit
+          && (!committedRateLimitRecovery || recoveryWaitMs + waitMs <= COMMITTED_RATE_LIMIT_WAIT_MS)) {
           const reason = formatError(err);
           log.warn("retrying provider request", {
             kind: retryKind,
             attempt: attempt + 1,
-            maxRetries,
+            maxRetries: retryLimit,
             waitMs,
           });
           visibleRetryAttempt += 1;
           yield { type: "retry", attempt: visibleRetryAttempt, reason, waitMs };
+          recoveryWaitMs += waitMs;
           const retryWaitStartedAt = Date.now();
           await sleep(waitMs, params.signal);
           timings.retryWaitMs += Math.max(0, Date.now() - retryWaitStartedAt);
@@ -3448,7 +3474,9 @@ export class AgentRunner {
         const e = this.errorResult(startTime, modelId, provider.id, {
           kind: isProviderRateLimitError(err) ? "rate_limit" : (retryKind === "timeout" ? "timeout" : "provider_error"),
           message: formatError(err),
-          code: errorCodeForMeta(err),
+          code: committedRateLimitRecovery && retryKind
+            ? (isProviderRateLimitError(err) ? "PROVIDER_RATE_LIMIT_EXHAUSTED" : "RETRY_EXHAUSTED")
+            : errorCodeForMeta(err),
           statusCode: providerHttpStatusOf(err),
         }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings), convergenceSignals());
         yield { type: "done", result: e };
@@ -3583,8 +3611,8 @@ export class AgentRunner {
     return catalog[streamModel || modelId] ?? catalog[modelId];
   }
 
-  private resolveUsableInputTokens(modelId: string, streamModel?: string): number {
-    const entry = this.modelCatalogEntry(modelId, streamModel);
+  private resolveUsableInputTokens(modelId: string, streamModel?: string, candidateBudget?: ProviderContextBudget): number {
+    const entry = candidateBudget ?? this.modelCatalogEntry(modelId, streamModel);
     const contextWindow = entry?.contextWindow ?? 200_000;
     const maxOutputTokens = entry?.maxOutputTokens ?? 8_192;
     // No floor: a window smaller than its output limit is rejected by
@@ -3769,8 +3797,9 @@ export class AgentRunner {
     toolDefs: unknown[],
     turnEphemeral?: string,
     streamModel?: string,
+    candidateBudget?: ProviderContextBudget,
   ): ContextBudget {
-    const entry = this.modelCatalogEntry(modelId, streamModel);
+    const entry = candidateBudget ?? this.modelCatalogEntry(modelId, streamModel);
     const contextWindow = entry?.contextWindow;
     if (!contextWindow || !Number.isFinite(contextWindow)) return DEFAULT_CONTEXT_BUDGET;
     const maxOutputTokens = entry?.maxOutputTokens ?? 8_192;
@@ -4455,6 +4484,10 @@ async function runToolWithWatchdog(opts: {
     outcome: Omit<ToolExecutionOutcome, "result"> = {},
     diagnostic?: { errorCode: string; errorSeverity: "error" },
   ): Promise<ToolExecutionOutcome> => {
+    // Process output is untrusted, including on nonzero exit.
+    const parameterContent = result.observations?.execution ? result.content
+      : formatParameterError(result.content, result.isError);
+    if (parameterContent !== result.content) result = { ...result, content: parameterContent };
     if (projected.receipt && result.appliedInputReceipt !== projected.receipt) {
       result = { ...result, content: appendInputReceipt(result.content, projected.receipt) };
     }

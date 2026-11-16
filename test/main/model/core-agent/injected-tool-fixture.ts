@@ -1,3 +1,5 @@
+import { buildSaveAppTool } from '../../../../src/main/features/group_chat/app_save_tool';
+import { buildListAppsTool } from '../../../../src/main/features/group_chat/app_catalog_tool';
 import {
   createExecutionPlanTool,
   getBuiltinTools,
@@ -29,6 +31,8 @@ export function enumerateRuntimeSchemaTools(): AgentTool[] {
   const store = { list: fail, read: fail, touch: fail, create: fail, patch: fail, delete: fail };
   return [
     createSkillManageTool(store as unknown as SkillStore),
+    buildListAppsTool('schema-probe', { isActive: () => false }),
+    buildSaveAppTool(() => ({ userId: 'schema-probe', cid: 'schema-probe', workspace: '', roots: [], isActive: () => false })),
     createAutoTasksTool({ userId: 'schema-probe' }),
     createProjectTasksTool({ list: fail, get: fail, create: fail, update: fail, complete: fail }),
     createRunProgramTool({ listToolNames: () => [], invokeTool: fail, loadSourceFile: fail }),
@@ -142,6 +146,8 @@ export function enumerateAllInjectedToolNames(): Set<string> {
     'hand_off_to',
     'run_worker',
     'open_app_view',
+    'list_apps',
+    'save_app',
     'app_health',
     'skill_manage',
     'tool_load',

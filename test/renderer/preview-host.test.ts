@@ -12,6 +12,19 @@ function host() {
 }
 const item = (key: string) => ({ key, src: key, alt: key });
 
+it('refreshes the Apps page from disk after a detached preview saves files', () => {
+  const handlers = new Map<string, (payload: any) => void>();
+  const loadSavedApps = vi.fn();
+  const context: any = { currentView: 'apps', loadSavedApps,
+    window: { orkas: { onPushEvent: (event: string, handler: any) => handlers.set(event, handler) } } };
+  vm.runInNewContext(readFileSync(path.resolve(__dirname, '../../src/renderer/modules/preview-windows.js'), 'utf8'), context);
+  handlers.get('preview-windows:files-changed')!({});
+  expect(loadSavedApps).toHaveBeenCalledExactlyOnceWith(true);
+  context.currentView = 'conversation';
+  handlers.get('preview-windows:files-changed')!({});
+  expect(loadSavedApps).toHaveBeenCalledTimes(1);
+});
+
 describe('in-place preview replacement', () => {
   it('renders the latest queued selection and its context before acknowledging readiness', async () => {
     const handlers = new Map<string, () => Promise<void>>();

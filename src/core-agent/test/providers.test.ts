@@ -13,6 +13,186 @@ import { MIRRORED_PI_AI_SERIALIZER_VERSION, restoreHostMessageRoles } from "../s
 import * as fs from "node:fs";
 
 describe("Providers (pi-ai backed)", () => {
+  it.each([
+    ['complete', 'openai-completions'], ['stream', 'openai-completions'],
+    ['complete', 'openai-responses'], ['stream', 'openai-responses'],
+  ] as const)('ignores account-only HTTP diagnostics on a public connection in %s / %s', async (method, api) => {
+    try {
+      for (const owner of ['custom']) {
+        const provider = createPiProvider({ provider: owner, apiKey: 'fixture', customModel: {
+          id: 'fixture', name: 'fixture', provider: owner, api,
+          baseUrl: 'https://fixture.invalid/v1', reasoning: false, input: ['text'],
+          contextWindow: 128000, maxTokens: 4096,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        } });
+        for (const [code, upstreamStatus] of [['authentication_error', '401'], ['PRIVATE_CODE', 'invalid'], ['', '']]) {
+          const fetchStub = vi.fn(async () => new Response(JSON.stringify({ error: {
+            code: 'upstream_error', type: 'upstream_error', message: 'Service unavailable',
+          } }), { status: 502, headers: { 'content-type': 'application/json',
+            'x-orkas-upstream-error-code': code, 'x-orkas-upstream-status': upstreamStatus } }));
+          vi.stubGlobal('fetch', fetchStub);
+          const failures: any[] = [];
+          const params: CompletionParams = { messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+            requestMetadata: { orkasRequestId: 'a'.repeat(32) }, onRequestFailure: failure => failures.push(failure) };
+          let delivered: any;
+          if (method === 'complete') delivered = await provider.complete(params).catch(error => error);
+          else for await (const event of provider.stream(params)) if (event.type === 'error') delivered = event.error;
+          expect(delivered).toBeInstanceOf(ProviderError);
+          expect(delivered.statusCode).toBe(502);
+          expect(failures).toHaveLength(1);
+          expect(failures[0]).toMatchObject({ httpStatus: 502, phase: 'after_response' });
+          expect(failures[0]).not.toHaveProperty('requestRef');
+          expect(failures[0]).not.toHaveProperty('managedUpstreamCode');
+          expect(failures[0]).not.toHaveProperty('managedUpstreamStatus');
+          expect(JSON.stringify(failures)).not.toContain('PRIVATE');
+          expect(fetchStub).toHaveBeenCalledTimes(1);
+        }
+      }
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each((['complete', 'stream'] as const).flatMap(method => (['openai-completions', 'openai-responses'] as const).map(api => [method, api] as const)))('ignores account-only SSE diagnostics through the real public SDK: %s / %s', async (method, api) => {
+    try {
+      for (const owner of ['custom']) {
+        const provider = createPiProvider({ provider: owner, apiKey: 'fixture', customModel: {
+          id: 'fixture', name: 'fixture', provider: owner, api, baseUrl: 'https://fixture.invalid/v1',
+          reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 4096,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        } });
+        for (const diagnostic of [{ code: 'authentication_error', status: 401 }, { code: 'PRIVATE', status: '401' }, undefined]) {
+          const error = { code: 'upstream_error', type: 'upstream_error', status: 502,
+            message: 'Service unavailable', ...(diagnostic ? { orkas_diagnostic: diagnostic } : {}) };
+          const wire = ': opening\n\n' + (api === 'openai-responses'
+            ? 'event: error\ndata: ' + JSON.stringify({ ...error, type: 'error', error }) + '\n\n'
+            : 'data: ' + JSON.stringify({ error }) + '\n\ndata: [DONE]\n\n');
+          const fetchStub = vi.fn(async () => new Response(wire, { headers: { 'content-type': 'text/event-stream' } }));
+          vi.stubGlobal('fetch', fetchStub);
+          const failures: any[] = []; let delivered: any;
+          const params: CompletionParams = { messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+            onRequestFailure: failure => failures.push(failure) };
+          if (method === 'complete') delivered = await provider.complete(params).catch(error => error);
+          else for await (const event of provider.stream(params)) if (event.type === 'error') delivered = event.error;
+          expect(delivered).toBeInstanceOf(ProviderError);
+          expect(delivered.statusCode).toBeUndefined();
+          expect(classifyRetryableError(delivered)).toBe('service_unavailable');
+          expect(failures).toHaveLength(1);
+          expect(failures[0]).toMatchObject({ httpStatus: 200, phase: 'after_response' });
+          expect(failures[0]).not.toHaveProperty('managedUpstreamCode');
+          expect(failures[0]).not.toHaveProperty('managedUpstreamStatus');
+          expect(JSON.stringify(failures)).not.toContain('PRIVATE');
+          expect(fetchStub).toHaveBeenCalledTimes(1);
+        }
+      }
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+
+  it.each((['complete', 'stream'] as const).flatMap(method => (['off', 'low'] as const).map(reasoning => [method, reasoning] as const)))
+  ('retains Codex rejection metadata without changing retry classification (%s/%s)', async (method, reasoning) => {
+    const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
+    const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-6.1-sol', apiKey: `fixture.${token}.fixture` });
+    const failures: any[] = [];
+    try {
+      for (const type of ['error', 'response.failed']) {
+        for (const code of ['invalid_request_error', 'rate_limit_error', 'PRIVATE_CODE']) {
+          const error = { code, param: 'input[0].id', message: 'PRIVATE diagnostic' };
+          const envelope = type === 'error' ? { type, ...error } : { type, response: { error } };
+          const fetch = vi.fn(async () => new Response(`event: ${type}\ndata: ${JSON.stringify(envelope)}\n\n`, {
+            headers: { 'content-type': 'text/event-stream' },
+          }));
+          vi.stubGlobal('fetch', fetch);
+          const params: CompletionParams = { model: 'gpt-6.1-sol', reasoning,
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'Probe' }] }],
+            onRequestFailure: failure => failures.push(failure) };
+          let delivered: unknown;
+          if (method === 'complete') delivered = await provider.complete(params).catch(error => error);
+          else for await (const event of provider.stream(params)) if (event.type === 'error') delivered = event.error;
+          expect(delivered).toBeInstanceOf(ProviderError);
+          // These codes remain diagnostic-only: the former unknown error's
+          // recovery decision, user error and single SDK send are preserved.
+          expect(classifyRetryableError(delivered)).toBe('network');
+          expect((delivered as Error).message).toContain('PRIVATE diagnostic');
+          expect(fetch).toHaveBeenCalledTimes(1);
+          expect(failures.at(-1)).toMatchObject({ httpStatus: 200, phase: 'after_response',
+            source: 'sdk_error', code: code === 'PRIVATE_CODE' ? 'unknown' : code,
+            responsesStatus: { rejected_index: 0, rejected_field: 'id' } });
+        }
+      }
+      expect(failures).toHaveLength(6);
+      expect(JSON.stringify(failures)).not.toContain('PRIVATE');
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each((['complete', 'stream'] as const).flatMap(method => (['off', 'low'] as const).map(reasoning => [method, reasoning] as const)))
+  ('replays complete Anthropic tool history across rebuilt providers without server continuation (%s/%s)', async (method, reasoning) => {
+    const bodies: any[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+      const wire = new Request(input, init);
+      bodies.push(JSON.parse(await wire.text()));
+      const events = [
+        { type: 'message_start', message: { id: 'msg_history', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [], usage: { input_tokens: 12, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Recorded.' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+        { type: 'message_stop' },
+      ];
+      return new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } });
+    }));
+    const params: CompletionParams = { sessionId: `history-${method}-${reasoning}`, cacheRetention: 'long', reasoning,
+      systemPrompt: 'Stable reference', messages: [{ role: 'user', content: [{ type: 'text', text: 'Original request' }] }],
+      tools: [{ name: 'lookup', description: 'Lookup', inputSchema: { type: 'object', properties: {} } }],
+    };
+    try {
+      for (let round = 0; round < 2; round++) {
+        const p = createPiProvider({ provider: 'anthropic', model: 'claude-sonnet-5', apiKey: 'fixture' });
+        if (method === 'complete') expect((await p.complete(params)).content).toContainEqual(expect.objectContaining({ type: 'text', text: 'Recorded.' }));
+        else {
+          const events: StreamEvent[] = [];
+          for await (const event of p.stream(params)) events.push(event);
+          expect(events.some(e => e.type === 'message_end')).toBe(true);
+          expect(events.some(e => e.type === 'error')).toBe(false);
+        }
+        if (!round) params.messages.push(
+          { role: 'assistant', content: [{ type: 'text', text: 'Recorded.' }, { type: 'tool_use', id: 'call_lookup', name: 'lookup', input: {} }] },
+          { role: 'user', content: [{ type: 'tool_result', toolUseId: 'call_lookup', content: 'saved receipt' }] },
+          { role: 'user', content: [{ type: 'text', text: 'Continue after reopening' }] },
+        );
+      }
+      expect(bodies).toHaveLength(2);
+      expect(bodies.every(body => body.thread === undefined)).toBe(true);
+      expect(JSON.stringify(bodies[1].messages)).toContain('Original request');
+      expect(JSON.stringify(bodies[1].messages)).toContain('saved receipt');
+      expect(JSON.stringify(bodies[1].messages)).toContain('Continue after reopening');
+      expect(bodies[1].system).toBeDefined();
+      expect(bodies[1].tools).toContainEqual(expect.objectContaining({ name: 'lookup' }));
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each([false, true])('uses the SDK tools-history compatibility declaration without rewriting history (%s)', async requiresToolsWithToolHistory => {
+    let payload: any;
+    const transport = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('must-not-send'));
+    const model: Model<'openai-completions'> = { id: 'fixture', name: 'Fixture', provider: 'custom', api: 'openai-completions',
+      baseUrl: 'https://fixture.invalid/v1', reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 4096,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { requiresToolsWithToolHistory } as any,
+    };
+    try {
+      const p = createPiProvider({ provider: 'custom', customModel: model, apiKey: 'fixture',
+        onPayload(value) { payload = value; throw new Error('captured-before-transport'); } });
+      await expect(p.complete({ messages: [
+        { role: 'user', content: [{ type: 'text', text: 'Lookup' }] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'call_lookup', name: 'lookup', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', toolUseId: 'call_lookup', content: 'saved receipt' }] },
+      ], onRequestFailure() {} })).rejects.toThrow('captured-before-transport');
+      if (requiresToolsWithToolHistory) expect(payload.tools).toEqual([]);
+      else expect(payload).not.toHaveProperty('tools');
+      expect(JSON.stringify(payload.messages)).toContain('saved receipt');
+      expect(transport).not.toHaveBeenCalled();
+    } finally { transport.mockRestore(); }
+  });
+
+
   it.each(['complete', 'stream'] as const)('rejects malformed final tool arguments before returning an executable %s result', async (method) => {
     const modelId = 'google/gemini-3.8-flash';
     let rawArguments = '{"private_fixture":';
@@ -169,7 +349,11 @@ describe("Providers (pi-ai backed)", () => {
       const secondError = await provider.complete({ ...params, requestMetadata: { orkasRequestId: 'b'.repeat(32) }, onRequestFailure: failure => second.push(failure) }).catch(error => error);
       release();
       const firstError = await firstCall;
-      expect(firstError.message).toBe('fetch failed');
+      // The SDK may expand its display message; original transport ownership survives.
+      expect(firstError).toBeInstanceOf(ProviderError);
+      expect(firstError.cause).toBeInstanceOf(TypeError);
+      expect(firstError.cause.message).toBe('fetch failed');
+      expect(firstError.cause.cause.code).toBe('ECONNRESET');
       expect(secondError.statusCode).toBe(503);
       expect(first).toMatchObject([{ code: 'ECONNRESET', phase: 'before_response', elapsedMs: expect.any(Number), aborted: false }]);
       expect(second).toMatchObject([{ code: 'unknown', phase: 'after_response', httpStatus: 503, elapsedMs: expect.any(Number), aborted: false }]);
@@ -1257,6 +1441,8 @@ describe("Providers (pi-ai backed)", () => {
       ["anthropic", "claude-sonnet-5-5", "anthropic"],
       ["anthropic", "claude-haiku-5-5", "anthropic"],
       ["openrouter", "anthropic/claude-fable-5.1", "anthropic"],
+      ["anthropic", "claude-fable-5-2", "anthropic"],
+      ["openrouter", "anthropic/claude-fable-5.2", "anthropic"],
       ["openrouter", "anthropic/claude-opus-5.5", "anthropic"],
       ["openrouter", "anthropic/claude-sonnet-5.5", "anthropic"],
       ["openrouter", "anthropic/claude-haiku-5.5", "anthropic"],

@@ -1,3 +1,4 @@
+import { appLocalConversationRoot } from '../../paths';
 /**
  * Persist a single CLI agent dispatch to disk.
  *
@@ -63,10 +64,11 @@ function genRunId(): string {
 }
 
 export async function start(uid: string, init: Omit<RunMeta, 'runId' | 'startedAt'> & { prompt: string }): Promise<RunHandle> {
-  await fsp.mkdir(userLocalAgentRunsDir(uid), { recursive: true });
+  const appRoot = appLocalConversationRoot(uid, init.cid);
+  const runPath = (id: string) => appRoot ? path.join(appRoot, 'cli-runs', id) : localAgentRunDir(uid, id);
   let runId = genRunId();
-  while (fs.existsSync(localAgentRunDir(uid, runId))) runId = genRunId();
-  const dir = localAgentRunDir(uid, runId);
+  while (fs.existsSync(runPath(runId))) runId = genRunId();
+  const dir = runPath(runId);
   await fsp.mkdir(dir, { recursive: true });
   const meta: RunMeta = {
     runId,

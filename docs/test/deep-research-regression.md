@@ -8,6 +8,50 @@
 
 ## 自动化覆盖
 
+## Shared research and social-analysis scenarios
+
+### SocialResearcher consolidation and investigation boundary
+
+The requester confirmed merging SocialResearcher into DeepResearcher and keeping
+DeepResearcher focused on investigation, not every search. Version 1.0.67
+advertises evidence synthesis and sample analysis in both selection descriptions;
+ordinary fact lookup and link finding are explicitly outside the role. Scope is
+determined by the requested work and deliverable, not by a keyword matcher or a
+minimum number of searches. A focused brand or social brief remains valid research
+without requiring a long report.
+
+| Request / evidence state | Intended result | Failure guarded against |
+|---|---|---|
+| Ordinary fact lookup or finding a link | Shared capability-boundary handback if misdirected to this Agent | Turning every search into a research project |
+| Public social reputation investigation | `social-data` primary route, bounded platforms/keywords/period/sample plan, traceable themes and next experiments | Losing the retired Agent's collection boundaries or treating public samples as complete platform coverage |
+| Supplied campaign data sufficient for analysis | Validate fields and analyze supported metrics without public collection | Unnecessary fetches, replacing missing denominators with guesses, or forcing deep-report ledgers |
+| Platform failure or zero results | Preserve completed scope and disclose gaps; do not expand the frozen scope | Inventing discussion, concluding no discussion exists, or trying unrelated platforms |
+| Social findings need brand context | Only a decision-changing brand extension | Unbounded cross-domain research |
+| Brand brief or broader/durable investigation | Existing brand chat/file contract or deep-research evidence/resume/report route respectively | Replacing established research paths with a social template |
+
+### Revenue and cost inputs
+
+| Input / scenario | Independent expected result |
+|---|---|
+| Spend 100, revenue 1,000, matching non-marketing costs 600 | ROAS 10; ROI 300%, with its cost basis |
+| Revenue 0 versus missing revenue | With explicit zero other costs: ROI -100%; missing revenue: return unavailable |
+| Revenue known, matching costs unavailable | ROAS computable; profit ROI unavailable |
+| Spend missing or zero | Return ratios unavailable; explicit zero spend can still produce zero CPC when clicks are positive |
+| Declared conversion value or explicit interaction value | Separate scenario fields and basis; no substitute for observed revenue/profit and no automatic budget-scaling advice |
+| Campaign totals plus post amounts | Campaign fields win, including zero/null; only complete post columns are summed when the campaign field is absent |
+| Partial counters or invalid input | Preserve independently supported metrics; reject invalid numeric/corpus/JSON input with a structured error, not a partial report or traceback |
+
+### Brand investigation
+
+| Request / evidence state | Intended result | Failure guarded against |
+|---|---|---|
+| Focused company/product profile or Brand DNA | Bounded requested-field brief via `brand-research`, with frozen source/competitor scope and at most one relevant social extension | Forcing deep-research ledgers and a published long report onto a simple brand request |
+| Positioning, audience, competitors, voice, pricing, proof or content gaps | Sourced facts, company statements, third-party evidence and labeled interpretation; requested fields only | Treating marketing claims as independent proof, or filling optional fields from guesses |
+| Weak, blocked or missing sources | Disclosed source caveats and missing fields | Declaring no discussion from empty social results, or implying diligence conclusions |
+| Broader or complex investigation, literature review, market comparison or durable resume | Existing `deep-research` normal/resume/compact route, budget/state retention, claim checks and canonical report delivery | Replacing existing deep investigations with a shallow brand template or losing saved accounting |
+| Focused brief with / without requested file | Existing `brand-research` chat/file output contract | Unsolicited saved brand files, or suppressing the canonical file on a deep-research route |
+
+
 Production quality evidence identifies attached outputs from persisted host
 delivery records and places their contents before working files. Earlier drafts
 and verification attempts remain available as execution evidence, explicitly
@@ -233,8 +277,8 @@ on a live model run is not yet measured.
 
 ## 能力边界与转交
 
-1. 任务实为知识库沉淀（写入笔记/Notion/Obsidian）、社媒抓取/指标、办公文档成品时，应转交对应入口（知识库/社媒/办公），而非在本 agent 内越权处理。
-2. 跨 agent 转交应写能力型边界（如「转给知识库管理入口」），不硬编码其他 agent 的显示名。
+1. Ordinary fact lookup, link finding, knowledge-base writes and final Office artifacts remain outside this research role. Social sampling and campaign analysis now belong to its `social-data` route; they no longer require a separate social Agent.
+2. Use the shared capability-boundary handback for unsupported work, preserving progress and continuation facts; do not hard-code another Agent's display name or add a transfer protocol.
 
 ## 失败模式与降级
 

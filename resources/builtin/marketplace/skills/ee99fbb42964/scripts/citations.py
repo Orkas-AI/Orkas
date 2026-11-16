@@ -793,7 +793,50 @@ def references(payload: dict) -> dict:
             "references": v["references"]}
 
 
-def _evidence_ledger_rows(input_path) -> tuple[str | None, list[dict]]:
+def _record_ledger_issue(diagnostics: dict, line: int, reason: str, **details):
+    counts = diagnostics["reason_counts"]
+    counts[reason] = counts.get(reason, 0) + 1
+    if len(diagnostics["samples"]) < 12:
+        diagnostics["samples"].append({"line": line, "reason": reason, **details})
+    else:
+        diagnostics["omitted_samples"] += 1
+
+
+def _compact_ledger_diagnostics(
+    row: dict, line: int, candidates: set[str], diagnostics: dict,
+):
+    """Explain input shape/scope without changing evidence selection or support."""
+    candidate = _inline_markdown(row.get("candidate"))
+    if not candidate:
+        _record_ledger_issue(diagnostics, line, "missing_candidate")
+        return
+    if candidate.casefold() not in candidates:
+        # Other candidates may be valid evidence for a different selection.
+        _record_ledger_issue(diagnostics, line, "candidate_outside_selection")
+        return
+    raw_fields = row.get("fields")
+    if not isinstance(raw_fields, list):
+        raw_fields = [row.get("field")]
+    fields = {
+        str(value).strip() for value in raw_fields
+        if value is not None and str(value).strip()
+    }
+    if not fields:
+        _record_ledger_issue(diagnostics, line, "missing_fields")
+    elif fields.difference(_COMPARISON_FACTUAL_FIELDS):
+        _record_ledger_issue(diagnostics, line, "unrecognized_fields")
+    if fields.intersection(_COMPARISON_FACTUAL_FIELDS):
+        missing = [
+            key for key in ("id", "claim", "quote", "source_id")
+            if not _inline_markdown(row.get(key))
+        ]
+        if missing:
+            _record_ledger_issue(diagnostics, line, "incomplete_evidence", missing_fields=missing)
+
+
+def _evidence_ledger_rows(
+    input_path, *, diagnostics: dict | None = None, candidates: set[str] | None = None,
+) -> tuple[str | None, list[dict]]:
     if not input_path or input_path == "-":
         return None, []
     ledger_path = os.path.join(
@@ -806,15 +849,23 @@ def _evidence_ledger_rows(input_path) -> tuple[str | None, list[dict]]:
     rows = []
     try:
         with open(ledger_path, encoding="utf-8") as fh:
-            for line in fh:
+            for line_number, line in enumerate(fh, 1):
                 if not line.strip():
                     continue
+                if diagnostics is not None:
+                    diagnostics["nonempty_lines"] += 1
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
+                    if diagnostics is not None:
+                        _record_ledger_issue(diagnostics, line_number, "invalid_json")
                     continue
                 if isinstance(row, dict):
                     rows.append(row)
+                    if diagnostics is not None and candidates is not None:
+                        _compact_ledger_diagnostics(row, line_number, candidates, diagnostics)
+                elif diagnostics is not None:
+                    _record_ledger_issue(diagnostics, line_number, "non_object")
     except OSError:
         return None, []
     return ledger_path, rows
@@ -944,11 +995,21 @@ def _expand_compact_landscape_payload(payload: dict, input_path) -> dict:
             "compact_landscape must not be mixed with sources, claims, or comparison"
         )
 
-    ledger_path, ledger_rows = _evidence_ledger_rows(input_path)
+    ledger_diagnostics = {
+        "nonempty_lines": 0, "reason_counts": {}, "samples": [], "omitted_samples": 0,
+    }
+    profiles = spec.get("candidates")
+    candidate_names = {
+        _inline_markdown(profile.get("candidate")).casefold()
+        for profile in (profiles if isinstance(profiles, list) else [])
+        if isinstance(profile, dict)
+    }
+    ledger_path, ledger_rows = _evidence_ledger_rows(
+        input_path, diagnostics=ledger_diagnostics, candidates=candidate_names,
+    )
     if not ledger_path:
         raise ValueError("compact_landscape requires sibling evidence_ledger.jsonl")
 
-    profiles = spec.get("candidates")
     if not isinstance(profiles, list) or not profiles:
         raise ValueError("compact_landscape.candidates must be a non-empty array")
 
@@ -1073,6 +1134,7 @@ def _expand_compact_landscape_payload(payload: dict, input_path) -> dict:
         "enabled": True,
         "ledger": os.path.basename(ledger_path),
         "ledger_rows": len(ledger_rows),
+        "ledger_diagnostics": ledger_diagnostics,
         "selected_evidence_rows": len(unique_rows),
         "candidate_rows": len(comparison),
         "trusted_source_snapshots": snapshot_diagnostics,

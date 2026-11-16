@@ -19,6 +19,22 @@ function stubHandler(): { handler: ProjectTasksToolHandler; calls: any[] } {
 }
 
 describe('todo_tasks tool', () => {
+  it('restricts conversation scope resolution to an unbound writable handler', () => {
+    const { handler, calls } = stubHandler();
+    const resolveScope = async () => ({ ok: true as const, project: { project_id: '__global__', name: '' }, handler });
+    const selector: ProjectTasksProjectSelector = {
+      listProjects: async () => [],
+      resolveProject: resolveScope,
+    };
+    for (const options of [{ resolveScope }, { resolveScope, globalScope: true, readOnly: true }]) {
+      expect(() => createProjectTasksTool(handler, options)).toThrow('Conversation scope resolution requires an unbound writable handler');
+    }
+    expect(() => createProjectTasksTool(selector, { resolveScope, globalScope: true }))
+      .toThrow('Conversation scope resolution requires an unbound writable handler');
+    expect(calls).toEqual([]);
+  });
+
+
   it.each([{}, { globalScope: true }, { readOnly: true }, { globalScope: true, readOnly: true }])('hides member-only operations outside a writable shared project: %j', (options) => {
     const { handler } = stubHandler();
     const schema = createProjectTasksTool(handler, options).inputSchema as any;

@@ -12,3 +12,7 @@ The commercial desktop edition and the open-source build share this guide. **Com
 | **Open-source API-key access** | The separately configured **Orkas API Key** can fund supported public chat, search, image, video, speech, voice-input and credit-based connector services. It is not Orkas desktop sign-in or membership. Provider/API services can require their own accounts, authorization and fees. |
 
 In the open-source build, open sidebar **Settings > Models**, **Settings > Data**, or **Settings > General** for the corresponding local controls. It has no Account/Plan/credits page or personal cloud-sync settings. Local app data and the local Recycle Bin remain usable. Older builds can lack newer controls or retain earlier app restrictions; the visible screen and operation result are authoritative, not a promise that installing this guide upgrades the application.
+
+## Public API and desktop tasks
+
+The Orkas API is a separate service for use in other applications. It does not automatically start Commander or the desktop AI team. For API setup and usage, see the [Orkas API documentation](https://orkas.ai/api-docs/).

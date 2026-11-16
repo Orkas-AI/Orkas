@@ -1,11 +1,10 @@
 /**
  * Host↔skill contract handshake for the video_studio tool.
  *
- * The host tool protocol (gate semantics, decision_evidence, signature-bound
- * review forms) and the VideoStudio agent skills ship through different
- * channels: the host with the app release, the skills through marketplace
- * reconcile. A skill generation older than the host protocol loops on every
- * gate instead of failing visibly (observed in production when a reconcile
+ * The host tool's operations and the VideoStudio agent skills ship through
+ * different channels: the host with the app release, the skills through
+ * marketplace reconcile. A skill generation older than the host protocol loops
+ * instead of failing visibly (observed in production when a reconcile
  * downgraded the installed agent by 25 versions). This module lets the host
  * detect that skew explicitly instead of degrading silently.
  *
@@ -26,11 +25,11 @@ import * as path from 'node:path';
 import { userMarketplaceAgentDir } from '../paths';
 import { compareVersions } from '../util/app-version-compat';
 
-/** Bump when gate/evidence/review tool semantics change incompatibly. */
-export const VIDEO_STUDIO_TOOL_CONTRACT = 2;
+/** Bump when the tool's operations change incompatibly. */
+export const VIDEO_STUDIO_TOOL_CONTRACT = 3;
 
-/** First agent release whose skills speak the current (contract 2) protocol. */
-export const VIDEO_STUDIO_MIN_COMPATIBLE_AGENT_VERSION = '1.1.40';
+/** First agent release whose skills speak the current (contract 3) protocol. */
+export const VIDEO_STUDIO_MIN_COMPATIBLE_AGENT_VERSION = '2.0.0';
 
 export type VideoStudioContractCheck =
   | { compatible: true }

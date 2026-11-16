@@ -95,7 +95,7 @@ describe('development dependency preparation', () => {
       'verify-native-dependencies.cjs:host', 'build-notification-permission-addon.cjs',
       'ensure-sqlite-electron-abi.mjs', 'build-phone-passkey.cjs', 'ensure-runtime.cjs',
       'fetch-embedding-model.mjs', 'fetch-officecli.cjs', 'fetch-ffmpeg.cjs',
-      'verify-native-dependencies.cjs', 'fetch-whisper.cjs',
+      'verify-native-dependencies.cjs', 'fetch-whisper.cjs', 'fetch-libraw.cjs',
       ...(platform === 'win32' ? ['fetch-win-vc-runtime.cjs'] : []),
     ]));
     expect(run.messages.at(-1)).toContain('built-in dependencies ready');

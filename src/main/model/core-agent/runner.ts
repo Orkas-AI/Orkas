@@ -1,3 +1,5 @@
+import { providerUserCacheKey } from './provider-cache-scope';
+import { modelKeyFailureMessage } from './user-visible-errors';
 /**
  * Runner factory — assembles a fresh `AgentRunner` per chat request.
  *
@@ -100,7 +102,7 @@ import {
   sessionAnalysisInputsDir,
   userMarketplaceAgentSkillsDir,
 } from '../../paths';
-import { artifactDirForConversation, chatAttachmentDirForConversation } from '../../util/project-layout';
+import { artifactDirForConversation, conversationLayout, chatAttachmentDirForConversation } from '../../util/project-layout';
 import {
   capToolResultWithRetry,
   DEFAULT_INLINE_RESULT_TOKENS,
@@ -131,6 +133,7 @@ import {
   resolveConfiguredPiModel,
   modelInputImageLimit,
 } from '../provider_catalog';
+import { clientConfig, getRetryErrorPolicyConfig } from '../../features/client_config';
 import { readDisabledSets } from '../../features/component_enabled';
 import type { OrkasApiUsageContext } from '../../features/orkas_api';
 import {
@@ -223,12 +226,15 @@ type CoreAgentConfig = ReturnType<CA['createConfig']>;
 let _caPromise: Promise<CA> | null = null;
 function applyRetryErrorPolicy(mod: CA): void {
   try {
-    mod.configureRetryErrorPolicy();
+    mod.configureRetryErrorPolicy(getRetryErrorPolicyConfig());
   } catch (err) {
     runnerLog.warn('retry error policy sync failed', { error: logErrorSummary(err) });
   }
 }
 
+clientConfig.subscribe('model.retry_error_policy', () => {
+  _caPromise?.then(applyRetryErrorPolicy).catch(() => {});
+});
 
 // core-agent has no browser runtime, so `web_fetch` falls back to the host's
 // offscreen Chromium when a direct response is a bot check or an app shell.
@@ -287,6 +293,8 @@ export interface BuildRunnerParams {
   /** Current real user text, used by tools that must bind an approval action
    * to explicit user intent rather than merely to the existence of a turn. */
   userMessage?: string;
+  /** Host-owned approval source, refreshed only after a real user steer is durably applied. */
+  currentUserMessage?: { text: string };
   /** Image-understanding calls must never fall back to a text-only request. */
   requireImageInput?: boolean;
   /** Current-turn attachment kinds. Tool exposure uses this metadata without
@@ -514,8 +522,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     if (oauthExpiredMessage) throw new Error(oauthExpiredMessage);
     const cooldown = getConfiguredModelCooldown();
     if (cooldown) {
-      const seconds = Math.max(1, Math.ceil((cooldown.cooledUntil - Date.now()) / 1000));
-      throw new Error(t('errors.model_temporarily_unavailable', { seconds }));
+      // Preserve the classified credential cause across preflight without
+      // parsing localized recovery text or exposing the raw provider error.
+      throw Object.assign(
+        new Error(modelKeyFailureMessage(cooldown.kind) || t('errors.model_temporarily_unavailable')),
+        { code: `provider_${cooldown.kind}` },
+      );
     }
     if (hasConfiguredModel().configured) {
       throw new Error(t('errors.model_config_unavailable'));
@@ -752,20 +764,25 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     }));
   }
 
-  // Backlogs follow the conversation scope. An unbound Commander uses the
-  // same global-only executor as an unbound named Agent; project selectors
-  // cannot widen either direct or programmatic calls.
+  // Only Commander can follow the project it creates during this turn.
+  // Existing project and named-Agent scopes remain fixed.
   if (uid && memoryAgentScope && (params.projectId || isCommander || isGroupAgent)) {
-    const { createProjectTasksHandler } = await import('../../features/project_tasks_tool_handler');
-    const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
-    injectedTools.push(createProjectTasksTool(createProjectTasksHandler(
-      uid, params.projectId || '', params.cid || '', agentDisplayNameById,
-      { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' },
-      params.onTodoTaskSaved, params.onTodoTaskDeleted,
-    ), {
-      globalScope: !params.projectId,
-      readOnly: !isCommander && !isGroupAgent,
-    }));
+    if (isCommander && !params.projectId) {
+      const { createConversationTasksTool } = await import('../../features/conversation_tasks_tool');
+      injectedTools.push(createConversationTasksTool(uid, params.cid || '', agentDisplayNameById,
+        params.onTodoTaskSaved, params.onTodoTaskDeleted));
+    } else {
+      const { createProjectTasksHandler } = await import('../../features/project_tasks_tool_handler');
+      const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
+      injectedTools.push(createProjectTasksTool(createProjectTasksHandler(
+        uid, params.projectId || '', params.cid || '', agentDisplayNameById,
+        { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' },
+        params.onTodoTaskSaved, params.onTodoTaskDeleted,
+      ), {
+        globalScope: !params.projectId,
+        readOnly: !isCommander && !isGroupAgent,
+      }));
+    }
   }
 
   if (uid && memoryAgentScope && params.projectId) {
@@ -1002,23 +1019,27 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Owner-only native Studio runtimes are large implementation modules. Do
   // not import or construct them for Commander or unrelated Agents merely to
   // discard them at the owner gate below.
-  const videoStudioTools: AgentTool[] = uid && isToolVisibleToAgent('video_studio', agentId)
-    ? [(await import('./video-studio-tool')).createVideoStudioTool({
-        userId: uid,
-        ...(params.cid ? { cid: params.cid } : {}),
-        ...(params.turnId ? { turnId: params.turnId } : {}),
-        ...(params.userMessage ? { userMessage: params.userMessage } : {}),
-        ...(agentId ? { agentId } : {}),
-        ...(agentName ? { agentName } : {}),
-        ...(params.projectId ? { projectId: params.projectId } : {}),
-        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
-        ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
-        ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
-        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
-        ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
-        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
-      })]
-    : [];
+  const videoStudioTools: AgentTool[] = [];
+  if (uid && isToolVisibleToAgent('video_studio', agentId)) {
+    const studioOpts = {
+      userId: uid,
+      ...(params.cid ? { cid: params.cid } : {}),
+      ...(params.turnId ? { turnId: params.turnId } : {}),
+      ...(params.userMessage ? { userMessage: params.userMessage } : {}),
+      ...(params.currentUserMessage ? { currentUserMessage: params.currentUserMessage } : {}),
+      ...(agentId ? { agentId } : {}),
+      ...(agentName ? { agentName } : {}),
+      ...(params.projectId ? { projectId: params.projectId } : {}),
+      ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+      ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+      ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+      ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+      ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+      ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+    };
+    const sharedStudio = (await import('./video-studio-tool')).createVideoStudioTool(studioOpts);
+    videoStudioTools.push((await import('./video-timeline-tool')).createVideoTimelineTool(studioOpts, sharedStudio));
+  }
 
   const imageStudioTools: AgentTool[] = uid && isToolVisibleToAgent('image_studio', agentId)
     ? [(await import('./image-studio-tool')).createImageStudioTool({
@@ -1046,6 +1067,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const officeTools: AgentTool[] = uid && officeCliAvailable()
     ? createOfficeTools({
         userId: uid,
+        creationStateDir: path.join(params.cid ? conversationLayout(uid, params.cid, params.projectId).groupDir : toolResultsDir, 'office-creation'),
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
@@ -1563,11 +1585,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // Build a rotating provider covering the whole primary group. Even
     // when there's only one candidate, the wrapper is cheap (just one
     // pass-through) and keeps the code path uniform.
-    // The candidate that owned the latest visible outcome decides whether the
-    // observed latency belongs to the monitored official model.
-    let answeredProviderId: string | undefined;
     const onCandidateChosen = (info: { profileId: string; providerId: string; modelId: string }) => {
-      answeredProviderId = info.providerId;
       params.onCandidateChosen?.(info);
     };
     const rotating = await buildRotatingProvider(
@@ -1768,26 +1786,28 @@ export function skillSearchExposureFromSessionId(sessionId: string): boolean {
 async function buildExternalProvider(
   choice: ChatEntryChoice,
   usageContext?: OrkasApiUsageContext,
+  userCacheKey?: string,
 ): Promise<LLMProvider> {
   const { provider: providerId, apiKey, model: modelId } = choice;
   switch (providerId) {
     case 'orkas-api':
-      return await createOrkasApiProvider({ apiKey, modelId, usageContext });
+      return await createOrkasApiProvider({ apiKey, modelId, usageContext, userCacheKey });
     case 'moonshot':
-      return await createMoonshotProvider({ apiKey, modelId });
+      return await createMoonshotProvider({ apiKey, modelId, userCacheKey });
     case 'deepseek':
-      return await createDeepSeekProvider({ apiKey, modelId });
+      return await createDeepSeekProvider({ apiKey, modelId, userCacheKey });
     case 'doubao':
-      return await createDoubaoProvider({ apiKey, modelId });
+      return await createDoubaoProvider({ apiKey, modelId, userCacheKey });
     case 'custom':
       if (!choice.customConfig) throw new Error('custom model configuration is incomplete');
       return await createCustomOpenAICompatibleProvider({
         apiKey,
         modelId,
         ...choice.customConfig,
+        userCacheKey,
       });
     default:
-      return createConfiguredOpenAICompatibleProvider({ providerId, apiKey, modelId });
+      return createConfiguredOpenAICompatibleProvider({ providerId, apiKey, modelId, userCacheKey });
   }
 }
 
@@ -1826,6 +1846,7 @@ async function buildRotatingProvider(
   requireImageInput = false,
   onRequestFailure?: (failure: ProviderRequestFailure) => void,
 ): Promise<LLMProvider> {
+  const userCacheKey = providerUserCacheKey(userId);
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
     const candModelId = choice.model;
@@ -1863,7 +1884,7 @@ async function buildRotatingProvider(
       } } : {}),
       build: async () => {
         if (isExternal) {
-          return withTaskBudget(await buildExternalProvider({ ...choice, apiKey: currentApiKey }, usageContext), cid);
+          return withTaskBudget(await buildExternalProvider({ ...choice, apiKey: currentApiKey }, usageContext, userCacheKey), cid);
         }
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {
@@ -1877,7 +1898,8 @@ async function buildRotatingProvider(
           provider: candProviderId,
           ...(resolvedModel?.needsCustomModel ? { customModel: resolvedModel.model } : { model: candModelId }),
           apiKey: currentApiKey,
-            onPayload: omitReservedOutputLimitForProvider(
+          userCacheKey,
+          onPayload: omitReservedOutputLimitForProvider(
             candProviderId,
             buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
           ),

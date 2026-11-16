@@ -25,6 +25,95 @@ const test = base.extend({
   },
 });
 
+test('a removed iframe cannot discard a pending root file upload', async ({ orkas }, info) => {
+  const receipts: string[] = [];
+  const server = createServer((req, res) => {
+    if (req.url === '/upload') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => { receipts.push(body); res.end('received'); });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<!doctype html><input type="file"><script>document.querySelector("input").onchange=e=>{window.upload=(async()=>{const response=await fetch("/upload",{method:"POST",body:await e.target.files[0].text()});return response.text()})()}</script>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '::', resolve));
+  const port = (server.address() as { port: number }).port;
+  const file = orkas.createWorkspaceFile('retained-upload.txt', 'retained-upload-字节');
+  try {
+    const result = await orkas.electronApp!.evaluate(async ({ BrowserWindow }, args) => {
+      const req = (process as any).mainModule.require;
+      const protocol = req(args.root + '/src/main/features/web_assist_protocol.ts');
+      const { withOperationTimeout } = req(args.root + '/src/main/util/operation-timeout.ts');
+      const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      const contents = win.webContents;
+      let selectionOpened!: () => void;
+      const opened = new Promise<void>(resolve => { selectionOpened = resolve; });
+      protocol.attachWebAssistFileChoosers(contents, () => 'isolated-upload-run', selectionOpened);
+      const originalSend = contents.debugger.sendCommand.bind(contents.debugger);
+      let releaseSetup!: () => void;
+      const heldSetup = new Promise<void>(resolve => { releaseSetup = resolve; });
+      let setupEntered!: () => void;
+      const entered = new Promise<void>(resolve => { setupEntered = resolve; });
+      let removedSession = '';
+      let uploadCommands = 0;
+      const bounded = (promise: Promise<any>) => withOperationTimeout(promise, {
+        timeoutMs: 5000, code: 'test_native_event_timeout', stage: 'native iframe upload regression',
+      });
+      try {
+        await win.loadURL(args.url);
+        await protocol.webAssistFrames(contents);
+        await contents.executeJavaScript('document.querySelector("input").click()', true);
+        await bounded(opened);
+        const selection = protocol.webAssistFileChooser(contents);
+        if (!selection) throw new Error('Root upload selection missing');
+        contents.debugger.sendCommand = (async (method: string, params: any, sessionId?: string) => {
+          if (method === 'Runtime.enable' && sessionId) {
+            removedSession = sessionId;
+            setupEntered();
+            await heldSetup;
+          }
+          if (method === 'DOM.setFileInputFiles') uploadCommands++;
+          return originalSend(method, params, sessionId);
+        }) as any;
+        await contents.executeJavaScript(`(() => { const frame=document.createElement('iframe'); frame.id='transient'; frame.src=${JSON.stringify(args.child)}; document.body.append(frame); })()`);
+        await bounded(entered);
+        const refresh = protocol.refreshWebAssistFileChoosers(contents);
+        // Let refresh reach the pending child setup, then retire the actual
+        // Chromium target before its delayed protocol command is dispatched.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const detached = new Promise<void>(resolve => {
+          const listener = (_event: unknown, method: string, params: any) => {
+            if (method !== 'Target.detachedFromTarget' || params.sessionId !== removedSession) return;
+            contents.debugger.removeListener('message', listener); resolve();
+          };
+          contents.debugger.on('message', listener);
+        });
+        await contents.executeJavaScript('document.getElementById("transient").remove()');
+        await bounded(detached);
+        releaseSetup();
+        await refresh;
+        const retained = protocol.webAssistFileChooser(contents) === selection;
+        const attached = contents.debugger.isAttached();
+        const count = await protocol.setWebAssistInputFiles(contents, selection, [args.file]);
+        await bounded(contents.executeJavaScript('window.upload'));
+        protocol.clearWebAssistFileChooser(contents);
+        return { retained, attached, count, uploadCommands };
+      } finally {
+        releaseSetup();
+        contents.debugger.sendCommand = originalSend;
+        win.destroy();
+      }
+    }, { root: path.resolve(__dirname, '../..'), url: `http://127.0.0.1:${port}/`, child: `http://localhost:${port}/child`, file });
+    writeFileSync(info.outputPath('retired-frame-upload.json'), JSON.stringify(result, null, 2));
+    expect(result).toEqual({ retained: true, attached: true, count: 1, uploadCommands: 1 });
+    await expect.poll(() => receipts).toEqual(['retained-upload-字节']);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('AI attachment buttons yield upload targets, transfer exact bytes once and release stale selections', async ({ orkas }) => {
   test.setTimeout(90_000);
   const receipts: string[] = [];

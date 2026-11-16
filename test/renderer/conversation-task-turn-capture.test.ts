@@ -81,6 +81,7 @@ describe('conversation terminal and media presentation', () => {
       },
     );
     const mediaHandler = vi.fn();
+    const refreshLinks = vi.fn();
     const pushHandlers: Record<string, (payload: unknown) => void> = {};
     vm.runInNewContext(extractPresentationRegistration(), {
       window: {
@@ -92,6 +93,7 @@ describe('conversation terminal and media presentation', () => {
       },
       _taskTerminalHandlePresentation: presentationHandler,
       _conversationMediaHandleMaterialized: mediaHandler,
+      _scheduleConversationTaskLinksRefresh: refreshLinks,
     });
     const terminal = {
       type: 'terminal',
@@ -103,11 +105,15 @@ describe('conversation terminal and media presentation', () => {
     expect(Object.keys(pushHandlers).sort()).toEqual([
       'conversation:media_materialized',
       'conversation:task_terminal',
+      'projects:tasks-changed',
     ]);
     pushHandlers['conversation:task_terminal'](terminal);
 
     expect(syncFailure).toHaveBeenCalledWith(terminal);
     expect(handleUnread).toHaveBeenCalledWith(terminal);
+    expect(refreshLinks).toHaveBeenCalledOnce();
+    pushHandlers['projects:tasks-changed']({});
+    expect(refreshLinks).toHaveBeenCalledTimes(2);
     const materialized = { conversation_id: 'conversation-ui-only', local_url: 'chat-media://cid/x/y.png' };
     pushHandlers['conversation:media_materialized'](materialized);
     expect(mediaHandler).toHaveBeenCalledWith(materialized);

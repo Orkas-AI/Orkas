@@ -434,6 +434,9 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         expect(rejected.result.isError).toBe(true);
         expect(rejected.result.content[0].text).toContain(field);
         expect(rejected.result.content[0].text).toContain(bound);
+        expect(JSON.parse(rejected.result.content[0].text)).toMatchObject({ code: 'E_BAD_INPUT', issues: [
+          expect.objectContaining({ field, reason: expect.any(String), expected: expect.any(String) }),
+        ] });
       }
       expect(bridgeConnectorMock.resolveVisibleConnectors).not.toHaveBeenCalled();
       expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
@@ -593,9 +596,12 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
       const connectors = await import('../../../../src/main/features/connectors');
       expect(joined).toBe(connectors.stringifyMcpResult({ content: [{ type: 'text', text: content }] }));
       expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
-      expect(JSON.parse((await call('publish_outputs', { paths: ['report.txt'] })).result.content[0].text)).toEqual({ requested: 1, published: 1 });
+      const publication = JSON.parse((await call('publish_outputs', { paths: ['report.txt'] })).result.content[0].text);
+      expect(publication).toMatchObject({ requested: 1, published: 1, outputs: [{ path: output }] });
+      expect(publication.outputs).toHaveLength(1);
+      expect(decodeURIComponent(new URL(publication.outputs[0].url).pathname).replace(/^\/(?=[A-Za-z]:\/)/, '')).toBe(output.replace(/\\/g, '/'));
       expect(published).toEqual([output]);
-      await call('publish_outputs', { paths: [] });
+      expect(JSON.parse((await call('publish_outputs', { paths: [] })).result.content[0].text)).toEqual({ requested: 0, published: 0, outputs: [] });
       expect(published).toEqual([]);
       expect((await call('orkas_read_skill', { id: 'private-helper', path: '../outside' })).result.isError).toBe(true);
       expect((await call('publish_outputs', { paths: ['../outside'] })).result.isError).toBe(true);
@@ -643,9 +649,9 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
       ] as const) {
         const rejected = await call(args);
         expect(rejected.isError).toBe(true);
-        // SDK 1.31 renders the actionable message and field as plain text.
-        expect(rejected.content[0].text).toContain(field);
-        expect(rejected.content[0].text).toContain(message);
+        expect(JSON.parse(rejected.content[0].text)).toMatchObject({ code: 'E_BAD_INPUT', issues: [
+          { field, reason: 'invalid_format', expected: message },
+        ] });
       }
       expect(browserHost.observeModelWebAssist).not.toHaveBeenCalled();
       expect(browserHost.actOnModelWebAssist).not.toHaveBeenCalled();
@@ -883,10 +889,35 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         const automationSchema = listed.result.tools.find((t: any) => t.name === 'auto_tasks').inputSchema;
         expect(automationSchema).toEqual(nativeAuto.inputSchema);
         expect(JSON.stringify(listed.result.tools)).not.toMatch(/"(?:oneOf|anyOf)":/);
+        for (const selection of [
+          { type: 'weekly', weekday: 'workdays' },
+          { type: 'weekly', weekdays: [3, 1] },
+          { type: 'monthly', days: [1, 8, 31] },
+        ]) {
+          const schedule = { ...selection, hour: 9, minute: 5 };
+          const saved = await client.request(1100, 'tools/call', { name: 'auto_tasks', arguments: {
+            action: 'create', content: 'Calendar report', schedule, enabled: false,
+          } });
+          expect(saved.result.isError).toBeFalsy();
+          const id = JSON.parse(saved.result.content[0].text).taskId;
+          const detail = await client.request(1101, 'tools/call', { name: 'auto_tasks', arguments: { action: 'get', task_id: id } });
+          expect(JSON.parse(detail.result.content[0].text).task.schedule).toEqual(schedule);
+          const edited = await client.request(1102, 'tools/call', { name: 'auto_tasks', arguments: {
+            action: 'update', task_id: automationId, schedule,
+          } });
+          expect(edited.result.isError).toBeFalsy();
+          expect(await autoTasks.getTask(TEST_UID, automationId)).toMatchObject({ schedule, enabled: false });
+          const removed = await client.request(1103, 'tools/call', { name: 'auto_tasks', arguments: { action: 'delete', task_id: id } });
+          expect(removed.result.isError).toBeFalsy();
+        }
         const savedAutomation = await autoTasks.getTask(TEST_UID, automationId);
         for (const fields of [
           { schedule: { type: 'daily', hour: 9 } },
           { schedule: { type: 'daily', hour: 9, minute: 0, day: 1 } },
+          { schedule: { type: 'weekly', weekday: 'workdays', weekdays: [1], hour: 9, minute: 0 } },
+          { schedule: { type: 'weekly', weekdays: [1, 1], hour: 9, minute: 0 } },
+          { schedule: { type: 'monthly', days: [], hour: 9, minute: 0 } },
+          { schedule: { type: 'monthly', days: [1, 32], hour: 9, minute: 0 } },
           { end_condition: { type: 'count' } },
           { recipient: { kind: 'agent' } },
         ]) {
@@ -1539,9 +1570,29 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         const denied = await call('orkas_read_skill', args);
         expect(denied.result.isError).toBe(true);
       }
-      const schema = await call('orkas_read_skill', {id:'web-app-sdk',path:'references/api.json'});
-      expect(schema.result.isError).not.toBe(true);
-      const document = JSON.parse(JSON.parse(schema.result.content[0].text).content);
+      // The SDK reference exceeds one byte page; follow its opaque cursor.
+      const chunks: Buffer[] = [];
+      let offset: number | null = 0;
+      let bytes = 0;
+      for (let pageCount = 0; offset !== null && pageCount < 20; pageCount++) {
+        const schema = await call('orkas_read_skill', {id:'web-app-sdk',path:'references/api.json',offset});
+        expect(schema.result.isError).not.toBe(true);
+        const page = JSON.parse(schema.result.content[0].text);
+        expect(page.offset).toBe(offset);
+        expect(page.encoding).toBe('utf8');
+        const chunk = Buffer.from(page.content, 'utf8');
+        expect(chunk.length).toBeLessThanOrEqual(60_000);
+        chunks.push(chunk);
+        bytes = page.bytes;
+        if (page.next_offset !== null) expect(page.next_offset).toBe(offset + chunk.length);
+        offset = page.next_offset;
+      }
+      expect(offset).toBeNull();
+      expect(chunks.length).toBeGreaterThan(1);
+      const complete = Buffer.concat(chunks);
+      expect(complete.length).toBe(bytes);
+      expect(complete).toEqual(fs.readFileSync(path.join(process.cwd(), 'resources/builtin/system/skills/web-app-sdk/references/api.json')));
+      const document = JSON.parse(complete.toString('utf8'));
       expect(document.methods.some((method: any) => method.name === 'ai.generate')).toBe(true);
       const starter = await call('orkas_read_skill', {id:'web-app-sdk',path:'assets/starter/index.html'});
       expect(starter.result.isError).not.toBe(true);

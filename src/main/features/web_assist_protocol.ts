@@ -151,8 +151,13 @@ export async function refreshWebAssistFileChoosers(contents: WebContents): Promi
     await state.ready;
     await updateFileChooserSession(contents);
     for (const [sessionId, ready] of state.sessions) {
-      await ready;
-      if (state.sessions.has(sessionId)) await updateFileChooserSession(contents, sessionId);
+      try {
+        await ready;
+        if (state.sessions.get(sessionId) === ready) await updateFileChooserSession(contents, sessionId);
+      } catch (error) {
+        // A retired child cannot revoke the live page's interception or upload.
+        if (state.sessions.get(sessionId) === ready) throw error;
+      }
     }
   } catch (error) {
     // Releasing our debugger also releases interception. A failed disable
@@ -267,9 +272,14 @@ export async function webAssistFrames(contents: WebContents): Promise<WebAssistF
     for (const [id, ready] of [...state.sessions]) {
       if (visited.has(id)) continue;
       visited.add(id);
-      await ready;
+      try { await ready; }
+      catch (error) {
+        if (state.sessions.get(id) === ready) throw error;
+        continue;
+      }
+      if (state.sessions.get(id) !== ready) continue;
       try { collect((await webAssistCommand(contents, 'Page.getFrameTree', {}, id)).frameTree, id); }
-      catch { if (state.sessions.has(id)) throw new Error('browser_frame_unavailable'); }
+      catch { if (state.sessions.get(id) === ready) throw new Error('browser_frame_unavailable'); }
     }
   }
   return [...frames.values()];

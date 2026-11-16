@@ -51,6 +51,61 @@ def _data_of_optional(obj: dict | None) -> dict:
     return obj.get("data", obj) if isinstance(obj.get("data", obj), dict) else {}
 
 
+def build_page_evidence(crawl_obj: dict | None) -> dict | None:
+    """Project existing crawl facts; no scoring, intent inference or acquisition.
+
+    Per-field serialized UTF-8 limits keep each added summary below 8 KiB,
+    including JSON escaping and truncation metadata. Full facts stay in crawl.
+    Identity URLs are omitted rather than exposing a shortened target.
+    """
+    data = _data_of_optional(crawl_obj)
+    pages = data.get('pages')
+    if not isinstance(pages, list) or not pages or not isinstance(pages[0], dict):
+        return None
+    page = pages[0]
+    site = data.get('site') if isinstance(data.get('site'), dict) else {}
+    truncated = []
+
+    def bounded(value, field, limit, *, identity=False):
+        if not isinstance(value, str):
+            return None
+        candidate = value[:limit]
+        low, high = 0, len(candidate)
+        try:
+            while low < high:
+                middle = (low + high + 1) // 2
+                if len(json.dumps(candidate[:middle], ensure_ascii=False).encode('utf-8')) <= limit:
+                    low = middle
+                else:
+                    high = middle - 1
+        except UnicodeEncodeError:
+            if field not in truncated:
+                truncated.append(field)
+            return None
+        clipped = low < len(value)
+        if clipped and field not in truncated:
+            truncated.append(field)
+        return None if identity and clipped else candidate[:low]
+
+    result = {
+        'url': bounded(page.get('final_url') or page.get('url'), 'url', 2048, identity=True),
+        'source': bounded(page.get('source') or site.get('source'), 'source', 32, identity=True),
+        'title': bounded(page.get('title'), 'title', 256),
+        'canonical': bounded(page.get('canonical'), 'canonical', 2048, identity=True),
+        'meta_description': bounded(page.get('meta_description'), 'meta_description', 512),
+        'first_paragraph': bounded(page.get('first_paragraph'), 'first_paragraph', 512),
+        'h1s': None,
+        'source_truncated': page.get('truncated') if isinstance(page.get('truncated'), bool) else None,
+    }
+    headings = page.get('h1s')
+    if isinstance(headings, list):
+        result['h1s'] = [bounded(text, 'h1s', 256) for text in headings[:4]]
+        if len(headings) > 4 and 'h1s' not in truncated:
+            truncated.append('h1s')
+    result['truncated_fields'] = truncated
+    return result
+
+
 def _health_tone(score: int) -> str:
     return "positive" if score >= 80 else "warning" if score >= 50 else "negative"
 
@@ -522,7 +577,11 @@ def merge_audits(primary: dict, adds: list) -> dict:
 
 
 def _load(path: str | None) -> dict:
-    raw = sys.stdin.read() if not path or path == "-" else open(path, encoding="utf-8").read()
+    if not path or path == '-':
+        raw = sys.stdin.read()
+    else:
+        with open(path, encoding='utf-8') as handle:
+            raw = handle.read()
     return json.loads(raw)
 
 
@@ -580,6 +639,9 @@ def main(argv):
     d = _data_of(audit_obj)
     result = {"ok": True, "dashboard": dashboard, "action_plan_md": plan,
               "health_score": d.get("health_score"), "summary": d.get("summary")}
+    page_evidence = build_page_evidence(crawl_obj)
+    if page_evidence is not None:
+        result['page_evidence'] = page_evidence
     if skipped_inputs:
         result["skipped_inputs"] = skipped_inputs
     return result

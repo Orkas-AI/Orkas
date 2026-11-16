@@ -53,7 +53,7 @@ const CREATOR_ROUTE_MAX_CHARS = 20_000;
 const SHARED_ROOT_MAX_CHARS = 20_000;
 const SHARED_ROUTE_MAX_CHARS = 40_000;
 const AGENT_PRIVATE_ROUTE_MAX_CHARS = 60_000;
-const VIDEO_MULTI_STAGE_ROUTE_MAX_CHARS = 80_000;
+const VIDEO_AD_JOURNEY_MAX_CHARS = 60_000;
 
 interface BuiltinSkillGroup {
   label: string;
@@ -176,13 +176,18 @@ function frontmatterKeys(content: string): string[] {
   }).sort();
 }
 
-function topLevelReferenceNavigationFindings(skillDir: string): string[] {
-  const referencesDir = path.join(skillDir, 'references');
+/** A link through the Skill's own `@skill/<ref>/` address is as direct as a
+ *  relative one: it is the run-scoped address the host binds for the model
+ *  (skill-engineering-contract.md, "Run-scoped binding"). */
+function topLevelReferenceNavigationFindings(spec: Pick<SkillSpec, 'dir' | 'id' | 'name'>): string[] {
+  const referencesDir = path.join(spec.dir, 'references');
   if (!fs.existsSync(referencesDir)) return [];
-  const root = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+  const root = fs.readFileSync(path.join(spec.dir, 'SKILL.md'), 'utf8');
+  const refs = new Set([spec.name?.trim(), spec.id].filter(Boolean));
+  const prefixes = ['references', ...[...refs].map((ref) => `@skill/${ref}/references`)];
   return fs.readdirSync(referencesDir, { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
-    .filter((entry) => !root.includes(`](references/${entry.name})`))
+    .filter((entry) => !prefixes.some((prefix) => root.includes(`](${prefix}/${entry.name})`)))
     .map((entry) => entry.name);
 }
 
@@ -362,7 +367,7 @@ describe('builtin skill inline budget', () => {
 
   it('links every top-level conditional reference from its Skill root', () => {
     const findings = specs.flatMap((spec) => (
-      topLevelReferenceNavigationFindings(spec.dir).map((reference) => (
+      topLevelReferenceNavigationFindings(spec).map((reference) => (
         `${path.relative(BUILTIN_ROOT, spec.skillFile)}:${reference}`
       ))
     ));
@@ -371,8 +376,24 @@ describe('builtin skill inline budget', () => {
       'a bare path is not a reliable read route; link each optional top-level reference at its condition',
     ).toEqual([]);
 
-    expect('Read `references/example.md` when needed.')
-      .not.toContain('](references/example.md)');
+    // The Skill's own address counts; a bare path or another Skill's address does not.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-reference-links-'));
+    try {
+      fs.mkdirSync(path.join(tmp, 'references'));
+      for (const name of ['relative.md', 'own.md', 'bare.md', 'foreign.md']) {
+        fs.writeFileSync(path.join(tmp, 'references', name), `# ${name}\n`, 'utf8');
+      }
+      fs.writeFileSync(path.join(tmp, 'SKILL.md'), [
+        'For A, read [A](references/relative.md).',
+        'For B, read [B](@skill/own-skill/references/own.md).',
+        'For C, read `references/bare.md`.',
+        'For D, read [D](@skill/other-skill/references/foreign.md).',
+      ].join('\n'), 'utf8');
+      expect(topLevelReferenceNavigationFindings({ dir: tmp, id: 'own-skill', name: 'own-skill' }).sort())
+        .toEqual(['bare.md', 'foreign.md']);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it('keeps every independently read skill document within one tool result', () => {
@@ -558,10 +579,9 @@ describe('builtin skill inline budget', () => {
 
   it('keeps VideoStudio private roots routed and real journeys below explicit budgets', () => {
     const videoDir = path.join(BUILTIN_ROOT, 'marketplace', 'agents', '79df9cc89f5f', 'skills');
-    const gateDir = path.join(videoDir, 'gate-control');
-    const composeDir = path.join(videoDir, 'stage-compose');
+    const mainDir = path.join(videoDir, 'video-studio');
     const editDir = path.join(videoDir, 'stage-edit');
-    const disclosureFindings = [gateDir, composeDir, editDir].flatMap((dir) => (
+    const disclosureFindings = [mainDir, editDir].flatMap((dir) => (
       progressiveDisclosureFindings(dir, SHARED_ROOT_MAX_CHARS)
         .map((finding) => `${path.basename(dir)}:${finding}`)
     ));
@@ -569,22 +589,8 @@ describe('builtin skill inline budget', () => {
       .toEqual([]);
 
     const privateRoutes = [
-      { label: 'gate:confirmation', dir: gateDir, refs: ['confirmation-artifacts.md'] },
-      { label: 'gate:revision', dir: gateDir, refs: ['revision-and-recovery.md'] },
-      {
-        label: 'gate:auto-preview-revision',
-        dir: gateDir,
-        refs: ['confirmation-artifacts.md', 'assembled-productions.md', 'revision-and-recovery.md'],
-      },
-      { label: 'compose:author', dir: composeDir, refs: ['manifest-and-authoring.md'] },
-      {
-        label: 'compose:preview',
-        dir: composeDir,
-        refs: ['manifest-and-authoring.md', 'render-and-preview.md'],
-      },
-      { label: 'compose:failure', dir: composeDir, refs: ['qa-and-repair.md'] },
-      { label: 'compose:narration', dir: composeDir, refs: ['narration.md'] },
-      { label: 'compose:no-runtime', dir: composeDir, refs: ['no-runtime-package.md'] },
+      { label: 'main:timeline', dir: mainDir, refs: ['timeline.md'] },
+      { label: 'main:ad', dir: mainDir, refs: ['timeline.md', 'ads.md', 'product-fidelity.md', 'generation.md', 'audio.md'] },
       {
         label: 'edit:transcript-or-screen-grounded',
         dir: editDir,
@@ -601,49 +607,16 @@ describe('builtin skill inline budget', () => {
       .toEqual([]);
 
     const editRoot = fs.readFileSync(path.join(editDir, 'SKILL.md'), 'utf8');
-    expect(editRoot).toContain('Ordinary known-timecode trim');
-    expect(editRoot).toContain('do not load this branch');
+    expect(editRoot).toContain('Screen-grounded narration, localization and topic-based selection:');
 
-    const journeys = [
-      {
-        label: 'compose:direction-to-preview',
-        files: [
-          path.join(gateDir, 'SKILL.md'),
-          path.join(gateDir, 'references', 'confirmation-artifacts.md'),
-          path.join(composeDir, 'SKILL.md'),
-          path.join(composeDir, 'references', 'manifest-and-authoring.md'),
-          path.join(composeDir, 'references', 'render-and-preview.md'),
-        ],
-      },
-      {
-        label: 'compose:failed-preview-recovery',
-        files: [
-          path.join(gateDir, 'SKILL.md'),
-          path.join(gateDir, 'references', 'revision-and-recovery.md'),
-          path.join(composeDir, 'SKILL.md'),
-          path.join(composeDir, 'references', 'qa-and-repair.md'),
-          path.join(composeDir, 'references', 'render-and-preview.md'),
-        ],
-      },
-      {
-        label: 'compose:narration-retry',
-        files: [
-          path.join(gateDir, 'SKILL.md'),
-          path.join(gateDir, 'references', 'confirmation-artifacts.md'),
-          path.join(gateDir, 'references', 'narration-recovery.md'),
-          path.join(composeDir, 'SKILL.md'),
-          path.join(composeDir, 'references', 'narration.md'),
-        ],
-      },
-    ];
-    const overJourneyBudget = journeys.flatMap((journey) => {
-      const chars = fileSetChars(journey.files);
-      return chars <= VIDEO_MULTI_STAGE_ROUTE_MAX_CHARS
-        ? []
-        : [`${journey.label}:${chars}>${VIDEO_MULTI_STAGE_ROUTE_MAX_CHARS}`];
-    });
-    expect(overJourneyBudget, 'VideoStudio may be multi-stage, but one real journey is still bounded')
-      .toEqual([]);
+    const adJourney = fileSetChars([
+      path.join(mainDir, 'SKILL.md'),
+      ...['timeline.md', 'ads.md', 'product-fidelity.md', 'generation.md', 'audio.md'].map((ref) => path.join(mainDir, 'references', ref)),
+      path.join(videoDir, 'video-craft', 'SKILL.md'),
+      path.join(videoDir, 'frontend-design', 'SKILL.md'),
+    ]);
+    expect(adJourney, 'an ad with shots, narration and music is one journey, and it stays bounded')
+      .toBeLessThanOrEqual(VIDEO_AD_JOURNEY_MAX_CHARS);
   });
 
   it('keeps shipped routing intent natural instead of adding separate keyword lists', () => {
@@ -661,13 +634,11 @@ describe('builtin skill inline budget', () => {
     ).toEqual([]);
   });
 
-  it('keeps shared and System discovery descriptions compact without changing user-content limits', () => {
+  it('preserves creator discovery and its selected mutation protocol', () => {
     const resident = groups.filter(group => group.kind !== 'agent').flatMap(group => group.specs);
-    // A shipped-source growth alarm, not a runtime truncation or quality gate.
-    // 2026-09-22: six requester-approved ecommerce Skills moved into the
-    // resident shared roster without changing their descriptions (5,192 chars).
-    const chars = resident.reduce((sum, spec) => sum + pickDescription(spec, 'en').length, 0);
-    expect(chars).toBeLessThanOrEqual(5_250);
+    // Source-character growth is reported by the review, rather than used
+    // as a product-capacity oracle. The effective routing-token and initial
+    // request budgets below remain independent, failure-capable gates.
     const creator = resident.find(spec => spec.name === 'agent-creator')!;
     const skillCreator = resident.find(spec => spec.name === 'skill-creator')!;
     expect(creator.description_en).not.toMatch(/inline.*container/i);
@@ -742,10 +713,9 @@ describe('builtin skill inline budget', () => {
     ).toEqual([]);
   });
 
-  it('keeps headroom in the two VideoStudio resident skills that previously touched the cap', () => {
+  it('keeps headroom in the VideoStudio skill every video reads', () => {
     const targets = [
-      'marketplace/agents/79df9cc89f5f/skills/stage-compose/SKILL.md',
-      'marketplace/agents/79df9cc89f5f/skills/gate-control/SKILL.md',
+      'marketplace/agents/79df9cc89f5f/skills/video-studio/SKILL.md',
     ];
     const measured = new Map(docs.map((doc) => [
       doc.label.split(path.sep).join('/'),

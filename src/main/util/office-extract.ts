@@ -4,7 +4,7 @@ import { Worker } from 'node:worker_threads';
 import * as path from 'node:path';
 import { isZipSpreadsheet, xlsBufferToMarkdown } from './extract-xls';
 
-export type OfficeExtraction = 'xlsx-markdown' | 'xlsx-html' | 'pptx-markdown' | 'pptx-html' | 'spreadsheet-markdown';
+export type OfficeExtraction = 'docx-markdown' | 'docx-html' | 'xlsx-markdown' | 'xlsx-html' | 'pptx-markdown' | 'pptx-html' | 'spreadsheet-markdown';
 type Input = Buffer | ((signal: AbortSignal) => Promise<Buffer>);
 type Job = { kind: OfficeExtraction; input: Input; resolve(value: string): void; reject(error: Error): void };
 const queue: Job[] = [];

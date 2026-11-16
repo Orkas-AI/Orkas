@@ -1,3 +1,4 @@
+import { VIDEO_MODEL_SPECS } from '../../src/main/features/video_models';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
@@ -32,6 +33,15 @@ function loadSettingsSandbox(): any {
 }
 
 describe('settings model whitelist', () => {
+it('keeps fallback and loaded video model names aligned for new and saved profiles', () => {
+    const sandbox = loadSettingsSandbox();
+    const models = Object.entries(VIDEO_MODEL_SPECS).flatMap(([provider, specs]) => specs.map(spec => ({ provider, ...spec })));
+    expect(sandbox._settingsVideoProviderOptions()).toHaveLength(21);
+    for (const model of models) {
+      expect(sandbox._videoProviderLabel(model.provider, model.id)).toBe(model.name);
+    }
+    expect(sandbox._videoProviderLabel('orkas-api', 'orkas-video')).toBe('Orkas · Video');
+  });
   it('does not inject an unavailable saved model into the current options', () => {
     const sandbox = loadSettingsSandbox();
     const state = sandbox._settingsEntryModelState({

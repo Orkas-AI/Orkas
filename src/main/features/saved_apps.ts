@@ -34,6 +34,7 @@ import { t } from '../i18n';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
+import { builtinAppRoot, acquireBuiltinApp, isBuiltinAppId, builtinAppDisplayTitle } from './builtin_apps';
 import { atomicTmpPath, isAtomicWriteTempPath, renameWithRetrySync, writeTextAtomicSync } from '../storage';
 
 const log = createLogger('saved_apps');
@@ -65,6 +66,8 @@ export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; co
 type ResolveCode = 'bad_input' | 'forbidden' | 'not_found';
 
 export interface SavedAppMeta {
+  builtinOrigin?: { id: string; version: string };
+  version?: string;
   sourcePathKey?: string;
   browserStorage?: 'isolated-v1';
   appType?: AppType;
@@ -110,6 +113,16 @@ function safeAppId(id: unknown): string {
   // separators / dots / NUL.
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new Error('invalid appId');
   return id;
+}
+
+/** Built-ins share the existing sandbox/runtime resolver, never its write root. */
+function readableAppDir(uid: string, id: string): string {
+  if (isBuiltinAppId(id)) {
+    const root = builtinAppRoot(uid, id);
+    if (!root) throw new Error('app not found');
+    return root;
+  }
+  return savedAppDir(uid, id);
 }
 
 function sanitiseTitle(t: unknown): string {
@@ -174,19 +187,19 @@ function readMeta(dir: string): Partial<SavedAppMeta> {
 /** The absence of this additive marker preserves legacy browser storage. */
 export function hasIsolatedBrowserStorage(uid: string, appId: string): boolean {
   try {
-    const dir = savedAppDir(uid, safeAppId(appId));
+    const dir = readableAppDir(uid, safeAppId(appId));
     return isRealSavedAppDirectory(dir) && readMeta(dir).browserStorage === 'isolated-v1';
   } catch { return false; }
 }
 
 /** Read only bounded local metadata, including legacy app types. */
 export function declaredSavedAppType(uid: string, appId: string): AppType | undefined {
-  const dir = savedAppDir(uid, safeAppId(appId));
+  const dir = readableAppDir(uid, safeAppId(appId));
   if (!isRealSavedAppDirectory(dir)) throw new Error('app not found');
   return storedAppType(dir);
 }
 export async function resolveSavedAppType(uid: string, appId: string): Promise<AppType> {
-  const id = safeAppId(appId), dir = savedAppDir(uid, id);
+  const id = safeAppId(appId), dir = readableAppDir(uid, id);
   if (!isRealSavedAppDirectory(dir)) throw new Error('app not found');
   return storedAppType(dir) ?? 'local';
 }
@@ -507,6 +520,11 @@ export async function exportAppData(uid:string,cid:string,source:DataSource,dest
 const activeEditSaves = new Map<string, number>();
 const deferredEditCleanup = new Set<string>();
 type SaveMode = 'new' | 'update' | 'auto';
+/** Optional host guard; legacy manual callers retain their existing behavior. */
+export interface SaveGuard {
+  isActive: () => boolean;
+  target: { appId: string; revision: string } | null;
+}
 type PathSource = { rootDir: string; bindingRoot: string; entry: string; explicitEntry: boolean; explicitTitle: boolean; title: string; files: string[]; appType: AppType; sourceCid: string };
 const saveQueues = new Map<string, Promise<unknown>>();
 const legacyPathSourceKey = (root: string) => crypto.createHash('sha256').update(path.resolve(root)).digest('hex');
@@ -523,8 +541,14 @@ function readPathBinding(uid:string,key:string):{version:1|2;appId:string}|null 
   }
 }
 
-/** A source owns its current save destination; conversation-wide edit bindings are only a fallback. */
-export async function getSaveTarget(uid: string, cid: string, source: {artifactId?: string; rootDir?: string; legacyRoot?: string}) {
+type SaveTargetSource = { artifactId?: string; rootDir?: string; legacyRoot?: string };
+
+/** Destination precedence is shared by presentation and writes; only writes resolve missing types. */
+async function findSaveTarget<T extends AppType | undefined>(
+  uid: string, cid: string, source: SaveTargetSource,
+  resolveType: (appId: string, known: AppType | undefined) => T | Promise<T>,
+  requireExisting = false,
+) {
   let id: string | undefined;
   if (source.artifactId) id = chatArtifacts.readArtifactMeta(uid, cid, source.artifactId, { strictSaveBinding: true })?.savedAppId;
   else if (source.rootDir) {
@@ -541,13 +565,23 @@ export async function getSaveTarget(uid: string, cid: string, source: {artifactI
   }
   // A deleted explicit destination must not fall back to an unrelated original.
   if (id) {
+    if (isBuiltinAppId(id)) throw new Error('app_save_binding_unavailable');
     const dir = savedAppDir(uid, safeAppId(id));
-    if (!isRealSavedAppDirectory(dir, 'app_save_binding_unavailable')) return null;
+    if (!isRealSavedAppDirectory(dir, 'app_save_binding_unavailable')) {
+      if (requireExisting) throw new Error('app_edit_target_missing');
+      return null;
+    }
     const meta = readMeta(dir);
-    return { appId: id, title: sanitiseTitle(meta.title), appType: metadataAppType(meta.appType) ?? await resolveSavedAppType(uid, id) };
+    return { appId: id, title: sanitiseTitle(meta.title), appType: await resolveType(id, metadataAppType(meta.appType)) };
   }
-  const edit = cid ? await getEditTarget(uid, cid) : null;
-  if (edit) return isRealSavedAppDirectory(savedAppDir(uid, edit.appId), 'app_save_binding_unavailable') ? edit : null;
+  const edit = cid ? readEditTarget(uid, cid) : null;
+  if (edit) {
+    const target = { ...edit, appType: await resolveType(edit.appId, edit.appType) };
+    if (isRealSavedAppDirectory(savedAppDir(uid, edit.appId), 'app_save_binding_unavailable')) return target;
+    if (requireExisting) throw new Error('app_edit_target_missing');
+    return null;
+  }
+  if (!source.artifactId && !source.rootDir) return null;
   // Recover only unique historical provenance; duplicate copies are not a choice.
   const sourceKeys=source.rootDir?[pathSourceKey(source.rootDir),legacyPathSourceKey(source.legacyRoot??source.rootDir)]:[];
   const candidates = listSavedApps(uid).filter(app => {
@@ -558,7 +592,23 @@ export async function getSaveTarget(uid: string, cid: string, source: {artifactI
       : sourceKeys.includes(meta.sourcePathKey!);
   });
   return candidates.length === 1 ? { appId: candidates[0].id, title: candidates[0].title,
-    appType: candidates[0].appType ?? await resolveSavedAppType(uid, candidates[0].id) } : null;
+    appType: await resolveType(candidates[0].id, candidates[0].appType) } : null;
+}
+
+/** Unknown types remain unknown for UI labels; displaying an action grants no save authority. */
+export function getSaveTargetForDisplay(uid: string, cid: string, source: SaveTargetSource) {
+  return findSaveTarget(uid, cid, source, (_id, known) => known);
+}
+
+/** A source owns its save destination; writes must also resolve its capability identity. */
+export function getSaveTarget(uid: string, cid: string, source: SaveTargetSource, opts: { requireExisting?: boolean } = {}) {
+  return findSaveTarget(uid, cid, source, (id, known) => known ?? resolveSavedAppType(uid, id), !!opts.requireExisting);
+}
+
+/** Read an opaque code revision without exposing the saved directory. */
+export async function inspectSaveTarget(uid: string, cid: string, source: SaveTargetSource) {
+  const target = await getSaveTarget(uid, cid, source, { requireExisting: true });
+  return target ? { ...target, revision: await fingerprintAppAsync(savedAppDir(uid, target.appId)) } : null;
 }
 
 function bindSave(uid: string, cid: string, artifactId: string, appId: string, source?: PathSource) {
@@ -567,7 +617,7 @@ function bindSave(uid: string, cid: string, artifactId: string, appId: string, s
   writeTextAtomicSync(pathBindingFile(uid, pathSourceKey(source.rootDir)), JSON.stringify({version:2,appId}));
 }
 
-export async function saveFromArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode = 'new', recovery?:SaveRecovery, source?: PathSource): Promise<Result<{ id: string; title: string; entry?:string }>> {
+export async function saveFromArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode = 'new', recovery?:SaveRecovery, source?: PathSource, guard?: SaveGuard): Promise<Result<{ id: string; title: string; entry?:string }>> {
   const key = JSON.stringify([userId, cid]);
   // Keep each conversation's recovery journal exclusive, and share the source
   // queue when different conversations save the same workspace bundle.
@@ -581,7 +631,7 @@ export async function saveFromArtifact(userId: string, cid: string, artifactId: 
   // resolves so every acquired save reaches the matching finally below.
   activeEditSaves.set(key, (activeEditSaves.get(key) || 0) + 1);
   const previous = queueKeys.map(queueKey => saveQueues.get(queueKey)?.catch(() => {}));
-  const saving = Promise.all(previous).then(() => saveArtifact(userId, cid, artifactId, mode, recovery, source));
+  const saving = Promise.all(previous).then(() => saveArtifact(userId, cid, artifactId, mode, recovery, source, guard));
   for (const queueKey of queueKeys) saveQueues.set(queueKey, saving);
   try { return await saving; }
   finally {
@@ -595,7 +645,8 @@ export async function saveFromArtifact(userId: string, cid: string, artifactId: 
   }
 }
 
-async function saveArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode, recovery?:SaveRecovery, source?: PathSource): Promise<Result<{ id: string; title: string; entry?:string }>> {
+async function saveArtifact(userId: string, cid: string, artifactId: string, mode: SaveMode, recovery?:SaveRecovery, source?: PathSource, guard?: SaveGuard): Promise<Result<{ id: string; title: string; entry?:string }>> {
+  if (guard && !guard.isActive()) return { ok: false, error: 'app_save_closed' };
   recoverEditedSaves(userId);
   const resolved = source ? {ok:true as const,dirPath:source.rootDir} : chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
   if (!resolved.ok) return { ok: false, error: (resolved as { error?: string }).error || 'artifact not found' };
@@ -610,7 +661,7 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
   try {
     appType = source?.appType ?? await resolveArtifactAppType(userId, cid, artifactId, srcMeta);
     if (mode !== 'new') {
-      const target = await getSaveTarget(userId, cid, source ? {rootDir:source.rootDir,legacyRoot:source.bindingRoot} : {artifactId});
+      const target = await getSaveTarget(userId, cid, source ? {rootDir:source.rootDir,legacyRoot:source.bindingRoot} : {artifactId}, { requireExisting: !!guard });
       if (target) {
         // Updating a durable destination preserves its capability identity;
         // another task's creation defaults belong only to new applications.
@@ -621,6 +672,12 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
   } catch (err) {
     log.warn('saveFromArtifact edit binding unavailable', { error: logErrorSummary(err) });
     return { ok: false, error: 'app_edit_target_missing' };
+  }
+  if (guard) {
+    if (!guard.isActive()) return { ok: false, error: 'app_save_closed' };
+    if (mode === 'update' && !context) return { ok: false, error: 'app_edit_target_missing' };
+    if (context ? context.appId !== guard.target?.appId || context.fingerprint !== guard.target.revision : guard.target !== null)
+      return { ok: false, error: 'app_edit_conflict' };
   }
   if(recovery&&(!context||(source&&!recovery.appId)||(recovery.appId!==undefined&&recovery.appId!==context.appId)
     ||!Number.isInteger(recovery.clearVersion)||typeof recovery.clearFingerprint!=='string'
@@ -683,7 +740,12 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
       if (manifest.capabilities.some(capability => capability !== 'data') || (manifest.capabilities.includes('data') && !manifest.data)) throw new Error('app_web_interfaces_required');
       await fsp.writeFile(file,JSON.stringify({...manifest,minimumClient:'1.9.0'}));
     }
+    const previousMeta = context ? readMeta(savedAppDir(userId,context.appId))
+      : editContext ? readMeta(path.join(editContextDir(userId,cid),'snapshot')) : undefined;
+    const origin = editContext && isBuiltinAppId(editContext.appId)
+      ? {id:editContext.appId,version:String(readMeta(path.join(editContextDir(userId,cid),'snapshot')).version || '')} : previousMeta?.builtinOrigin;
     const meta: SavedAppMeta = {
+      ...(origin ? {builtinOrigin:origin} : {}),
       ...(mode === 'new' || hasIsolatedBrowserStorage(userId, appId) ? { browserStorage: 'isolated-v1' as const } : {}),
       appType,
       ...(source ? {sourcePathKey:pathSourceKey(source.rootDir),entry} : {}),
@@ -710,6 +772,7 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
       // No await between the comparison and swap: other main-process actions
       // cannot silently overwrite a newer save, rename or deletion.
       if((await import('./users')).getActiveUserId()!==userId)throw new Error('app_edit_conflict');
+      if (guard && !guard.isActive()) throw new Error('app_save_closed');
       if (!isRealSavedAppDirectory(destDir)) throw new Error('app_edit_target_missing');
       if (fingerprintApp(destDir) !== context.fingerprint) throw new Error('app_edit_conflict');
       const backup = `${tmpDir}.previous`;
@@ -735,6 +798,7 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
         log.warn('edited app post-save cleanup deferred', { error: logErrorSummary(err) });
       }
     } else {
+      if (guard && !guard.isActive()) throw new Error('app_save_closed');
       await fsp.rename(tmpDir, destDir);
       // Do not report a successful copy if its source association could not be persisted.
       bindSave(userId,cid,artifactId,appId,source);
@@ -775,7 +839,7 @@ async function saveArtifact(userId: string, cid: string, artifactId: string, mod
 export async function saveFromPath(
   userId: string,
   targetPath: string,
-  opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown; mode?: SaveMode; recovery?:SaveRecovery } = {},
+  opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown; mode?: SaveMode; recovery?:SaveRecovery; guard?: SaveGuard } = {},
 ): Promise<Result<{ id: string; title: string; rootDir: string; entry: string; fileCount: number; totalBytes: number }>> {
   try {
     const inspected = await inspectBundle(targetPath, opts);
@@ -797,7 +861,7 @@ export async function saveFromPath(
       rootDir:realRoot,bindingRoot:inspected.rootDir,entry:inspected.entry,
       explicitEntry:/\.html?$/i.test(targetPath)&&fs.statSync(targetPath).isFile(),
       explicitTitle:!!opts.title,title,files:inspected.files!.map(file=>path.join(realRoot,path.relative(inspected.rootDir,file))),appType,sourceCid,
-    });
+    }, opts.guard);
     if (result.ok === false) return result;
     return {...result,rootDir:inspected.rootDir,entry:result.entry!,fileCount:inspected.fileCount,totalBytes:inspected.totalBytes};
   } catch (error) {
@@ -880,7 +944,9 @@ export function resolveSavedAppIndex(
   let safeId: string;
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, code: 'bad_input', error: (err as Error).message }; }
-  const root = path.resolve(savedAppDir(userId, safeId));
+  let root: string;
+  try { root = path.resolve(readableAppDir(userId, safeId)); }
+  catch { return { ok: false, code: 'not_found', error: 'app not found' }; }
   if (!isRealSavedAppDirectory(root)) {
     return { ok: false, code: 'not_found', error: 'app not found' };
   }
@@ -914,7 +980,9 @@ export function resolveSavedAppFilePath(
   let safeId: string;
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, code: 'bad_input', error: (err as Error).message }; }
-  const root = path.resolve(savedAppDir(userId, safeId));
+  let root: string;
+  try { root = path.resolve(readableAppDir(userId, safeId)); }
+  catch { return { ok: false, code: 'not_found', error: 'app not found' }; }
   if (!isRealSavedAppDirectory(root)) {
     return { ok: false, code: 'not_found', error: 'not found' };
   }
@@ -958,6 +1026,7 @@ export function resolveSavedAppFilePath(
 
 /** Rename a saved app (rewrites `__orkas-meta.json`). */
 export function renameSavedApp(userId: string, appId: string, title: unknown): Result<{ title: string }> {
+  if (isBuiltinAppId(appId)) return { ok: false, error: 'app_builtin_readonly' };
   recoverEditedSaves(userId);
   let safeId: string;
   try { safeId = safeAppId(appId); }
@@ -981,6 +1050,7 @@ export function renameSavedApp(userId: string, appId: string, title: unknown): R
 /** Delete a saved app (`rm -rf saved_apps/<appId>/`). */
 type DeleteResult = Result & { recoveryPending?: true };
 export async function deleteSavedApp(userId: string, appId: string): Promise<DeleteResult> {
+  if (isBuiltinAppId(appId)) return { ok: false, error: 'app_builtin_readonly' };
   recoverEditedSaves(userId);
   let safeId: string;
   try { safeId = safeAppId(appId); }
@@ -1367,18 +1437,26 @@ function readEditContext(userId: string, cid: string): EditContext | null {
     return {...data, appType: metadataAppType(data.appType)};
   } catch { return null; }
 }
-export async function getEditTarget(userId: string, cid: string): Promise<{ appId: string; title: string; appType: AppType } | null> {
+function readEditTarget(userId: string, cid: string) {
   const context = readEditContext(userId, cid);
   if (!context && (fs.existsSync(path.join(editContextDir(userId, cid),'context.json')) || fs.existsSync(path.join(editContextDir(userId, cid),'snapshot')))) throw Object.assign(new Error(t('web_apps.error_E_CLOSED')), { code: 'app_edit_context_unavailable' });
-  if (!context) return null;
+  if (!context || isBuiltinAppId(context.appId)) return null;
   const dir = savedAppDir(userId, context.appId);
   const persisted = isRealSavedAppDirectory(dir) ? storedAppType(dir) : undefined;
-  const appType = context.appType === 'web' || persisted === 'web' ? 'web' : context.appType ?? persisted ?? 'local';
+  const appType = context.appType === 'web' || persisted === 'web' ? 'web' as const : context.appType ?? persisted;
   return { appId: context.appId, title: context.title, appType };
+}
+
+export async function getEditTarget(userId: string, cid: string): Promise<{ appId: string; title: string; appType: AppType } | null> {
+  const target = readEditTarget(userId, cid);
+  return target ? { ...target, appType: target.appType ?? await resolveSavedAppType(userId, target.appId) } : null;
 }
 
 /** Read the structured task/edit binding without any publication lookup. */
 export async function boundAppType(userId: string, cid: string): Promise<AppType | undefined> {
+  const builtinContext = readEditContext(userId, cid);
+  if (builtinContext && isBuiltinAppId(builtinContext.appId)) return builtinContext.appType
+    ?? storedAppType(path.join(editContextDir(userId, cid), 'snapshot'));
   const target = await getEditTarget(userId, cid); if (target) return target.appType;
   const conversation = await chats.getConversationMetadata(userId, cid);
   // The sidebar's normalizing reader is deliberately tolerant. Its recovery
@@ -1408,9 +1486,9 @@ export async function boundAppType(userId: string, cid: string): Promise<AppType
 export async function resolveArtifactAppType(userId:string,cid:string,artifactId:string,meta=chatArtifacts.readArtifactMeta(userId,cid,artifactId)):Promise<AppType>{
   const resolved = chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
   if (!resolved.ok) throw new Error('artifact not found');
-  const bound = await boundAppType(userId, cid);
-  if (bound === 'web') return bound;
-  return storedAppType(resolved.dirPath) ?? bound ?? 'local';
+  const stored = storedAppType(resolved.dirPath);
+  if (stored) return stored;
+  return await boundAppType(userId, cid) ?? 'local';
 }
 
 /** Resolve only canonical managed pools; HTML content and manifest capabilities
@@ -1434,7 +1512,8 @@ export async function declaredArtifactAppType(userId:string,cid:string,artifactI
   const meta=chatArtifacts.readArtifactMeta(userId,cid,artifactId);
   if(meta?.appType)return meta.appType;
   const context=readEditContext(userId,cid);
-  if(context)return context.appType??storedAppType(savedAppDir(userId,context.appId))??'local';
+  if(context)return context.appType??storedAppType(isBuiltinAppId(context.appId)
+    ? path.join(editContextDir(userId,cid),'snapshot') : savedAppDir(userId,context.appId));
   if(fs.existsSync(path.join(editContextDir(userId,cid),'context.json')) || fs.existsSync(path.join(editContextDir(userId,cid),'snapshot')))return undefined;
   return await boundAppType(userId,cid)??'local';
 }
@@ -1507,18 +1586,27 @@ export async function openForEditing(
   userId: string,
   appId: string,
 ): Promise<Result<{ conversation: unknown; title: string; sourceFileName: string }>> {
+  const release = await acquireBuiltinApp(userId, appId);
+  try { return await openAppForEditing(userId, appId); }
+  finally { release(); }
+}
+
+async function openAppForEditing(userId: string, appId: string): Promise<Result<{ conversation: unknown; title: string; sourceFileName: string }>> {
   let safeId: string;
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
-  const dir = savedAppDir(userId, safeId);
+  let dir: string;
+  try { dir = readableAppDir(userId, safeId); }
+  catch { return { ok: false, error: 'app not found' }; }
   if (!isRealSavedAppDirectory(dir)) return { ok: false, error: 'app not found' };
   let title = DEFAULT_TITLE;
-  let appType: AppType = 'local';
+  let appType: AppType | undefined;
   try {
     const m = readMeta(dir);
-    if (m && typeof m.title === 'string' && m.title.trim()) title = m.title;
+    const displayTitle = isBuiltinAppId(safeId) ? builtinAppDisplayTitle(m, DEFAULT_TITLE) : m.title;
+    if (typeof displayTitle === 'string' && displayTitle.trim()) title = displayTitle;
   } catch { /* fallback */ }
-  try { appType = await resolveSavedAppType(userId, safeId); }
+  try { appType = storedAppType(dir); }
   catch (error) {
     log.warn('saved app type recovery unavailable', { error: logErrorSummary(error) });
     return { ok: false, error: t('web_apps.error_E_FAILED') };
@@ -1538,6 +1626,7 @@ export async function openForEditing(
     conv = await chats.createConversation(userId, {
       kind: 'normal',
       title: t('apps.edit_conv_title', { name: title }),
+      assistance: { kind: 'app_editing', title, sourceFileName: SOURCE_BUNDLE_NAME },
     });
   } catch (err) {
     log.warn('openForEditing createConversation failed', {

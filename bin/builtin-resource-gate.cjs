@@ -11,6 +11,9 @@ const BUILTIN_EXTRA_RESOURCE_FILTERS = Object.freeze([
   '!**/.DS_Store',
   '!**/__pycache__/**',
   '!**/*.pyc',
+  '!**/{test,tests,__tests__,test-results,playwright-report,coverage}/**',
+  '!**/*.{test,spec}.{js,cjs,mjs,ts,tsx,jsx,py}',
+  '!**/{test_*,*_test}.py',
 ]);
 const SAFE_SKILL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const MARKETPLACE_ID = /^[0-9a-f]{12}$/;
@@ -54,7 +57,6 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
     'bcfcb4921dce',
     'e0f3a98c624b',
     'e064dca9e1bd',
-    'fa3e1f2f9e07',
   ]),
   marketplace_skills: Object.freeze([
     '081c15ffbab4',
@@ -72,12 +74,14 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
     'c72c656eca12',
     'c91a84e7b206',
     'd47b20f9a631',
+    'de1fe2e2c26a',
     'de52c67d49dd',
     'e8868f762c1d',
     'e7f5c0e6f1be',
     'ee99fbb42964',
     'f283632103ba',
     'f347f715469c',
+    'fb79ebe322c7',
     'fc125b9df078',
   ]),
 });
@@ -90,6 +94,14 @@ function isIgnoredJunk(relativePath) {
   const parts = slash(relativePath).split('/');
   const name = parts.at(-1) || '';
   return name === '.DS_Store' || name.endsWith('.pyc') || parts.includes('__pycache__');
+}
+
+function isDevelopmentOnlyResource(relativePath) {
+  const parts = slash(relativePath).split('/');
+  const name = parts.pop() || '';
+  return parts.some(part => ['test', 'tests', '__tests__', 'test-results', 'playwright-report', 'coverage'].includes(part))
+    || /\.(?:test|spec)\.(?:js|cjs|mjs|ts|tsx|jsx|py)$/.test(name)
+    || /^(?:test_.*|.*_test)\.py$/.test(name);
 }
 
 function requiredDirectory(label, dir) {
@@ -126,6 +138,10 @@ function collectBuiltinFiles(root, options = {}) {
       const absolute = path.join(dir, entry.name);
       const relativePath = slash(path.relative(root, absolute));
       if (relativePath === BUILTIN_MANIFEST_NAME) continue;
+      if (isDevelopmentOnlyResource(relativePath)) {
+        if (options.allowIgnoredJunk || options.allowDevelopmentFiles) continue;
+        throw new Error('[builtin-resource-gate] development-only content is not allowed in a packaged builtin');
+      }
       if (options.allowIgnoredJunk && isIgnoredJunk(relativePath)) continue;
       if (entry.isSymbolicLink()) {
         throw new Error(`[builtin-resource-gate] symbolic links are not allowed: ${absolute}`);
@@ -568,11 +584,31 @@ function createBuiltinManifest(root, options = {}) {
     content_tree_sha256: contentTreeSha256(files),
     files,
     inventory: {
+      apps: builtinAppInventory(root),
       system_skills: systemSkillInventory(root),
       marketplace_agents: marketplaceAgentInventory(root, marketplaceSkills),
       marketplace_skills: marketplaceSkills,
     },
   };
+}
+
+function builtinAppInventory(root) {
+  const appsRoot = path.join(root, 'apps');
+  const ids = directoryNames('builtin apps', appsRoot);
+  exactNames('required builtin app inventory', ids, ['builtin-content-workbench','builtin-product-listing']);
+  return ids.map(id => {
+    const dir = path.join(appsRoot,id);
+    const meta = readJson(`builtin app ${id} metadata`,path.join(dir,'__orkas-meta.json'));
+    if (!SEMVER.test(meta.version || '') || !['local','web'].includes(meta.appType)
+      || typeof meta.title !== 'string' || !meta.title.trim()) throw new Error(`[builtin-resource-gate] invalid builtin app metadata: ${id}`);
+    const entry = meta.entry || 'index.html';
+    if (typeof entry !== 'string' || entry.includes('\\') || entry.split('/').some(p => !p || p === '.' || p === '..')
+      || !/\.html?$/.test(entry)) throw new Error(`[builtin-resource-gate] invalid builtin app entry: ${id}`);
+    requiredFile(`builtin app ${id} entry`,path.join(dir,entry));
+    const manifest = readJson(`builtin app ${id} SDK manifest`,path.join(dir,'orkas-app.json'));
+    if (manifest.sdkVersion !== 1 || !Array.isArray(manifest.capabilities)) throw new Error(`[builtin-resource-gate] invalid builtin app SDK manifest: ${id}`);
+    return {id,version:meta.version,entry,appType:meta.appType};
+  });
 }
 
 function verifyBuiltinRoot(root, options = {}) {

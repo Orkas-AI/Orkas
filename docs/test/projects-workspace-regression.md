@@ -2,6 +2,51 @@
 
 本规范覆盖本机项目、任务、资料库、工作区和恢复。使用隔离的本地用户与临时文件。
 
+## Rich-document source revisions
+
+Rich-document reads and searches share `file_indexer.test.ts` and
+`file-tools.test.ts` source-revision coverage: PDF/DOCX/XLSX/PPTX edits that keep
+size and mtime, legacy metadata, atomic replacement with colliding timestamps,
+replacement during extraction/publication/read, shared concurrent preparation,
+and failure recovery. A current cache hit must not reread the original document.
+Persistent changes get at most three preparations; a changed in-flight page
+must fail rather than claim complete content. Local caches rebuild on demand;
+source files and other entries remain untouched. Windows/native package and
+unusual filesystem timestamp semantics need separate platform verification.
+
+DOCX source numbering is owned by `docx-numbering.test.ts`: original starts,
+instance overrides, nested restart/continuation, inherited styles, Roman/letter
+labels, manual text, bullets, tables and escaped labels must agree in Markdown,
+HTML and chunks. `office-extract.test.ts` covers concurrent Word/spreadsheet
+work, parser failure isolation and main-loop responsiveness. DOCX alone has an
+extraction revision: legacy read caches rebuild lazily, without touching sources
+or other formats. Existing ready knowledge-base entries still require explicit
+re-indexing; no automatic embedding or full-library rebuild is authorized.
+
+Numbering labels become literal text to prevent downstream renderers renumbering
+them. This preserves values, not native Word list indentation, accessibility
+semantics or page layout. Unsupported active number formats fail explicitly;
+Word fields, footnote numbering and unusual namespace/style constructs are not
+claimed as a complete Word numbering implementation. XML parsing is bounded
+(32 MiB per selected part, 64 MiB combined). Conversion uses the existing two-slot
+Office pool and trades extra cold latency/memory for main-thread responsiveness.
+Platform measurements and unresolved cache/native findings remain separate evidence; this procedure does not mark those findings accepted.
+
+## Due-day attention
+
+`src/renderer/modules/todo-due.js` shares ownership with the existing project
+and personal To-do views. A responsible user's unfinished work becomes visible
+on its local calendar due day and remains visible when overdue or viewed.
+Completion, deletion, clearing or postponing the day removes that attention;
+another member's work must not create the user's attention indicator.
+
+`todo-due.test.ts` covers invalid/future days, midnight and foreground calendar
+changes, event coalescing, stale responses, account isolation, failed-read
+snapshot preservation and local-only project tabs. `todos_e2e_due_date.spec.ts`
+owns the real-window personal/project/home entry-point journey in Chinese and
+English. Execution and log acceptance remain specific to each platform/run;
+this ownership entry does not mark unrelated project capabilities reviewed.
+
 ## 分层评测矩阵
 
 | 核心场景 | 预期用户结果 | 单测 / 集成 | Electron E2E | 模型 benchmark |
@@ -15,7 +60,35 @@
 
 ## 自动化覆盖
 
-`test/e2e/projects_e2e_smoke.spec.ts` 已通过真实 Electron 覆盖项目创建、重复名称行内错误、重命名、删除确认取消、回收站恢复、项目指令、项目记忆、To-do 状态、项目 Library 上传/预览/删除、删除项目时清除派生向量、恢复后重新索引、Agent 绑定，以及项目内真实模型会话和任务归属；同时验证项目指令/记忆进入实际模型请求、自包含请求不产生多余历史检索、跨会话搜索并读取同项目证据后直接续做，以及结果在整应用重启后恢复且不重新调用模型或重放历史检索。主进程测试额外覆盖并发创建/改名仍保持名称唯一、损坏 UTF-8 文件夹拒绝且不产生半份副本、项目 Library 符号链接不能越界读写，以及索引进行中删除项目时迟到结果不能复活本地向量库；the separately authorized model canary 固定了“先检索 Library 证据、不得凭模型记忆编造总结”及项目 scope/优先级/历史连续性场景。确定性的删除/恢复存储生命周期由单测与 Electron E2E 负责，不重复放入模型 benchmark。云同步和跨进程冲突仍按本文人工回归；扩展方式见 `docs/test/e2e-testing.md`。
+`test/e2e/projects_e2e_smoke.spec.ts` owns the real-window project journey:
+create, duplicate-name correction, rename, cancelled deletion, recycle recovery,
+instructions, memory, task state, Library upload/preview/delete, vector removal
+and re-indexing, Agent binding, conversation ownership, actual assembled project
+context, evidence-based cross-session continuation, and restart without replay.
+Run-specific execution and unresolved findings are recorded separately; listing
+these scenarios is not a current pass. Main-process cases own concurrent unique
+names, invalid UTF-8 directory rollback, symlink rejection and late indexing after
+delete. Private benchmark and cloud collaboration fixtures are excluded.
+
+## Refresh and failure recovery portfolio
+
+1. Type an unfinished project name, then force a list refresh that replaces the
+   focused DOM. Text, selection and focus survive; no blur-triggered creation
+   occurs. Cancel, reread durable state and verify no hidden project exists.
+2. Repeat for rename. Create and rename retain their draft, original value,
+   error, commit lock and request generation; redraw alone cannot submit either.
+3. Hold a create response while trying to edit the in-flight editor or rename a
+   different project. The active editor retains ownership; one accepted response
+   cannot be discarded as stale after the project was actually saved.
+4. Correct a duplicate name and retry successfully. Use real Electron for browser
+   blur semantics and deterministic delayed IPC cases for response ordering.
+5. Reject a project-list refresh: preserve the last successful sidebar snapshot.
+   Complete two overlapping refreshes in reverse order: the newer request wins.
+6. Reject child enumeration before cascading deletion: mutate nothing. Fail the
+   second child deletion after the first succeeds: restore and verify the exact
+   project/conversation/automation snapshot. A failed root removal also retains
+   the chosen machine-local workspace. Never report a half deletion as success.
+
 
 ## 项目 UI
 
@@ -59,7 +132,7 @@
 
 1. 从项目内新建对话、自动化、资料库文件，应带项目归属，并只显示在对应项目列表。
 2. 项目删除进入回收站后，关联任务、自动化、资料库文件应从 UI 移除；恢复后回到原项目。
-4. 完成一次 v4 项目目录迁移后连续重启，后续正常启动不应重复扫描/搬运旧目录；恢复旧版本地数据后，强制修复仍应将旧路径迁入项目目录。
+3. 完成一次 v4 项目目录迁移后连续重启，后续正常启动不应重复扫描/搬运旧目录；恢复旧版本地数据后，强制修复仍应将旧路径迁入项目目录。
 
 ## 项目说明与项目记忆
 

@@ -1,3 +1,4 @@
+import { appConversationForPath, appConversationRoot } from '../paths';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -112,7 +113,8 @@ export function imageGenerationControlStatePath(userId: string, projectDirAbs: s
     .update(`${userId}\0${path.resolve(projectDirAbs)}`)
     .digest('hex')
     .slice(0, 32);
-  return path.join(userLocalRoot(userId), 'image_studio', 'generation', `${key}.json`);
+  const cid = appConversationForPath(userId, projectDirAbs);
+  return path.join(cid ? appConversationRoot(userId, cid)! : path.join(userLocalRoot(userId), 'image_studio'), 'generation', `${key}.json`);
 }
 
 export async function readImageGenerationControlState(stateAbsPath: string): Promise<ImageGenerationControlState | null> {

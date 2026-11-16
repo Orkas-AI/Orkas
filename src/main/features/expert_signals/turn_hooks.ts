@@ -7,6 +7,7 @@
  */
 
 import { emitSignal } from './index';
+import { appConversationOwner } from '../../paths';
 import { isTransientError } from '../../util/transient-errors';
 import {
   buildSkillIneffectiveSignal,
@@ -80,6 +81,7 @@ export function createSkillTurnBuffer(): SkillTurnBuffer {
       invoked.add(enc(system, skill_id));
     },
     drainAndEmit({ uid, cid, aid, turn_id, msg_ids, errText, aborted }) {
+      if (appConversationOwner(cid)) return;
       if (!turn_id) {
         // Without a turn id (= agent msg id) the signal can't be joined to
         // anything else — drop instead of emitting a useless record.
@@ -154,6 +156,7 @@ export function onAgentTurnEnd(args: {
   agentMsg: { id: string; text: string };
   errText?: string;
 }): void {
+  if (appConversationOwner(args.cid)) return;
   try {
     const aid = args.isCommander ? null : args.actorId;
     const turn_id = args.agentMsg.id;

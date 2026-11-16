@@ -377,9 +377,13 @@ describe("AgentRunner — parallel tool execution (G4)", () => {
       const contextWrites = writeSpy.mock.calls.filter(
         ([target]) => target === `${contextFile}.tmp`,
       );
-      // The full run has five durability boundaries. Regressing to one sidecar
-      // rewrite per parallel result raises this from five to seven.
-      expect(contextWrites).toHaveLength(5);
+      // Changed recovery state is saved at turn creation, settled batch and
+      // turn completion. The two assistant rows are still durable in JSONL;
+      // they no longer rewrite an identical recovery snapshot.
+      expect(contextWrites).toHaveLength(3);
+      const savedStates = contextWrites.map(([, body]) => JSON.parse(String(body)));
+      expect(savedStates.filter(state => state.activeTurn && state.completedWork?.length === 3)).toHaveLength(1);
+      expect(savedStates.at(-1).activeTurn).toBeUndefined();
       expect(session.getExecutionPlan()).toBeUndefined();
 
       const transcript = fs.readFileSync(sessionFile, "utf8")

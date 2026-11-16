@@ -13,7 +13,33 @@
   const mounts = new Map();
   const activeTurns = new Map();
   const dockEntries = new Map();
+  const questionsByCid = new Map();
+  const blockingByCid = new Map();
+  const waiting = new Map();
   let visibleCid = null;
+
+  function isLiveQuestion(cid, question) {
+    return activeTurns.get(cid)?.some(turn => turn.actor === question.actor
+      && turn.turn_id === question.turnId && turn.steerable === true) === true;
+  }
+
+  // Observe background messages without mounting cards. History alone cannot
+  // establish attention: the exact question turn must still accept steering.
+  function updateWaiting(cid) {
+    let count = blockingByCid.get(cid)?.size || 0;
+    for (const [key, question] of questionsByCid.get(cid) || []) {
+      if (!question.expired && !replies.has(key) && !cancelledQuestions.has(key)
+          && isLiveQuestion(cid, question)) count += 1;
+    }
+    if (count === (waiting.get(cid) || 0)) return;
+    if (count) waiting.set(cid, count);
+    else waiting.delete(cid);
+    window.dispatchEvent(new CustomEvent('cli-waiting-changed'));
+  }
+
+  function closeBlockingRequests(cid) {
+    for (const close of [...(blockingByCid.get(cid)?.values() || [])]) close();
+  }
 
   function syncDock() {
     const dock = document.getElementById('chat-cli-questions');
@@ -60,6 +86,16 @@
   const keyFor = (cid, id) => JSON.stringify([cid, id]);
 
   function observe(cid, message) {
+    const question = message?.cli_question;
+    const messageId = message?.id || message?._msg_id;
+    if (cid && messageId && Array.isArray(question?.questions) && question.questions.length) {
+      if (!questionsByCid.has(cid)) questionsByCid.set(cid, new Map());
+      const questions = questionsByCid.get(cid);
+      const key = keyFor(cid, messageId);
+      if (!questions.has(key)) questions.set(key, {
+        actor: message.from || message._from, turnId: message.turn_id || message._turn_id,
+      });
+    }
     if (message?.cli_question?.cancelled === true) {
       const key = keyFor(cid, message.id || message._msg_id);
       cancelledQuestions.add(key);
@@ -68,12 +104,14 @@
       refresh(key);
     }
     const answer = message && message.cli_answer;
-    if (!answer || !Array.isArray(answer.answers)) return;
-    const key = keyFor(cid, answer.message_id);
-    replies.set(key, answer.answers.slice());
-    drafts.delete(key);
-    pendingSaves.delete(key);
-    refresh(key);
+    if (answer && Array.isArray(answer.answers)) {
+      const key = keyFor(cid, answer.message_id);
+      replies.set(key, answer.answers.slice());
+      drafts.delete(key);
+      pendingSaves.delete(key);
+      refresh(key);
+    }
+    if (question || answer) updateWaiting(cid);
   }
 
   function refresh(key) {
@@ -112,8 +150,7 @@
       const answers = saved || drafts.get(key) || questions.map(() => '');
       if (!saved && !cancelled) drafts.set(key, answers);
       const turns = activeTurns.get(cid);
-      const closed = expired || (Array.isArray(turns) && !turns.some(turn =>
-        turn.actor === actor && turn.turn_id === turnId && turn.steerable === true));
+      const closed = expired || (Array.isArray(turns) && !isLiveQuestion(cid, { actor, turnId }));
       const title = document.createElement('div');
       title.className = 'form-title';
       title.textContent = t(saved || savePending ? 'chat.cli_question.answered'
@@ -206,6 +243,11 @@
           error = t('chat.cli_question.cancel_failed');
         } finally {
           pendingCancels.delete(key);
+          if (expired) {
+            const question = questionsByCid.get(cid)?.get(key);
+            if (question) question.expired = true;
+          }
+          updateWaiting(cid);
           refresh(key);
         }
       });
@@ -233,6 +275,11 @@
           error = t('chat.cli_question.send_failed');
         } finally {
           submitting = false;
+          if (expired) {
+            const question = questionsByCid.get(cid)?.get(key);
+            if (question) question.expired = true;
+          }
+          updateWaiting(cid);
           paint();
         }
       });
@@ -469,33 +516,47 @@
       },
       onClosed: () => {
         dockEntries.delete(id);
+        const requests = blockingByCid.get(cid);
+        requests?.delete(id);
+        if (!requests?.size) blockingByCid.delete(cid);
         entry.host.remove();
         syncDock();
+        updateWaiting(cid);
         spec.onClosed?.();
       },
     });
     if (!settle) return null;
     dockEntries.set(id, entry);
+    if (!blockingByCid.has(cid)) blockingByCid.set(cid, new Map());
+    blockingByCid.get(cid).set(id, settle);
     syncDock();
+    updateWaiting(cid);
     return settle;
   }
 
   window.CliAsyncInput = {
     mount, showQuestion, observe, showCliInputRequest,
+    waitingCids: () => new Set(waiting.keys()),
+    waitingCount: cid => waiting.get(cid) || 0,
     showConversation(cid) {
       visibleCid = cid || null;
       syncDock();
     },
     setActiveTurns(cid, turns) {
       if (!Array.isArray(turns)) return;
+      if (!turns.length) closeBlockingRequests(cid);
       const old = activeTurns.get(cid);
       const identity = values => values.map(turn => [turn.actor, turn.turn_id, turn.steerable]);
       if (old && JSON.stringify(identity(old)) === JSON.stringify(identity(turns))) return;
       activeTurns.set(cid, turns);
+      updateWaiting(cid);
       for (const [key, list] of mounts) if ([...list].some(item => item.cid === cid)) refresh(key);
     },
     forget(cid) {
       activeTurns.delete(cid);
+      questionsByCid.delete(cid);
+      closeBlockingRequests(cid);
+      updateWaiting(cid);
       for (const [key, entry] of dockEntries) if (entry.cid === cid) dockEntries.delete(key);
       syncDock();
       for (const collection of [drafts, replies, mounts, pendingSaves, cancelledQuestions, pendingCancels]) {

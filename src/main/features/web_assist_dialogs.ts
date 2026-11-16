@@ -1,6 +1,6 @@
 /** Task-local adapter for Electron 42's -run-dialog callback boundary.
  * CDP alone cannot suppress Electron's parallel native dialog handler. Keep the
- * built-in listener for manual control and scope interception to this contents.
+ * built-in listener for unsupported hosts and scope interception to this contents.
  * The real-Electron journey is the compatibility oracle for this private event;
  * unknown listener layouts retain Electron behavior rather than patching globals.
  */
@@ -28,8 +28,8 @@ export class WebAssistDialogOpenedError extends Error {
 let registered = false;
 const controllers = new WeakMap<WebContents, ReturnType<typeof createController>>();
 
-function createController(contents: WebContents, authority: () => string | undefined, changed: () => void,
-  native: (...args: any[]) => void) {
+function createController(contents: WebContents, authority: () => string | undefined, changed: (pendingChanged: boolean) => void,
+  native: (...args: any[]) => void, autoDismissAlerts: () => boolean) {
   let pending: Pending | undefined;
   let alerts: Array<{ type: 'alert'; message: string; message_truncated?: true }> = [];
   let omittedAlerts = 0;
@@ -39,7 +39,7 @@ function createController(contents: WebContents, authority: () => string | undef
     const dialog = pending;
     if (!dialog) return;
     pending = undefined;
-    changed();
+    changed(true);
     dialog.reply(accepted, value);
   };
   const cancel = () => finish(false);
@@ -55,14 +55,14 @@ function createController(contents: WebContents, authority: () => string | undef
     // Chromium serializes dialogs per contents. A second callback must never
     // replace a live decision or resolve it as approved.
     if (pending) { reply(false, ''); return; }
-    changed();
-    if (info.dialogType === 'alert') {
+    if (info.dialogType === 'alert' && autoDismissAlerts()) {
       if (alerts.length < 4) alerts.push({ type: 'alert', message: info.messageText.slice(0, 500), ...(info.messageText.length > 500 ? { message_truncated: true as const } : {}) });
       else omittedAlerts++;
-      reply(true, '');
+      changed(false); reply(true, '');
       return;
     }
     pending = { id: genId12(), authority: owner, info, reply, value: info.defaultPromptText };
+    changed(true);
     for (const wake of waiting) wake();
   };
   const prompt = (event: IpcMainEvent, message: unknown, defaultValue: unknown) => {
@@ -113,12 +113,6 @@ function createController(contents: WebContents, authority: () => string | undef
       } finally { waiting.delete(wake); }
     },
     pending: () => current(),
-    handback() {
-      const dialog = pending;
-      if (!dialog) return;
-      pending = undefined; changed();
-      native.call(contents, dialog.info, dialog.reply);
-    },
     notices() {
       if (!alerts.length && !omittedAlerts) return {};
       const result = { dismissed_dialogs: alerts, ...(omittedAlerts ? { dismissed_dialogs_omitted: omittedAlerts } : {}) };
@@ -132,8 +126,10 @@ function createController(contents: WebContents, authority: () => string | undef
         dialog.value = text!;
         return { ok: true, outcome: 'acted', action };
       }
-      const accepted = action === 'click' && ref === 'e1' || action === 'press' && keys === 'Enter';
-      const dismissed = action === 'click' && ref === 'e2' || action === 'press' && keys === 'Escape';
+      const accepted = action === 'click' && ref === 'e1' || action === 'press'
+        && (keys === 'Enter' || dialog.info.dialogType === 'alert' && keys === 'Escape');
+      const dismissed = dialog.info.dialogType !== 'alert'
+        && (action === 'click' && ref === 'e2' || action === 'press' && keys === 'Escape');
       if (!accepted && !dismissed) return { ok: false, code: 'invalid_action', error: 'This dialog supports its OK/Cancel buttons, prompt input, Enter or Escape.' };
       finish(accepted, accepted && dialog.info.dialogType === 'prompt' ? dialog.value : '');
       return { ok: true, outcome: 'acted', action };
@@ -141,11 +137,12 @@ function createController(contents: WebContents, authority: () => string | undef
   };
 }
 
-export function attachWebAssistDialogs(contents: WebContents, authority: () => string | undefined, changed: () => void) {
+export function attachWebAssistDialogs(contents: WebContents, authority: () => string | undefined, changed: (pendingChanged: boolean) => void,
+  autoDismissAlerts: () => boolean = () => true) {
   // Lightweight hosts without Electron's built-in handler keep their old seam.
   const listeners = contents.listeners?.('-run-dialog');
   if (!listeners || listeners.length !== 1) return undefined;
-  const controller = createController(contents, authority, changed, listeners[0] as (...args: any[]) => void);
+  const controller = createController(contents, authority, changed, listeners[0] as (...args: any[]) => void, autoDismissAlerts);
   controllers.set(contents, controller);
   return controller;
 }

@@ -76,6 +76,7 @@ describe('assessVoiceoverCoverage', () => {
     expect(cv.trailingGapSec).toBeCloseTo(7.65, 2);
     expect(cv.overshootSec).toBeLessThan(0);
     expect(cv.warnings.join(' ')).toMatch(/silent tail|uncovered/i);
+    expect(cv.warnings.join(' ')).not.toMatch(/trim the clip|lengthen the script|closing line/i);
   });
 
   it('flags overshoot (narration longer than the clip → truncated)', () => {
@@ -114,11 +115,12 @@ describe('assessVoiceoverCoverage', () => {
     });
     expect(cv.voicedStartSec).toBe(4);
     expect(cv.voicedEndSec).toBe(14);
+    expect(cv.warnings.join(' ')).not.toMatch(/trim the head|reduce the offset/i);
     expect(cv.trailingGapSec).toBeCloseTo(6, 5); // 20 - 14
     expect(cv.warnings.join(' ')).toMatch(/silent tail|uncovered/i);
   });
 
-  it('reports interior dead air instead of scoring how far the last line reached (the 95% lie)', () => {
+  it('reports interior uncovered intervals without deciding they need narration (the 95% lie)', () => {
     // The 2026-08-05 draft: seven lines pinned to scene starts on a 60 s cut,
     // 29.7 s of it silent in holes up to 6.9 s — and the old ratio still said
     // 0.95 because the last line ended at 56.8 s. The report has to carry the
@@ -142,8 +144,8 @@ describe('assessVoiceoverCoverage', () => {
     expect(cv.maxInteriorGapSec).toBeCloseTo(6.88, 1);
     expect(cv.interiorGaps.length).toBe(6);
     expect(cv.interiorGaps[0]).toMatchObject({ startSec: 19.41, endSec: 26.29 });
-    expect(cv.warnings.join(' ')).toMatch(/dead air/i);
-    expect(cv.warnings.join(' ')).toMatch(/music bed|re-time|shorten/i);
+    expect(cv.warnings.join(' ')).toMatch(/uncovered/i);
+    expect(cv.warnings.join(' ')).not.toMatch(/dead air|music bed|re-time|shorten/i);
   });
 
   it('reports two lines speaking at once — the 2026-08-06 double-narration mix', () => {

@@ -31,7 +31,195 @@ function cardNodes(node: any): any[] {
   return [node, ...(node.children || []).flatMap(cardNodes)];
 }
 
+describe('project to-do asynchronous ownership and recovery', () => {
+  function harness(elements: Record<string, any> = {}, invoke = vi.fn(async () => ({ ok: true }))) {
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn() }),
+      document: { readyState: 'loading', addEventListener() {}, getElementById: (id: string) => elements[id] || null },
+      window: { addEventListener() {}, orkas: { invoke } },
+      uiConfirmDanger: async () => true, t: (key: string) => key, setTimeout, clearTimeout,
+    });
+    vm.runInContext(source, context);
+    return context;
+  }
+
+  it('does not clear the new account error state when an old account list finishes', async () => {
+    let finish!: (value: any) => void;
+    const error = { hidden: false };
+    const context = harness({ 'project-todo-error': error }, vi.fn(() => new Promise(resolve => { finish = resolve; })));
+    vm.runInContext("_projectDetailPid = 'p_one';", context);
+    const pending = context._loadProjectTodos('p_one');
+    context.currentUserId = 'other';
+    finish({ ok: true, tasks: [] });
+    await pending;
+    expect(error.hidden).toBe(false);
+    expect(vm.runInContext('_projectTodos.length', context)).toBe(0);
+  });
+
+  it.each(['busy', 'loading'])('closes the Agent menu when the editor becomes %s', state => {
+    const trigger = { disabled: false };
+    const close = vi.fn();
+    const context = harness({
+      'project-todo-input': { value: 'Keep this draft.', maxLength: 1000 },
+      'project-todo-agent': { querySelector: () => trigger },
+    });
+    context.closeAgentMenu = close;
+    vm.runInContext(`_todoEditorAgentSelect = { close: closeAgentMenu }; ${state === 'busy' ? '_projectTodoMutating' : '_todoEditorAgentLoading'} = true;`, context);
+    context._updateProjectTodoEditor();
+    expect(trigger.disabled).toBe(true);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('does not mutate a task that disappeared from the current list', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const context = harness({}, invoke);
+    await context._setTodoStatus('gone', 'review', { pid: '', tasks: [] });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('keeps a stored Agent identity readable with the shared Agent glyph when its profile is missing', () => {
+    const element = (tag: string): any => {
+      const node: any = { tag, children: [], dataset: {}, className: '', attributes: {},
+        appendChild(child: any) { this.children.push(child); return child; },
+        setAttribute(key: string, value: string) { this.attributes[key] = value; } };
+      node.classList = { add: (name: string) => { node.className += ` ${name}`; } };
+      return node;
+    };
+    const context = harness();
+    context.document.createElement = element;
+    context.escapeHtml = String;
+    context.uiIconHtml = (name: string) => `<svg data-icon="${name}"></svg>`;
+    const card = context._renderTodoCard({ id: 't_one', status: 'todo', owner_agent_id: 'stored_agent' }, { pid: '', global: true, agents: [] });
+    const button = cardNodes(card).find(node => node.dataset.action === 'todo-assign');
+    expect(button.innerHTML).toContain('stored_agent');
+    expect(button.innerHTML).toContain('data-icon="users"');
+    expect(button.disabled).not.toBe(true);
+  });
+
+  it('keeps the deletion failure actionable and records the bounded local failure', async () => {
+    const alerts = vi.fn();
+    const diagnostic = vi.fn();
+    const invoke = vi.fn(async () => ({ ok: false, error: 'not_found' }));
+    const context = harness({}, invoke);
+    context.uiAlert = alerts;
+    context._projectLogFailure = diagnostic;
+    const task = { id: 't_one', content: 'Keep the original task.', status: 'todo' };
+    await context._deleteTodoTask(task.id, { pid: '', tasks: [task] });
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(alerts).toHaveBeenCalledWith('project.todo.failed');
+    expect(diagnostic).toHaveBeenCalledWith('project_todo_action', expect.objectContaining({ action: 'delete', error_code: 'not_found' }));
+    expect(task).toEqual({ id: 't_one', content: 'Keep the original task.', status: 'todo' });
+  });
+
+  it.each(['uploading', 'deleting'])('keeps a project draft and sends nothing while an attachment is %s', async status => {
+    const input = { value: 'Keep my project question.' };
+    const create = vi.fn();
+    const alert = vi.fn();
+    const context = harness({ 'project-chat-input': input });
+    vm.runInContext(composerAccessorSource, context);
+    vm.runInContext("_projectDetailPid = 'p_one';", context);
+    context.apiFetch = create;
+    context.uiAlert = alert;
+    context.ensureModelConfigured = () => true;
+    context._getQuotes = () => [];
+    context._chatAttachList = () => [{ name: 'brief.pdf', status }];
+    await context._submitProjectChat();
+    expect(create).not.toHaveBeenCalled();
+    expect(input.value).toBe('Keep my project question.');
+    expect(alert).toHaveBeenCalledWith('chat.attach_still_uploading');
+  });
+});
+
 describe('project to-do controls', () => {
+  it.each(['upcoming', 'overdue'])('shows a to-do\'s due day in the meta row and marks an %s one only while the task is open', (kind) => {
+    const element = (tag: string): any => {
+      const node: any = { tag, children: [], dataset: {}, className: '', attributes: {},
+        appendChild(child: any) { this.children.push(child); return child; },
+        setAttribute(key: string, value: string) { this.attributes[key] = value; },
+        querySelector() { return this.children.find((child: any) => child.className === 'project-todo-title'); },
+      };
+      node.classList = {
+        add(value: string) { node.className += ` ${value}`; },
+        toggle(value: string, enabled: boolean) {
+          const classes = node.className.split(' ').filter((name: string) => name !== value);
+          if (enabled) classes.push(value);
+          node.className = classes.join(' ');
+        },
+      };
+      return node;
+    };
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, createElement: element },
+      window: { addEventListener() {}, orkas: { invoke: vi.fn() } },
+      t: (key: string, vars?: Record<string, unknown>) => `${key}${vars?.date !== undefined ? `:${vars.date}` : ''}`,
+      escapeHtml: (value: unknown) => String(value),
+    });
+    vm.runInContext(source, context);
+    const pad = (value: number) => String(value).padStart(2, '0');
+    const now = new Date();
+    const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() + (kind === 'overdue' ? -3 : 3));
+    const due_at = `${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}`;
+    const scope = { pid: 'p_one', global: false, tasks: [], project: {}, agents: [], members: [] };
+    const metaOf = (card: any) => card.children.find((child: any) => child.className === 'todo-card-meta')?.children || [];
+    const dueOf = (card: any) => metaOf(card).find((child: any) => String(child.className).startsWith('project-todo-due'));
+
+    const open = dueOf(context._renderTodoCard({ id: 't_1', content: 'Send it', status: 'todo', due_at }, scope));
+    expect(open.textContent).toMatch(new RegExp(`^project\\.todo\\.${kind === 'overdue' ? 'due_overdue' : 'due_on'}:.+`));
+    expect(open.textContent).not.toContain(due_at);
+    expect(String(open.className).includes('is-overdue')).toBe(kind === 'overdue');
+    // A finished task is never overdue, and an undated one shows no day.
+    const done = dueOf(context._renderTodoCard({ id: 't_2', content: 'Done', status: 'done', due_at }, scope));
+    expect(String(done.className).includes('is-overdue')).toBe(false);
+    expect(dueOf(context._renderTodoCard({ id: 't_3', content: 'Plain', status: 'todo' }, scope))).toBeUndefined();
+  });
+
+  it.each(['global', 'private'])('requires confirmation before deleting a %s to-do and preserves cancellation and account isolation', async (kind) => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    let resolveConfirmation!: (confirmed: boolean) => void;
+    const uiConfirmDanger = vi.fn(() => new Promise<boolean>(resolve => { resolveConfirmation = resolve; }));
+    let items: any[] = [];
+    const task = { id: 't_aaaaaaaaaaaa', content: 'Review <release> & notes', status: 'todo' };
+    const scope = { pid: kind === 'global' ? '' : 'p_one', global: kind === 'global', tasks: [task],
+      project: {}, agents: [] };
+    const context = vm.createContext({ currentUserId: 'me', uiConfirmDanger,
+      createLogger: () => ({ warn() {}, info() {}, error() {} }),
+      document: { readyState: 'loading', addEventListener() {}, getElementById() { return null; } },
+      window: { addEventListener() {}, orkas: { invoke } },
+      showContextMenu(_event: any, next: any[]) { items = next; },
+      t: (key: string) => key, setTimeout, clearTimeout,
+    });
+    vm.runInContext(source, context);
+    context._openTodoRowMenu({}, task.id, scope);
+    const remove = items.find(item => item.label === 'project.todo.delete');
+    const cancelled = remove.onClick();
+    expect(uiConfirmDanger).toHaveBeenCalledWith({
+      title: 'project.todo.delete_confirm', message: task.content, dangerLabel: 'project.todo.delete',
+    });
+    expect(invoke).not.toHaveBeenCalled();
+    resolveConfirmation(false);
+    await cancelled;
+    expect(invoke).not.toHaveBeenCalled();
+    expect(scope.tasks).toEqual([task]);
+
+    const changedAccount = remove.onClick();
+    context.currentUserId = 'other-account';
+    resolveConfirmation(true);
+    await changedAccount;
+    expect(invoke).not.toHaveBeenCalled();
+
+    context.currentUserId = 'me';
+    const confirmed = remove.onClick();
+    expect(invoke).not.toHaveBeenCalled();
+    resolveConfirmation(true);
+    await confirmed;
+    expect(invoke.mock.calls).toEqual([
+      ['projects.tasks.delete', { projectId: scope.pid, taskId: task.id }],
+    ]);
+    expect(remove.danger).toBe(true);
+  });
+
+
   it.each(['same board', 'account', 'project', 'grouping'])('keeps reading positions only within the mounted scope: %s', (change) => {
     const element = (): any => ({
       children: [], dataset: {}, scrollTop: 0, scrollLeft: 0,

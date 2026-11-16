@@ -137,6 +137,7 @@ describePosix('local_agents/backends/codex process lifecycle', () => {
     fs.writeFileSync(fakeCodexPath, `#!/usr/bin/env node
 const fs = require('node:fs');
 const specialScenarios = [
+  'eof-completed', 'eof-failed', 'eof-interrupted', 'eof-answer', 'eof-truncated',
   'exit-with-child',
   'bootstrap-hang',
   'resume-hang',
@@ -312,6 +313,22 @@ process.stdin.on('data', (chunk) => {
         send({ jsonrpc: '2.0', method: 'turn/started', params: {
           threadId: 'fresh-thread', turn: { id: 'turn-1' },
         } });
+        if (scenario.startsWith('eof-')) {
+          if (scenario === 'eof-failed' || scenario === 'eof-truncated') {
+            send({ method: 'item/agentMessage/delta', params: { threadId: 'fresh-thread', itemId: 'answer', delta: 'Partial reply.' } });
+          }
+          const final = scenario === 'eof-truncated' ? '{"method":"turn/completed","params":' : JSON.stringify(
+            scenario === 'eof-answer'
+              ? { method: 'item/completed', params: { threadId: 'fresh-thread', item: { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'Final 中文🙂 reply.' } } }
+              : { method: 'turn/completed', params: { threadId: 'fresh-thread', turn: { id: 'turn-1', status: scenario.slice(4),
+                  ...(scenario === 'eof-failed' ? { error: { message: 'Fixture connection failed' } } : {}) } } }
+          );
+          const bytes = Buffer.from(final);
+          const split = bytes.indexOf(Buffer.from('中')) + 1;
+          process.stdout.write(bytes.subarray(0, split));
+          setTimeout(() => process.stdout.end(bytes.subarray(split), () => process.exit(0)), 20);
+          continue;
+        }
         if (scenario === 'fatal-lingers') {
           send({ jsonrpc: '2.0', method: 'error', params: {
             threadId: 'fresh-thread',
@@ -926,6 +943,27 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     expect(events.filter(event => event.type === 'done')).toHaveLength(1);
     expect(events.at(-1)).toMatchObject({ status: 'completed' });
   });
+  it.each(['completed', 'failed', 'interrupted', 'answer', 'truncated'])('preserves the final stdout record at EOF: %s', async scenario => {
+    const events: any[] = [];
+    await codexBackend.run({ binPath: fakeCodexPath, prompt: 'Complete the EOF fixture', cwd: tempDir,
+      customArgs: ['--eof-' + scenario], signal: new AbortController().signal,
+      timeoutMs: 3_000, onEvent: event => events.push(event) });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done', sessionId: 'fresh-thread' });
+    if (scenario === 'failed') {
+      expect(events.at(-1)).toMatchObject({ status: 'failed', error: 'Fixture connection failed', output: 'Partial reply.' });
+    } else if (scenario === 'interrupted') {
+      expect(events.at(-1).status).toBe('cancelled');
+    } else if (scenario === 'truncated') {
+      expect(events).toContainEqual({ type: 'raw-line', line: '{"method":"turn/completed","params":' });
+      expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual(['Partial reply.']);
+    } else {
+      expect(events.at(-1)).toMatchObject({ status: 'completed', output: scenario === 'answer' ? 'Final 中文🙂 reply.' : '' });
+      expect(events.filter(event => event.type === 'text-delta').map(event => event.text))
+        .toEqual(scenario === 'answer' ? ['Final 中文🙂 reply.'] : []);
+    }
+  });
+
   it('falls back from an expired resume, restores recovery context, and completes the turn', async () => {
     const tracePath = path.join(tempDir, 'resume-trace.json');
     const events: any[] = [];

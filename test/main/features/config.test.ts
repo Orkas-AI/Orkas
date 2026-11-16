@@ -274,3 +274,30 @@ describe('features/config › getLanguage', () => {
     expect(process.env.ORKAS_ACCEPT_LANGUAGE).toBe(acceptLanguage);
   });
 });
+
+describe('account to-do grouping', () => {
+  it('restores its persisted value after reload, updates its own clock and isolates accounts', async () => {
+    let config = await import('../../../src/main/features/config');
+    config.writePreferences({ language: 'ja' });
+    expect(config.getTodoGrouping(TEST_UID)).toBe('project');
+    config.setTodoGrouping(TEST_UID, 'status');
+    const before = config.readPreferences();
+    expect(before.todo_grouping).toBe('status');
+    expect(before._field_updated_at?.todo_grouping).toBeGreaterThan(0);
+    expect(config.getTodoGrouping('other-user')).toBe('project');
+    config.setTodoGrouping(TEST_UID, 'status');
+    expect(config.readPreferences()).toEqual(before);
+    vi.resetModules();
+    config = await import('../../../src/main/features/config');
+    expect(config.getTodoGrouping(TEST_UID)).toBe('status');
+  });
+
+  it('rejects unsupported writes and reads legacy or unknown values without rewriting them', async () => {
+    const config = await import('../../../src/main/features/config');
+    config.writePreferences({ todo_grouping: 'future-mode' as any, language: 'en' });
+    const before = config.readPreferences();
+    expect(config.getTodoGrouping(TEST_UID)).toBe('project');
+    expect(() => config.setTodoGrouping(TEST_UID, 'unknown')).toThrow('invalid todo grouping');
+    expect(config.readPreferences()).toEqual(before);
+  });
+});

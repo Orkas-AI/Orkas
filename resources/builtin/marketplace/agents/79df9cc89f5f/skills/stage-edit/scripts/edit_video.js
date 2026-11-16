@@ -100,6 +100,8 @@ function parseArgs(args) {
     else if (a === '--subtitles' || a === '--subtitles-path') { out.subtitlesPath = nextValue(args, i, a); i += 1; }
     else if (a.startsWith('--subtitles=')) out.subtitlesPath = a.slice('--subtitles='.length);
     else if (a.startsWith('--subtitles-path=')) out.subtitlesPath = a.slice('--subtitles-path='.length);
+    else if (a === '--cover') { out.cover = nextValue(args, i, a); i += 1; }
+    else if (a.startsWith('--cover=')) out.cover = a.slice('--cover='.length);
     else if (a === '--overlay' || a === '--overlay-path') { out.overlayPath = nextValue(args, i, a); i += 1; }
     else if (a.startsWith('--overlay=')) out.overlayPath = a.slice('--overlay='.length);
     else if (a.startsWith('--overlay-path=')) out.overlayPath = a.slice('--overlay-path='.length);
@@ -107,6 +109,7 @@ function parseArgs(args) {
     else if (a.startsWith('--transcript=')) out.transcriptPath = a.slice('--transcript='.length);
     else if (a.startsWith('--transcript-path=')) out.transcriptPath = a.slice('--transcript-path='.length);
     else if (a === '--on-existing-audio') { out.onExistingAudio = nextValue(args, i, a); i += 1; }
+    else if (a === '--duck') out.duck = true;
     else if (a.startsWith('--on-existing-audio=')) out.onExistingAudio = a.slice('--on-existing-audio='.length);
     else if (a === '--start') { out.start = parseNumber(nextValue(args, i, a), a); i += 1; }
     else if (a.startsWith('--start=')) out.start = parseNumber(a.slice('--start='.length), '--start');
@@ -134,6 +137,8 @@ function parseArgs(args) {
     else if (a.startsWith('--height=')) out.height = parseNumber(a.slice('--height='.length), '--height');
     else if (a === '--mode') { out.mode = nextValue(args, i, a); i += 1; }
     else if (a.startsWith('--mode=')) out.mode = a.slice('--mode='.length);
+    else if (a === '--plan') { out.focusPlan = parseJsonOrFile(nextValue(args, i, a), a); i += 1; }
+    else if (a.startsWith('--plan=')) out.focusPlan = parseJsonOrFile(a.slice('--plan='.length), '--plan');
     else if (a === '--focus-x') { out.focusX = parseNumber(nextValue(args, i, a), a); i += 1; }
     else if (a.startsWith('--focus-x=')) out.focusX = parseNumber(a.slice('--focus-x='.length), '--focus-x');
     else if (a === '--focus-y') { out.focusY = parseNumber(nextValue(args, i, a), a); i += 1; }
@@ -187,6 +192,16 @@ function normalizeAudioSegments(raw) {
     if (typeof item.start === 'number') segment.startSec = item.start;
     if (typeof item.start_sec === 'number') segment.startSec = item.start_sec;
     if (typeof item.startSec === 'number') segment.startSec = item.startSec;
+    const end = item.end_sec ?? item.endSec ?? item.end;
+    if (end !== undefined) {
+      if (typeof end !== 'number' || !Number.isFinite(end)) fail('E_ARGS', `audio_segments[${index}].end must be finite seconds`);
+      for (const field of ['start', 'start_sec', 'startSec']) {
+        if (item[field] !== undefined && (typeof item[field] !== 'number' || !Number.isFinite(item[field]) || item[field] < 0)) {
+          fail('E_ARGS', `audio_segments[${index}].${field} must be nonnegative finite seconds`);
+        }
+      }
+      segment.endSec = end;
+    }
     return segment;
   });
 }
@@ -224,6 +239,10 @@ module.exports = async function editVideoScript({ args }) {
   if (opts.op === 'burnsubs') {
     if (!opts.subtitlesPath) fail('E_ARGS', 'burnsubs requires --subtitles');
     params.subtitlesAbsPath = inputFile(opts.subtitlesPath, 'subtitles');
+    if (opts.cover !== undefined) {
+      const [top, bottom] = String(opts.cover).split(',').map((v) => Number(v.trim()));
+      params.cover = { top, bottom };
+    }
   }
   if (opts.op === 'overlay') {
     if (!opts.overlayPath) fail('E_ARGS', 'overlay requires --overlay');
@@ -241,6 +260,7 @@ module.exports = async function editVideoScript({ args }) {
       params.audioAbsPath = inputFile(opts.audioPath, 'audio');
     }
     if (['reject', 'mix', 'replace'].includes(opts.onExistingAudio)) params.onExistingAudio = opts.onExistingAudio;
+    if (opts.duck) params.duck = true;
   }
   if (opts.op === 'reframe') {
     const hasSize = typeof opts.width === 'number' && typeof opts.height === 'number';
@@ -252,6 +272,7 @@ module.exports = async function editVideoScript({ args }) {
     if (opts.aspect) params.aspect = opts.aspect;
     if (opts.mode) params.mode = opts.mode;
     if (opts.padColor) params.padColor = opts.padColor;
+    if (opts.focusPlan !== undefined) params.focusPlan = opts.focusPlan;
   }
 
   if (OUTPUT_OPS.has(opts.op)) {

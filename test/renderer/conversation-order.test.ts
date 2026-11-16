@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
+import ts from 'typescript';
 
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
 
@@ -39,6 +40,9 @@ class FakeElement {
   dataset: Record<string, string> = {};
   classList: FakeClassList;
   parentElement: FakeHistory | null = null;
+  style = {};
+  querySelector() { return null; }
+  matches(selector: string) { return selector === '.chat-message[data-ts]' && this.dataset.ts != null; }
 
   constructor(public label: string, className: string, dataset: Record<string, string> = {}) {
     this.classList = new FakeClassList(className);
@@ -50,10 +54,26 @@ class FakeElement {
     const idx = this.parentElement.children.indexOf(this);
     return idx > 0 ? this.parentElement.children[idx - 1] : null;
   }
+
+  get nextElementSibling(): FakeElement | null {
+    if (!this.parentElement) return null;
+    const idx = this.parentElement.children.indexOf(this);
+    return this.parentElement.children[idx + 1] || null;
+  }
 }
 
 class FakeHistory {
   children: FakeElement[] = [];
+  scrollTop = 123;
+  style = { removeProperty() {} };
+
+  querySelector(selector: string) {
+    const id = selector.match(/data-msg-id="([^"]+)"/)?.[1];
+    return id ? this.children.find(el => el.dataset.msgId === id) || null : null;
+  }
+
+  querySelectorAll() { return this.children.filter(el => el.dataset.ts != null); }
+  appendChild(el: FakeElement) { this.insertBefore(el, null); }
 
   append(label: string, className: string, dataset: Record<string, string> = {}) {
     const el = new FakeElement(label, className, dataset);
@@ -75,6 +95,39 @@ class FakeHistory {
   }
 }
 
+function loadSnapshotOrdering(history: FakeHistory, row: FakeElement) {
+  const parsed = ts.createSourceFile('conversation.js', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const names = new Set(['_restoreLiveDisplaySnapshot', '_restoreStreamingMessageActivityPosition',
+    '_insertByTimestamp', '_appendBeforeSpacer', '_nextChatMessage', '_isChatMessageEl',
+    '_hasChatMessageClass', '_isLivePlaceholderMessage', '_anchorPlaceholderToTurnStart',
+    '_isTimestampPositionCorrect']);
+  const functions = parsed.statements.filter(node => ts.isFunctionDeclaration(node)
+    && names.has(node.name?.text || '')).map(node => node.getText(parsed)).join('\n');
+  const context: any = {
+    currentCid: 'c1', CSS: { escape: (s: string) => s },
+    formatTime: (s: string) => s,
+    _turnHasEndedRow: () => false, _unpersistedTurnRows: () => [row],
+    _cancelPendingStreamRaf() {}, _phKey: (...parts: string[]) => parts.join('|'),
+    _groupPlaceholders: new Map(), _absorbedTurnSegments: new Map(),
+    _isFoldableSegmentActor: () => true, _rowSegmentIndex: () => 0,
+    _stampRenderKey(el: FakeElement, _cid: string, key: string) { el.dataset.renderKey = key; },
+    _segmentRenderKey: (turn: string, seg: number) => `s:${turn}:${seg}`,
+    _replayPersistedProcessItems() {}, _streamingAppendFinalDelta() {},
+    _markProgrammaticStickyScroll() {}, pendingConvs: new Map(),
+    _liveDisplayWatermarks: new Map(), _offViewLiveDisplayDirty: new Set(),
+    document: { getElementById: () => history },
+  };
+  vm.createContext(context);
+  vm.runInContext(functions, context);
+  return {
+    restore: (afterMessageId?: string) => context._restoreLiveDisplaySnapshot('c1', {
+      sequence: 4, turns: [{ actor: 'codex', turn_id: 'turn', activity_after_message_id: afterMessageId,
+        records: [{ seg: 0, text: 'Recovered output', process: [] }] }],
+    }),
+    reanchor: (startedAt: number) => context._anchorPlaceholderToTurnStart(row, startedAt),
+  };
+}
+
 function loadMoveHelper(): (container: FakeHistory, userEl: FakeElement) => boolean {
   const fns = [
     '_isChatMessageEl',
@@ -88,6 +141,39 @@ function loadMoveHelper(): (container: FakeHistory, userEl: FakeElement) => bool
 }
 
 describe('conversation message ordering', () => {
+  it.each([1000, 2300])('restores output after the updates it followed while retaining a newer same-second user below it (start=%s)', startedAt => {
+    const history = new FakeHistory();
+    history.append('original', 'chat-message user', { ts: '900', msgId: 'original' });
+    const row = history.append('reply', 'chat-message assistant', {
+      ts: String(startedAt), placeholder: '1', renderKey: 's:turn:0',
+    });
+    history.append('update-1', 'chat-message user', { ts: '2000', msgId: 'update-1' });
+    history.append('update-2', 'chat-message user', { ts: '2000', msgId: 'update-2' });
+    history.append('not-yet-followed', 'chat-message user', { ts: '2000', msgId: 'newer' });
+    const { restore, reanchor } = loadSnapshotOrdering(history, row);
+    restore('update-2');
+    expect(history.labels()).toEqual(['original', 'update-1', 'update-2', 'reply', 'not-yet-followed']);
+    reanchor(startedAt);
+    expect(history.labels()).toEqual(['original', 'update-1', 'update-2', 'reply', 'not-yet-followed']);
+    expect(history.scrollTop).toBe(123);
+    // Repeated foreground recovery does not change order or promote the
+    // recovered old content across a user message received after that content.
+    restore('update-2');
+    expect(history.labels()).toEqual(['original', 'update-1', 'update-2', 'reply', 'not-yet-followed']);
+    expect(row.dataset.activitySortAfter).toBe('2000');
+  });
+
+  it.each([undefined, 'not-in-page', 'original'])('keeps an earlier reply in place without a newer recovered user boundary: %s', afterId => {
+    const history = new FakeHistory();
+    history.append('original', 'chat-message user', { ts: '900', msgId: 'original' });
+    const row = history.append('reply', 'chat-message assistant', {
+      ts: '1000', placeholder: '1', renderKey: 's:turn:0',
+    });
+    history.append('newer', 'chat-message user', { ts: '1000', msgId: 'newer' });
+    loadSnapshotOrdering(history, row).restore(afterId);
+    expect(history.labels()).toEqual(['original', 'reply', 'newer']);
+  });
+
   it('places a late-rendered user message before an orphan live placeholder', () => {
     const move = loadMoveHelper();
     const history = new FakeHistory();

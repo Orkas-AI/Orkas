@@ -68,6 +68,73 @@ jobs:
           test/renderer/cli-account-usage.test.ts
           test/renderer/local-agents-status.test.ts
           test/renderer/agent-detail-return-navigation.test.ts
+
+      - name: Prepare the declared Chromium test browser
+        run: node node_modules/playwright/cli.js install chromium --only-shell
+      - name: Verify unread task status geometry and sidebar transitions
+        run: >-
+          npm run test:e2e --
+          test/e2e/sidebar_e2e_badges.spec.ts
+          test/e2e/ai_select_e2e_geometry.spec.ts
+
+      - name: Verify OpenCode stream termination and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/local_agents/opencode_backend.test.ts
+          test/main/features/local_agents/opencode_parser.test.ts
+          test/main/features/local_agents/runtime_options.test.ts
+          test/main/features/local_agents/version.test.ts
+          test/main/features/local_agents/base.test.ts
+          test/main/features/local_agents/watchdog.test.ts
+      - name: Verify running sidebar indicator placement and transitions
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/conversation-sidebar.test.ts
+          test/renderer/conversation-keyed-rendering.test.ts
+          test/renderer/conversation-bucket.test.ts
+      - name: Verify project rules draft and acknowledgement ownership
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/project-instructions-editor.test.ts
+          test/renderer/project-detail-local-cache.test.ts
+          test/renderer/project-memory-controls.test.ts
+          test/renderer/project-library-index-recovery.test.ts
+          test/renderer/project-viewer-ownership.test.ts
+          test/main/features/projects.test.ts
+      - name: Verify failed OpenCode capability discovery and retry
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/local_agents/runner.test.ts
+          test/main/ipc/local-agents-runtime-options.test.ts
+          test/main/features/local_agents/sessions.test.ts
+      - name: Verify artifact menu scroll ownership
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/artifact-menu-scroll.test.ts
+          test/renderer/artifact-security.test.ts
+          test/renderer/artifact-submit.test.ts
+          test/renderer/artifact-revisions.test.ts
+          test/main/features/chat-artifact-frame-contract.test.ts
+          test/main/features/chat-artifact-revisions.test.ts
+      - name: Verify Claude final stream records and lifecycle
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/local_agents/claude_e2e.test.ts
+          test/main/features/local_agents/claude_parser.test.ts
+          test/main/features/local_agents/cli_input_cancel.test.ts
+      - name: Verify malformed local media recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/utils-autolink.test.ts
+          test/renderer/conversation-video-error-recovery.test.ts
+          test/renderer/utils-html-embed.test.ts
+          test/renderer/utils-sanitize.test.ts
+          test/main/util/window-security.test.ts
+          test/main/util/http-range.test.ts
+      - name: Verify worksheet selection failure and cleanup
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/office/office_page_renderer.test.ts
       - name: Verify workbook formulas and interrupted directory recovery
         run: >-
           npm run test:js -- --maxWorkers=1
@@ -76,9 +143,80 @@ jobs:
           test/main/features/auto_tasks.test.ts
           test/main/model/core-agent/office-batch.test.ts
           test/main/model/core-agent/office-tools.test.ts
+      - name: Verify Codex final stream records and lifecycle
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/local_agents/codex_backend.test.ts
+          test/main/features/local_agents/codex_parser.test.ts
+          test/main/features/local_agents/cli_input_cancel.test.ts
+      - name: Verify BGRA brightness and contrast calibration
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_studio_bitmap.test.ts
+      - name: Prepare the declared video runtimes for delivery checks
+        run: npm run ffmpeg:fetch
+      - name: Verify HTML copy references and project acceptance
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_studio_html_check.test.ts
+          test/main/features/image_studio.test.ts
+          test/main/features/video_studio_core_freshness.test.ts
+          test/main/features/video_studio_delivery.test.ts
+          test/main/features/image_studio_provenance.test.ts
+      - name: Verify Agent catalog isolation and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/agents.test.ts
+          test/main/features/group_chat/agents-index.test.ts
+      - name: Verify device-local message timestamps
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/renderer/device-local-time.test.ts
+          test/renderer/conversation-bucket.test.ts
+          test/renderer/conversation-keyed-rendering.test.ts
+          test/renderer/global-search-navigation.test.ts
       - name: Verify operator policy Worker, ASAR runtime and write boundaries
         run: >-
           npm run test:js -- --maxWorkers=1
           test/main/quality/operator-policy.test.ts
           test/main/quality/operator-policy-asar.test.ts
           test/main/features/skills.test.ts
+      - name: Verify retired browser frame upload ownership
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/web-assist-file-chooser.test.ts
+          test/main/features/web-assist-upload.test.ts
+
+      - name: Verify painted video text contrast
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_studio_contrast.test.ts
+
+      - name: Verify local media Markdown boundaries and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/util/chat-media-url.test.ts
+          test/main/util/chat-media-protocol.test.ts
+          test/main/util/history-media.test.ts
+          test/main/features/conversation-history-cache.test.ts
+          test/renderer/utils-autolink.test.ts
+          test/renderer/conversation-video-error-recovery.test.ts
+      - name: Verify media persistence and history reload
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/group_chat/bus-integration.test.ts
+          -t "generated-media URL freshness"
+
+      - name: Prepare the declared Python runtime for legacy spreadsheet coverage
+        run: node bin/ensure-runtime.cjs --kind python --root resources/runtime
+      - name: Verify single-owner attachment paste and recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/chat_attachments.test.ts
+          test/renderer/chat-rich-composer-paste.test.ts
+          test/renderer/chat-rich-composer-newline.test.ts
+          test/renderer/conversation-attachment-drop-route.test.ts
+          test/renderer/project-chat-attachment-binding.test.ts
+          test/renderer/conversation-submit-attach-guards.test.ts
+      - name: Type-check portable attachment journeys
+        run: npm run test:e2e:typecheck

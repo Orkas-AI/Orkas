@@ -1,3 +1,5 @@
+import { VIDEO_MODEL_SPECS, LEGACY_VIDEO_MODELS, videoModelSpec, WAN_REGIONS } from './video_models';
+import { createVideoCloudCredentials } from './video_cloud_auth';
 /**
  * Video-generation API key management for BYO providers.
  *
@@ -21,17 +23,8 @@ import {
 const log = createLogger('video-auth');
 
 export const VIDEO_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
-  [ORKAS_API_PROVIDER]: [{ id: ORKAS_API_VIDEO_MODEL, name: 'Video' }],
-  doubao: [
-    { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
-    { id: 'doubao-seedance-2-0-fast-260128', name: 'Seedance 2.0 Fast' },
-    { id: 'doubao-seedance-2-0-mini', name: 'Seedance 2.0 Mini' },
-  ],
-  minimax: [{ id: 'MiniMax-Hailuo-2.3', name: 'Hailuo 2.3' }],
-  vidu: [{ id: 'viduq3-pro', name: 'Q3 Pro' }],
-  kling: [{ id: 'kling-v3-0-turbo', name: '3.0 Turbo' }],
-  google: [{ id: 'veo-3.1-generate-preview', name: 'Veo 3.1' }],
-  runway: [{ id: 'gen4.5', name: 'Gen-4.5' }],
+ [ORKAS_API_PROVIDER]: [{id:ORKAS_API_VIDEO_MODEL,name:'Video'}],
+ ...Object.fromEntries(Object.entries(VIDEO_MODEL_SPECS).map(([provider,models])=>[provider,models.map(({id,name})=>({id,name}))])),
 };
 
 let _idCounter = 0;
@@ -53,25 +46,36 @@ export interface AddVideoProfileInput {
   model?: string;
   apiKey: string;
   label?: string;
+  workspaceId?: string;
+  region?: string;
 }
 
-export function isVideoProviderModelAllowed(provider: string, model: string): boolean {
-  return !!VIDEO_MODELS_BY_PROVIDER[provider]?.some((m) => m.id === model);
-}
+export function isVideoProviderModelAllowed(provider:string,model:string):boolean { return !!VIDEO_MODELS_BY_PROVIDER[provider]?.some(m=>m.id===model) || !!LEGACY_VIDEO_MODELS[provider]?.includes(model); }
 
 function defaultVideoModel(provider: string): string {
   return VIDEO_MODELS_BY_PROVIDER[provider]?.[0]?.id || '';
 }
 
-export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: string } | { ok: false; error: string } {
+export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: string } | { ok: false; error: string; errorKey?: string } {
   const provider = String(input.provider || '').trim();
   const model = String(input.model || '').trim() || defaultVideoModel(provider);
   const apiKey = String(input.apiKey || '').trim();
   if (!provider) return { ok: false, error: 'provider required' };
-  if (!isVideoProviderModelAllowed(provider, model)) {
+  if (!model) return { ok: false, error: 'model required' };
+  if (!isVideoProviderModelAllowed(provider, model) || (provider !== ORKAS_API_PROVIDER && !videoModelSpec(provider, model))) {
     return { ok: false, error: `unsupported video model "${provider}/${model}"` };
   }
   if (!apiKey) return { ok: false, error: 'apiKey required' };
+  if (provider === 'google-cloud') {
+    try { createVideoCloudCredentials(apiKey); }
+    catch (err) { return { ok: false, error: (err as Error).message, errorKey: 'settings.video.error_cloud_credentials' }; }
+  }
+  const workspaceId = String(input.workspaceId || '').trim();
+  const region = String(input.region || 'cn-beijing').trim();
+  if (provider === 'aliyun') {
+    if (!/^[a-zA-Z0-9-]{1,100}$/.test(workspaceId)) return { ok: false, error: 'Alibaba Cloud workspace ID required', errorKey: 'settings.video.error_wan_configuration' };
+    if (!WAN_REGIONS.includes(region as typeof WAN_REGIONS[number])) return { ok: false, error: 'unsupported Alibaba Cloud region', errorKey: 'settings.video.error_wan_configuration' };
+  }
   const list = loadVideoProfiles();
   const profile: VideoProfile = {
     id: nextVideoProfileId(),
@@ -80,6 +84,8 @@ export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: st
     apiKey,
     label: sanitizeLabel(input.label || 'default'),
     createdAt: Date.now(),
+    ...(provider === 'aliyun' ? { workspaceId, region } : {}),
+    ...(['minimax', 'vidu', 'kling'].includes(provider) ? { apiSite: 'cn' as const } : {}),
   };
   list.unshift(profile);
   saveVideoProfiles(list);
@@ -110,17 +116,19 @@ export function reorderVideoProfiles(orderedIds: string[]): { ok: boolean } {
 
 export function listVideoProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
   return [
+    { id: ORKAS_API_PROVIDER, label: 'Orkas', docs: ORKAS_API_KEYS_URL },
     {
-      id: ORKAS_API_PROVIDER,
-      label: 'Orkas',
-      docs: ORKAS_API_KEYS_URL,
+      id: 'doubao',
+      label: 'DouBao · Seedance',
+      docs: 'https://ark.volcengine.com/region:cn-beijing/apikey',
     },
-    { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
-    { id: 'minimax', label: 'MiniMax', docs: 'https://platform.minimax.io/user-center/basic-information/interface-key' },
-    { id: 'vidu', label: 'Vidu', docs: 'https://platform.vidu.com/' },
-    { id: 'kling', label: 'Kling', docs: 'https://kling.ai/global/dev' },
-    { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
-    { id: 'runway', label: 'Runway', docs: 'https://dev.runwayml.com/' },
+    { id: 'minimax', label: 'MiniMax', docs: 'https://platform.minimax.cn/docs/guides/quickstart-preparation' },
+    { id: 'vidu', label: 'Vidu', docs: 'https://platform.vidu.cn/' },
+    { id: 'kling', label: 'Kling', docs: 'https://app.klingai.com/cn/dev' },
+    { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/apikey' },
+    { id: 'google-cloud', label: 'Google Cloud', docs: 'https://console.cloud.google.com/iam-admin/serviceaccounts' },
+    { id: 'aliyun', label: 'Alibaba Cloud', docs: 'https://help.aliyun.com/zh/model-studio/get-api-key' },
+    { id: 'runway', label: 'Runway', docs: 'https://docs.dev.runwayml.com/guides/setup/' },
   ];
 }
 
@@ -149,14 +157,14 @@ export function flattenVideoProviderOptions(
   providers: Array<{ id: string; label: string; docs?: string }>,
 ): VideoProviderPickerOption[] {
   return providers.flatMap((provider) => {
+    if (provider.id === ORKAS_API_PROVIDER) return [{...provider,provider:provider.id,model:ORKAS_API_VIDEO_MODEL,label:'Orkas · Video'}];
     const models = listVideoModelOptions(provider.id);
-    if (!models.length) return [];
     if (models.length <= 1) {
       return [{
         ...provider,
         provider: provider.id,
         ...(models[0] ? { model: models[0].id } : {}),
-        label: models[0] ? `${provider.label} · ${models[0].name}` : provider.label,
+        label: models[0]?.name || provider.label,
       }];
     }
     return models.map((model) => ({
@@ -164,9 +172,7 @@ export function flattenVideoProviderOptions(
       id: `${provider.id}:${model.id}`,
       provider: provider.id,
       model: model.id,
-      label: provider.id === 'doubao'
-        ? `DouBao · ${model.name}`
-        : `${provider.label} · ${model.name}`,
+      label: model.name,
     }));
   });
 }

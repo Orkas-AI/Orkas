@@ -18,6 +18,93 @@ const _globalTodoDirtyScopes = new Set();
 const _globalTodoDriverMutating = new Set();
 // A to-do the home asked to show; applied once by the next full load.
 let _globalTodoPendingFocus = null;
+let _todoGroupingState = null;
+let _todoGroupingDragging = false;
+
+function _todoGroupingAccountState() {
+  const uid = typeof currentUserId === 'string' ? currentUserId : '';
+  if (!_todoGroupingState || _todoGroupingState.uid !== uid) {
+    if (_todoGroupingState) _globalTodoMode = 'project';
+    _todoGroupingState = { uid, revision: 0, read: 0, writes: 0,
+      chain: Promise.resolve(), pending: null, refresh: false };
+  }
+  return _todoGroupingState;
+}
+
+function _todoGroupingIsCurrent(state) {
+  return state === _todoGroupingState
+    && state.uid === (typeof currentUserId === 'string' ? currentUserId : '');
+}
+
+function _todoGroupingBusy() {
+  return _todoGroupingDragging || document.getElementById('todo-editor-modal')?.classList?.contains('open')
+    || (typeof _projectTodoMutating !== 'undefined' && _projectTodoMutating);
+}
+
+function _applyTodoGrouping(grouping, render = true) {
+  const state = _todoGroupingAccountState();
+  if (_todoGroupingBusy()) { state.pending = grouping; return; }
+  state.pending = null;
+  const changed = _globalTodoMode !== grouping;
+  _globalTodoMode = grouping;
+  _syncTodoGroupingButtons();
+  if (changed && render && currentView === 'todos') _renderGlobalTodos();
+}
+
+function _syncTodoGroupingButtons() {
+  for (const button of document.querySelectorAll?.('[data-todo-group]') || []) {
+    button.setAttribute('aria-pressed', String(button.dataset.todoGroup === _globalTodoMode));
+  }
+}
+
+function _applyPendingTodoGrouping() {
+  const state = _todoGroupingAccountState();
+  if (state.pending) _applyTodoGrouping(state.pending);
+}
+
+async function refreshTodoGroupingFromMain({ render = true } = {}) {
+  const state = _todoGroupingAccountState();
+  if (!state.uid) return;
+  if (state.writes) { state.refresh = true; return; }
+  const read = ++state.read, revision = state.revision;
+  try {
+    const result = await window.orkas.invoke('prefs.getTodoGrouping');
+    if (!_todoGroupingIsCurrent(state) || read !== state.read || revision !== state.revision) return;
+    if (!result?.ok) throw new Error('todo grouping read failed');
+    _applyTodoGrouping(result.grouping === 'status' ? 'status' : 'project', render);
+  } catch (_) {
+    if (_todoGroupingIsCurrent(state)) _projectDetailLog.warn('todo grouping read failed');
+  }
+}
+
+function _chooseTodoGrouping(grouping) {
+  if (grouping !== 'project' && grouping !== 'status') return Promise.resolve();
+  const state = _todoGroupingAccountState();
+  const revision = ++state.revision;
+  state.pending = null;
+  _applyTodoGrouping(grouping);
+  if (!state.uid) return Promise.resolve();
+  state.writes += 1;
+  const save = state.chain.then(async () => {
+    if (!_todoGroupingIsCurrent(state)) return;
+    const result = await window.orkas.invoke('prefs.setTodoGrouping', { grouping });
+    if (!result?.ok) throw new Error('todo grouping save failed');
+  }).catch(() => {
+    if (_todoGroupingIsCurrent(state) && revision === state.revision) {
+      _projectDetailLog.warn('todo grouping save failed');
+      if (typeof uiToast === 'function') uiToast(t('project.todo.failed'));
+      state.refresh = true;
+    }
+  }).finally(async () => {
+    state.writes -= 1;
+    if (_todoGroupingIsCurrent(state) && !state.writes && state.refresh) {
+      state.refresh = false;
+      await refreshTodoGroupingFromMain();
+    }
+  });
+  state.chain = save;
+  return save;
+}
 
 function _globalTodoContext(pid, showProject = false) {
   const group = _globalTodoGroups.find((item) => item.project.project_id === pid);
@@ -87,7 +174,9 @@ async function loadGlobalTodos() {
   host?.setAttribute('aria-busy', 'true');
   _bindProjectTodos();
   try {
-    const res = await window.orkas.invoke('projects.list', {});
+    const [res] = await Promise.all([
+      window.orkas.invoke('projects.list', {}), refreshTodoGroupingFromMain({ render: false }),
+    ]);
     if (!res?.ok || !Array.isArray(res.projects)) throw new Error('load_failed');
     const projects = res.projects;
     const globalGroup = await _loadGlobalTodoGroup(_globalTodoScopeProject(''));
@@ -281,6 +370,7 @@ function _renderGlobalTodoScopeSwitcher(groups) {
       : '';
     chip.innerHTML = folder
       + `<span class="todo-scope-chip-name">${escapeHtml(_globalTodoScopeName(group.project))}</span>`
+      + (window.TodoDue?.scopeDotHtml(pid) || '')
       + `<span class="todo-scope-chip-count">${group.tasks.length}</span>`;
     chip.addEventListener('click', () => {
       if (_globalTodoActiveScope === pid) return;
@@ -357,9 +447,7 @@ function _renderGlobalTodos() {
   const trackScroll = _captureTodoScrollTrack(host);
   _closeProjectDriverHint();
   host.innerHTML = '';
-  for (const button of document.querySelectorAll('[data-todo-group]')) {
-    button.setAttribute('aria-pressed', String(button.dataset.todoGroup === _globalTodoMode));
-  }
+  _syncTodoGroupingButtons();
   const groups = _globalTodoGroups;
   if (!groups.length) {
     const empty = document.createElement('div');
@@ -370,7 +458,8 @@ function _renderGlobalTodos() {
   }
   if (_globalTodoMode === 'status') {
     // Composite identity is necessary even when imported tasks share an id.
-    const tasks = groups.flatMap((group) => group.tasks.map((task) => ({ ...task, project_id: group.project.project_id })));
+    const tasks = groups.flatMap((group) => group.tasks
+      .map((task) => ({ ...task, project_id: group.project.project_id })));
     const bar = _renderGlobalTodoDriverBar(groups);
     host.appendChild(bar);
     _mountTodoScrollTrack(bar.querySelector('.todo-scroll-track'), trackScroll);
@@ -410,15 +499,14 @@ function _renderGlobalTodos() {
   _restoreTodoScroll(host, scroll);
 }
 
-/** Open the To-dos page on one to-do: switch to the by-project view and its
- *  scope and the row is highlighted once loaded. If it is gone by then (done or
+/** Open the To-dos page on one to-do in the user's chosen grouping and its
+ *  scope; the row is highlighted once loaded. If it is gone by then (done or
  *  deleted meanwhile), the page simply opens. */
 function focusTodo(scope, taskId, opts = {}) {
   const pid = String(scope || '');
   const id = String(taskId || '');
   _globalTodoPendingFocus = id ? { pid, id, reportMissing: opts.reportMissing === true } : null;
   if (id) {
-    _globalTodoMode = 'project';
     _globalTodoActiveScope = pid;
   }
   setView('todos', null, opts.entryPoint ? { entryPoint: opts.entryPoint } : {});
@@ -430,7 +518,7 @@ function _applyGlobalTodoPendingFocus() {
   if (!target) return;
   const host = document.getElementById('todos-content');
   const row = Array.from(host?.querySelectorAll('.project-todo-item[data-tid]') || [])
-    .find((el) => el.dataset.tid === target.id);
+    .find((el) => el.dataset.tid === target.id && (el.dataset.pid || '') === target.pid);
   if (!row) {
     if (target.reportMissing && typeof uiToast === 'function') uiToast(t('todo.notification.unavailable'));
     return;
@@ -486,10 +574,15 @@ function _initGlobalTodos() {
   document.getElementById('todos-retry')?.addEventListener('click', loadGlobalTodos);
   for (const button of document.querySelectorAll('[data-todo-group]')) {
     button.addEventListener('click', () => {
-      _globalTodoMode = button.dataset.todoGroup;
-      _renderGlobalTodos();
+      void _chooseTodoGrouping(button.dataset.todoGroup);
     });
   }
+  const host = document.getElementById('todos-content');
+  host?.addEventListener('dragstart', () => { _todoGroupingDragging = true; });
+  for (const event of ['dragend', 'drop']) host?.addEventListener(event, () => {
+    _todoGroupingDragging = false;
+    _applyPendingTodoGrouping();
+  });
   document.getElementById('todos-add-btn')?.addEventListener('click', () => {
     const context = _globalTodoCreateContext();
     _openProjectTodoEditor(null, {
