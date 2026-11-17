@@ -68,36 +68,19 @@ it('honors explicit export specifications while retaining legacy defaults',async
   await save({segments:[{id:'source',path:'source.wav'}]});
   const legacy=await call('render');expect(probe(output(legacy)).streams[0]).toMatchObject({codec_name:'mp3',sample_rate:'48000',channels:2,bit_rate:'192000'});
 });
-it('attenuates music during speech and restores it during a pause, only when ducking is enabled',async()=>{
+it.each(['legacy','timeline'])('attenuates music during speech and restores it during a pause in the %s mixer',async mixer=>{
   ff(['-f','lavfi','-i',"aevalsrc='if(between(t,1,3),0.3*sin(2*PI*660*t),0)':s=48000:d=4",'-c:a','pcm_s16le',path.join(root,'speech.wav')]);
   ff(['-f','lavfi','-i','sine=frequency=220:sample_rate=48000:duration=4','-c:a','pcm_s16le',path.join(root,'music.wav')]);
   const plan={segments:[{id:'speech',path:'speech.wav'}],music:{path:'music.wav',volume:1,duck:false},export:{format:'wav',normalize_loudness:false}};
-  await save(plan);const plain=output(await call('render'));
-  plan.music.duck=true;await save(plan);const ducked=output(await call('render'));
+  const saved = mixer === 'legacy' ? plan : { ...plan, schema_version:3, music:undefined, tracks:[{ id:'bg',kind:'music',...plan.music }] };
+  await save(saved);const plain=output(await call('render'));
+  if(mixer === 'legacy') plan.music.duck=true; else (saved as any).tracks[0].duck=true;
+  await save(saved);const ducked=output(await call('render'));
   const amplitude=(file:string,start:number)=>{
     const b=ff(['-ss',String(start),'-i',file,'-t','0.3','-ac','1','-ar','48000','-f','s16le','-']);let a=0,c=0,n=b.length/2;
     for(let i=0;i<n;i++){const s=b.readInt16LE(i*2);a+=s*Math.cos(i*2*Math.PI*220/48000);c+=s*Math.sin(i*2*Math.PI*220/48000);}
     return Math.hypot(a,c)/n;
   };
-  // Compare independent full-file windows with seeked extraction when a codec
-  // platform disagrees about release recovery; retain the original assertions.
-  const windows = (file: string) => {
-    const bytes = ff(['-i',file,'-ac','1','-ar','48000','-f','s16le','-']);
-    return [.2,1.8,3.7].map(start => {
-      const first = Math.round(start * 48000), n = Math.min(14400, bytes.length / 2 - first); let re = 0, im = 0;
-      for(let i=0;i<n;i++){const sample=bytes.readInt16LE((first+i)*2);re+=sample*Math.cos(i*2*Math.PI*220/48000);im+=sample*Math.sin(i*2*Math.PI*220/48000);}
-      return { frames:n,amplitude:Math.hypot(re,im)/n };
-    });
-  };
-  const seekRatios = [.2,1.8,3.7].map(start => amplitude(ducked,start)/amplitude(plain,start));
-  const plainWindows = windows(plain), duckedWindows = windows(ducked);
-  if(seekRatios[0] <= .95 || seekRatios[1] >= .4 || seekRatios[2] <= .8) {
-    console.info('Audio release diagnostic',JSON.stringify({
-      ffmpeg:spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!,['-version'],{encoding:'utf8',timeout:10000}).stdout.split('\n')[0],
-      plainDuration:probe(plain).format.duration,duckedDuration:probe(ducked).format.duration,
-      seekRatios,plainWindows,duckedWindows,
-    }));
-  }
   expect(amplitude(ducked,1.8)/amplitude(plain,1.8)).toBeLessThan(.4);
   expect(amplitude(ducked,3.7)/amplitude(plain,3.7)).toBeGreaterThan(.8);
   expect(amplitude(ducked,.2)/amplitude(plain,.2)).toBeGreaterThan(.95);

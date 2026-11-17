@@ -397,9 +397,23 @@ history and monorepo retained logs are excluded. Local effects and supplied BGM
 remain available. No document update marks model behavior, paid suppliers,
 packaging, Windows/Linux native paths or perceptual listening accepted.
 
+### Background music at compressor EOF (2026-11-17)
+
+VoiceStudio legacy/timeline mixes and VideoStudio edit/render mixes align
+complete 1024-sample audio frames before split sources and compressors drain.
+This prevents some FFmpeg builds from dropping late background music. Final
+voice/timeline/known clip trimming or the existing video-master shortest stream
+removes bounded final-frame padding. Source files and earlier exports survive.
+
+The delivery cases exercise both VoiceStudio mixers;
+`test/main/features/video_ducking_e2e_frames.test.ts` verifies the packaged edit
+core and native render/remux graph with actual codecs and a whole-file frequency
+oracle. Retain leading music, attenuation during speech and music after release.
+These are local deterministic codec checks; no provider or model call is needed.
+
 ### Untreated same-rate PCM cuts (2026-11-17)
 
-VoiceStudio 1.0.26 preserves retained integer PCM samples for recorded-only WAV
+VoiceStudio 1.0.27 preserves retained integer PCM samples for recorded-only WAV
 cuts with matching source/export rate, precision and channels, unit speed/gain,
 and normalization disabled. Processing, fades, gaps, word edits, music and timed
 tracks retain their existing treatment pipeline.
