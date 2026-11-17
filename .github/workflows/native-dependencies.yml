@@ -166,6 +166,7 @@ jobs:
       - name: Verify audio frame draining and background music recovery
         run: >-
           npm run test:js -- --maxWorkers=1
+          test/main/features/voice_studio_pcm.test.ts
           test/main/features/voice_studio_core.test.ts
           test/main/features/voice_studio_e2e_channels.test.ts
           test/main/features/voice_studio_processing.test.ts

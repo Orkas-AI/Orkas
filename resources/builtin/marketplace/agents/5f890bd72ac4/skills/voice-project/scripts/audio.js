@@ -274,6 +274,20 @@ async function render(root, plan, state, input, signal) {
   const channels = options.channels ?? 2;
   const ffmpeg = await binary('ORKAS_BUNDLED_FFMPEG');
   const newMix = composition.enabled(plan);
+  // A plain PCM cut with matching export properties needs no format round trip.
+  // Resampling through 48 kHz or narrowing to 16 bits alters retained samples.
+  const sampleRate = options.sample_rate ?? 48000;
+  const pcmCodec = `pcm_s${options.bit_depth ?? 16}le`;
+  const preservePcm = format === 'wav' && !newMix && !plan.music && !plan.processing?.length && !options.normalize_loudness
+    && rows.every((row, i) => {
+      const segment = plan.segments[i];
+      return typeof segment.path === 'string' && row.audio_streams.length === 1
+        && row.audio_streams[0].codec === pcmCodec && row.sample_rate === sampleRate && row.channels === channels
+        && (segment.speed ?? 1) === 1 && (segment.volume ?? 1) === 1 && !segment.word_edit && !segment.denoise
+        && !segment.fade_in_sec && !segment.fade_out_sec && !segment.gap_after_sec;
+    });
+  const clipRate = preservePcm ? sampleRate : 48000;
+  const clipCodec = preservePcm ? pcmCodec : 'pcm_s16le';
   const music = plan.music && !newMix ? await local(root, plan.music.path) : undefined;
   if (music) await probe(music, signal);
   const temp = await fs.mkdtemp(path.join(root, '.voice-render-'));
@@ -295,13 +309,13 @@ async function render(root, plan, state, input, signal) {
       // Even at unity, atempo can discard a final partial analysis window.
       // Preserve unretimed recordings sample-for-sample through this stage.
       if (speed !== 1) filters.push(`atempo=${speed}`);
-      filters.push(`volume=${s.volume ?? 1}`);
+      if (!preservePcm) filters.push(`volume=${s.volume ?? 1}`);
       if (s.denoise) filters.push('afftdn');
       if (s.fade_in_sec) filters.push(`afade=t=in:d=${Math.min(duration, s.fade_in_sec)}`);
       if (s.fade_out_sec) { const fade = Math.min(duration, s.fade_out_sec); filters.push(`afade=t=out:st=${Math.max(0, duration - fade)}:d=${fade}`); }
       if (s.gap_after_sec) filters.push(`apad=pad_dur=${s.gap_after_sec}`);
       const clip = path.join(temp, `${i}.wav`);
-      await run(ffmpeg, ['-v', 'error', '-nostdin', ...(plan.schema_version === 3 ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-af', filters.join(','), '-ar', '48000', '-ac', String(channels), '-c:a', 'pcm_s16le', clip], signal);
+      await run(ffmpeg, ['-v', 'error', '-nostdin', ...(plan.schema_version === 3 ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-af', filters.join(','), '-ar', String(clipRate), '-ac', String(channels), '-c:a', clipCodec, clip], signal);
       const measured = await probe(clip, signal);
       if (s.text) cues.push({ start_sec: cursor, end_sec: cursor + duration, text: s.text });
       cursor += measured.duration_sec;
