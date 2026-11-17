@@ -396,3 +396,32 @@ are unchanged. Managed separation/music, official credits, private model cohort
 history and monorepo retained logs are excluded. Local effects and supplied BGM
 remain available. No document update marks model behavior, paid suppliers,
 packaging, Windows/Linux native paths or perceptual listening accepted.
+
+### Background music at compressor EOF (2026-11-17)
+
+VoiceStudio legacy/timeline mixes and VideoStudio edit/render mixes align
+complete 1024-sample audio frames before split sources and compressors drain.
+This prevents some FFmpeg builds from dropping late background music. Final
+voice/timeline/known clip trimming or the existing video-master shortest stream
+removes bounded final-frame padding. Source files and earlier exports survive.
+
+The delivery cases exercise both VoiceStudio mixers;
+`test/main/features/video_ducking_e2e_frames.test.ts` verifies the packaged edit
+core and native render/remux graph with actual codecs and a whole-file frequency
+oracle. Retain leading music, attenuation during speech and music after release.
+These are local deterministic codec checks; no provider or model call is needed.
+
+### Untreated same-rate PCM cuts (2026-11-17)
+
+VoiceStudio 1.0.27 preserves retained integer PCM samples for recorded-only WAV
+cuts with matching source/export rate, precision and channels, unit speed/gain,
+and normalization disabled. Processing, fades, gaps, word edits, music and timed
+tracks retain their existing treatment pipeline.
+
+Run `npm run test:js -- --maxWorkers=1 test/main/features/voice_studio_pcm.test.ts`
+for exact source-byte-slice oracles at 16/24/32-bit precision, mono/stereo output,
+fresh bundled-Node reopen, explicit gain, concatenation, request overrides and
+rejected-trim/cancel/retry preservation. The wider VoiceStudio owner cases cover
+normalization, processing, word timing, synthesis receipts and supplied music.
+These local codec checks do not establish perceptual listening quality, live
+provider availability or signed-package acceptance.

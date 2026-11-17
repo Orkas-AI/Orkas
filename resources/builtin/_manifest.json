@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "ed884664e483a3b5765ba8f527c86d0bce41a57aa95ab04b8ecf9081cc048a91",
+  "content_tree_sha256": "b131b9688c7c4fc1555ad080a16a7751c65b6cdcf099cd2b7c39d4e72fed4ca0",
   "files": [
     {
       "path": "apps/builtin-content-workbench/__orkas-meta.json",
@@ -195,7 +195,7 @@
     {
       "path": "marketplace/agents/5f890bd72ac4/agent.json",
       "bytes": 3690,
-      "sha256": "de4c819ba14cf8c9116a9cc9c3f4586f5ee491dcdfa6b056db1c323854aea0c9"
+      "sha256": "cdffc4410880a457a8bfc24b6942889fa8834a86024bdbe97b69af5932f574d5"
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/references/audio-processing.md",
@@ -234,13 +234,13 @@
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/audio.js",
-      "bytes": 29743,
-      "sha256": "b63ed87dddce695d39fbd01fa48423d9a579045974631d7614b0ab83f01445c4"
+      "bytes": 30956,
+      "sha256": "47138322972f44986bfbc7d15678aa6ac633d78ce39dcd0602de43f952460156"
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/composition.js",
-      "bytes": 9647,
-      "sha256": "d3a452894f1c8dc03c48ebea7e17d7a9c9934df217275ea45cbe233360521652"
+      "bytes": 9867,
+      "sha256": "d36292a7d1b5f3112a6a1b96f1d0e2ca02b478e58990b1d210dc5382def73367"
     },
     {
       "path": "marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/processing.js",
@@ -275,7 +275,7 @@
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
       "bytes": 5069,
-      "sha256": "070446afe411198ec4cedf00cb94e1e5a555c2036446ffed225c0c4673bf9018"
+      "sha256": "b626e0474c38c416f040fb66527059059a73ab305086318f8935b475e4ca8b78"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/audio_rhythm.ts",
@@ -314,8 +314,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit.ts",
-      "bytes": 105547,
-      "sha256": "27de224771690eb62d726162835d015af29c85e08bf563ef4cef3c8123feca1c"
+      "bytes": 106009,
+      "sha256": "d941a210eb868baad214bc4a70f978ee2fcc75f3461b419826768d588c995fe5"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/design-system-importer/SKILL.md",
@@ -449,8 +449,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/lib/video_edit_core.cjs",
-      "bytes": 77017,
-      "sha256": "f17396bc5b606bd6cc4cae123da6f432f0221091e0c021db43319ec7a4881379"
+      "bytes": 77196,
+      "sha256": "7748bed16eca1855f815616fac538f1b1d367143388a0d1ee136dfbfa5ace220"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/SKILL.md",
@@ -2192,10 +2192,10 @@
       {
         "id": "5f890bd72ac4",
         "name": "VoiceStudio",
-        "version": "1.0.25",
+        "version": "1.0.27",
         "icon": "music",
         "color": "violet",
-        "updated_at": "2026-11-13T08:41:19.669Z",
+        "updated_at": "2026-11-16T22:55:11.272Z",
         "skill_list": [
           "voice-project"
         ],
@@ -2221,10 +2221,10 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "2.0.60",
+        "version": "2.0.66",
         "icon": "film",
         "color": "violet",
-        "updated_at": "2026-11-15T02:25:40.471Z",
+        "updated_at": "2026-11-16T23:31:00.000Z",
         "skill_list": [
           "design-system-importer",
           "frontend-design",
