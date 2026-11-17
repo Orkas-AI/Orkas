@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { StringDecoder } from "node:string_decoder";
-import { decodeProcessOutput, type SandboxExecutor, type SandboxResult } from "../sandbox/executor.js";
+import { createProcessOutputDecoder, type SandboxExecutor, type SandboxResult } from "../sandbox/executor.js";
 import { discardStreamedToolOutput } from "../sandbox/output-capture.js";
 import type { ToolContext, ToolResult, ToolReadContinuation } from "./base.js";
 import { isProgrammaticToolCallContext } from "./run-program.js";
@@ -173,7 +172,7 @@ export async function startCommandSession(
     stopRequested: false, stoppedByRequest: false,
   };
   sessions.set(session.id, session);
-  const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
+  const decoders = { stdout: createProcessOutputDecoder(), stderr: createProcessOutputDecoder() };
   const terminal = ctx.state.commandSessionTerminal as ((result: ToolResult) => Promise<ToolResult>) | undefined;
   const callSignal = ctx.signal;
   const runSignal = ctx.state.commandSessionSignal instanceof AbortSignal ? ctx.state.commandSessionSignal : undefined;
@@ -182,8 +181,7 @@ export async function startCommandSession(
       session.control = control;
       if (session.stopRequested) control.stop();
     },
-    onOutput: (bytes, stream, env) => append(session, process.platform === "win32"
-      ? decodeProcessOutput(bytes, process.platform, env) : decoders[stream].write(bytes)),
+    onOutput: (bytes, stream, env) => append(session, decoders[stream].write(bytes, env)),
   }).then(async (raw) => {
     // Pin attribution at execution completion, before asynchronous formatting
     // or host file delivery. An overlapping original cancellation wins.

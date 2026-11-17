@@ -7,7 +7,7 @@ import path from "node:path";
 import {
   buildSandboxedShellInvocation,
   buildSandboxEnv,
-  decodeProcessOutput,
+  createProcessOutputDecoder,
   defaultShellForPlatform,
   killProcessTree,
 } from "../sandbox/executor.js";
@@ -29,7 +29,7 @@ interface ProcessSession {
   cwd: string;
   child: ChildProcessWithoutNullStreams;
   closed: boolean;
-  env: NodeJS.ProcessEnv;
+  decoders: Record<"stdout" | "stderr", ReturnType<typeof createProcessOutputDecoder>>;
   status: ProcessSessionStatus;
   createdAt: number;
   updatedAt: number;
@@ -102,7 +102,7 @@ function appendOutput(
   const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), "utf8");
   if (stream === "stdout") session.stdoutBytes += buffer.length;
   if (stream === "stderr") session.stderrBytes += buffer.length;
-  const text = decodeProcessOutput(buffer, process.platform, session.env);
+  const text = stream ? session.decoders[stream].write(buffer) : buffer.toString("utf8");
   if (!text) return;
   session.output += text;
   session.outputEnd += text.length;
@@ -142,6 +142,7 @@ function finishSession(
   } = {},
 ): void {
   if (session.status !== "running") return;
+  appendOutput(session, session.decoders.stdout.end() + session.decoders.stderr.end());
   session.status = status;
   session.updatedAt = Date.now();
   if ("exitCode" in patch) session.exitCode = patch.exitCode;
@@ -365,7 +366,7 @@ function startProcessSession(command: string, ctx: ToolContext, maxLifetimeMs: u
     cwd,
     child,
     closed: false,
-    env,
+    decoders: { stdout: createProcessOutputDecoder(process.platform, env), stderr: createProcessOutputDecoder(process.platform, env) },
     status: "running",
     createdAt: now,
     updatedAt: now,

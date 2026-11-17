@@ -101,6 +101,72 @@ afterEach(async () => {
 });
 
 describe("persistent process sessions", () => {
+  it.each(["legacy", "managed"])("preserves split UTF-8 from a real child through completion: %s", async mode => {
+    const stdout = "中文 café 😀\n";
+    const stderr = "错误 🧪\n";
+    const script = `const out=Buffer.from(${JSON.stringify(stdout)}),err=Buffer.from(${JSON.stringify(stderr)});
+process.stdout.write(out.subarray(0,1));
+setTimeout(()=>{process.stderr.write(err);process.stdout.write(out.subarray(1));},100);`;
+    const ctx = { ...context("split-output"), state: { processSessionOwner: "split-output", commandSessionEnabled: mode === "managed" } };
+    // Keep the real shell boundary without reserializing inline JavaScript.
+    const scriptPath = path.join(workingDir, "split-output-fixture.cjs");
+    await fs.writeFile(scriptPath, script, "utf8");
+    const command = shellInvoke(TEST_NODE, [scriptPath]);
+    const started = mode === "managed"
+      ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
+      : await processStartTool.execute({ command }, ctx);
+    // Reuse the public bounded polling helper so available output cannot
+    // starve the child close event while waiting for terminal status.
+    const { result } = await waitForProcessRead("split-output",
+      json(started.content).session_id, 0, payload => payload.status !== "running", 5000);
+    const payload = json(result.content);
+    expect(result.isError).toBeFalsy();
+    expect(payload).toMatchObject({ status: "exited", exit_code: 0 });
+    expect(payload.output).toContain(stdout);
+    expect(payload.output).toContain(stderr);
+    const execution = result.observations?.execution ?? started.observations?.execution;
+    expect(execution?.stdout.bytes).toBe(Buffer.byteLength(stdout));
+    expect(execution?.stderr.bytes).toBe(Buffer.byteLength(stderr));
+  });
+
+  it.each(["legacy", "managed"])("preserves UTF-8 and isolates streams in Windows continuation decoding: %s", async mode => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill: vi.fn(),
+    });
+    const stdout = Buffer.from("中文 café 😀\n");
+    const stderr = Buffer.from("错误 🧪\n");
+    const spawnMock = vi.mocked(spawn);
+    spawnMock.mockImplementationOnce((() => child) as typeof spawn);
+    try {
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      const ctx = { ...context("windows-split-output"), state: {
+        processSessionOwner: "windows-split-output", commandSessionEnabled: mode === "managed",
+      } };
+      const pending = mode === "managed"
+        ? bashTool.execute({ command: "fixture", yield_time_ms: 0 }, ctx)
+        : processStartTool.execute({ command: "fixture" }, ctx);
+      child.stdout.write(stdout.subarray(0, 1));
+      for (const byte of stderr) child.stderr.write(Buffer.from([byte]));
+      for (const byte of stdout.subarray(1)) child.stdout.write(Buffer.from([byte]));
+      child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+      const started = await pending;
+      const { result } = await waitForProcessRead("windows-split-output",
+        json(started.content).session_id, 0, payload => payload.status !== "running", 5000);
+      expect(result.isError).toBeFalsy();
+      expect(json(result.content)).toMatchObject({ status: "exited", exit_code: 0,
+        output: stderr.toString("utf8") + stdout.toString("utf8") });
+      const execution = result.observations?.execution ?? started.observations?.execution;
+      expect(execution?.stdout.bytes).toBe(stdout.length);
+      expect(execution?.stderr.bytes).toBe(stderr.length);
+    } finally {
+      Object.defineProperty(process, "platform", descriptor);
+      spawnMock.mockReset();
+      const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      spawnMock.mockImplementation(actual.spawn);
+    }
+  });
+
   it.each(["legacy", "managed"])("keeps a local server alive through startup, readiness checks and explicit shutdown: %s", async mode => {
     const reservation = createTcpServer();
     await new Promise<void>(resolve => reservation.listen(0, "127.0.0.1", resolve));
