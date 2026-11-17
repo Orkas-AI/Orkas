@@ -68,12 +68,14 @@ it('honors explicit export specifications while retaining legacy defaults',async
   await save({segments:[{id:'source',path:'source.wav'}]});
   const legacy=await call('render');expect(probe(output(legacy)).streams[0]).toMatchObject({codec_name:'mp3',sample_rate:'48000',channels:2,bit_rate:'192000'});
 });
-it('attenuates music during speech and restores it during a pause, only when ducking is enabled',async()=>{
+it.each(['legacy','timeline'])('attenuates music during speech and restores it during a pause in the %s mixer',async mixer=>{
   ff(['-f','lavfi','-i',"aevalsrc='if(between(t,1,3),0.3*sin(2*PI*660*t),0)':s=48000:d=4",'-c:a','pcm_s16le',path.join(root,'speech.wav')]);
   ff(['-f','lavfi','-i','sine=frequency=220:sample_rate=48000:duration=4','-c:a','pcm_s16le',path.join(root,'music.wav')]);
   const plan={segments:[{id:'speech',path:'speech.wav'}],music:{path:'music.wav',volume:1,duck:false},export:{format:'wav',normalize_loudness:false}};
-  await save(plan);const plain=output(await call('render'));
-  plan.music.duck=true;await save(plan);const ducked=output(await call('render'));
+  const saved = mixer === 'legacy' ? plan : { ...plan, schema_version:3, music:undefined, tracks:[{ id:'bg',kind:'music',...plan.music }] };
+  await save(saved);const plain=output(await call('render'));
+  if(mixer === 'legacy') plan.music.duck=true; else (saved as any).tracks[0].duck=true;
+  await save(saved);const ducked=output(await call('render'));
   const amplitude=(file:string,start:number)=>{
     const b=ff(['-ss',String(start),'-i',file,'-t','0.3','-ac','1','-ar','48000','-f','s16le','-']);let a=0,c=0,n=b.length/2;
     for(let i=0;i<n;i++){const s=b.readInt16LE(i*2);a+=s*Math.cos(i*2*Math.PI*220/48000);c+=s*Math.sin(i*2*Math.PI*220/48000);}
