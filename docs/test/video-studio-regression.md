@@ -307,3 +307,7 @@ reject a source copy, ambiguous versions, an unsupported operation or a missing
 publication. A late end-card inspection must distinguish a visible closing line
 from a blank ending. None of these controls grants visual approval from decoding
 alone or replaces a fresh human/perceptual assessment.
+
+## 2026-11-17: retain selected video frames after an accurate seek
+
+On the declared Linux FFmpeg 7 build, a 30 fps fourteen-frame cut could be muxed as twelve frames after the filtered output cadence was inferred. Keep the selected input cadence explicit and preserve every filtered frame. The existing independent beat-grid check still requires fourteen frames for one cut, 225 frames across sixteen cuts, aligned picture/sound starts and the original frame timestamps. Source files and fallback handling for unknown frame rates remain unchanged.
