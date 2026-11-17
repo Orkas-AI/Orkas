@@ -74,8 +74,8 @@ describe('buildMixFilter — ducking the base under the added sound', () => {
   it('keys a sidechain compressor on the base with the added bed, matching the timeline duck', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [2], baseHasAudio: true, mode: 'mix', padWholeDurSec: 6, loudnorm: LN, duck: true });
     expect(f).toContain('[1:a]aresample=48000,adelay=2000:all=1[seg0]');
-    expect(f).toContain('[seg0]asplit=2[bedmix][bedkey0]');
-    expect(f).toContain('[0:a]aresample=48000[base0]');
+    expect(f).toContain('[seg0]asetnsamples=n=1024:p=1,asplit=2[bedmix][bedkey0]');
+    expect(f).toContain('[0:a]aresample=48000,asetnsamples=n=1024:p=1[base0]');
     expect(f).toContain('[base0][bedkey]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[base]');
     expect(f).toContain('[base][bedmix]amix=inputs=2:duration=longest:normalize=0,apad=whole_dur=6.000,');
   });
@@ -84,15 +84,15 @@ describe('buildMixFilter — ducking the base under the added sound', () => {
     // sidechaincompress stops with whichever input ends first; an unpadded key
     // left everything after the last line silent (measured 2026-11-12).
     const f = buildMixFilter({ sr: SR, segmentStartSec: [2], baseHasAudio: true, mode: 'mix', padWholeDurSec: 6, loudnorm: LN, duck: true });
-    expect(f).toContain('[bedkey0]apad=whole_dur=6.000[bedkey]');
+    expect(f).toContain('[bedkey0]apad=whole_dur=6.000,asetnsamples=n=1024:p=1[bedkey]');
     const unknown = buildMixFilter({ sr: SR, segmentStartSec: [2], baseHasAudio: true, mode: 'mix', padWholeDurSec: null, loudnorm: LN, duck: true });
-    expect(unknown).toContain('[bedkey0]apad[bedkey]');
+    expect(unknown).toContain('[bedkey0]apad,asetnsamples=n=1024:p=1[bedkey]');
   });
 
   it('ducks under the combined bed when several lines are placed', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0, 5], baseHasAudio: true, mode: 'mix', padWholeDurSec: 30, loudnorm: LN, duck: true });
     expect(f).toContain('[seg0][seg1]amix=inputs=2:duration=longest:normalize=0[vobed]');
-    expect(f).toContain('[vobed]asplit=2[bedmix][bedkey0]');
+    expect(f).toContain('[vobed]asetnsamples=n=1024:p=1,asplit=2[bedmix][bedkey0]');
   });
 
   it('ignores duck when there is no base sound to lower', () => {
