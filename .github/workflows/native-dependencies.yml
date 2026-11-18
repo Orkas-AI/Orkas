@@ -1,42 +1,26 @@
-name: Windows shell fixture host setup proof
+name: Exact PR head Intel attachment type check
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  shell-test:
-    runs-on: windows-2022
-    timeout-minutes: 12
+  intel-types:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    env:
+      ONNXRUNTIME_NODE_INSTALL_CUDA: skip
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 8574d33f4100e7aa68a9ed226852931ad5259eb9
+      - name: Verify the pinned PR checkout
+        run: test "$(git rev-parse HEAD)" = 8574d33f4100e7aa68a9ed226852931ad5259eb9
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
           cache: npm
       - run: npm ci --include=optional
-      - name: Prepare the native Windows PowerShell cache in its default location
-        shell: pwsh
-        run: |
-          $legacyCache = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
-          $runnerCache = $env:PSModuleAnalysisCachePath
-          $defaultIsPresent = Test-Path -LiteralPath $legacyCache -PathType Leaf
-          $preloadedIsPresent = $runnerCache -and (Test-Path -LiteralPath $runnerCache -PathType Leaf)
-          Write-Host "Default cache exists before setup: $defaultIsPresent"
-          Write-Host "Runner cache exists before setup: $preloadedIsPresent"
-          if (-not $defaultIsPresent) {
-            New-Item -ItemType Directory -Path (Split-Path -Parent $legacyCache) -Force | Out-Null
-            New-Item -ItemType File -Path $legacyCache | Out-Null
-          }
-          if (-not (Test-Path -LiteralPath $legacyCache -PathType Leaf)) {
-            throw 'The native PowerShell module cache was not prepared'
-          }
-      - name: Compare the ordinary location when explicitly selected
-        env:
-          ORKAS_DIAGNOSTIC_PS_CACHE: default
-        run: >-
-          npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts
-          -t 'executes a simple command|prints a blocked command name|reports duration'
-      - name: Exercise both owners with the image cache as explicit fixture input
-        if: always()
-        env:
-          ORKAS_DIAGNOSTIC_PS_CACHE: image
-        run: npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts src/core-agent/test/process-session.test.ts
+      - run: npm run native:repair
+      - name: Verify the locked manifests
+        run: git diff --exit-code -- package.json package-lock.json
+      - name: Type-check portable attachment journeys
+        run: npm run test:e2e:typecheck
