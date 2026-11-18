@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import os from 'node:os';
+import path from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { buildSandboxEnv, buildShellInvocation } from '../src/core-agent/src/sandbox/executor.ts';
 import { withWindowsPowerShellModules } from './test-runtime-env.mjs';
@@ -11,20 +13,26 @@ const pick = (names: string[]) => Object.fromEntries(names.flatMap(name => {
   const value = parent[name] ?? Object.entries(parent).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
   return value ? [[name, value]] : [];
 }));
-const drive = pick(['SystemDrive', 'HOMEDRIVE', 'HOMEPATH']);
-const hostPaths = pick(['ALLUSERSPROFILE', 'PUBLIC', 'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432', 'DriverData']);
-const runtime = pick(['OS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION', 'NUMBER_OF_PROCESSORS', 'USERNAME', 'USERDOMAIN', 'USERDOMAIN_ROAMINGPROFILE', 'SESSIONNAME', 'LOGONSERVER', 'COMPUTERNAME']);
-const modules = pick(['PSModulePath', 'PSModuleAnalysisCachePath']);
+const moduleEnv = pick(['PSModulePath']);
+const cacheEnv = pick(['PSModuleAnalysisCachePath']);
+const windowsRoots = [
+  [sandbox.SystemRoot ?? sandbox.WINDIR, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'],
+  [sandbox.ProgramFiles, 'WindowsPowerShell', 'Modules'],
+  [sandbox.USERPROFILE, 'Documents', 'WindowsPowerShell', 'Modules'],
+].filter(parts => parts[0]).map(parts => path.win32.join(...parts)).join(';');
+const cacheRoot = mkdtempSync(path.join(os.tmpdir(), 'orkas-shell-probe-'));
+console.log(JSON.stringify({ inheritedCacheVariable: Object.keys(cacheEnv).length === 1,
+  legacyModuleDirectories: (moduleEnv.PSModulePath || '').split(';').filter(Boolean).length }));
 const profiles = [
   ['sandbox-cold', sandbox],
-  ['drive-and-home', { ...sandbox, ...drive }],
-  ['standard-host-paths', { ...sandbox, ...hostPaths }],
-  ['runtime-identity', { ...sandbox, ...runtime }],
-  ['normalized-module-path', { ...sandbox, ...modules }],
-  ['combined-system-variables', { ...sandbox, ...drive, ...hostPaths, ...runtime, ...modules }],
+  ['windows-default-directories', { ...sandbox, PSModulePath: windowsRoots }],
+  ['normalized-path-only', { ...sandbox, ...moduleEnv }],
+  ...(Object.keys(cacheEnv).length ? [['inherited-cache-only', { ...sandbox, ...cacheEnv }] as const] : []),
+  ['isolated-fresh-cache', { ...sandbox, PSModuleAnalysisCachePath: path.win32.join(cacheRoot, 'ModuleAnalysisCache') }],
   ['sandbox-repeat', sandbox],
-  ['full-parent-control', { ...parent, ...sandbox }],
+  ['normalized-path-repeat', { ...sandbox, ...moduleEnv }],
 ] as const;
+process.on('exit', () => rmSync(cacheRoot, { recursive: true, force: true, maxRetries: 3 }));
 const observations: unknown[] = [];
 for (const [profile, env] of profiles) {
   const shell = 'powershell.exe';
