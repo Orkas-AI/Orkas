@@ -13,10 +13,13 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --include=optional
+      - name: Measure PowerShell with the actual sandbox environment in Node
+        run: node --import tsx scripts/windows-shell-baseline.mts
+      - name: Measure PowerShell with the actual sandbox environment in Electron
+        env:
+          ELECTRON_RUN_AS_NODE: '1'
+        run: .\node_modules\electron\dist\electron.exe --import=tsx scripts/windows-shell-baseline.mts
       - name: Reproduce the existing Windows sandbox cases on main
         run: >-
           npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts
           -t 'executes a simple command|prints a blocked command name|reports duration'
-      - name: Observe raw PowerShell spawn, output and exit on the same runner
-        if: always()
-        run: node --import tsx scripts/windows-shell-baseline.mts
