@@ -132,13 +132,29 @@ export function buildDocxBatch(
   images: readonly DocxImageSpec[] = [],
 ): OfficeBatchOp[] {
   const ops: OfficeBatchOp[] = [];
+  const definedHeadings = new Set<string>();
   let paraCount = 0;
   let tableCount = 0;
 
   for (const p of paragraphs) {
     if (!p || typeof p.text !== 'string') continue;
     const props: Record<string, string> = { text: p.text };
-    if (typeof p.style === 'string' && p.style) props.style = p.style;
+    if (typeof p.style === 'string' && p.style) {
+      props.style = p.style;
+      const heading = /^Heading([1-9])$/.exec(p.style);
+      if (heading && !definedHeadings.has(p.style)) {
+        // The fresh native template defines Normal only. A heading reference
+        // needs a paragraph style with an outline level to be navigable.
+        ops.push({
+          command: 'add', parent: '/styles', type: 'style',
+          props: {
+            id: p.style, name: `Heading ${heading[1]}`, type: 'paragraph',
+            basedOn: 'Normal', next: 'Normal', outlineLvl: String(Number(heading[1]) - 1),
+          },
+        });
+        definedHeadings.add(p.style);
+      }
+    }
     if (typeof p.align === 'string' && p.align) props.align = p.align;
     if (p.list === 'bullet' || p.list === 'ordered') props.listStyle = p.list;
     addPassthrough(props, p, DOCX_STRUCTURAL);
