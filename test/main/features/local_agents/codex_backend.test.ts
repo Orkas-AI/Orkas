@@ -242,6 +242,16 @@ process.stdin.on('data', (chunk) => {
     } else if (message.method === 'thread/resume') {
       if (scenario === 'resume-hang') continue;
       if (rejectUnnegotiatedPermissions(message)) continue;
+      if (process.argv.includes('--metadata-only-resume')) {
+        // The native 0.145.0 contract can resume without returning its stored
+        // turns. Refuse full hydration here instead of allocating a huge fixture.
+        if (message.params.excludeTurns !== true) {
+          send({ id: message.id, error: { code: -32602, message: 'metadata-only resume required' } });
+        } else {
+          send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [] } } });
+        }
+        continue;
+      }
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32001, message: 'thread expired' } });
     } else if (message.method === 'thread/start') {
       if (rejectUnnegotiatedPermissions(message)) continue;
@@ -964,6 +974,44 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     }
   });
 
+  it.each(['0.145.0', '0.160.1'].flatMap(cliVersion => [true, false].map(resumed => ({ cliVersion, resumed }))))(
+    'continues the same session with metadata only, or restores bounded context without a SID: $cliVersion / $resumed', async fixture => {
+      const tracePath = path.join(tempDir, `metadata-${fixture.cliVersion}-${fixture.resumed}.json`);
+      const events: any[] = [];
+      const recovery = 'bounded recent dialogue\n\ncurrent turn';
+      await codexBackend.run({
+        binPath: fakeCodexPath, cliVersion: fixture.cliVersion,
+        prompt: fixture.resumed ? 'incremental context\n\ncurrent turn' : recovery,
+        ...(fixture.resumed ? { resumeSessionId: 'fresh-thread' } : {}),
+        resumeFallbackPrompt: recovery,
+        systemPrompt: 'durable Orkas instructions', reuseSessionInstructions: fixture.resumed,
+        customArgs: ['--metadata-only-resume', '--configured-model', 'fixture-model', '--trace', tracePath],
+        cwd: tempDir, signal: new AbortController().signal, timeoutMs: 2_000,
+        onEvent: event => events.push(event),
+      });
+      const requests = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
+      const resumes = requests.filter((entry: any) => entry.method === 'thread/resume');
+      const starts = requests.filter((entry: any) => entry.method === 'thread/start');
+      const turns = requests.filter((entry: any) => entry.method === 'turn/start');
+      expect(resumes).toHaveLength(fixture.resumed ? 1 : 0);
+      expect(starts).toHaveLength(fixture.resumed ? 0 : 1);
+      if (fixture.resumed) {
+        expect(resumes[0].params).toMatchObject({ threadId: 'fresh-thread', excludeTurns: true });
+        expect(resumes[0].params).not.toHaveProperty('history');
+        expect(resumes[0].params).not.toHaveProperty('developerInstructions');
+      } else {
+        expect(starts[0].params).not.toHaveProperty('excludeTurns');
+        expect(starts[0].params.developerInstructions).toBe('durable Orkas instructions');
+      }
+      expect(turns).toHaveLength(1);
+      expect(turns[0].params).toMatchObject({ threadId: 'fresh-thread',
+        input: [{ type: 'text', text: fixture.resumed ? 'incremental context\n\ncurrent turn' : recovery }] });
+      expect(events.filter(event => event.type === 'done')).toEqual([
+        expect.objectContaining({ status: 'completed', sessionId: 'fresh-thread', output: 'Codex result!' }),
+      ]);
+    },
+  );
+
   it('falls back from an expired resume, restores recovery context, and completes the turn', async () => {
     const tracePath = path.join(tempDir, 'resume-trace.json');
     const events: any[] = [];
@@ -971,12 +1019,13 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
 
     await codexBackend.run({
       binPath: fakeCodexPath,
+      cliVersion: '0.145.0',
       prompt: 'current turn',
       resumeSessionId: 'expired-thread',
       resumeFallbackPrompt: 'bounded recovery\n\ncurrent turn',
       systemPrompt: 'durable Orkas instructions',
       reuseSessionInstructions: true,
-      customArgs: ['--trace', tracePath],
+      customArgs: ['--configured-model', 'fixture-model', '--trace', tracePath],
       permissionPolicy: 'ask',
       cwd: process.cwd(),
       signal: new AbortController().signal,
@@ -996,6 +1045,7 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
 
     expect(initialize.params.capabilities).toEqual({ experimentalApi: true });
     expect(resume.params).not.toHaveProperty('model');
+    expect(resume.params.excludeTurns).toBe(true);
     expect(resume.params).not.toHaveProperty('developerInstructions');
     expect(resume.params).toMatchObject({
       approvalPolicy: 'on-request',
@@ -1003,6 +1053,7 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
       permissions: ':workspace',
     });
     expect(start.params).not.toHaveProperty('model');
+    expect(start.params).not.toHaveProperty('excludeTurns');
     expect(start.params.developerInstructions).toBe('durable Orkas instructions');
     expect(start.params).toMatchObject({
       approvalPolicy: 'on-request',
