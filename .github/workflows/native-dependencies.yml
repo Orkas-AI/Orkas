@@ -13,22 +13,21 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --include=optional
-      - name: Test both original owners with Windows PowerShell module directories
+      - name: Prepare the native Windows PowerShell cache in its default location
         shell: pwsh
         run: |
-          $previousModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'User')
-          $system = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
-          $shared = Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
-          $user = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'
-          try {
-            [Environment]::SetEnvironmentVariable('PSModulePath', "$user;$shared;$system", 'User')
-            npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts src/core-agent/test/process-session.test.ts
-            $result = $LASTEXITCODE
-          } finally {
-            [Environment]::SetEnvironmentVariable('PSModulePath', $previousModulePath, 'User')
-            if ([Environment]::GetEnvironmentVariable('PSModulePath', 'User') -ne $previousModulePath) {
-              throw 'Windows module path was not restored'
-            }
-            Write-Host 'Restored the original Windows module path setting'
+          $legacyCache = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\PowerShell\ModuleAnalysisCache'
+          $runnerCache = $env:PSModuleAnalysisCachePath
+          $defaultIsPresent = Test-Path -LiteralPath $legacyCache -PathType Leaf
+          $preloadedIsPresent = $runnerCache -and (Test-Path -LiteralPath $runnerCache -PathType Leaf)
+          Write-Host "Default cache exists before setup: $defaultIsPresent"
+          Write-Host "Runner cache exists before setup: $preloadedIsPresent"
+          if (-not $defaultIsPresent) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $legacyCache) -Force | Out-Null
+            New-Item -ItemType File -Path $legacyCache | Out-Null
           }
-          exit $result
+          if (-not (Test-Path -LiteralPath $legacyCache -PathType Leaf)) {
+            throw 'The native PowerShell module cache was not prepared'
+          }
+      - name: Run both unchanged owners with the native cache ready
+        run: npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts src/core-agent/test/process-session.test.ts
