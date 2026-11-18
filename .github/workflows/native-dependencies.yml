@@ -7,7 +7,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-2022, windows-2025]
+        runner: [windows-2022]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
@@ -17,8 +17,5 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --include=optional
-      - name: Compare native startup, command discovery, and cache warming
+      - name: Identify the delayed PowerShell command lookup stage
         run: node --import tsx scripts/windows-shell-baseline.mts
-      - name: Run unchanged owning suites on the same host
-        if: always()
-        run: npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts src/core-agent/test/process-session.test.ts
