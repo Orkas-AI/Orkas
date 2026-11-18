@@ -219,7 +219,7 @@ test.describe('CLI Agent runtime settings', () => {
       .toContainText('deterministic command output');
   });
 
-  test('persists overrides, resets model-specific thinking, and restores CLI defaults', async ({ cliOrkas }) => {
+  test('persists overrides, resets model-specific thinking, and restores CLI defaults', async ({ cliOrkas }, testInfo) => {
     // Three cold application launches are fixture preparation, not a single
     // interaction's latency budget. Keep each model/element wait unchanged.
     test.setTimeout(240_000);
@@ -229,12 +229,17 @@ test.describe('CLI Agent runtime settings', () => {
       agent_id: agentId,
       updates: { icon: 'code', color: 'lime' },
     });
+    const memoryText = 'Use the project formatter before submitting changes.';
+    await expect(cliOrkas.invoke('agents.memory.add', { agent_id: agentId, content: memoryText }))
+      .resolves.toMatchObject({ ok: true });
     await openSidebarEntry(page, '#agents-btn');
     const card = page.locator(`.agent-card[data-id="${agentId}"]`);
     await expect(card).toBeVisible({ timeout: 30_000 });
     await card.click();
 
     const model = page.locator('#agents-detail-cli-settings [data-role="model"]');
+    const savedMemory = page.locator('#agents-detail-memory').getByText(memoryText, { exact: true });
+    await expect(savedMemory).toBeVisible();
     await expect(model.locator('.ai-select-trigger'))
       .toContainText('GPT E2E Default', { timeout: 30_000 });
     await expect(page.locator('#agents-detail-cli-settings-section .agents-detail-section-desc')).toHaveCount(0);
@@ -298,6 +303,8 @@ test.describe('CLI Agent runtime settings', () => {
     // The model value is optimistic. Its dependent effort menu is ready only
     // after the saved runtime remounts the model-specific default.
     await expect(thinking.locator('.ai-select-trigger')).toHaveText('high');
+    await expect(savedMemory).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('cli-memory-after-model-change.png') });
 
     await selectAiOption(page, '#agents-detail-cli-settings [data-role="thinking"]', 'low');
     await expect(page.locator('#agents-detail-cli-settings [data-role="thinking"]'))
@@ -316,6 +323,7 @@ test.describe('CLI Agent runtime settings', () => {
       'agents.get', { agent_id: agentId },
     )).agent.runtime;
     await expect.poll(persistedRuntime).toEqual({ kind: 'cli', cli: 'codex' });
+    await expect(savedMemory).toBeVisible();
 
     await selectAiOption(page, '#agents-detail-cli-settings [data-role="model"]', 'gpt-e2e-deep');
     await expect(page.locator('#agents-detail-cli-settings [data-role="model"]'))
