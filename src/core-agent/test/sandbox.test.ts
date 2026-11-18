@@ -252,21 +252,23 @@ describe("SandboxExecutor", () => {
     expect((sandbox as any).checkBlockedCommand(command)).not.toBeNull();
   });
 
-  it("prints a blocked command name as data in foreground and detached execution", async () => {
+  it("prints a blocked command name as data in foreground execution", async () => {
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const result = await sandbox.execute("echo shutdown");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("shutdown");
+  }, NATIVE_SHELL_TEST_TIMEOUT_MS);
+
+  it("prints a blocked command name as data in detached execution", async ({ onTestFinished }) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-"));
+    onTestFinished(() => removeTree(dir));
     const sandbox = new SandboxExecutor({ workingDir: dir });
-    const command = "echo shutdown";
-    try {
-      const foreground = await sandbox.execute(command);
-      expect(foreground.exitCode).toBe(0);
-      expect(foreground.stdout.trim()).toBe("shutdown");
-      const logPath = path.join(dir, "output.log");
-      const background = sandbox.executeBackground(command, logPath);
-      expect(background.error).toBeUndefined();
-      expect(background.pid).toBeGreaterThan(0);
-      await expect.poll(async () => (await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
-      await waitForProcessExit(background.pid!);
-    } finally { await removeTree(dir); }
+    const logPath = path.join(dir, "output.log");
+    const { pid, error } = sandbox.executeBackground("echo shutdown", logPath);
+    expect(error).toBeUndefined();
+    expect(pid).toBeGreaterThan(0);
+    await waitForProcessExit(pid!, NATIVE_SHELL_STARTUP_BUDGET_MS);
+    expect((await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
   }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 
   it("blocks custom commands", async () => {
