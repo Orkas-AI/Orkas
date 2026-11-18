@@ -22,6 +22,9 @@ jobs:
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      # Hosted CPU runners use the CPU binaries bundled by ONNX Runtime.
+      ONNXRUNTIME_NODE_INSTALL_CUDA: skip
 
     steps:
       - name: Check out source
