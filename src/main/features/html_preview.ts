@@ -857,7 +857,7 @@ const INTERACTION_SCRIPT = `(async () => {
   for (const link of hashLinks.slice(0, 20)) {
     try {
       const href = String(link.getAttribute('href') || '');
-      const target = href && href !== '#' ? document.querySelector(href) : null;
+      const target = href.length > 1 ? document.getElementById(decodeURIComponent(href.slice(1))) : null;
       if (target) hashLinksChecked += 1;
       else failures.push('missing hash target for ' + label(link));
     } catch {
