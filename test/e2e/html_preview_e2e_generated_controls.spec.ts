@@ -16,7 +16,9 @@ for (const broken of [false, true]) {
       </nav>
       <h1 id="intro" class="note">Introduction</h1>
       <h2 id="release:notes">Release notes</h2>
-      <h2 id="导航">Navigation</h2>`);
+      <h2 id="导航">Navigation</h2>
+      <button onclick="document.getElementById('details').hidden = false">Show details</button>
+      <p id="details" hidden>Additional notes</p>`);
     const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
       const { renderInteractiveHtmlSmoke } = (process as any).mainModule.require(args.modulePath);
       return (await renderInteractiveHtmlSmoke(args.entry)).evidence;
@@ -26,7 +28,8 @@ for (const broken of [false, true]) {
       'missing hash target for Look-alike',
       'invalid hash target for Malformed',
     ] : []);
-    expect(evidence.ok).toBe(!broken);
+    expect(evidence.interactions.stateChangesObserved).toBe(1);
+    expect(evidence.ok, evidence.blockers.join('; ')).toBe(!broken);
   });
 }
 

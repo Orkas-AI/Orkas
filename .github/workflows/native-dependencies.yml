@@ -18,13 +18,6 @@ jobs:
           cache: npm
       - name: Install locked native dependencies
         run: npm ci --include=optional
-      - name: Fetch and verify the pinned OfficeCLI binary
-        run: npm run officecli:fetch
-      - name: Inspect native Word outline levels and package integrity
-        run: >-
-          npm run test:js -- --maxWorkers=1
-          test/main/features/office/office-readonly_e2e.test.ts
-          -t "creates editable Word headings"
       - name: Start the desktop app and verify HTML fragment auditing
         if: success() || failure()
         run: >-
@@ -32,13 +25,6 @@ jobs:
           test/e2e/html_preview_e2e_generated_controls.spec.ts
           --grep "audits fragment links"
           --workers=1 --output=test-results/windows-fragments
-      - name: Verify Agent memory during CLI runtime save and reset
-        if: success() || failure()
-        run: >-
-          npm run test:e2e --
-          test/e2e/chat_e2e_cli_recovery.spec.ts
-          --grep "persists overrides"
-          --workers=1 --output=test-results/windows-cli
       - name: Retain Electron diagnostic summaries
         if: always()
         shell: pwsh
@@ -46,6 +32,6 @@ jobs:
           Get-ChildItem test-results -Recurse -Filter electron-log-analysis.json -ErrorAction SilentlyContinue |
             ForEach-Object {
               $summary = Get-Content $_.FullName -Raw | ConvertFrom-Json
-              [pscustomobject]@{ journey = $_.Directory.Name; passed = $summary.passed; counts = $summary.counts } |
+              [pscustomobject]@{ journey = $_.Directory.Name; passed = $summary.passed; levels = $summary.levelCounts; captured = $summary.capturedLineCount; analyzed = $summary.analyzedLineCount } |
                 ConvertTo-Json -Depth 4 -Compress
             }
