@@ -156,6 +156,8 @@ jobs:
           npm run test:js -- --maxWorkers=1
           test/main/features/local_agents/codex_backend.test.ts
           test/main/features/local_agents/codex_parser.test.ts
+          test/main/features/local_agents/context.test.ts
+          test/main/features/local_agents/compatibility.test.ts
           test/main/features/local_agents/cli_input_cancel.test.ts
       - name: Verify BGRA brightness and contrast calibration
         run: >-

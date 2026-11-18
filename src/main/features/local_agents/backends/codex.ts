@@ -1437,6 +1437,10 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
         try {
           const r = await rpc('thread/resume', {
             threadId: o.resumeSessionId,
+            // Supported by the 0.145.0 floor with experimentalApi enabled.
+            // Native context stays in Codex; Orkas only needs the thread id.
+            // Hydrating unused turns can exhaust the main-process heap.
+            excludeTurns: true,
             cwd: o.cwd,
             ...(o.modelOverride ? { model: o.modelOverride } : {}),
             ...buildCodexThreadPermissionOverrides(o.permissionPolicy || 'inherit'),
