@@ -45,13 +45,23 @@ async function removeTree(dir: string): Promise<void> {
   await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
+
+const diagnosticsCache = process.env.ORKAS_DIAGNOSTIC_PS_CACHE === "default"
+  ? path.win32.join(process.env.LOCALAPPDATA ?? "", "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache")
+  : process.env.PSModuleAnalysisCachePath;
+function createSandbox(config: ConstructorParameters<typeof SandboxExecutor>[0]) {
+  if (!IS_WINDOWS || !process.env.ORKAS_DIAGNOSTIC_PS_CACHE || !diagnosticsCache || !path.win32.isAbsolute(diagnosticsCache)) {
+    throw new Error("Native cache comparison requires its selected absolute cache file");
+  }
+  return new SandboxExecutor({ ...config, env: { PSModuleAnalysisCachePath: diagnosticsCache, ...config.env } });
+}
 describe("SandboxExecutor", () => {
   it("defaults command execution to the long bash timeout", () => {
     expect(DEFAULT_SANDBOX_TIMEOUT_MS).toBe(60 * 60_000);
   });
 
   it("executes a simple command", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("echo hello");
     expect(result.stdout.trim()).toBe("hello");
     expect(result.exitCode).toBe(0);
@@ -60,7 +70,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("contains synchronous shell start failures as a non-executed command result", async () => {
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       shell: "invalid\0shell",
     });
@@ -93,7 +103,7 @@ describe("SandboxExecutor", () => {
 
   it("contains asynchronous shell start failures without exposing the shell path", async () => {
     const missingShell = path.join(os.tmpdir(), `missing-shell-${process.pid}-${Date.now()}`);
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       shell: missingShell,
     });
@@ -124,19 +134,19 @@ describe("SandboxExecutor", () => {
   });
 
   it("captures stderr", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     const result = await sandbox.execute(nodeEvalCommand("process.stderr.write('error')"));
     expect(result.stderr.trim()).toBe("error");
   });
 
   it("returns non-zero exit code for failing commands", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("exit 42");
     expect(result.exitCode).toBe(42);
   });
 
   it("enforces timeout", async () => {
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       timeoutMs: 500,
     });
@@ -150,7 +160,7 @@ describe("SandboxExecutor", () => {
       "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
       "console.log('parent done');",
     ].join("");
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       timeoutMs: 500,
     });
@@ -174,7 +184,7 @@ describe("SandboxExecutor", () => {
     const descendant = `require('fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid}));process.stderr.write(${JSON.stringify(stderr)});process.stdout.write(${JSON.stringify(stdout)});setTimeout(()=>process.exit(0),20000)`;
     const parent = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{detached:true,stdio:'inherit'});`;
     try {
-      const result = await new SandboxExecutor({
+      const result = await createSandbox({
         workingDir: dir, timeoutMs: 15_000, maxOutputBytes: spooled ? 16 : 1024,
         ...(spooled ? { outputSpoolDir: path.join(dir, "spool") } : {}),
       })
@@ -220,7 +230,7 @@ describe("SandboxExecutor", () => {
   }, 15_000);
 
   it("blocks dangerous commands", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("rm -rf /");
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("blocked");
@@ -232,7 +242,7 @@ describe("SandboxExecutor", () => {
     "printf '%s\\n' 'rm -rf /'", "echo init 0", "echo mkfs.ext4",
     "echo shutdown | cat", "cat < /dev/sda",
   ])("does not mistake literal arguments for blocked execution: %s", (command) => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     // Check admission without executing service mutations or destructive commands.
     expect((sandbox as any).checkBlockedCommand(command)).toBeNull();
   });
@@ -248,12 +258,12 @@ describe("SandboxExecutor", () => {
     ":(){ :|:& };:", "! reboot", "su -c shutdown", "ssh host shutdown",
     "X=1 /sbin/shutdown", '"C:\\Windows\\System32\\shutdown.exe" /s',
   ])("retains dangerous and opaque command denial: %s", (command) => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     expect((sandbox as any).checkBlockedCommand(command)).not.toBeNull();
   });
 
   it("prints a blocked command name as data in foreground execution", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("echo shutdown");
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe("shutdown");
@@ -262,7 +272,7 @@ describe("SandboxExecutor", () => {
   it("prints a blocked command name as data in detached execution", async ({ onTestFinished }) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-"));
     onTestFinished(() => removeTree(dir));
-    const sandbox = new SandboxExecutor({ workingDir: dir });
+    const sandbox = createSandbox({ workingDir: dir });
     const logPath = path.join(dir, "output.log");
     const { pid, error } = sandbox.executeBackground("echo shutdown", logPath);
     expect(error).toBeUndefined();
@@ -272,7 +282,7 @@ describe("SandboxExecutor", () => {
   }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 
   it("blocks custom commands", async () => {
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       blockedCommands: ["curl"],
     });
@@ -282,7 +292,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("enforces output size limit", async () => {
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       maxOutputBytes: 100,
     });
@@ -296,7 +306,7 @@ describe("SandboxExecutor", () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-spool-test-"));
     const output = "x".repeat(1_000);
     try {
-      const sandbox = new SandboxExecutor({
+      const sandbox = createSandbox({
         workingDir: tmpDir,
         maxOutputBytes: 100,
         outputSpoolDir: path.join(tmpDir, "results"),
@@ -323,7 +333,7 @@ describe("SandboxExecutor", () => {
   it("marks the stored prefix incomplete only at the hard spool limit", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-spool-cap-test-"));
     try {
-      const sandbox = new SandboxExecutor({
+      const sandbox = createSandbox({
         workingDir: tmpDir,
         maxOutputBytes: 100,
         outputSpoolDir: path.join(tmpDir, "results"),
@@ -350,7 +360,7 @@ describe("SandboxExecutor", () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-test-"));
     await fs.writeFile(path.join(tmpDir, "marker.txt"), "found");
 
-    const sandbox = new SandboxExecutor({ workingDir: tmpDir });
+    const sandbox = createSandbox({ workingDir: tmpDir });
     const result = await sandbox.execute(nodeEvalCommand("process.stdout.write(require('node:fs').readFileSync('marker.txt', 'utf8'))"));
     expect(result.stdout.trim()).toBe("found");
 
@@ -372,7 +382,7 @@ describe("SandboxExecutor", () => {
         `fs.writeFileSync(${JSON.stringify(allowedFile)}, 'ok');`,
         `fs.writeFileSync(${JSON.stringify(deniedFile)}, 'blocked');`,
       ].join("");
-      const sandbox = new SandboxExecutor({
+      const sandbox = createSandbox({
         workingDir: allowedDir,
         allowedDirs: [allowedDir],
       });
@@ -387,7 +397,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("passes custom environment variables", async () => {
-    const sandbox = new SandboxExecutor({
+    const sandbox = createSandbox({
       workingDir: os.tmpdir(),
       env: { MY_VAR: "test_value" },
     });
@@ -396,7 +406,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("reports duration", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = createSandbox({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("echo fast");
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(result.durationMs).toBeLessThan(NATIVE_SHELL_STARTUP_BUDGET_MS);
@@ -636,7 +646,7 @@ describe("augmentPath", () => {
       const diagnostics = vi.spyOn(console, "info").mockImplementation(() => {});
       try {
         const logPath = path.join(dir, "run.log");
-        const sandbox = new SandboxExecutor({ workingDir: dir });
+        const sandbox = createSandbox({ workingDir: dir });
         const { pid, error } = sandbox.executeBackground(
           nodeEvalCommand("process.stdout.write('done\\n')"),
           logPath,
@@ -667,7 +677,7 @@ describe("augmentPath", () => {
     it("refuses blocked commands without spawning", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
       try {
-        const sandbox = new SandboxExecutor({ workingDir: dir });
+        const sandbox = createSandbox({ workingDir: dir });
         const { pid, error } = sandbox.executeBackground("rm -rf /", path.join(dir, "x.log"));
         expect(pid).toBeNull();
         expect(error).toMatch(/blocked/i);

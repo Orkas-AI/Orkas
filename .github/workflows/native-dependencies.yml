@@ -29,5 +29,14 @@ jobs:
           if (-not (Test-Path -LiteralPath $legacyCache -PathType Leaf)) {
             throw 'The native PowerShell module cache was not prepared'
           }
-      - name: Run both unchanged owners with the native cache ready
+      - name: Compare the ordinary location when explicitly selected
+        env:
+          ORKAS_DIAGNOSTIC_PS_CACHE: default
+        run: >-
+          npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts
+          -t 'executes a simple command|prints a blocked command name|reports duration'
+      - name: Exercise both owners with the image cache as explicit fixture input
+        if: always()
+        env:
+          ORKAS_DIAGNOSTIC_PS_CACHE: image
         run: npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts src/core-agent/test/process-session.test.ts
