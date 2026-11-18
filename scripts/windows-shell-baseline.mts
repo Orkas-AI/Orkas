@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { buildSandboxEnv, buildShellInvocation } from '../src/core-agent/src/sandbox/executor.ts';
 import { withWindowsPowerShellModules } from './test-runtime-env.mjs';
@@ -13,30 +13,29 @@ const pick = (names: string[]) => Object.fromEntries(names.flatMap(name => {
   const value = parent[name] ?? Object.entries(parent).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
   return value ? [[name, value]] : [];
 }));
-const moduleEnv = pick(['PSModulePath']);
-const cacheEnv = pick(['PSModuleAnalysisCachePath']);
-const windowsRoots = [
-  [sandbox.SystemRoot ?? sandbox.WINDIR, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'],
-  [sandbox.ProgramFiles, 'WindowsPowerShell', 'Modules'],
+const roots = [
   [sandbox.USERPROFILE, 'Documents', 'WindowsPowerShell', 'Modules'],
-].filter(parts => parts[0]).map(parts => path.win32.join(...parts)).join(';');
-const cacheRoot = mkdtempSync(path.join(os.tmpdir(), 'orkas-shell-probe-'));
-console.log(JSON.stringify({ inheritedCacheVariable: Object.keys(cacheEnv).length === 1,
-  legacyModuleDirectories: (moduleEnv.PSModulePath || '').split(';').filter(Boolean).length }));
+  [sandbox.ProgramFiles, 'WindowsPowerShell', 'Modules'],
+  [sandbox.SystemRoot ?? sandbox.WINDIR, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'],
+].map(parts => path.win32.join(...parts)).join(';');
+const defaultCacheDir = path.win32.join(sandbox.LOCALAPPDATA, 'Microsoft', 'Windows', 'PowerShell');
+const cacheState = () => {
+  try { return readdirSync(defaultCacheDir).filter(name => name.startsWith('ModuleAnalysisCache')).map(name => statSync(path.join(defaultCacheDir, name)).size); }
+  catch { return []; }
+};
 const profiles = [
-  ['sandbox-cold', sandbox],
-  ['windows-default-directories', { ...sandbox, PSModulePath: windowsRoots }],
-  ['normalized-path-only', { ...sandbox, ...moduleEnv }],
-  ...(Object.keys(cacheEnv).length ? [['inherited-cache-only', { ...sandbox, ...cacheEnv }] as const] : []),
-  ['isolated-fresh-cache', { ...sandbox, PSModuleAnalysisCachePath: path.win32.join(cacheRoot, 'ModuleAnalysisCache') }],
-  ['sandbox-repeat', sandbox],
-  ['normalized-path-repeat', { ...sandbox, ...moduleEnv }],
+  ['cold-console', sandbox, "[Console]::WriteLine('fast')", 35000],
+  ['cold-echo', sandbox, 'echo fast', 35000],
+  ['explicit-echo', {...sandbox, PSModulePath: roots}, 'echo fast', 35000],
+  ['warm-default', sandbox, "$null = Get-Module -ListAvailable; echo fast; [Threading.Thread]::Sleep(3000)", 90000],
+  ['after-warm-echo', sandbox, 'echo fast', 35000],
+  ['after-warm-console', sandbox, "[Console]::WriteLine('fast')", 35000],
 ] as const;
-process.on('exit', () => rmSync(cacheRoot, { recursive: true, force: true, maxRetries: 3 }));
+console.log(JSON.stringify({initialCacheBytes:cacheState(), runnerAnalysisCacheConfigured:!!pick(['PSModuleAnalysisCachePath']).PSModuleAnalysisCachePath}));
 const observations: unknown[] = [];
-for (const [profile, env] of profiles) {
+for (const [profile, env, command, limit] of profiles) {
   const shell = 'powershell.exe';
-  const invocation = buildShellInvocation(shell, 'echo fast');
+  const invocation = buildShellInvocation(shell, command);
   const result = await new Promise((resolve, reject) => {
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
@@ -47,7 +46,7 @@ for (const [profile, env] of profiles) {
       exitMs: null as number | null, closeMs: 0, code: null as number | null,
       timedOut: false, expectedOutput: false, stderrBytes: 0};
     let stdout = '';
-    const timeout = setTimeout(() => { sample.timedOut = true; child.kill(); }, 25_000);
+    const timeout = setTimeout(() => { sample.timedOut = true; child.kill(); }, limit);
     child.once('spawn', () => { sample.spawnMs = elapsed(); });
     child.stdout.on('data', bytes => { sample.firstStdoutMs ??= elapsed(); stdout += bytes.toString('utf8'); });
     child.stderr.on('data', bytes => { sample.stderrBytes += bytes.length; });
@@ -62,6 +61,6 @@ for (const [profile, env] of profiles) {
     });
   });
   observations.push(result);
-  console.log(JSON.stringify({ sample: result }));
+  console.log(JSON.stringify({ sample: result, defaultCacheBytes:cacheState() }));
 }
 console.log(JSON.stringify({ runtime: process.versions.electron ? "Electron" : "Node", observations }));

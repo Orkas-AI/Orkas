@@ -1,11 +1,15 @@
-name: Windows PowerShell baseline diagnostic
+name: Windows PowerShell startup isolation
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  baseline:
-    runs-on: windows-2022
-    timeout-minutes: 12
+  shell:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -13,5 +17,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --include=optional
-      - name: Measure PowerShell with the actual sandbox environment in Node
+      - name: Compare native startup, command discovery, and cache warming
         run: node --import tsx scripts/windows-shell-baseline.mts
+      - name: Run unchanged owning suites on the same host
+        if: always()
+        run: npm run test:js -- --maxWorkers=1 src/core-agent/test/sandbox.test.ts src/core-agent/test/process-session.test.ts
