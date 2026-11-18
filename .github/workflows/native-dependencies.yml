@@ -146,6 +146,13 @@ jobs:
           test/main/features/auto_tasks.test.ts
           test/main/model/core-agent/office-batch.test.ts
           test/main/model/core-agent/office-tools.test.ts
+      - name: Verify incremental shell output and terminal receipts
+        env:
+          ORKAS_TEST_USE_HOSTED_POWERSHELL_CACHE: '1'
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          src/core-agent/test/sandbox.test.ts
+          src/core-agent/test/process-session.test.ts
       - name: Verify Codex final stream records and lifecycle
         run: >-
           npm run test:js -- --maxWorkers=1
