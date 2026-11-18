@@ -90,6 +90,9 @@ jobs:
         run: node node_modules/typescript/bin/tsc --noEmit
 
       - name: Launch the real Orkas application and renderer
+        env:
+          # This startup journey uses a virtual display on a hosted CPU runner.
+          ORKAS_E2E_SOFTWARE_RENDERING: '1'
         run: >-
           dbus-run-session -- xvfb-run --auto-servernum
           npm run test:e2e --
@@ -98,6 +101,8 @@ jobs:
 
 
       - name: Verify task pagination labels and navigation
+        env:
+          ORKAS_E2E_SOFTWARE_RENDERING: '1'
         run: >-
           dbus-run-session -- xvfb-run --auto-servernum npm run test:e2e --
           test/e2e/sidebar_e2e_pagination_spacing.spec.ts
