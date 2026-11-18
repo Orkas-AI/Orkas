@@ -17700,16 +17700,19 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
   const pending = isConvPending(cid) && !(state && state.aborted);
   const conv = snapshot ? snapshot.conversation : conversations.find(c => c.conversation_id === cid);
   const status = _convRowStatus(conv || { conversation_id: cid });
-  if (!pending || status === 'waiting') {
-    // Waiting for an answer takes the row's status slot ahead of the live pulse.
+  if (!pending) {
+    // Settled work has no live pulse.
     // The failed mark is maintained by the structured hooks
     // (`_finalizeActorPlaceholder`, history sync, onDone) — nothing to derive here.
     items.forEach((item) => item.querySelector('.conv-status-badge')?.remove());
     _repaintConvRowStatus(cid, snapshot);
     return;
   }
+  // A question can leave its turn running. Keep the leading live pulse and
+  // trailing attention label until the user answers or the turn ends.
+  if (status === 'waiting') _repaintConvRowStatus(cid, snapshot);
   items.forEach((item) => {
-    item.querySelector('.conv-item-status-label')?.remove();
+    if (status !== 'waiting') item.querySelector('.conv-item-status-label')?.remove();
     const existing = item.querySelector('.conv-status-badge');
     // Preserve an unchanged running indicator and its breathing animation.
     if (existing?.classList.contains('is-streaming')) return;
