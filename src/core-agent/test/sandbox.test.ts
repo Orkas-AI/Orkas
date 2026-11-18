@@ -256,16 +256,51 @@ describe("SandboxExecutor", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-"));
     const sandbox = new SandboxExecutor({ workingDir: dir });
     const command = "echo shutdown";
+    let childPid: number | null = null;
+    let launchedAt = 0;
+    let phase = "foreground";
     try {
       const foreground = await sandbox.execute(command);
       expect(foreground.exitCode).toBe(0);
       expect(foreground.stdout.trim()).toBe("shutdown");
       const logPath = path.join(dir, "output.log");
+      phase = "launch";
       const background = sandbox.executeBackground(command, logPath);
+      childPid = background.pid;
+      launchedAt = Date.now();
       expect(background.error).toBeUndefined();
       expect(background.pid).toBeGreaterThan(0);
+      phase = "output-poll";
       await expect.poll(async () => (await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
+      phase = "exit-poll";
       await waitForProcessExit(background.pid!);
+    } catch (error) {
+      console.info('sandbox-original-observation', { phase, elapsedMs: launchedAt ? Date.now() - launchedAt : null,
+        type: error instanceof Error ? error.name : 'unknown' });
+      if (childPid) {
+        await waitForProcessExit(childPid, NATIVE_SHELL_STARTUP_BUDGET_MS);
+        console.info('sandbox-original-terminal', { elapsedMs: Date.now() - launchedAt,
+          literalOutput: (await fs.readFile(path.join(dir, 'output.log'), 'utf8')).trim() === 'shutdown' });
+      }
+      throw error;
+    } finally { await removeTree(dir); }
+  }, 45_000);
+
+  it.runIf(IS_WINDOWS)("compares the one-second poll with completion for a slow real Windows shell", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-proof-"));
+    const sandbox = new SandboxExecutor({ workingDir: dir });
+    const logPath = path.join(dir, "output.log");
+    const launchedAt = Date.now();
+    const { pid, error } = sandbox.executeBackground("Start-Sleep -Milliseconds 1800; echo shutdown", logPath);
+    try {
+      expect(error).toBeUndefined();
+      expect(pid).toBeGreaterThan(0);
+      const early = expect.poll(async () => (await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
+      await expect(early).rejects.toThrow();
+      const earlyMs = Date.now() - launchedAt;
+      await waitForProcessExit(pid!, NATIVE_SHELL_STARTUP_BUDGET_MS);
+      expect((await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
+      console.info('sandbox-controlled-observation', { earlyMs, completionMs: Date.now() - launchedAt, literalOutput: true });
     } finally { await removeTree(dir); }
   }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 
