@@ -41,6 +41,7 @@ const SCENARIOS = [
   ['ppt-native-recovery', 'rejects an unsupported native graph atomically and corrects the same creation with custom dimensions'],
   ['ppt-unit-contract', 'rejects fractional unitless coordinates before native dispatch and preserves explicit and raw EMU lengths'],
   ['ppt-native-append', 'preserves native placeholders and the source while appending complete pages atomically after a rollback'],
+  ['create-docx-heading-outline', 'creates editable Word headings with their navigation levels'],
   ] as const;
 
 // OfficeCLI is bundled for desktop macOS/Windows, not Linux hosts.
@@ -49,7 +50,8 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform)).each([
   { cohort: 'edit', cases: SCENARIOS.slice(5, 10) },
   { cohort: 'notes', cases: SCENARIOS.slice(10, 15) },
   { cohort: 'creation', cases: SCENARIOS.slice(15, 24) },
-  { cohort: 'presentation', cases: SCENARIOS.slice(24) },
+  { cohort: 'presentation', cases: SCENARIOS.slice(24, 25) },
+  { cohort: 'docx-headings', cases: SCENARIOS.slice(25) },
 ])('real Office review lifecycle ($cohort)', ({ cases }) => {
   let root: string;
   let rows: Row[];

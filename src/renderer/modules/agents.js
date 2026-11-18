@@ -2458,7 +2458,11 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
         // fallback. Await it before returning control to the composer.
         await loadAgents(true, { summary: true });
       }
-      _renderAgentDetail(saved.agent, _agentEditing);
+      // The write response contains the definition, while detail reads also
+      // load saved memory and delivery stats. Refresh only the runtime controls.
+      if (_selectedAgent?.id === agent.agent_id && slot.dataset.runtimeKey === cacheKey) {
+        await _renderAgentDetailCliSettings({ ...agent, runtime: saved.agent.runtime });
+      }
     } catch (error) {
       throw error;
     }
