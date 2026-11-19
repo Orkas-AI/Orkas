@@ -42,6 +42,7 @@ const SCENARIOS = [
   ['ppt-unit-contract', 'rejects fractional unitless coordinates before native dispatch and preserves explicit and raw EMU lengths'],
   ['ppt-native-append', 'preserves native placeholders and the source while appending complete pages atomically after a rollback'],
   ['create-docx-heading-outline', 'creates editable Word headings with their navigation levels'],
+  ['read-tables', 'marks omitted Word table text as partial and provides a working native read path'],
   ] as const;
 
 // OfficeCLI is bundled for desktop macOS/Windows, not Linux hosts.
@@ -51,7 +52,8 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform)).each([
   { cohort: 'notes', cases: SCENARIOS.slice(10, 15) },
   { cohort: 'creation', cases: SCENARIOS.slice(15, 24) },
   { cohort: 'presentation', cases: SCENARIOS.slice(24, 25) },
-  { cohort: 'docx-headings', cases: SCENARIOS.slice(25) },
+  { cohort: 'docx-headings', cases: SCENARIOS.slice(25, 26) },
+  { cohort: 'docx-tables', cases: SCENARIOS.slice(26) },
 ])('real Office review lifecycle ($cohort)', ({ cases }) => {
   let root: string;
   let rows: Row[];
@@ -106,6 +108,10 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform)).each([
         : id === 'read-notes-end' ? ['/footnotes'] : id === 'read-notes-none' ? ['/footnotes', '/endnotes'] : [];
       expect(failures.map(({ verb, target, code }) => ({ verb, target, code }))).toEqual(
         absent.map(target => ({ verb: 'get', target, code: 1 })),
+      );
+    } else if (id === 'read-tables') {
+      expect(failures.map(({ verb, target, code }) => ({ verb, target, code }))).toEqual(
+        ['/footnotes', '/endnotes'].map(target => ({ verb: 'get', target, code: 1 })),
       );
     } else expect(failures).toEqual([]);
   });
