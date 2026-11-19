@@ -2312,7 +2312,14 @@ async function observeWebAssistTab(
   const controlRevision = tab.controlRevision || 0;
   const navigationRevision = tab.navigationRevision || 0;
   const currentUrl = contents.getURL() === 'about:blank' ? 'about:blank' : safeWebAssistUrl(contents.getURL());
-  if (!currentUrl) return { ok: false, code: 'page_unavailable', error: 'There is no controllable web page.' };
+  if (!currentUrl || currentUrl === 'about:blank') {
+    const failure = pageLoadWaitFailure(tab);
+    if (failure) return failure;
+    if (tab.loading && tab.pendingAddressUrl && tab.pendingAddressUrl !== currentUrl) {
+      return { ok: false, code: 'page_loading', error: 'The page is loading. Wait on this tab, then observe it again.' };
+    }
+    if (!currentUrl) return { ok: false, code: 'page_unavailable', error: 'There is no controllable web page.' };
+  }
   try {
     // A parser-ready page can be observed before subresources finish. Restore
     // the desktop viewport for recreated hidden views on macOS as well.

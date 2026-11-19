@@ -76,9 +76,15 @@ export function createAutoTasksTool(opts: {
           return { content: JSON.stringify({ ok: true, task: taskView(task) }) };
         }
         const updates = Object.fromEntries(EDIT_FIELDS.filter((key) => data[key] !== undefined).map((key) => [key, data[key]]));
+        const observed = opts.projectId === undefined && action !== 'create'
+          ? { expectedSourceProjectId: (await autoTasks.getTask(opts.userId, taskId))?.project_id ?? null }
+          : {};
         const result = await autoTasks.applyAutoTaskMutation(opts.userId, {
           action, taskId, updates,
-        }, { sourceAttachmentCid: opts.cid, projectId: opts.projectId, ...(opts.cid ? { conversationId: opts.cid } : {}) });
+        }, {
+          sourceAttachmentCid: opts.cid, projectId: opts.projectId, ...observed,
+          ...(opts.cid ? { conversationId: opts.cid } : {}),
+        });
         if (!result.ok && result.error && !/^[a-z][a-z0-9_]*$/.test(result.error)) return fail('automation operation failed');
         if (result.ok && result.taskId && result.kind !== 'deleted') {
           try { opts.onSaved?.(result.taskId, result.task?.title || result.title || ''); } catch { /* navigation is an offer, never a failure */ }
