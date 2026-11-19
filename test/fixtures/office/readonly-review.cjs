@@ -147,6 +147,7 @@ app.whenReady().then(async () => {
   } finally { probeWindow.destroy(); active = undefined; }
   const rows = [];
   const scenarioIds = ['combined-review', 'partial-page-retry', 'cancel-after-check', 'invalid-document', 'edit-then-review', 'xlsx-render', 'pptx-render', 'edit-10-paragraphs', 'edit-1000-paragraphs', 'create-centered-footer', 'read-notes-foot', 'read-notes-end', 'read-notes-both', 'read-notes-none', 'read-notes-many', 'creation-recovery-pptx', 'ppt-crop-percentages', 'ppt-parameter-recovery', 'saved-before-record-docx', 'saved-before-record-xlsx', 'saved-before-record-pptx', 'ppt-native-production', 'ppt-native-recovery', 'ppt-unit-contract', 'ppt-native-append', 'create-docx-heading-outline'];
+  scenarioIds.push('read-tables');
   const selectedCases = process.argv[4] === undefined ? scenarioIds : JSON.parse(process.argv[4]);
   assert(Array.isArray(selectedCases) && selectedCases.length > 0
     && new Set(selectedCases).size === selectedCases.length
@@ -166,6 +167,14 @@ app.whenReady().then(async () => {
     if (id === 'invalid-document') {
       const zip = new AdmZip(original);
       zip.updateFile('word/document.xml', Buffer.from(zip.readAsText('word/document.xml').replace('<w:body>', '<w:body><w:invalidElement/>')));
+      fs.writeFileSync(file, zip.toBuffer());
+    } else if (id === 'read-tables') {
+      const zip = new AdmZip(original);
+      const table = '<w:tbl><w:tblPr><w:tblW w:w="4800" w:type="dxa"/></w:tblPr>'
+        + '<w:tblGrid><w:gridCol w:w="4800"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4800" w:type="dxa"/></w:tcPr>'
+        + '<w:p><w:r><w:t>TABLE_EVIDENCE_726</w:t></w:r></w:p></w:tc></w:tr></w:tbl>';
+      zip.updateFile('word/document.xml', Buffer.from(zip.readAsText('word/document.xml')
+        .replace('<w:sectPr>', table + '<w:sectPr>')));
       fs.writeFileSync(file, zip.toBuffer());
     } else fs.writeFileSync(file, original);
     const before = fs.readFileSync(file);
@@ -536,6 +545,23 @@ app.whenReady().then(async () => {
         assert.equal(fs.existsSync(target), false);
         assert.equal(row.commands.length, commands, 'deleted successful file must not dispatch another native create');
         assert.deepEqual(written.slice(writtenBefore), [target]);
+      } else if (id === 'read-tables') {
+        const read = tools.find(tool => tool.name === 'office_read');
+        const initial = await read.execute({ path: file }, context);
+        assert(!initial.isError, initial.content);
+        const result = JSON.parse(initial.content);
+        assert.equal(result.status, 'partial');
+        assert.deepEqual(result.unread_sections, ['/body']);
+        const body = result.sections.find(section => section.target === '/body');
+        assert.equal(body.status, 'partial');
+        assert(body.content.includes('Stable text 123'));
+        assert(!body.content.includes('TABLE_EVIDENCE_726'));
+        assert.deepEqual(body.unread_table_paths, ['/body/tbl[1]']);
+        const targeted = await read.execute({ path: file, mode: 'get',
+          targets: [body.unread_table_paths[0] + '/tr[1]/tc[1]/p[1]'] }, context);
+        assert(!targeted.isError, targeted.content);
+        assert(targeted.content.includes('TABLE_EVIDENCE_726'));
+        await noResident(file);
       } else if (id.startsWith('read-notes-')) {
         const checked = await review.execute({ action: 'check', path: file }, context);
         assert(!checked.isError, checked.content);

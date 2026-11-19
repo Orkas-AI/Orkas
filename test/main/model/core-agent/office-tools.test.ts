@@ -1077,7 +1077,7 @@ describe('Office built-in tools', () => {
     }, ctx());
 
     expect(JSON.parse(text.content)).toMatchObject({ status: 'partial',
-      unread_sections: ['/footnotes', '/endnotes'], sections: [{ target: '/body', content: 'ok' },
+      unread_sections: ['/body', '/footnotes', '/endnotes'], sections: [{ target: '/body', content: 'ok', status: 'partial' },
         { target: '/footnotes', status: 'unavailable' }, { target: '/endnotes', status: 'unavailable' }] });
     expect(outline.content).toBe('ok');
     expect(JSON.parse(get.content)).toEqual({
@@ -1098,6 +1098,7 @@ describe('Office built-in tools', () => {
       ['view', file, 'text'],
       ['get', file, '/footnotes', '--json'],
       ['get', file, '/endnotes', '--json'],
+      ['query', file, 'table', '--json'],
       ['view', file, 'outline'],
       ['get', file, '/body/p[1]', '--json'],
       ['query', file, 'p.title', '--json'],
@@ -1109,11 +1110,13 @@ describe('Office built-in tools', () => {
   });
 
   // A content review must retain facts outside the body and disclose incomplete scope.
+  const noBodyTables = { code: 0, stdout: '{"success":true,"data":{"matches":0,"results":[]}}', stderr: '' };
   function docxReadFixture(noteFailure?: 'failure' | 'malformed' | 'overflow') {
     const file = path.join(h.workspace, 'annotated.docx');
     fs.writeFileSync(file, 'protected source bytes');
     h.runOfficeCli.mockImplementation(async (args: string[]) => {
       if (args[0] === 'view') return { code: 0, stdout: '[/body/p[1]] Body fact 418', stderr: '' };
+      if (args[0] === 'query') return noBodyTables;
       if (args[2] === '/footnotes' && noteFailure === 'overflow') {
         throw new OfficeCliError('E_OFFICE_OUTPUT_LIMIT', 'private source diagnostic');
       }
@@ -1150,14 +1153,15 @@ describe('Office built-in tools', () => {
     expect(fs.readFileSync(file, 'utf8')).toBe('protected source bytes');
     expect(onFileWritten).not.toHaveBeenCalled();
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
-    expect(h.runOfficeCli).toHaveBeenCalledTimes(3);
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(4);
   });
 
   it('marks authoritatively absent DOCX notes as absent rather than unread', async () => {
     const file = docxReadFixture();
     h.runOfficeCli.mockImplementation(async (args: string[]) => args[0] === 'view'
       ? { code: 0, stdout: 'Body', stderr: '' }
-      : { code: 1, stdout: JSON.stringify({ success: false, error: { code: 'not_found' } }), stderr: '' });
+      : args[0] === 'query' ? noBodyTables
+        : { code: 1, stdout: JSON.stringify({ success: false, error: { code: 'not_found' } }), stderr: '' });
     const p = JSON.parse((await getTool('office_read').execute({ path: file }, ctx())).content);
     expect(p.status).toBe('complete');
     expect(p.unread_sections).toEqual([]);
@@ -1182,7 +1186,7 @@ describe('Office built-in tools', () => {
   it('shares the source byte budget and reports overflow plus unattempted notes without replay', async () => {
     const file = docxReadFixture('overflow');
     const p = JSON.parse((await getTool('office_read').execute({ path: file }, ctx())).content);
-    expect(p).toMatchObject({ status: 'partial', source_truncated: true, unread_sections: ['/footnotes', '/endnotes'] });
+    expect(p).toMatchObject({ status: 'partial', source_truncated: true, unread_sections: ['/body', '/footnotes', '/endnotes'] });
     expect(p.sections.slice(1)).toEqual([
       { target: '/footnotes', status: 'truncated', error: 'E_OFFICE_OUTPUT_LIMIT' },
       { target: '/endnotes', status: 'not_read', error: 'E_OFFICE_OUTPUT_LIMIT' },
@@ -1202,7 +1206,7 @@ describe('Office built-in tools', () => {
       return result;
     });
     const p = JSON.parse((await getTool('office_read').execute({ path: file }, ctx())).content);
-    expect(p).toMatchObject({ status: 'partial', unread_sections: ['/endnotes'], source_truncated: false });
+    expect(p).toMatchObject({ status: 'partial', unread_sections: ['/body', '/endnotes'], source_truncated: false });
     expect(p.sections[2]).toEqual({ target: '/endnotes', status: 'not_read', error: 'E_OFFICE_TIMEOUT' });
     expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
     expect(h.runOfficeCli.mock.calls[1][1].timeoutMs).toBe(500);
@@ -1249,7 +1253,7 @@ describe('Office built-in tools', () => {
     expect(complete.sections[0].content).toBe('[/body/p[1]] ' + 'Long body text. '.repeat(2000));
     expect(complete.sections[1].data.results[0].children[0].text).toBe('footnote fact 529');
     expect(complete.sections[2].data.results[0].children[0].text).toBe('endnote fact 529');
-    expect(h.runOfficeCli).toHaveBeenCalledTimes(3);
+    expect(h.runOfficeCli).toHaveBeenCalledTimes(4);
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
     expect(onFileWritten).not.toHaveBeenCalled();
   });
