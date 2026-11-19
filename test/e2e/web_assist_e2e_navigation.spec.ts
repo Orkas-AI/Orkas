@@ -342,3 +342,64 @@ test('observe discards old DOM after same URL reload and permits fresh observati
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('reports loading until the first browser document is available on the same tab', async ({ modelOrkas: orkas }) => {
+  let sendDocument: (() => void) | undefined;
+  const server = createServer((req, res) => {
+    if (new URL(req.url!, 'http://loopback').pathname !== '/first') { res.writeHead(404).end(); return; }
+    sendDocument = () => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<title>First document</title><h1>First document is ready</h1>');
+    };
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const root = path.resolve(__dirname, '../..');
+  let cid = '';
+  try {
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title: 'First document' });
+    cid = created.conversation.conversation_id;
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/first`;
+    await orkas.page!.evaluate(async id => {
+      await (window as any).loadConversations();
+      (window as any).setView('conversation', id);
+      (window as any).ConversationInfo.openAndSetTab('browser');
+    }, cid);
+    const opened = await orkas.invoke<any>('webAssist.open', { conversationId: cid, url });
+    expect(opened.ok).toBe(true);
+    const tabId = opened.state.active_tab_id;
+    await orkas.electronApp!.evaluate(({ BrowserWindow }, args) => {
+      const require = (process as any).mainModule.require;
+      require(args.root + '/src/main/features/web_assist.ts')
+        .bindWebAssistConversation('account-e2e', args.cid, BrowserWindow.getAllWindows()[0].webContents);
+      require(args.root + '/src/main/features/web_assist_lifecycle.ts')
+        .beginBrowserTaskRun('account-e2e', args.cid, 'first-document');
+    }, { root, cid });
+    const run = (input: Record<string, unknown>) => orkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require;
+      const tool = require(args.root + '/src/main/features/group_chat/browser_tool.ts')
+        .buildConversationBrowserTool('account-e2e', args.cid);
+      const result = await tool.execute(args.input, { state: {} });
+      return { ...JSON.parse(result.content), isError: result.isError === true };
+    }, { root, cid, input });
+    expect(tabId).toBeTruthy();
+    await expect.poll(() => typeof sendDocument).toBe('function');
+    const observation = await run({ operation: 'observe', tab_id: tabId });
+    expect(observation).toMatchObject({ ok: false, isError: true, code: 'page_loading' });
+    expect(observation).not.toHaveProperty('page_id');
+
+    sendDocument!();
+    await expect.poll(() => run({ operation: 'wait', tab_id: tabId, wait_condition: 'loaded', timeout_ms: 500 }))
+      .toMatchObject({ ok: true, tab_id: tabId });
+    expect(await run({ operation: 'observe', tab_id: tabId })).toMatchObject({
+      ok: true, tab_id: tabId, text: expect.stringContaining('First document is ready'),
+    });
+  } finally {
+    if (cid) await orkas.electronApp!.evaluate(async (_electron, args) => {
+      (process as any).mainModule.require(args.root + '/src/main/features/web_assist_lifecycle.ts')
+        .finishBrowserTaskRun('account-e2e', args.cid, 'first-document');
+    }, { root, cid });
+    await orkas.invoke('webAssist.close', {});
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
