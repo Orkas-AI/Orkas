@@ -1255,6 +1255,74 @@ describe('Web Assist controlled connector lifecycle', () => {
     });
   });
 
+  describe('initial task browser navigation', () => {
+    it.each(['', 'about:blank'])('observes a pending first document from %j on the same tab after commit', async initialUrl => {
+      const cid = 'c-initial-document';
+      const prototype = Object.getPrototypeOf(electronMock.createPage());
+      const nativeLoad = prototype.loadURL;
+      let finish!: () => Promise<void>;
+      const load = vi.spyOn(prototype, 'loadURL').mockImplementationOnce(function (this: any, url: string) {
+        return new Promise<void>(resolve => {
+          finish = async () => { await nativeLoad.call(this, url); resolve(); };
+        });
+      });
+      try {
+        bindWebAssistConversation('u1', cid, electronMock.renderer);
+        const opened = await openModelWebAssist('u1', cid, { url: 'https://example.invalid/pending' });
+        expect(opened).toMatchObject({ ok: true, tab: { loading: true, display_url: '' } });
+        const id = opened.active_tab_id;
+        const page = electronMock.page;
+        expect(id).toBeTruthy();
+        page.url = initialUrl;
+        expect(page.getURL()).toBe(initialUrl);
+        expect(load).toHaveBeenCalledTimes(1);
+        const pending = await observeModelWebAssist('u1', cid, id);
+        expect.soft(pending).toMatchObject({ ok: false, code: 'page_loading' });
+        expect(pending).not.toHaveProperty('page_id');
+        await finish();
+        await expect(waitForModelWebAssist('u1', cid, { tabId: id, condition: 'loaded' })).resolves.toMatchObject({ ok: true, tab_id: id });
+        await expect(observeModelWebAssist('u1', cid, id)).resolves.toMatchObject({ ok: true, tab_id: id });
+        expect(load).toHaveBeenCalledTimes(1);
+      } finally {
+        load.mockRestore();
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+
+    it('returns the actual first-document failure instead of waiting on a blank page', async () => {
+      const cid = 'c-initial-load-failure';
+      const prototype = Object.getPrototypeOf(electronMock.createPage());
+      const load = vi.spyOn(prototype, 'loadURL').mockImplementationOnce(async () => {});
+      try {
+        bindWebAssistConversation('u1', cid, electronMock.renderer);
+        const open = await openModelWebAssist('u1', cid, { url: 'https://example.invalid/failed' });
+        const page = electronMock.page;
+        page.url = 'about:blank';
+        page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://example.invalid/failed', true);
+        expect(await observeModelWebAssist('u1', cid, open.active_tab_id)).toMatchObject({
+          ok: false, code: 'page_load_failed',
+        });
+        expect(load).toHaveBeenCalledTimes(1);
+      } finally {
+        load.mockRestore();
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+
+    it('keeps an empty non-loading tab unavailable without telling the caller to wait', async () => {
+      const cid = 'c-empty-document';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      const added = await addWebAssistTab('u1', electronMock.renderer, { conversationId: cid });
+      if (!added.ok) throw new Error('Blank tab could not be prepared');
+      expect(added.state.tabs[0]).toMatchObject({ loading: false, display_url: '' });
+      try {
+        await expect(observeModelWebAssist('u1', cid, added.state.active_tab_id)).resolves.toMatchObject({ ok: false, code: 'page_unavailable' });
+      } finally {
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+  });
+
   describe('idle native page reclamation', () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => {
