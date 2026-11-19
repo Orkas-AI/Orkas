@@ -431,6 +431,29 @@ describe('auto_tasks shared tool', () => {
     } finally { list.mockRestore(); }
   });
 
+  it.each(['update', 'enable', 'disable', 'delete'] as const)(
+    'keeps a concurrent move to a project when an older automation %s arrives',
+    async action => {
+      const enabled = action === 'disable';
+      const created = await run(createTool({ userId: uid }), { action: 'create', ...draft, enabled });
+      expect(created.ok).toBe(true);
+      const id = created.taskId;
+      const getTask = tasks.getTask;
+      const read = vi.spyOn(tasks, 'getTask').mockImplementationOnce(async (userId, taskId) => {
+        const before = await getTask(userId, taskId);
+        expect((await tasks.updateTask(uid, id, { project_id: pid })).ok).toBe(true);
+        return before;
+      });
+      try {
+        const result = await run(createTool({ userId: uid }), {
+          action, task_id: id, ...(action === 'update' ? { title: 'Stale title' } : {}),
+        });
+        expect(result).toMatchObject({ ok: false, isError: true, error: 'not_found' });
+        expect(await getTask(uid, id)).toMatchObject({ project_id: pid, enabled, content: draft.content });
+        expect((await getTask(uid, id))?.title).not.toBe('Stale title');
+      } finally { read.mockRestore(); }
+    });
+
   it('keeps unbound Commander explicit project selection and global schedules compatible', async () => {
     const tool = createTool({ userId: uid });
     const a = await run(tool, { action: 'create', ...draft, project_id: pid });
@@ -439,5 +462,9 @@ describe('auto_tasks shared tool', () => {
     expect(b.task).not.toHaveProperty('project_id');
     expect((await run(tool, { action: 'list', project_id: pid })).tasks.map((t: any) => t.id)).toEqual([a.taskId]);
     expect((await run(tool, { action: 'list', project_id: null })).tasks.map((t: any) => t.id)).toEqual([b.taskId]);
+    expect((await run(tool, { action: 'update', task_id: b.taskId, project_id: pid })).task.project_id).toBe(pid);
+    const movedBack = await run(tool, { action: 'update', task_id: b.taskId, project_id: null });
+    expect(movedBack.ok).toBe(true);
+    expect(movedBack.task).not.toHaveProperty('project_id');
   });
 });

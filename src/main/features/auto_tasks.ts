@@ -763,12 +763,19 @@ export async function createTask(
 export async function updateTask(
   uid: string, taskId: string, patch: TaskUpdatePatch,
   expectedProjectId?: string | null,
+  expectedSourceProjectId?: string | null,
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
+  const sourceProjectId = expectedProjectId !== undefined ? expectedProjectId : expectedSourceProjectId;
   return _runExclusive(uid, async () => {
     const stored = await _readOne(uid, taskId);
     if (!stored) return { ok: false as const, error: 'not_found' as const };
-    if (expectedProjectId !== undefined && ((stored.project_id ?? null) !== expectedProjectId || (patch.project_id !== undefined && patch.project_id !== expectedProjectId))) return { ok: false as const, error: 'not_found' as const };
+    if (sourceProjectId !== undefined && (stored.project_id ?? null) !== sourceProjectId) {
+      return { ok: false as const, error: 'not_found' as const };
+    }
+    if (expectedProjectId !== undefined && patch.project_id !== undefined && patch.project_id !== expectedProjectId) {
+      return { ok: false as const, error: 'not_found' as const };
+    }
     const cur = await _migrateLegacyDeviceBindingIfOwned(uid, stored);
     const priorDueAtMs = _timers.get(taskId)?.dueAtMs;
     const legacyMessageChanged = patch.content !== undefined
@@ -932,6 +939,8 @@ export interface AutoTaskMutationOptions {
   sourceAttachmentCid?: string;
   /** Host-bound scope: null is global, undefined preserves Commander selection. */
   projectId?: string | null;
+  /** Scope observed by an unbound caller and verified again under the storage lock. */
+  expectedSourceProjectId?: string | null;
   /** Conversation the mutation was made in. A created task runs there;
    *  an update leaves the run conversation unchanged. */
   conversationId?: string;
@@ -952,6 +961,7 @@ export async function applyAutoTaskMutation(
 ): Promise<AutoTaskMutationResult> {
   const action = mutation.action || (mutation.taskId ? 'update' : 'create');
   const taskId = mutation.taskId || '';
+  const sourceProjectId = opts.projectId !== undefined ? opts.projectId : opts.expectedSourceProjectId;
   try {
     if (opts.projectId !== undefined) {
       if (mutation.updates.project_id !== undefined && mutation.updates.project_id !== opts.projectId) return { ok: false, error: 'project_scope_mismatch' };
@@ -978,7 +988,7 @@ export async function applyAutoTaskMutation(
     if (!taskId) return { ok: false, error: 'task_id_required' };
     if (action === 'delete') {
       const before = await getTask(uid, taskId);
-      const result = await deleteTask(uid, taskId, opts.projectId);
+      const result = await deleteTask(uid, taskId, sourceProjectId);
       if (!result.ok) return { ok: false, error: 'not_found' };
       return {
         ok: true,
@@ -988,7 +998,7 @@ export async function applyAutoTaskMutation(
       };
     }
     if (action === 'enable' || action === 'disable') {
-      const result = await setTaskEnabled(uid, taskId, action === 'enable', opts.projectId);
+      const result = await setTaskEnabled(uid, taskId, action === 'enable', sourceProjectId);
       if (!result.ok) return { ok: false, error: (result as { error: string }).error };
       return {
         ok: true,
@@ -999,7 +1009,7 @@ export async function applyAutoTaskMutation(
       };
     }
     if (!Object.keys(mutation.updates).length) return { ok: false, error: 'empty_update' };
-    const result = await updateTask(uid, taskId, mutation.updates, opts.projectId);
+    const result = await updateTask(uid, taskId, mutation.updates, opts.projectId, sourceProjectId);
     if (!result.ok) return { ok: false, error: (result as { error: string }).error };
     await _stageMutationAttachments(uid, taskId, mutation, opts);
     return {
