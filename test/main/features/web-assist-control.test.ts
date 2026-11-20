@@ -1,5 +1,6 @@
 import * as vm from 'node:vm';
 import * as path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { dialog, session } from 'electron';
 import { prepareWebAssistCache } from '../../../src/main/features/web_assist_cache';
 import { registerUserSwitchHook } from '../../../src/main/features/user-switch-hooks';
@@ -1256,6 +1257,59 @@ describe('Web Assist controlled connector lifecycle', () => {
   });
 
   describe('initial task browser navigation', () => {
+    it('distinguishes a missing main frame from a stale selected frame', async () => {
+      const cid = 'c-observe-frame-availability';
+      const url = 'https://example.invalid/first-document';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      const opened = await openModelWebAssist('u1', cid, { url });
+      const tabId = opened.active_tab_id;
+      const page = electronMock.page;
+      let frame: { id: string; url: string } | undefined;
+      let attached = false;
+      const debuggerSession = Object.assign(new EventEmitter(), {
+        isAttached: () => attached,
+        attach: () => { attached = true; },
+        detach: () => { attached = false; debuggerSession.emit('detach'); },
+        sendCommand: vi.fn(async (method: string, params: Record<string, unknown>) => {
+          if (method === 'Page.getFrameTree') return { frameTree: { frame } };
+          if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
+          if (method === 'Runtime.evaluate') {
+            const value = await page.executeJavaScriptInIsolatedWorld(1001, [{ code: params.expression }]);
+            return { result: { value } };
+          }
+          return {};
+        }),
+      });
+      Object.assign(page, { mainFrame: {}, debugger: debuggerSession });
+      try {
+        page.loading = true;
+        const pending = await observeModelWebAssist('u1', cid, tabId);
+        expect.soft(pending).toMatchObject({ ok: false, code: 'page_loading' });
+        expect(pending).not.toHaveProperty('page_id');
+
+        page.loading = false;
+        const unavailable = await observeModelWebAssist('u1', cid, tabId);
+        expect.soft(unavailable).toMatchObject({ ok: false, code: 'observation_failed' });
+        expect(unavailable).not.toHaveProperty('page_id');
+        expect(debuggerSession.sendCommand).not.toHaveBeenCalledWith('Runtime.evaluate', expect.anything(), undefined);
+
+        page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', url, true);
+        await expect.soft(observeModelWebAssist('u1', cid, tabId)).resolves.toMatchObject({
+          ok: false, code: 'page_load_failed',
+        });
+        page.emit('did-navigate', {}, url, 200, 'OK');
+        frame = { id: 'current-frame', url };
+        const stale = await observeModelWebAssist('u1', cid, tabId, 'full', { frameId: 'old-frame' });
+        expect.soft(stale).toMatchObject({ ok: false, code: 'unknown_frame' });
+        expect.soft(stale.error).toContain('without frame_id');
+        await expect(observeModelWebAssist('u1', cid, tabId)).resolves.toMatchObject({
+          ok: true, tab_id: tabId, frame_id: frame.id, text: 'Create an app',
+        });
+      } finally {
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+
     it.each(['', 'about:blank'])('observes a pending first document from %j on the same tab after commit', async initialUrl => {
       const cid = 'c-initial-document';
       const prototype = Object.getPrototypeOf(electronMock.createPage());
