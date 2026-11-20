@@ -136,6 +136,7 @@
   "errors.contexts.formats_only": "Sono supportati solo questi formati: {allowed}",
   "errors.unknown_actor": "agente sconosciuto: \"{name}\"; il nome deve corrispondere al campo `name` di una voce nell'\"Elenco agenti\". Verifica anche se l'agente è disabilitato.",
   "errors.no_model_configured": "Nessun modello configurato. Aggiungi una chiave API nelle Impostazioni oppure accedi.",
+  "errors.task_restore_unavailable": "Non è possibile riprendere questa attività. Invia di nuovo la richiesta per continuare.",
   "errors.model_temporarily_unavailable": "Il modello configurato è temporaneamente non disponibile. Riprova più tardi oppure verifica le credenziali o cambia modello nelle Impostazioni.",
   "errors.model_currently_unavailable": "Questo modello non è al momento disponibile",
   "errors.model_config_unavailable": "Un modello è configurato, ma le sue credenziali non sono utilizzabili al momento. Verifica la chiave API, lo stato dell'accesso o il modello di riserva nelle Impostazioni.",

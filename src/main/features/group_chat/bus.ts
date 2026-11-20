@@ -2226,6 +2226,8 @@ async function buildGroupHistoryForTurn(params: {
 
 // ── enqueue ──────────────────────────────────────────────────────────────
 
+export const FAILED_TURN_RETRY_ACTOR_UNAVAILABLE = 'E_FAILED_TURN_RETRY_ACTOR_UNAVAILABLE';
+
 export interface EnqueueParams {
   /** Trusted internal source metadata; public sends do not accept this field. */
   orchestrationGoal?: string;
@@ -2440,6 +2442,7 @@ async function _enqueueBody(
   // Resolve the project before parsing names: an unavailable Agent is plain
   // text, not a segment that can be discarded after routing.
   let projectAgentIds: Set<string> | null = null;
+  let projectRecipientScopeUnavailable = false;
   try {
     const { getConversation } = await import('../chats');
     const conv = await getConversation(uid, cid);
@@ -2447,12 +2450,22 @@ async function _enqueueBody(
       const { resolveProjectScope } = await import('../projects');
       const scope = await resolveProjectScope(uid, conv.project_id);
       if (scope) projectAgentIds = new Set(scope.agents);
+      else projectRecipientScopeUnavailable = true;
     }
   } catch (err) {
+    projectRecipientScopeUnavailable = true;
     log.warn('project recipient scope unavailable', { cid: maskId(cid), error: logErrorSummary(err) });
   }
   const eligibleRecipient = (id: string) => RESERVED_IDS.has(id)
     || ((!projectAgentIds || projectAgentIds.has(id)) && isAgentEnabled(uid, id));
+
+  // Retry belongs to the original actor. Recheck admission after queueing
+  // and before the general send path can fall back to Commander.
+  const retryActor = params.failedTurnRetryMode ? params.forceTo?.[0] : undefined;
+  if (retryActor && !RESERVED_IDS.has(retryActor)
+    && (projectRecipientScopeUnavailable || !eligibleRecipient(retryActor))) {
+    throw Object.assign(new Error(t('errors.task_restore_unavailable')), { code: FAILED_TURN_RETRY_ACTOR_UNAVAILABLE });
+  }
 
   // The conversation floor: a no-`@` USER message routes here (the agent the
   // commander handed off to, or the one the user picked on the chip), else
