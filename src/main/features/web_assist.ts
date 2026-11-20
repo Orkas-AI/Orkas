@@ -2326,7 +2326,17 @@ async function observeWebAssistTab(
     await applyDesktopViewport(tab);
     const frames = await webAssistFrames(contents);
     const frame = window.frameId ? frames.find(frame => frame.id === window.frameId) : frames.find(frame => !frame.parentId);
-    if (!frame) return { ok: false, code: 'unknown_frame', error: 'Choose a frame from observe.' };
+    if (!frame) {
+      if (window.frameId) {
+        return { ok: false, code: 'unknown_frame', error: 'Observe this tab without frame_id to get the current frame list.' };
+      }
+      const failure = pageLoadWaitFailure(tab);
+      if (failure) return failure;
+      if (tab.loading || contents.isLoading()) {
+        return { ok: false, code: 'page_loading', error: 'The page is loading. Wait on this tab, then observe it again.' };
+      }
+      return { ok: false, code: 'observation_failed', error: 'The main frame is unavailable. Check this tab before observing it again.' };
+    }
     const raw = await withAssistantAction(record, tab, 'observing', () => (
       withOperationTimeout(executeWebAssistScript(contents, webAssistObserveScript(tab.controlContext?.scope, window), false, frame.id),
         { timeoutMs: 5000, code: 'observation_timeout', stage: 'browser observation' })
