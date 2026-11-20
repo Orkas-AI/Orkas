@@ -96,3 +96,42 @@ test('restores and updates a complete process rail without changing disclosure o
     await app.page!.screenshot({ path: testInfo.outputPath('unchanged-app.png') });
   } finally { await app.dispose(); }
 });
+
+test('restores unsuccessful generic tool results with failure labels', async ({}, testInfo) => {
+  const app = new OrkasTestApp(testInfo, { marketplaceStub: true });
+  try {
+    await app.launch();
+    const result = await app.page!.evaluate(() => {
+      const api = window as any;
+      const host = document.createElement('div');
+      host.className = 'chat-history';
+      host.style.cssText = 'position:fixed;top:80px;left:300px;width:600px;background:var(--bg-primary);z-index:9999';
+      document.body.appendChild(host);
+      const message: HTMLElement = api._createStreamingAssistantMessage(host);
+      api._replayPersistedProcessItems(message, [
+        { type: 'event', event: { stream: 'tool', data: {
+          phase: 'end', name: 'tool_result', callId: 'native-generic-failure', isError: true, duration_ms: 9,
+        } } },
+        { type: 'event', event: { stream: 'cli', data: {
+          type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cli-generic-failure', isError: true,
+        } } },
+        { type: 'event', event: { stream: 'cli', data: {
+          type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cli-generic-success', isError: false,
+        } } },
+      ]);
+      message.querySelectorAll<HTMLDetailsElement>('details').forEach(details => { details.open = true; });
+      const rows = Array.from(message.querySelectorAll<HTMLElement>('[data-process-operation="1"]'));
+      return {
+        rows: rows.map(row => ({ kind: row.dataset.processKind, text: row.textContent?.trim() || '' })),
+        failed: api.t('chat.process.status_failed'),
+        done: api.t('chat.process.status_done'),
+      };
+    });
+    expect(result.rows.map(row => row.kind)).toEqual(['err', 'err', 'tool']);
+    expect(result.rows[0].text).toContain(result.failed);
+    expect(result.rows[0].text).toContain('9');
+    expect(result.rows[1].text).toContain(result.failed);
+    expect(result.rows[2].text).toContain(result.done);
+    await app.page!.screenshot({ path: testInfo.outputPath('generic-tool-results.png') });
+  } finally { await app.dispose(); }
+});

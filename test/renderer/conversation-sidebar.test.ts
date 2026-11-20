@@ -162,6 +162,7 @@ function loadConversationRenderer() {
       'chat.stream.plan_with_steps': `Plan (${params?.n} steps): ${params?.titles}`,
       'chat.stream.plan': `Plan ${params?.p}`,
       'chat.stream.phase_progress': 'progress',
+      'chat.stream.phase_end': 'Done',
       'chat.process.with_target': `${params?.action} · ${params?.target}`,
       'chat.process.with_status': `${params?.label} · ${params?.status}`,
       'chat.process.started_action': `Started · ${params?.label}`,
@@ -4245,6 +4246,19 @@ describe('conversation process read_file resource labels', () => {
         },
       },
     })).toBe('Started · Delete agent · Data Analyst');
+  });
+
+  it.each([
+    { stream: 'tool', data: { phase: 'end', name: 'tool_result', duration_ms: 9 } },
+    { stream: 'cli', data: { type: 'tool-event', phase: 'result', tool: 'tool_result' } },
+  ])('labels an unsuccessful generic $stream result as failed', ({ stream, data }) => {
+    const context = loadConversationRenderer();
+    const failed = { stream, data: { ...data, isError: true } };
+    const succeeded = { stream, data: { ...data, isError: false } };
+
+    expect(context._eventProcessKind(failed)).toBe('err');
+    expect(context._formatEventLine(failed)).toContain('Run action · Failed');
+    expect(context._formatEventLine(succeeded)).toContain('Run action · Done');
   });
 
   it('keeps project-relative file paths but reduces absolute paths to a filename', () => {

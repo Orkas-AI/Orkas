@@ -16764,7 +16764,10 @@ function _formatEventLine(evt, displayContext) {
     if (friendly === null) return null;
     if (friendly) return friendly;
 
-    const p = data?.execution_state === 'skipped' ? t('chat.process.status_not_executed') : phaseCn(phase);
+    const failed = (phase === 'end' || phase === 'result') && _processToolResultFailed(data);
+    const p = data?.execution_state === 'skipped'
+      ? t('chat.process.status_not_executed')
+      : (failed ? t('chat.process.status_failed') : phaseCn(phase));
     const fallbackDurationValue = data?.end_to_end_duration_ms
       ?? data?.endToEndDurationMs
       ?? data?.duration_ms
@@ -16854,7 +16857,9 @@ function _formatEventLine(evt, displayContext) {
       if (friendly === null) return null;
       if (friendly) return friendly;
       if (['apply_patch', 'patch_apply'].includes(_processToolKey(name))) return null;
-      const phase = isResult ? 'chat.process.status_done' : '';
+      const phase = isResult
+        ? (_processToolResultFailed(data) ? 'chat.process.status_failed' : 'chat.process.status_done')
+        : '';
       return _processActionLine('chat.process.action_execute', '', phase);
     }
     if (cliType === 'process-info') {
