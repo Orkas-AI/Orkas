@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Orkas README &#22810;&#35821;&#35328;&#39044;&#35272;</title>
+<style>
+:root{color-scheme:light;--bg:#f6f8fa;--paper:#fff;--text:#1f2328;--muted:#59636e;--line:#d0d7de;--accent:#5b57d6;--code:#f6f8fa}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Noto Sans",sans-serif}.bar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;padding:12px 20px;background:rgba(255,255,255,.96);border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}.bar strong{white-space:nowrap}.bar select{min-width:220px;padding:8px 34px 8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;font-size:14px}.status{margin-left:auto;color:var(--muted);font-size:13px}.page{max-width:1024px;margin:24px auto;padding:0 18px}.markdown{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:36px 44px;box-shadow:0 1px 2px rgba(31,35,40,.04)}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:24px 0 16px;font-weight:650}h1{font-size:2em;border-bottom:1px solid var(--line);padding-bottom:.3em}h2{font-size:1.5em;border-bottom:1px solid var(--line);padding-bottom:.3em}h3{font-size:1.25em}p{margin:0 0 16px}a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}img{max-width:100%;height:auto;border-radius:6px}pre{overflow:auto;padding:16px;border-radius:8px;background:var(--code);border:1px solid var(--line)}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:85%;background:var(--code);padding:.15em .35em;border-radius:4px}pre code{padding:0;background:transparent}blockquote{margin:0 0 16px;padding:0 1em;color:var(--muted);border-left:.25em solid var(--line)}table{display:block;width:max-content;max-width:100%;overflow:auto;border-collapse:collapse;margin:0 0 16px}th,td{padding:6px 13px;border:1px solid var(--line)}tr:nth-child(2n){background:var(--bg)}hr{height:1px;border:0;background:var(--line);margin:24px 0}ul,ol{padding-left:2em}details{margin:12px 0;padding:8px 12px;border:1px solid var(--line);border-radius:8px}summary{cursor:pointer}.error{padding:30px;color:#b42318;background:#fff1f0;border:1px solid #ffccc7;border-radius:10px}.rtl{direction:rtl;text-align:right}.rtl pre,.rtl code,.rtl table{direction:ltr;text-align:left}.language-nav{display:flex;flex-wrap:wrap;gap:4px 10px;direction:ltr!important;text-align:left!important;padding:10px 0}.language-nav a{white-space:nowrap}@media(max-width:700px){.bar{align-items:flex-start;flex-wrap:wrap}.status{width:100%;margin-left:0}.page{margin:12px auto;padding:0 8px}.markdown{padding:22px 18px;border-radius:8px}}
+</style>
+</head>
+<body>
+<div class="bar"><strong>Orkas README &#39044;&#35272;</strong><label for="locale">&#35821;&#35328;</label><select id="locale" aria-label="&#36873;&#25321; README &#35821;&#35328;"></select><span id="status" class="status">&#27491;&#22312;&#21152;&#36733;</span></div>
+<main class="page"><article id="content" class="markdown"></article></main>
+<script>
+const langs=[['en','English'],['es','Espa\u00f1ol'],['id','Bahasa Indonesia'],['es-419','Espa\u00f1ol (Latinoam\u00e9rica)'],['ru','\u0420\u0443\u0441\u0441\u043a\u0438\u0439'],['pt-BR','Portugu\u00eas (Brasil)'],['ko','\ud55c\uad6d\uc5b4'],['tr','T\u00fcrk\u00e7e'],['zh-TW','\u7e41\u9ad4\u4e2d\u6587'],['vi','Ti\u1ebfng Vi\u1ec7t'],['de','Deutsch'],['th','\u0e44\u0e17\u0e22'],['fr','Fran\u00e7ais'],['it','Italiano'],['pt-PT','Portugu\u00eas (Portugal)'],['ja','\u65e5\u672c\u8a9e'],['ar','\u0627\u0644\u0639\u0631\u0628\u064a\u0629'],['zh-CN','\u7b80\u4f53\u4e2d\u6587']];
+const sel=document.getElementById('locale'),out=document.getElementById('content'),status=document.getElementById('status');let loadSequence=0;
+for(const [v,n] of langs){const o=document.createElement('option');o.value=v;o.textContent=n;sel.appendChild(o)}
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function inline(s){
+ s=esc(s);
+ s=s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,'<img alt="$1" src="$2">');
+ s=s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,'<a href="$2">$1</a>');
+ s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
+ s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+ s=s.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g,'<em>$1</em>');
+ return s;
+}
+function render(md){
+ const lines=md.replace(/\r/g,'').split('\n');let h='',para=[],list=null,table=false,code=false,codeLang='',codeBuf=[];
+ const flushP=()=>{if(para.length){h+='<p>'+inline(para.join(' '))+'</p>';para=[]}};
+ const closeList=()=>{if(list){h+='</'+list+'>';list=null}};
+ const closeTable=()=>{if(table){h+='</tbody></table>';table=false}};
+ for(let i=0;i<lines.length;i++){let line=lines[i];
+  if(code){if(/^```/.test(line)){h+='<pre><code class="language-'+esc(codeLang)+'">'+esc(codeBuf.join('\n'))+'</code></pre>';code=false;codeBuf=[]}else codeBuf.push(line);continue}
+  const fence=line.match(/^```\s*(.*)$/);if(fence){flushP();closeList();closeTable();code=true;codeLang=fence[1]||'';continue}
+  if(/^\s*$/.test(line)){flushP();closeList();closeTable();continue}
+  if(line.includes('README.en.md')&&line.includes('README.zh-CN.md')){flushP();closeList();closeTable();h+='<nav class="language-nav" aria-label="Language links">'+inline(line).replace(/\s*[\u00b7?]\s*/g,'<span aria-hidden="true">\u00b7</span>')+'</nav>';continue}
+  if(/^\s*<\/?(?:details|summary|br|div|picture|source|video|kbd)[^>]*>\s*$/.test(line)){flushP();closeList();closeTable();h+=line;continue}
+  const head=line.match(/^(#{1,6})\s+(.+)$/);if(head){flushP();closeList();closeTable();const n=head[1].length;h+=`<h${n}>${inline(head[2])}</h${n}>`;continue}
+  if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)){flushP();closeList();closeTable();h+='<hr>';continue}
+  const quote=line.match(/^>\s?(.*)$/);if(quote){flushP();closeList();closeTable();h+='<blockquote><p>'+inline(quote[1])+'</p></blockquote>';continue}
+  const li=line.match(/^\s*[-*+]\s+(.+)$/),ol=line.match(/^\s*\d+[.)]\s+(.+)$/);if(li||ol){flushP();closeTable();const kind=li?'ul':'ol';if(list!==kind){closeList();h+='<'+kind+'>';list=kind}h+='<li>'+inline((li||ol)[1])+'</li>';continue}
+  if(line.includes('|')&&i+1<lines.length&&/^\s*\|?\s*:?-+/.test(lines[i+1])){flushP();closeList();closeTable();const cells=line.replace(/^\||\|$/g,'').split('|');h+='<table><thead><tr>'+cells.map(x=>'<th>'+inline(x.trim())+'</th>').join('')+'</tr></thead><tbody>';table=true;i++;continue}
+  if(table&&line.includes('|')){const cells=line.replace(/^\||\|$/g,'').split('|');h+='<tr>'+cells.map(x=>'<td>'+inline(x.trim())+'</td>').join('')+'</tr>';continue}
+  if(/^https?:\/\/\S+$/.test(line.trim())){flushP();closeList();closeTable();const u=line.trim();h+='<p><a href="'+u+'">'+u+'</a></p>';continue}
+  para.push(line.trim());
+ }
+ flushP();closeList();closeTable();if(code)h+='<pre><code>'+esc(codeBuf.join('\n'))+'</code></pre>';return h;
+}
+function fileFor(locale){return locale==='zh-CN'?'README.zh-CN.md':`README.${locale}.md`}
+async function load(locale,push=true){
+ const sequence=++loadSequence,file=fileFor(locale);sel.value=locale;status.textContent='\u6b63\u5728\u52a0\u8f7d '+file+'...';out.classList.toggle('rtl',locale==='ar');document.documentElement.lang=locale;document.documentElement.dir='ltr';
+ try{const r=await fetch('./'+file+'?v='+Date.now());if(!r.ok)throw new Error('HTTP '+r.status);const md=new TextDecoder('utf-8').decode(await r.arrayBuffer());if(sequence!==loadSequence)return;out.innerHTML=render(md);status.textContent=file+' \u00b7 \u5df2\u52a0\u8f7d';if(push)history.replaceState(null,'','#'+locale);window.scrollTo({top:0,behavior:'auto'});}catch(e){if(sequence!==loadSequence)return;out.innerHTML='<div class="error"><strong>\u65e0\u6cd5\u52a0\u8f7d README</strong><br>'+esc(String(e))+'<br>\u8bf7\u786e\u8ba4\u5df2\u901a\u8fc7 HTTP \u670d\u52a1\u6253\u5f00\u6b64 HTML \u9884\u89c8\u3002</div>';status.textContent='\u52a0\u8f7d\u5931\u8d25';}
+}
+sel.addEventListener('change',()=>load(sel.value));
+out.addEventListener('click',e=>{const a=e.target.closest('a');if(!a)return;const href=a.getAttribute('href')||'';const m=href.match(/^\.\/README\.([\w-]+)\.md$/);if(m){e.preventDefault();load(m[1]);}});
+const initial=(location.hash.slice(1)||'en');load(langs.some(x=>x[0]===initial)?initial:'en',false);
+</script>
+</body></html>
