@@ -1,12 +1,12 @@
 # Orkas
 
-**デスクトップで動くオープンソースの AI エージェントチーム。あなたの目標を完成した成果物に変え、仕事を前に進め続けます。**
+**An デスクトップ上の AI エージェントのオープンソースチーム - それはあなたの目標を完成した作業に変え、それを移動し続ける。 **の特長
 
-Orkas は、オープンソース（MIT）でローカルファーストのマルチエージェント・デスクトップアプリです。チームとして働く AI アシスタントです。必要なことを **Commander** に伝えてください。多くのタスクは Commander が自分で仕上げます。大きな仕事では手順を計画し、専門エージェントに加えて、すでにお使いのコーディングエージェントやパーソナルエージェント（**Claude Code、Codex、OpenCode、OpenClaw、Hermes-Agent**）を呼び込み、協力して取り組ませます。
+Orkasオープンソース(MIT)ローカルファーストのマルチエージェントデスクトップアプリ —AIチームとして働くアシスタント お問い合わせ**Commander**あなたが必要とするもの:それは自分自身で多くのタスクを終了し、より大きな作業のために、ステップを計画し、あなたが既に使用しているコーディングと個人エージェントと一緒に専門家のエージェントをもたらす -**Claude Code, Codex, OpenCode, OpenClawそして、Hermes-Agent**一緒に仕事をする。
 
-Orkas は、1 つのプロンプトに答えるだけでなく、プロジェクトを前に進め続けるために作られています。**プロジェクト**には目標、ルール、メモリ、ファイルが保存されるため、新しい会話はいつも前回の続きから始まります。**ToDo** は仕事を人とエージェントで分担し、**自動推進**はチームが次の ToDo に自ら取りかかれるようにし、**定期自動化**は定型作業を毎時・毎日・毎週・毎月繰り返します。データはすべてあなたのコンピューターに残り、完成した成果物はレビューのためにあなたのもとへ戻ってきます。だからこそ、ビジネスの継続的な仕事を安心して Orkas に任せられます。
+Orkasは、プロジェクトを移動させながら、1つのプロンプトに答えるだけでなく、プロジェクトを維持するために構築されています。 **project**は、目標、ルール、メモリ、ファイルを保持しているため、すべての新しい会話は、最後に残った場所をピックアップします。 **To-dos**は、人々とエージェントの間で作業を分割し、**Auto-advance**は、チームは、それ自体で次の対決に取り、**scheduled自動化**は、毎日、週、または毎月、定期的な作業を繰り返します。 すべてのデータはあなたのコンピュータにとどまり、あなたのレビューのために終わる仕事は戻ってくるので、あなたのビジネスの進行中の仕事とOrkasを信頼できます。
 
-**[⬇ macOS & Windows 版 Orkas をダウンロード](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — 無料で、内蔵の Orkas モデル用に 500 クレジットが付属するので、API キーなしで始められます。自分のキーを使いたい場合は、Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao、またはローカルの OpenAI 互換エンドポイントを利用できます。
+**[ダウンロードOrkasお問い合わせmacOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)**— ビルトインの500クレジットで無料Orkasモデルなので、必要ないAPI起動するキー。 自分のキーを優先しますか?Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · DoubaoローカルのOpenAI対応エンドポイント
 
 [![Download for macOS & Windows](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
 
@@ -16,159 +16,161 @@ Orkas は、1 つのプロンプトに答えるだけでなく、プロジェク
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 [![Website: orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
 
-[English](./README.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md)
+[English](./README.en.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md) · [한국어](./README.ko.md) · [Español](./README.es.md) · [Bahasa Indonesia](./README.id.md) · [Español (Latinoamérica)](./README.es-419.md) · [Русский](./README.ru.md) · [Português (Brasil)](./README.pt-BR.md) · [Türkçe](./README.tr.md) · [繁體中文](./README.zh-TW.md) · [Tiếng Việt](./README.vi.md) · [Deutsch](./README.de.md) · [ไทย](./README.th.md) · [Français](./README.fr.md) · [Italiano](./README.it.md) · [Português (Portugal)](./README.pt-PT.md) · [العربية](./README.ar.md)
 
 ---
 
 https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
-![Orkas デスクトップ — タスクの会話と成果物](./resources/app-ui/task-en.png)
+![Orkas desktop — task conversation and deliverables](./resources/app-ui/task-en.png)
 
 ---
 
-## チームが届けるもの
+## チームが提供するもの
 
-- **動画、ナレーション、画像** — VideoStudio、VoiceStudio、ImageStudio
-- **リサーチレポート、SEO 監査、市場分析** — DeepResearcher、SeoGeoAgent、StockAnalyser
-- **投稿、記事、ニュースレター、スライド資料** — ContentWriter、PptMaker
-- **Web サイト、UI、コード** — UIDesigner、ProductDeveloper
-- **Word、Excel、PowerPoint、PDF ファイル** — OfficeWorker
-- **EC 業務** — 5 つの EC エージェントによる商品リサーチ、出品、レビュー分析、売上分析、カタログ変更
-- **複数のエージェントが必要な複雑な仕事** — Commander が仕事を分割し、各部分を適切なエージェントに渡して結果をまとめます。たとえば、市場調査からレポート、スライド資料、ローンチ動画までを作成できます
+- **Videos、ボイスオーバーと画像** — VideoStudio、VoiceStudio、ImageStudio
+- **リサーチレポート、SEO監査、市場分析** — DeepResearcher、SeoGeoAgent、StockAnalyser
+- **投稿、記事、ニュースレター、スライドデッキ** — ContentWriter、PptMaker
+- **Website、UIおよびコード** — UIDesigner、ProductDeveloper
+- **Word、Excel、PowerPoint、PDFファイル** — OfficeWorker
+- **E-コマースワーク** — 製品研究、リスト、レビュー分析、販売分析、カタログ変更、5つのeコマースエージェントから
+- **コンプレックスは、いくつかのエージェントを取る仕事** — Commanderは、それを分割し、適切なエージェントに各部分を手にし、結果を組み合わせます。 たとえば、レポート、スライドデッキ、打ち上げビデオになる市場調査
 
-アプリには 16 の専門エージェントが同梱されており、それぞれが独自のスキル、メモリ、ツールを持っています。[エージェントマーケットプレイス](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas)で 30 以上のエージェントを探せるほか、必要な役割を説明すれば Commander がカスタムエージェントを作成します。
+16 人のスペシャリストが、それぞれ独自のスキル、メモリ、ツールでアプリを出荷します。 [agent Marketplace](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas)の30以上の代理店をブラウズするか、必要な役割を記述し、Commanderはあなたのための注文の代理店を造ります。
 
-<details>
-<summary><b>16 の内蔵エージェント一覧</b></summary>
+<details>の特長
+<summary><b>All 16の作り付けの代理店</b></summary>
 
-| 分野 | エージェント | 提供するもの |
+| エリア | エージェント | 配信する |
 | --- | --- | --- |
-| リサーチ・分析 | **DeepResearcher** | 検証済みの出典、矛盾点の指摘、監査可能なレポートを備えた、根拠に基づくリサーチ |
-| | **SeoGeoAgent** | URL を渡すだけで、技術監査、コンテンツ品質、Core Web Vitals、AI 回答（GEO）での引用されやすさ、優先順位付きの修正リストを提供 |
-| | **StockAnalyser** | 株式リサーチ、ファクタースクリーニング、バックテスト、ポートフォリオのリスクチェックを、追跡可能なダッシュボード付きで提供 |
-| コンテンツ・メディア | **ContentWriter** | 目標、資料、ラフ原稿から、そのまま公開できる投稿、記事、ニュースレター、事例紹介を作成 |
-| | **PptMaker** | トピック、アウトライン、ドキュメントから、編集・レビュー可能な PPTX 資料を作成 |
-| | **ImageStudio** | ポスター、カバー画像、SNS 用画像、インフォグラフィック |
-| | **VideoStudio** | ナレーション、AI プレゼンター、字幕と吹き替え、ハイライトクリップ、ローカライズ、そして自分のコンテンツと映像を使った参考動画の再現 |
-| | **VoiceStudio** | ナレーション、複数話者の音声、文字起こしと字幕、音声の編集とミキシング |
-| | **UIDesigner** | プロダクトの目標、PRD、スクリーンショット、Figma の素材から、編集可能な HTML ファーストの UI を作成 |
-| 開発・オフィス | **ProductDeveloper** | リポジトリを理解したエンジニアリング — PRD の実装、バグ修正、リファクタリング、レビューを、検証可能な結果とともに実施 |
-| | **OfficeWorker** | Word / Excel / PowerPoint / PDF ファイルの作成、編集、チェック、納品を、1 件ずつまたは一括で実施 |
-| EC | **ECommerceResearcher** | 予算、市場、仕入れ条件に応じた商品選定 — 候補、除外理由、検証計画 |
-| | **ECommerceWriter** | ブランドのトーンに合わせたタイトル、商品詳細ページ、FAQ、画像用コピー、動画台本 |
-| | **ECommerceReviewer** | レビューと評判の分析 — 顧客の声の傾向、低評価の根本原因、優先順位 |
-| | **ECommerceAnalyzer** | エクスポートしたデータから売上、利益、広告、返金、在庫を分析 — 整合済みの指標と意思決定 |
-| | **ECommerceOperator** | カタログ、価格、プロモーション、在庫の変更を計画し、接続したツールを通じてのみ実行 |
+| 研究・分析 | **DeepResearcher** | 検証されたソース、偽造された矛盾および監査可能なレポートによる証拠に基づく研究 |
+|  | **SeoGeoAgent** | URL — 技術的な監査、コンテンツの品質、Core Web Vitals、AI のanswer(GEO)引用性、ランク付けされた固定リスト |
+|  | **StockAnalyser** | エクイティリサーチ、ファクター画面、バックテスト、ポートフォリオリスクチェック、追跡可能なダッシュボード |
+| コンテンツとメディア | **ContentWriter** | ゴール、ソース、またはラフドラフトから公開準備投稿、記事、ニュースレター、ケーススタディ |
+|  | **PptMaker** | 編集可能、レビュー可能PPTXトピック、概要、文書からのデッキ |
+|  | **ImageStudio** | ポスター、カバー、ソーシャルイメージ、インフォグラフィック |
+|  | **VideoStudio** | ナレーション,AIプレゼンター、キャプション、ダビング、ハイライトクリップ、ローカリゼーション、および独自のコンテンツと映像で参照ビデオレクリエーション |
+|  | **VoiceStudio** | ナレーション、マルチボイスオーディオ、トランスクリプト、字幕、オーディオ編集、混合 |
+|  | **UIDesigner** | 編集可能で、製品目標、PRD、スクリーンショット、Figma素材からHTMLファーストUI |
+| ビルド&オフィス | **ProductDeveloper** | Repo-aware エンジニアリング — 実装PRD, バグを修正, 再ファクター, 検証可能な結果とレビュー, |
+|  | **OfficeWorker** | Word / Excel / PowerPoint / の作成、編集、チェック、配信PDFファイル、一度またはバッチで1つ |
+| Eコマース | **ECommerceResearcher** | 予算、市場、調達制限による製品選択 — 候補者、拒絶理由、検証計画 |
+|  | **ECommerceWriter** | タイトル、詳細ページ、FAQ、画像コピー、ビデオスクリプトなど、ブランドボイス |
+|  | **ECommerceReviewer** | レビューと評判の分析 — 顧客のテーマ、悪いレビューの根本原因、優先順位 |
+|  | **ECommerceAnalyzer** | 輸出から販売、利益、広告、払い戻し、在庫 - 調整されたメトリックと決定 |
+|  | **ECommerceOperator** | カタログ、価格、プロモーション、在庫の変更を計画し、接続するツールでのみ実行 |
 
-各エージェントの詳細 → [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
+各エージェントの詳細 →[orkas.ai/エージェント](https://orkas.ai/agents/?source=gh-orkas)
 
-</details>
+</details>の特長
 
-### 自分のコンテンツで参考動画を再現する
+### あなた自身のコンテンツで参照ビデオを再現する
 
-**VideoStudio** は、バズった動画の構成、映像スタイル、編集のテンポを、あなた自身の製品、台本、映像素材で再現できます。参考動画ファイルと素材を渡すと、エージェントがフック、情報の順序、映像の展開、CTA（行動喚起）を分析し、制作に入る前に何を残して何を差し替えるかを提案します。
+**VideoStudio**は、独自の製品、スクリプト、映像を使用して、バイラルビデオの物語構造、ビジュアルスタイル、編集ペースを再作成することができます。 参照ビデオファイルと資産を供給:エージェントは、ホック、情報注文、ビジュアルビート、行動への呼び出しを分析し、生産前に保存し、交換するものを提案します。
 
-この機能は、モーショングラフィックスの解説動画、SaaS やアプリのデモ、既存の映像から作る製品広告に最も適しています。ローカルで作成したテキスト、字幕、ナレーション、クリップは個別に修正できますが、AI 生成映像に焼き込まれたテキストを変えるには、その映像自体を変更する必要があります。
+これは、モーショングラフィックスの解説、SaaSまたはアプリのデモ、および既存の映像から構築された製品広告に最適です。 局所的に許可されたテキスト、キャプション、ナレーション、クリップを別々に変更することができます。AI生成された映像に焼かれたテキストは、その映像を変更する必要があります。
 
-> 「reference.mp4 を参考に、30 秒の縦型プロモーション動画を作って。フック、タイポグラフィ、テンポはそのままに、内容は私の製品と画面録画に差し替えて。まず分析結果と計画を見せて。」
+> は30秒の縦のpromoのための参照としてreference.mp4を使用します。 ホック、タイポグラフィ、パッシングを保ち、私の製品と画面の録画にコンテンツを交換し、まずはブレイクダウンと計画を立ててください。
 
-まずはエージェントが読み込める動画ファイルから始めてください。SNS の共有リンクからのダウンロード機能は内蔵されていません。正確なカメラワーク、人物の演技、フレーム単位での一致は保証されません。詳しくは[参考動画再現ワークフロー](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md)をご覧ください。
+エージェントが読み取れる動画ファイルから始めましょう。ソーシャルプラットフォームのシェアリンクのダウンロードは出来ません。 正確なカメラの動き、人的性能、フレームごとのマッチングは保証されません。 詳細はこちら[参照修復ワークフロー](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md).
 
 ---
 
-## 仕事を前に進め続ける
+## 仕事の移動を保って下さい
 
-1 つのタスクは良いスタートです。Orkas は、その先も続いていく仕事のために作られています。
+1つのタスクは良いスタートです。 Orkasは、仕事を続けていくために構築されています。
 
-- **プロジェクト** — 目標とルール、メモリ、ファイルを、プロジェクト内のすべての会話の出発点にします。毎回ゼロから説明し直す必要はありません。
-- **ToDo と自動推進** — すべてのプロジェクトに、人とエージェントのための ToDo リストがあります。自動推進をオンにすると、チームが次の項目に自ら取りかかり、完成した成果物をレビューのために戻してくれます。
-- **定期自動化** — どんなタスクでも毎時・毎日・毎週・毎月実行できます。Orkas はあなたのコンピューター上で動作します。v1.9 以降、コンピューターのスリープ解除時や Orkas の起動時に、各自動化は 12 時間以内に逃した直近の実行を 1 回分取り戻します。
-- **コネクター** — Gmail、Google Calendar、Sheets、Drive、Notion、Slack、Shopify、Stripe など多数に対応しています。デフォルトでは、Orkas は何かを送信、投稿、削除する前に確認を求めます。
-- **アプリ** — ツールの内容を説明すると、Orkas がデスクトップアプリ内のローカルアプリとして構築します。パッケージ版アプリでは、有料プランなら公開リンク付きの Web アプリとして公開することもできます。
-- **共有プロジェクト** *（パッケージ版アプリ）* — チームメイトやアシスタント（VA）を招待し、各 ToDo を人またはエージェントに割り当てられます。
+- **Projects** — 目標とルール、プロジェクト内のすべての会話が始まるメモリとファイル、スクラッチから簡単に始める。
+- **To-dosとAuto-advance** - すべてのプロジェクトは、人やエージェントのためのto-doリストを持っています。 オートアドバンスと、チームは、独自の次の項目をピックアップし、あなたのレビューのために完成した作業をもたらします。
+- **Scheduledオートメーション** — 毎日、週、または毎月、任意のタスクを実行します。 Orkasはあなたのコンピュータで動きます。 v1.9 から、コンピュータが目覚めるか、Orkas が始まる 12 時間以内に、各オートメーションは最新の見逃された実行をキャッチします。
+- **コネクタ** — Gmail, Google Calendar, Sheetsそして、Drive, Notion, Slack, Shopify, Stripe詳しくはこちら デフォルトでは、Orkas送信、投稿、削除の前に尋ねます。
+- **Apps** — ツールとOrkasはデスクトップアプリ内のローカルアプリとして構築します。 パッケージアプリでは、有料プランも公開できます。
+- **共有プロジェクト** *(packaged app)* — チームメイトやVAを招待し、それぞれを人やエージェントに与えます。
 
 > [!NOTE]
-> 共有プロジェクト、クラウド同期、Web アプリの公開はパッケージ版アプリのみの機能で、オープンソース版はまだ対応していません。利用するには、**[macOS & Windows 版 Orkas をダウンロード](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)**してください（無料、開始時に 500 クレジット付き）。
+> 共有プロジェクト、クラウド同期、Webアプリの公開は、パッケージ化されたアプリでのみ行われます。オープンソースのビルドはまだサポートしていません。 それらを使用するために、**[ダウンロードOrkasお問い合わせmacOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (無料で、500クレジットから始める).
 
-音声入力はソースビルドでも利用できます。**設定 → モデル**で **Orkas API Key** を設定し、入力欄の横にあるマイクをクリックしてください。確認が表示されたらマイクへのアクセスを許可します。音声は認識のために Orkas へ送信され、キー所有者の Orkas クレジットを消費します。もう一度クリックすると停止するので、テキストを確認してから自分で送信してください。アクセスを拒否してしまった場合は、システム設定でマイクを有効にしてください。
-
----
-
-## Claude Code、Codex、OpenCode、OpenClaw、Hermes-Agent を一緒に動かす
-
-Orkas は、すでにインストール済みの CLI エージェント（コーディングエージェントの **Claude Code、Codex、OpenCode**、パーソナルエージェントの **OpenClaw と Hermes-Agent**）を、独自の専門エージェントと並べてローカルセッションとして実行します。Commander は各エージェントに得意な部分を任せつつ、全体で 1 つの計画を保つので、1 つのチャットでバグを修正し、変更をレビューし、リリースノートの下書きまで作れます。HyperFrames などのオープンソースツールも同じ方法で組み込めます。
-
-[Claude Code と Codex を一緒に使う →](https://orkas.ai/blog/claude-code-codex-together/?source=gh-orkas)
+音声入力はソースビルドでも動作します。 **Orkas API Key**の**Settingsの→モデル**の構成し、作曲家の横にあるマイクロフォンをかちりと鳴らして下さい。 プロンプトが表示された場合にマイクアクセスを許可します。 音声は、Orkasに認証され、主要な所有者のOrkasクレジットを使用するために使用されます。 もう一度クリックして、テキストを止めて、それを自分で送信してください。 アクセスが拒否された場合、システム設定でマイクを有効にします。
 
 ---
 
-## Orkas を選ぶ理由
+## ログインClaude Code, Codex, OpenCode, OpenClawそして、Hermes-Agent一緒に
 
-- **計画し、任せ、残りは自分でこなす Commander** — 目標を分解し、適切なエージェント、スキル、コネクター、ツールを選びます。より適した専門エージェントがいない場合は、分析、執筆、リサーチ、ファイル作業を自分で処理します。
-- **ローカルファースト設計** — 会話、ファイル、ナレッジベース、カスタムエージェントは、デフォルトでディスク上に保存されます。パッケージ版アプリでは、クラウド同期は任意です。自分のキーを使う場合、モデルの呼び出しはあなたのマシンからプロバイダーへ直接送られます。内蔵の Orkas モデルは、Orkas のマネージドモデルサービスを経由して動作します。
-- **どのモデルでも、いつでも切り替え可能** — Commander と内蔵エージェントは 1 つのモデル設定を共有します。内蔵の Orkas モデル、自分のプロバイダー、ローカルエンドポイントのいずれでも選べます。外部 CLI エージェントは、それぞれ独自のモデル設定を維持します。
-- **成長するエージェント** — 各エージェントは専用のスキルとメモリを持ちます。アプリがアイドル状態のときにバックグラウンドレビューが新しいアクティビティを確認し、自己評価、再利用可能な手法、学習したスキルを改善できます。
-- **オープンソースでブラックボックスなし** — MIT ライセンスです。Orkas と、すべてのエージェントやスキルが何をしているかを正確に確認できます。
+Orkas実行するCLIすでにローカルセッションとしてインストールされているエージェント、独自のスペシャリストの横にあるコーディングエージェント**Claude Code, Codexそして、OpenCode**、および個人代理店**OpenClawそして、Hermes-Agent**. ザ・Commanderひとつひとつひとつひとつの部分を手にし、ひとつのプランを全て保持するので、ひとつのチャットでバグを修正し、変更を見直し、リリースノートをドラフトすることができます。 オープンソースツールなどHyperFrames同じように差し込みます。
 
-> ⭐ Orkas が役に立ったら、スターを付けていただくと、より多くの人がこのプロジェクトを見つけられるようになります。
+[Using Claude CodeおよびCodex一緒に→](https://orkas.ai/blog/claude-code-codex-together/?source=gh-orkas)
 
 ---
 
+## なぜ?Orkas
+
+- **A Commanderは計画し、委任し、残りの**をします-それは目標を破壊し、右の代理店、スキル、コネクターおよび用具を選び、専門家がよりよい適合しないとき分析、執筆、研究およびファイル仕事自体を処理します。
+- **Local-first by design** — 会話、ファイル、ナレッジベース、カスタムエージェントはデフォルトでディスクに滞在します。 クラウド同期は、パッケージされたアプリでオプションです。 自分の鍵を使うと、モデルコールはマシンからプロバイダに直進します。OrkasモデルはOrkasのマネージドモデルサービスで動作します。
+- **Anyモデル、いつでも切り替える** — Commanderとビルトインエージェントが1つのモデル設定を共有:ビルトインOrkasモデル、独自のプロバイダー、またはローカルエンドポイント。 外部のCLIエージェントは、独自のモデル設定を維持します。
+- **Agentsがより良い**を得る - 各エージェントは、プライベートなスキルとメモリを維持します。 背景レビューは、アプリがアイドル状態になると、自己評価、再利用可能な方法、学習スキルを磨くことができる新しい活動を検討します。
+- **オープンソース、ブラックボックス** — MITライセンス。 Orkasとすべてのエージェントとスキルが何をするかを正確にお読みください。
+
+> ✨ Orkasがあなたにとって有用であるならば、星はより多くの人々がプロジェクトを見つけるのを助けます。
+
+---
+
+<a id="download"></a>
 ## ダウンロード
 
-| | パッケージ版アプリ（推奨） | ソースから実行 |
+|  | パッケージアプリ(おすすめ) | ソースから実行 |
 | --- | --- | --- |
-| プラットフォーム | macOS 12+（Apple Silicon & Intel）、Windows 10+ | macOS、Windows、glibc 2.34+ Linux x64/arm64 |
-| アカウント | サインイン — 500 クレジット無料 | 不要 |
-| モデル | 内蔵の Orkas モデル、または自分のキー | 自分のキーまたはローカルエンドポイント |
-| その他の機能 | プロジェクトでの共同作業、アプリの公開、クラウド同期など | — |
-| 入手方法 | **[Orkas をダウンロード](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [クイックスタート](#クイックスタート) |
+| プラットフォーム | macOS 12+ (アップルシリコン&インテル), Windows 10+ | macOS, Windows, glibc 2.34+Linuxx64/アーム64 |
+| パスワード | サインイン — 500の無料クレジット | なし |
+| モデル | 作り付けOrkasモデル、またはあなた自身のキー | 独自のキーまたはローカルエンドポイント |
+| 含まれるもの | プロジェクト連携、アプリ公開、クラウド同期など | — |
+| お問い合わせ | **[ダウンロードOrkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [クイックスタート](#quick-start) |
 
-ダウンロードリンクはお使いのシステムを判別し、適切なインストーラーのダウンロードを開始します。
-
----
-
-## 主な用途
-
-- **マーケティングコンテンツ** — あなたらしいトーンのローンチ動画、製品ページ、投稿、ニュースレター。[コンテンツ執筆](https://orkas.ai/use/content-writing/?source=gh-orkas) · [動画](https://orkas.ai/use/make-videos/?source=gh-orkas)
-- **ストア運営** — 週次の売上レポート、レビューへの返信、出品、競合チェック。[EC](https://orkas.ai/use/ecommerce/?source=gh-orkas)
-- **リサーチとレポート** — 出典付きのレポートや資料を、必要なときに、または毎週。[リサーチ](https://orkas.ai/use/researchers/?source=gh-orkas) · [データ分析](https://orkas.ai/use/data-analysis/?source=gh-orkas)
-- **ドキュメントとのチャット** — 自分のファイルに基づき、出典箇所への引用付きで回答します。[ドキュメントとのチャット](https://orkas.ai/use/chat-with-documents/?source=gh-orkas)
-- **クライアントワーク** — 会議の資料、クライアント向け月次レポート、アップデート資料を、あなたのテンプレートで。[クライアント月次レポートのテンプレート](https://orkas.ai/blog/monthly-client-report-template/?source=gh-orkas)
-- **プロダクトのローンチ** — ランディングページ、テスト付きのバグ修正、変更履歴、ローンチ投稿。[開発者向け](https://orkas.ai/use/developers/?source=gh-orkas)
-- **アプリの構築** — 見積もり計算ツール、予約フォーム、社内ツール。[アプリを作る](https://orkas.ai/use/build-apps/?source=gh-orkas)
-- **小規模チーム** — 人とエージェントのための 1 つのプロジェクト。[小規模チーム](https://orkas.ai/use/small-teams/?source=gh-orkas)
+ダウンロードリンクはシステムを検出し、正しいインストーラーを開始します。
 
 ---
 
-## 他ツールとの比較
+## ご利用人数
 
-| ツール | 概要 | Orkas との違い |
+- **マーケティングコンテンツ**— 音声の動画、商品ページ、投稿、ニュースレターの配信[コンテンツ作成](https://orkas.ai/use/content-writing/?source=gh-orkas) · [ビデオ](https://orkas.ai/use/make-videos/?source=gh-orkas)
+- **Store操作** — 毎週の販売の簡略化、レビューの返信、リスト、競合他社のチェック。 [Eコマース](https://orkas.ai/use/ecommerce/?source=gh-orkas)
+- **リサーチとレポート** — レポートとデッキ、オンデマンドまたは毎週。 [Research](https://orkas.ai/use/researchers/?source=gh-orkas) · [データ分析](https://orkas.ai/use/data-analysis/?source=gh-orkas)
+- **Chat あなたの文書で** — あなた自身のファイルで接地された答え、引用はソース通路に戻ります。 [チャットとドキュメント](https://orkas.ai/use/chat-with-documents/?source=gh-orkas)
+- **Client work** — 会議の報告書、毎月のクライアントレポート、テンプレートのデッキの更新。 [Monthlyクライアントレポートテンプレート](https://orkas.ai/blog/monthly-client-report-template/?source=gh-orkas)
+- **Product Launch** — ランディングページ、テスト、変更ログ、リリース投稿でバグ修正。 [開発](https://orkas.ai/use/developers/?source=gh-orkas)
+- **Build app** — 引用計算機、予約フォーム、内部ツール。 [Buildアプリ](https://orkas.ai/use/build-apps/?source=gh-orkas)
+- **Small team** - 人やエージェントのための1つのプロジェクト。 [Small チーム](https://orkas.ai/use/small-teams/?source=gh-orkas)
+
+---
+
+## アクセス方法Orkas比較する
+
+| ツール | それが何か | アクセス方法Orkas異なる |
 | --- | --- | --- |
-| **Claude Code** | Anthropic のエージェント型コーディングツール。ターミナル、IDE、デスクトップ、Web で利用でき、Claude モデルを基盤としています。 | どちらか一方を選ぶ必要はありません。Orkas は Claude Code をエージェントの 1 つとして実行します。その周りに、リサーチ、コンテンツ、動画など、コード以外の仕事を担うモデル非依存のチームを加え、プロジェクト、ToDo、自動化で仕事を前に進め続けます。[Orkas vs Claude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
-| **Codex** | OpenAI のコーディングエージェント。ターミナル、エディター、クラウドで利用できます。 | どちらか一方を選ぶ必要はありません。Orkas は Codex を、Claude Code や OpenCode と並ぶエージェントの 1 つとして実行します。Commander はコーディングを Codex に、レビューを別のエージェントに任せたうえで、ドキュメント、ローンチ投稿、動画といったリリースのコード以外の半分もカバーできます。[Orkas vs Codex →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
-| **Claude Cowork** | Anthropic の日常業務向けエージェントで、現在は Claude の一部です。有料の Claude プランで、デスクトップ、Web、モバイルから利用できます。デフォルトでは Anthropic のクラウドで動作し、Claude モデルを基盤としています。 | Claude Cowork のオープンソース（MIT）代替で、500 クレジット付きで無料で始められます。エージェントはあなたのコンピューター上で動作し、データはデフォルトでローカルに保存されます。モデルは内蔵の Orkas モデル、自分のプロバイダーキー、ローカルエンドポイントから選べます。Commander は Claude Code、Codex などの CLI エージェントも呼び込めます。その代わり Orkas にはコンピューターの起動が必要ですが、Cowork のクラウドタスクはコンピューターがなくても動き続けられます。[Claude Cowork の代替ツール →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
-| **Manus** | デフォルトで Manus のクラウド上でタスクを計画・実行する AI エージェントです。デスクトップアプリの Manus Studio（macOS、Windows）は選択したフォルダーでも作業できますが、タスクの計画はクラウドで行われます。 | Manus のオープンソース（MIT）代替です。エージェントはあなたのコンピューター上で動作し、データはデフォルトでローカルに保存されます。モデルは内蔵の Orkas モデル、自分のプロバイダーキー、ローカルエンドポイントから選べ、プロジェクト、ToDo、自動化で仕事を前に進め続けます。その代わり Orkas にはコンピューターの起動が必要ですが、Manus のクラウドタスクはコンピューターがなくても動き続けられます。[オープンソースの Manus 代替 →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
-| **LangChain** | LLM アプリやエージェントを構築するための開発者向けフレームワーク／ライブラリ。コードファーストで、自分の Python/JS アプリに組み込んで使います。 | Orkas はオーケストレーションのコードを書くのではなく、チャットで指示するデスクトップアプリです。データはデフォルトでローカルに保存されます。 |
-| **CrewAI** | ロールプレイ型の自律エージェントをオーケストレーションするための Python フレームワーク。クルーとエージェントをコードで定義します。 | Orkas はマルチエージェントのオーケストレーションをデスクトップアプリで提供し、プロジェクト、ToDo、自動化、エージェントごとの自己改善を標準で備えています。 |
-| **OpenClaw** | メッセージング連携、マルチエージェントのルーティング、サブエージェントを備えたパーソナルエージェントプラットフォーム。 | Orkas は、完成した成果物のためのデスクトップワークスペースを提供し、内蔵の専門エージェントと、Claude Code、Codex、OpenCode などの CLI エージェントとの連携を備えています。OpenClaw も CLI エージェントとしてそのワークフローに参加できます。 |
-| **Hermes-Agent** | Nous Research による自己改善型エージェント。メモリとスキルを持つ単一のエージェントで、CLI、メッセージングゲートウェイ、デスクトップアプリとして利用できます。 | Orkas はチームを統括します。Commander が多くの専門エージェントやほかの CLI エージェントを指揮し、Hermes-Agent もその 1 つとして組み込まれます。 |
+| **Claude Code** | Anthropic端末、IDE、デスクトップ、Web の 's の agentic コーディング ツールClaudeモデル。 | または:OrkasログインClaude Code代理店として。 そこまで、Orkasコード、研究、コンテンツ、ビデオなどのコードを超えて、プロジェクト、To-dos、自動化など、作業のためのモデルアグノスティックチームを追加します。[Orkas対比Claude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
+| **Codex** | OpenAI's コーディングエージェント — 端末、エディタ、クラウド。 | または:OrkasログインCodex代理店として、次のClaude Codeそして、OpenCode. ザ・Commanderコーディングを渡すことができますCodexそして、別のエージェントへのレビューは、リリースの非コードの半分をカバー — docs, 投稿とビデオを起動します。[Orkas対比Codex →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
+| **Claudeコワーキング** | Anthropic「日常の仕事をするエージェント」Claude— デスクトップ、ウェブ、モバイルで有料Claudeプラン それはで実行されますAnthropicデフォルトで 's クラウドと使用Claudeモデル。 | オープンソース(MIT)代替方法Claude500クレジットで始めるのは自由です。Orkasエージェントをコンピュータ上で実行し、デフォルトでローカルにデータを保存します。Orkasモデル、独自のプロバイダーキーまたはローカルエンドポイント。 ふりがなCommander持込も可能です。Claude Code, Codexその他CLIエージェント。 トレードオフ:OrkasCoworkのクラウドタスクが実行せずに実行し続けることができる間、コンピュータの目を覚ます必要があります。[ClaudeCoworkの代替品 →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
+| **Manus** | ログインAIタスクを計画し実行するエージェントManusデフォルトで 's のクラウド。 ふりがなManus Studioデスクトップアプリ(macOSそして、Windows)選択したフォルダでも、クラウドで計画されているタスクで作業することができます。 | オープンソース(MIT)代替方法Manus. Orkasエージェントをコンピュータ上で実行し、デフォルトでローカルにデータを保存します。Orkasモデル、独自のプロバイダーキーまたはローカルエンドポイント。 プロジェクト、To-dos、自動化により、作業を移動します。 トレードオフ:Orkasコンピューターの覚醒が必要です。Manusクラウドタスクは、それなしで実行し続けることができます。[オープンソースManus代替 →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
+| **LangChain** | 開発者フレームワーク/ライブラリLLMアプリケーションとエージェント — コード優先、独自の組み込みPython/JSアプリ | Orkasオーケストラコードを書くことでではなく、チャットを通したデスクトップアプリです。 データはデフォルトでローカルにとどまります。 |
+| **CrewAI** | ツイートPythonロールプレイの自律エージェントをオーケストするためのフレームワーク — 乗組員とエージェントをコードで定義します。 | Orkas複数のエージェントのオーケストレーションをデスクトップアプリに、プロジェクト、To-dos、オートメーション、および各エージェントの自己改善が組み込まれています。 |
+| **OpenClaw** | メッセージングインテグレーション、マルチエージェントルーティング、サブエージェントを備えたパーソナルエージェントプラットフォーム。 | Orkasデスクトップのワークスペースで、完成した成果物を提供します。Claude Code, Codex, OpenCodeその他CLIエージェント。OpenClawそのワークフローをワークフローとして結合できます。CLI代理店。 |
+| **Hermes-Agent** | Nous Researchの自己改善剤 — メモリとスキルを持つ1つのエージェントは、CLI、メッセージングゲートウェイとデスクトップアプリ。 | Orkasチームを調整する:Commander多くの専門家や他の専門家を指示するCLI代理店、およびHermes-Agentそれらの1つとして差し込みます。 |
 
-**Orkas が向いているのは**、1 人のアシスタントではなくエージェントのチームが欲しい方、何日にもわたって仕事を前に進めたい方、データ、キー、エージェントを自分のディスクに置いておきたい方です。
+**Orkasは、あなたの if** は、1つのアシスタントではなく、エージェントのチームを望むなら、日々移動し続ける仕事、自分のディスク上のデータ、キーおよびエージェントです。
 
-**向いていないのは**、汎用チャットボットが 1 つあれば十分な方や、自分のアプリに組み込む純粋なコードライブラリを求めている方です。
+**あなたの if** あなただけの単一の汎用チャットボット、またはあなた自身のアプリに埋め込むための純粋なコードライブラリを望んでいません。
 
-**コーディングエージェントを比較検討中ですか？** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code の代替ツール](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
+**コーディングエージェント間の選択?** [Codex対比OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code対比Codex対比OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code代替品](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**詳しい比較はこちら →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**両面比較 →** [対比Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [対比Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [対比Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [対比LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [対比ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [対比OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [対比Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
 
 ---
 
+<a id="quick-start"></a>
 ## クイックスタート
 
-パッケージ版のインストーラーを使いたい場合は、上記の[ダウンロード](#ダウンロード)をご覧ください。ソースから実行する場合（現在、Linux で Orkas を動かす方法はこれだけです）は次のとおりです。
+代わりにパッケージ化されたインストーラをしたいですか? お問い合わせ[ダウンロード](#download)以上。 ソースから実行する — 現在実行する方法Orkasお問い合わせLinux:
 
-**動作要件**: Node 22.12+ · macOS / Windows 10+ / glibc 2.34+ Linux x64 または arm64。まれにネイティブモジュールのソースビルドへのフォールバックが発生する場合に備えて、Python 3 と C/C++ のビルドツールチェーンを利用できるようにしておいてください。
+**Requirements**: Node 22.12+ · macOS/Windows 10+/ glibc 2.34+ Linux x64かarm64。 Python 3およびC/C++のビルドツールチェーンは、珍しいネイティブモジュールのソース構築フォールバックのために利用できます。
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -177,102 +179,102 @@ cd Orkas
 run.cmd            # Windows
 ```
 
-Linux でソースから実行するには glibc 2.34+ が必要です。Alpine など musl ベースのディストリビューションはサポートされていません。ローカルの音声文字起こしでは、ソースからの初回起動時に、ターゲット環境ネイティブの whisper.cpp ランタイムと多言語モデルがダウンロード・検証されます。
+Linux ソースランは glibc 2.34+ が必要です。 アルパインとその他のムールベースの分布はサポートされていません。 ローカルスピーチの転写は、最初のソース起動時にターゲットネイティブwhisper.cppランタイムと多言語モデルをダウンロードし、検証します。
 
-`run.sh` / `run.cmd` は、ロックされた npm 依存関係ツリーをインストールし、初回起動時に固定バージョンの Python、uv、Node、埋め込みモデル（約 95 MB）、OfficeCLI、FFmpeg、whisper.cpp、多言語音声モデルのリソースを準備します。Linux では、アプリを開く前に、プラットフォームネイティブのモジュールと Whisper ランタイムが Electron の ABI で動作するかを検証します。OCR とスキル固有の Python パッケージは、それらの機能を初めて使うときに、分離されたローカル環境へインストールされます。初回起動時には、`~/.orkas/`（macOS / Linux）または `<smallest non-system drive>:\.orkas\`（Windows）の下にワークスペースが作成されます。その後、**設定 → AI プロバイダー**を開いて API キーまたは OAuth を追加してください。
+`run.sh` / `run.cmd`ロックされたnpmの依存関係の木を取付け、ピン留めを準備して下さいPython、紫外線、Nodeモデルを埋め込むこと(〜95メガバイト), OfficeCLI, FFmpeg, whisper.cpp第一起動時に、多言語のスピーチモデルのリソース。Linux起動すると、プラットフォームネイティブモジュールとウィスパーランタイムが下にあることを確認します。Electronアプリを開く前に ABI です。 OCR と スキル固有のPythonこれらの機能が最初に使用されるときパッケージは隔離されたローカル環境に取付けられます。 スタートアップがワークスペースを創り出す`~/.orkas/` (macOS / Linux)または`<smallest non-system drive>:\.orkas\` (Windows). それから開いた**設定 →AIプロバイダー**追加するAPIキーまたはOAuth.
 
-ネイティブ依存関係のエラーが出た場合: Node.js 24 LTS（最低 22.12.0）を使い、
-このチェックアウトで `npm run native:repair` を実行してください。オプションのパッケージを復元し、
-Electron 用に SQLite を修復し、分離された画像処理用に同梱の Node を準備したうえで、
-SQL、sqlite-vec、sharp をチェックしてから完了します。
-インストールを行わずにチェックだけをするには `npm run native:check` を使います。
-実行されるチェックの内容は、[ネイティブ依存関係の検証スクリプト](./scripts/verify-native-dependencies.cjs)をご覧ください。
+ネイティブの依存性エラー: Node.js 24 LTS (minimum 22.12.0)を使用して、実行します
+このチェックアウトから`npm run native:repair`。 オプションのパッケージを復元します。
+修理SQLiteお問い合わせElectron、束ねられた準備Node分離されたイメージの処理のため、
+成功前にSQL、sqlite-vec、シャープをチェックします。
+`npm run native:check`は、インストールせずにチェックします。
+[nativeの依存性検証スクリプト](./scripts/verify-native-dependencies.cjs)は、チェックを実行しました。
 
 ---
 
-## 仕組み
+## 作品紹介
 
-### タスクのルーティング
+### タスクルーティング
 
-Commander は一般的な仕事を自分で処理し、専門的な仕事は次の 3 つのツールで委任します。
+Commanderは、一般的な作業自体を扱い、3つのツールを通して専門家の仕事を委任します。
 
-- **`dispatch_to`** は、名前付きのエージェントを実行し、その結果を返して作業を続けます。結果を待つことも、非同期で実行してタスク完了時に Commander へ通知させることもできます。
-- **`hand_off_to`** は、残りの作業を名前付きのエージェントに引き継ぎ、現在の Commander のターンを終了します。エージェントが自ら返信します。オプションの継続設定を使うと、その後で Commander がより大きなタスクを再開できます。
-- **`run_worker`** は、匿名で分離されたサブタスクを実行し、非公開の結果を返します。会話履歴や名前付きエージェントのスキルは受け取りません。
+- **`dispatch_to`**は、名前付きエージェントを実行し、継続的な作業のために結果を返します。 結果の待ち合わせや非同期的に実行し、タスクが終了するとCommanderに通知することができます。
+- **`hand_off_to`**は残りの仕事を名前付き代理店に移し、現在のCommanderの回転を終わらせます。 エージェントは、独自の返信を提供します。オプションの継続により、Commanderはその後より広範な作業を再開できます。
+- **`run_worker`**は匿名で、独立したサブタスクを実行し、プライベートな結果を返します。 会話履歴や名前付きエージェントのスキルは受けません。
 
-名前付きエージェントのタスクと匿名ワーカーには、別々の並行実行制御があります。[ディスパッチの実装](./src/main/features/group_chat/bus.ts)と[実行ロック](./src/main/util/locks.ts)をご覧ください。
+エージェントのタスクと匿名のワーカーは、別の通貨コントロールを持っています。 [dispatch実装](./src/main/features/group_chat/bus.ts)および[executionロック](./src/main/util/locks.ts)。
 
 ### コンテキスト管理
 
-ランタイムは、プロンプト、ツール、永続的なランタイム状態を考慮したうえで、選択したモデルが実際に使える入力容量に合わせてコンテキストの予算を配分します。完了した対話には上限付きの直近履歴ウィンドウを使い、長く続くアクティブなタスクでは、チェックポイントを使って以前のプロセスメッセージを圧縮しつつ、直近の作業は保持します。ファイルの読み込み、ファイルの変更、コマンドの実行には構造化された記録もあり、コンテキストの圧縮後も残すことができます。
+選択したモデルの使用可能な入力容量に対するランタイム予算のコンテキスト, プロンプトの会計, ツールと永続的なランタイム状態. 完全な対話は、境界の最近の履歴ウィンドウを使用します。 長いアクティブなタスクは、最近の作業を維持しながら、以前のプロセスメッセージを凝縮するためにチェックポイントを使用します。 ファイル読み込み、ファイル変更、コマンド実行もコンテキストの圧縮を生き残ることができる構造化されたレコードを持っています。
 
-[コンテキスト予算](./src/core-agent/src/agent/context-budget.ts)、[セッション履歴とチェックポイント](./src/core-agent/src/agent/session.ts)、[ワークスペースの記録](./src/core-agent/src/agent/workspace-state.ts)をご覧ください。
+お問い合わせ[コンテキスト予算](./src/core-agent/src/agent/context-budget.ts), [セッション履歴とチェックポイント](./src/core-agent/src/agent/session.ts)そして、[ワークスペースレコード](./src/core-agent/src/agent/workspace-state.ts).
 
-### メモリとライブラリ
+### 記憶と図書館
 
-永続的なノートは、ユーザーの好み、プロジェクトの事実、各エージェントの再利用可能な知識を、それぞれ別のスコープで保持します。これらのノートは、ライブラリのドキュメントインデックスや保存された会話履歴とは別のものです。
+耐久性のあるノートは、ユーザーの好み、プロジェクトの事実、各エージェントの再利用可能な知識を別のスコープに保ちます。 これらのメモは、ライブラリのドキュメントインデックスと保存された会話履歴とは異なるものです。
 
-ライブラリはドキュメントをパッセージに分割して抽出し、ローカルの SQLite ベクトルインデックスに保存します。埋め込みモデルはあなたのマシン上で動作します。`library` ツールは、グローバルまたは現在のプロジェクトのライブラリから、ファイルの一覧表示、関連パッセージの検索、元のコンテンツの読み込みを行えます。過去の会話は `chat_history` を通じて別途取得されます。
+ライブラリは、ドキュメントを通路に抽出し、ローカルSQLiteベクトルインデックスを保存します。 組み込みモデルは、マシン上で実行されます。 `library` ツールは、ファイルをリストしたり、関連する通路を検索したり、ソースコンテンツをグローバルまたは現在のプロジェクトライブラリから読み込むことができます。 `chat_history`では、以前の会話が別々に取得されます。
 
-[スコープ付きメモリ](./src/main/features/memory.ts)、[ドキュメントの抽出](./src/main/util/file_to_chunks.ts)、[ライブラリのツール](./src/main/model/core-agent/kb-tools.ts)、[会話の取得](./src/main/model/core-agent/chat-history-tools.ts)をご覧ください。
+お問い合わせ[スコープ付きメモリ](./src/main/features/memory.ts), [ドキュメント抽出](./src/main/util/file_to_chunks.ts), [ライブラリーツール](./src/main/model/core-agent/kb-tools.ts)そして、[会話検索](./src/main/model/core-agent/chat-history-tools.ts).
 
-### 実行の制限と復旧
+### 実行限度と回復
 
-セッションロックと並行実行数の上限が、並列作業を制限します。ツールのラウンド数の予算、進捗チェックポイント、繰り返し呼び出しのチェック、フェーズを考慮したアイドル監視が、停止したり同じ作業を繰り返したりする実行を抑えます。名前付きエージェントのタスクは個別に追跡・キャンセルでき、受け付け済みまたはキューに入ったタスクが完了した結果として扱われることはありません。
+セッションロックと対立限界の境界線作業。 ツールラウンド予算、進捗チェックポイント、リピートコールチェック、およびフェーズアウェアアイドルウォッチドッグスは、そのストールまたはリピート作業を含む。 名前付きエージェントのタスクを追跡し、個別にキャンセルすることができます。 指定されたタスクまたはキューイングされたタスクは、完了した結果として扱われません。
 
-[アクターの予算](./src/main/features/group_chat/actor-budgets.ts)、[エージェントランタイム](./src/core-agent/src/agent/runner.ts)、[デスクトップ用モデルアダプター](./src/main/model/core-agent/client.ts)をご覧ください。
+お問い合わせ[俳優の予算](./src/main/features/group_chat/actor-budgets.ts), ,[エージェントランタイム](./src/core-agent/src/agent/runner.ts)そして、[デスクトップモデルアダプター](./src/main/model/core-agent/client.ts).
 
-### アクティビティからの学習
+### 活動から学ぶ
 
-バックグラウンドレビューは、クールダウンと実行制限の範囲内で、アプリがアイドル状態のときに新しいエージェントのアクティビティを確認します。レビューでは、エージェントの自己評価（`COMPETENCE.md`）、再利用可能な手法（`LEARNING_STRATEGIES.md`）、学習したスキルを更新することがあります。レビューはタスクの数ではなく新しいアクティビティに基づいて行われ、保存する価値のあるものは何もないと結論づけることもあります。
+背景レビューは、アプリがアイドル状態になると、クールダウンと実行制限の対象となる新しいエージェントの活動を調べます。 レビューは、エージェントの自己評価(`COMPETENCE.md`)、再利用可能な方法(`LEARNING_STRATEGIES.md`)または学習スキルを更新することができます。 レビューは、タスクカウントではなく、新しいアクティビティに依存し、保存する価値がないと結論づけることができます。
 
-[振り返りスケジューラー](./src/main/features/reflection-orchestrator.ts)と[レビュープロンプト](./src/core-agent/src/evolution/metacognition.ts)をご覧ください。
+[reflectionスケジューラ](./src/main/features/reflection-orchestrator.ts)および[reviewプロンプト](./src/core-agent/src/evolution/metacognition.ts)。
 
 ---
 
 ## よくある質問
 
-**Orkas とは何ですか？**
-Orkas は、オープンソース（MIT）でローカルファーストのマルチエージェント・デスクトップアプリです。Commander があなたの目標を ToDo に変え、16 の内蔵専門エージェントに加えて Claude Code、Codex、OpenCode、OpenClaw、Hermes-Agent を連携させて、完成したファイルを届けます。単一のチャットボットでも、コードフレームワークでも、ホスト型の SaaS でもありません。
+**ZOrkasとは?**
+Orkasは、オープンソースの(MIT)、ローカルファーストのマルチエージェントデスクトップアプリです。 そのCommanderは、あなたの目標をto-dosに変え、16の組み込みのスペシャリストエージェントを調整します。Claude Code、Codex、OpenCode、OpenClawとHermes-Agent - 完成したファイルを配信します。 単一のチャットボットではなく、コードフレームワークではなく、ホストされているSaaSではありません。
 
-**API キーは必要ですか？**
-いいえ。パッケージ版アプリには、内蔵の Orkas モデル用の 500 クレジットが付属しています。使い切った後は、クレジットを購入するか、有料プランを選ぶか、自分のプロバイダーのキーを追加してください。プロバイダーの料金は別途かかります。
+**Do APIキーが必要ですか? **の特長
+いいえ。 パッケージアプリは、Orkasモデルの500クレジットが付属しています。 その後、クレジットを購入し、有料プランを選択するか、または独自のプロバイダキーを追加してください。プロバイダー料金は別々です。
 
-**Orkas はローカル LLM ですか？**
-いいえ。Orkas はあなたのマシン上で動作し、選択したモデル（内蔵の Orkas モデル、自分の API キー、ローカルモデルのエンドポイント）を呼び出します。エージェントとツールをオーケストレーションするものであり、それ自体はモデルではありません。
+**Is Orkas ローカルLLM?**
+いいえ。 Orkas はマシン上で実行し、選択したモデルを呼び出します。内蔵の Orkas モデル、独自の API キー、またはローカルモデルエンドポイント。 エージェントやツールをオーケストし、モデルそのものではありません。
 
-**自分のドキュメントをもとに、引用付きで質問に答えられますか？**
-はい。PDF やドキュメントをローカルのライブラリに追加すると、Orkas はそれらを検索し、出典箇所への引用付きで回答できます。元の資料を開いて確認できます。インデックスはあなたのマシン上で作成されます。
+**Can Orkasは引用で私の文書からの質問に答えますか。 **の特長
+はい。 Orkasは、PDFやドキュメントをローカルライブラリに追加し、それらを検索し、ソースの通路への引用で答えることができるので、元のオープンとチェックをすることができます。 インデックスは機械に組み込まれています。
 
-**Ollama や LM Studio などのローカルモデルは使えますか？**
-はい。**アカウント設定 → モデル → チャット → モデルを追加 → カスタム**を開き、**OpenAI 互換**または **Anthropic 互換**を選択して、ベース URL、正確なモデル ID、API キーを入力します。保存したモデルを、タスクのモデル選択から選んでください。
+**Canの特長 OllamaやLM Studioなどのローカルモデルを使用していますか?**
+はい。 **Account設定 → モデル → チャット → モデル → Custom** を選択し、**OpenAI 互換** または **Anthropic-compatible** を選択し、ベース URL、モデル ID、API キーを入力します。 タスクのモデル制御から保存したモデルを選択します。
 
-**API キーとデータはどこに保存されますか？**
-デフォルトではあなたのディスク上です。自分のプロバイダーのキーはローカルで暗号化され、クラウド同期の対象外です。自分のキーを使う場合、モデルの呼び出しはあなたのマシンからプロバイダーへ直接送られます。内蔵の Orkas モデルは、Orkas のマネージドサービスを使います。パッケージ版アプリのオプションのクラウド同期と共有プロジェクトでは、選択したデータが Orkas のサーバーに保存されます。[セキュリティとデータの取り扱い →](https://orkas.ai/security/?source=gh-orkas)
+**Whereは私のAPIキーと保存されたデータですか? **の特長
+デフォルトでディスクに。 独自のプロバイダキーは、ローカルで暗号化され、クラウド同期から除外されます。 独自のキーで、モデルコールはマシンからプロバイダに直進します。OrkasモデルはOrkasのマネージドサービスを使用します。 パッケージ化されたアプリ内のオプションクラウド同期と共有プロジェクトでは、選択したデータをOrkasサーバーに保存します。 [セキュリティとデータ処理 →](https://orkas.ai/security/?source=gh-orkas)
 
-**Orkas はオフラインで使えますか？**
-ソースビルドは、ローカルモデルのエンドポイントを使えば完全にオフラインで動作します。パッケージ版アプリはサインインが必要で、クラウドモデルにはネットワーク接続が必要です。
+**Does Orkasはオフラインで動作しますか? **の特長
+ソースビルドは、ローカルモデルのエンドポイントに対して完全にオフラインで実行できます。 パッケージアプリは、サインインする必要があります。クラウドモデルはネットワーク接続が必要です。
 
-**コンピューターの電源が切れていても動き続けますか？**
-いいえ。Orkas はあなたのコンピューター上で動作するため、自動推進と自動化には、コンピューターが起動していて Orkas が実行中である必要があります。v1.9 以降、コンピューターのスリープ解除時や Orkas の起動時に、各自動化は 12 時間以内に逃した直近の実行を 1 回分取り戻します。
+**Doesは、コンピュータがオフ時に動作し続けるのですか? **の特長
+いいえ — Orkas はコンピュータ上で実行されますので、自動運転およびオートメーションはコンピュータ awake および Orkas ランニングを必要とします。 v1.9 から、コンピュータが目覚めるか、Orkas が始まる 12 時間以内に、各オートメーションは最新の見逃された実行をキャッチします。
 
-**アプリを作成して公開できますか？**
-はい。Orkas 内で動作するローカルアプリは無料です。Web アプリを公開リンクで公開するには有料プランが必要です（Lite は 5 個、Pro は 8 個、Max は 15 個まで）。また、公開された Web アプリでは、Orkas 内で使えるすべての機能が利用できるわけではありません。
+**Canの特長 アプリの作成と公開 **の特長
+はい。 Orkas内で動作するローカルアプリは無料です。 公開リンクにWebアプリを公開するには、有料プラン(Lite 5、Pro 8、Max 15 apps)、および公開されたWebアプリは、Orkas内で利用可能なすべての機能が含まれていません。
 
-**Orkas のアカウントは必要ですか？**
-パッケージ版のデスクトップアプリでは、初回起動時にサインインが求められます。このリポジトリのソースビルドにはアカウント機能がまったくなく、そのままアプリが起動します。
+**Do Orkasアカウントが必要ですか? **の特長
+パッケージされたデスクトップアプリは、最初に起動したときにサインインするように要求します。 このリポジトリのソースビルドはアカウントレイヤーが全くなく、アプリに直接起動します。
 
-**Orkas は Claude Code などの CLI エージェントを操作できますか？**
-はい。Orkas は 5 つの外部 CLI エージェント（コーディングエージェントの Claude Code、Codex、OpenCode と、パーソナルエージェントの OpenClaw、Hermes-Agent）をローカルのサブプロセスとして操作でき、HyperFrames などのオープンソースプロジェクトも取り込めます。すべて同じチャットから指示できます。
+**Can OrkasドライブClaude Codeおよび他のCLIの代理店か。 **の特長
+はい。 Orkasは、ローカルのサブプロセスとして5つの外部CLIエージェントを駆動することができます — コーディングエージェントClaude Code、CodexとOpenCode、および個人エージェントOpenClawとHermes-Agent - そして、HyperFramesなどのオンボードのオープンソースプロジェクト、すべてのチャットから直接指示します。
 
-**Orkas は Claude Code / Codex / CrewAI / LangChain とどう違いますか？**
-Claude Code と Codex はコーディングエージェントです。Orkas はその両方をチームのメンバーとして実行するので、どちらかを選ぶ必要はありません。CrewAI と LangChain はコードファーストのフレームワークです。Orkas はオープンソースのデスクトップアプリで、Commander が専門エージェントのチームとあなたの CLI エージェントを統括します。どのモデルプロバイダーでも使え、データとキーはローカルに保たれます。[詳しい比較](https://orkas.ai/compare/?source=gh-orkas)をご覧ください。
+**お問い合わせOrkas異なるClaude Code / Codex / CrewAI / LangChain?**
+Claude Code と Codex は、コーディングエージェントです。Orkas は、チームのメンバーとして実行されているため、それらの間で選択する必要はありません。CrewAI と LangChain はコードファーストフレームワークです。 Orkasは、CommanderがスペシャリストエージェントとCLIエージェントのチームを調整し、任意のモデルプロバイダで、データとキーをローカルに保ちます。 [fullの比較](https://orkas.ai/compare/?source=gh-orkas)を参照してください。
 
-**Orkas はどのプラットフォームに対応していますか？**
-macOS 12+（Apple Silicon および Intel）と Windows 10+ にはパッケージ版のインストーラーがあります。glibc 2.34+ の Linux x64/arm64 では現在ソースから実行でき、インストーラーはまだありません。Linux でのローカル音声文字起こしは、初回起動時に準備される固定バージョンの whisper.cpp ランタイムによってサポートされています。Alpine など musl ベースのディストリビューションはサポートされていません。ソースからのブートストラップには Node 22.12+ が必要です。Python 3 と C/C++ のビルドツールチェーンは、ネイティブ npm パッケージに互換性のあるビルド済みバイナリがなく、ローカルで再ビルドする必要がある場合にのみ必要です。
+**WhichプラットフォームはOrkas対応ですか? **の特長
+macOS 12+ (アップルシリコンとインテル)そして、Windows10 + は、インストーラーをパッケージ化しました。 glibc 2.34+Linuxx64/arm64 は、まだインストーラなしで、今日のソースから実行されます。 ローカルスピーチの転写をサポートLinuxピン留めwhisper.cpp初回起動時に用意されたランタイム アルパインとその他のムールベースの分布はサポートされていません。 ソースブートストラップのニーズNode 22.12+; Python3 と C/C++ ビルド ツールチェーンは、ネイティブ npm パッケージが互換性のあるプリビルドバイナリを持たない場合にのみ必要であり、ローカルに再構築する必要があります。
 
-**Orkas は無料でオープンソースですか？**
-はい。アプリは MIT ライセンスで、無料で使えます。パッケージ版アプリには内蔵の Orkas モデル用の 500 クレジットが付属しています。月額 $11.99 からの有料プランでは、毎月のクレジット、クラウド同期、より多くの共有プロジェクト、アプリの公開が追加されます。自分のキーを使う場合、モデルの利用料金はプロバイダーから請求され、Orkas が上乗せすることはありません。[料金 →](https://orkas.ai/pricing/?source=gh-orkas)
+**Is Orkas無料およびオープンソース? **の特長
+はい。アプリはMITのライセンスを受けており、無料でご利用いただけます。 パッケージアプリには、組み込みのOrkasモデルの500クレジットが含まれています。 $ 1.99 /月からの有料プランでは、毎月のクレジット、クラウド同期、より共有されたプロジェクトとアプリの公開を追加します。 あなた自身のキーを使うと、モデルの使用法はあなたの提供者によって請求されます;Orkasはマークアップを加えません。 [Pricing →](https://orkas.ai/pricing/?source=gh-orkas)
 
 ---
 
