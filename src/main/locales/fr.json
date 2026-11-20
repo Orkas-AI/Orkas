@@ -136,6 +136,7 @@
   "errors.contexts.formats_only": "Seuls les formats suivants sont pris en charge : {allowed}",
   "errors.unknown_actor": "acteur inconnu : « {name} » — le nom doit correspondre au champ `name` d’une entrée de la « liste des Agents » ; vérifiez aussi si l’Agent est désactivé.",
   "errors.no_model_configured": "Aucun modèle configuré. Ajoutez une clé API dans les paramètres ou connectez-vous.",
+  "errors.task_restore_unavailable": "Cette tâche ne peut pas être reprise. Renvoyez votre demande pour continuer.",
   "errors.model_temporarily_unavailable": "Le modèle configuré est temporairement indisponible. Réessayez plus tard, vérifiez les identifiants ou changez de modèle dans les paramètres.",
   "errors.model_currently_unavailable": "Ce modèle est actuellement indisponible",
   "errors.model_config_unavailable": "Un modèle est configuré, mais son identifiant d’accès n’est pas utilisable actuellement. Vérifiez la clé API, l’état de connexion ou le modèle de repli dans les paramètres.",

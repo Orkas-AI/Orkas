@@ -35,7 +35,7 @@ import { isPlaceholderTitle } from './conv_title';
 import type { CommanderMentionDisplay } from './message-display';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot, liveDisplaySnapshot,
-  type GroupEvent,
+  FAILED_TURN_RETRY_ACTOR_UNAVAILABLE, type GroupEvent,
   cancelConversationTask as busCancelConversationTask,
   sendConversationTaskNow as busSendConversationTaskNow,
   editConversationTask as busEditConversationTask,
@@ -809,7 +809,9 @@ export async function retryFailedTurn(
     _acceptedRetries.set(key, msg.id);
     return { ok: true, mode: resolved.value.mode, msg };
   } catch (err) {
-    log.error('failed-turn retry failed', { error: logErrorRef(err) });
+    if ((err as NodeJS.ErrnoException).code !== FAILED_TURN_RETRY_ACTOR_UNAVAILABLE) {
+      log.error('failed-turn retry failed', { error: logErrorRef(err) });
+    }
     return { ok: false, error: (err as Error).message || String(err) };
   } finally {
     _retriesInFlight.delete(key);

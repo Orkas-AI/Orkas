@@ -4876,6 +4876,49 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(rows.some((row: any) => String(row.model_text || '').includes('<orchestration-resume>'))).toBe(false);
   }, 15_000);
 
+  it('refuses a failed-turn retry after removing its named Agent from the project, then accepts a retry after rebinding', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const projects = await import('../../../../src/main/features/projects');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const project = await projects.createProject(TEST_UID, 'Scoped failed-turn recovery');
+    if (!project.ok) throw new Error('Project fixture failed');
+    const pid = project.project.project_id;
+    expect((await projects.addAgentBinding(TEST_UID, pid, AGENT_ID)).ok).toBe(true);
+    const {conversation_id: cid} = await chats.createConversation(TEST_UID, {projectId:pid});
+    cidsToDrop.add(cid);
+    const agentSession = state.buildGmemberSessionId(cid, AGENT_ID);
+    const commanderSession = state.buildGconvSessionId(cid);
+    _setScript(agentSession, [{type:'error', text:'Scoped task interrupted', failureKind:'model', failureCode:'provider_unavailable'}]);
+    _setScript(commanderSession, [{type:'final', text:'WRONG-ACTOR-RETRY: did unassigned work'}]);
+    expect((await groupChat.send({userId:TEST_UID,cid,text:`@${AGENT_NAME} Prepare the approved scoped note`})).ok).toBe(true);
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const before = await groupChat.readMessages(TEST_UID, cid);
+    const tasksBefore = await groupChat.listTasks(TEST_UID, cid);
+    const failure = before.find(row => row.from === AGENT_ID && row.failure_code === 'provider_unavailable');
+    expect(failure?.id).toBeTruthy();
+    expect(_recordedCalls.map(call => call.sid)).toEqual([agentSession]);
+
+    expect((await projects.removeAgentBinding(TEST_UID, pid, AGENT_ID)).ok).toBe(true);
+    expect((await projects.resolveProjectScope(TEST_UID, pid))?.agents).not.toContain(AGENT_ID);
+    const retry = {userId:TEST_UID,cid,failedMessageId:failure!.id,visibleText:'Continue failed scoped task'};
+    const refused = await groupChat.retryFailedTurn({...retry,client_msg_id:`removed-agent-${cid}`});
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    expect({accepted:refused.ok, sessions:_recordedCalls.map(call=>call.sid),
+      newMessages:(await groupChat.readMessages(TEST_UID,cid)).slice(before.length).map(row=>row.from)})
+      .toEqual({accepted:false,sessions:[agentSession],newMessages:[]});
+    expect(refused.error).toBe('This task cannot be resumed. Send the task again to continue.');
+    expect(await groupChat.listTasks(TEST_UID, cid)).toEqual(tasksBefore);
+
+    expect((await projects.addAgentBinding(TEST_UID, pid, AGENT_ID)).ok).toBe(true);
+    _setScript(agentSession, [{type:'final',text:'SCOPED-RETRY-RECOVERED: delivered the approved note'}]);
+    expect((await groupChat.retryFailedTurn({...retry,client_msg_id:`rebound-agent-${cid}`})).ok).toBe(true);
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    expect(_recordedCalls.map(call=>call.sid)).toEqual([agentSession,agentSession]);
+    const after = await groupChat.readMessages(TEST_UID, cid);
+    expect(after.filter(row=>row.from===AGENT_ID&&row.text?.includes('SCOPED-RETRY-RECOVERED'))).toHaveLength(1);
+  }, 15_000);
+
   it('restores a missing Agent roster entry before persisting and dispatching a failed-turn retry', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');

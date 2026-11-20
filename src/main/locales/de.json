@@ -136,6 +136,7 @@
   "errors.contexts.formats_only": "Nur folgende Formate werden unterstützt: {allowed}",
   "errors.unknown_actor": "unbekannter Akteur: „{name}“ – der Name muss dem Feld `name` eines Eintrags in der „Agenten-Liste“ entsprechen; prüfen Sie auch, ob der Agent deaktiviert ist.",
   "errors.no_model_configured": "Kein Modell konfiguriert. Fügen Sie in den Einstellungen einen API-Schlüssel hinzu oder melden Sie sich an.",
+  "errors.task_restore_unavailable": "Diese Aufgabe kann nicht fortgesetzt werden. Sende die Aufgabe erneut, um fortzufahren.",
   "errors.model_temporarily_unavailable": "Das konfigurierte Modell ist vorübergehend nicht verfügbar. Versuchen Sie es später erneut oder prüfen Sie die Zugangsdaten bzw. wechseln Sie das Modell in den Einstellungen.",
   "errors.model_currently_unavailable": "Dieses Modell ist derzeit nicht verfügbar",
   "errors.model_config_unavailable": "Ein Modell ist konfiguriert, aber seine Zugangsdaten sind derzeit nicht verwendbar. Prüfen Sie API-Schlüssel, Anmeldestatus oder Ausweichmodell in den Einstellungen.",
