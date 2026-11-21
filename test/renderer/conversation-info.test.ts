@@ -135,6 +135,17 @@ describe('ConversationInfo files tab', () => {
     expect(result.counts.attachments).toBe('2');
   });
 
+  it('loads a saved spreadsheet when entering Attachments from Browser with a stale inventory', async () => {
+    const snapshot = { history: [], files: { items: [] }, attachments: [] as Array<{ name: string; bytes: number }> };
+    const result = await renderFilesResult(snapshot, async context => {
+      context.window.ConversationInfo.openAndSetTab('browser');
+      snapshot.attachments = [{ name: 'database-export.xls', bytes: 4096 }];
+      await context.document.querySelectorAll('.conversation-info-tab')[1].onclick();
+    });
+    expect(result.html).toContain('data-attachment-name="database-export.xls"');
+    expect(result.counts.attachments).toBe('1');
+  });
+
   it('keeps sent attachments when the composer clears and removes deleted files on refresh', async () => {
     const snapshot = {
       activeTab: 'attachments' as const,

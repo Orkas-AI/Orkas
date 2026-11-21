@@ -1229,9 +1229,11 @@ const ConversationInfo = (() => {
       if (tab.dataset.bound === '1') return;
       tab.dataset.bound = '1';
       tab.addEventListener('click', () => {
+        const wasBrowser = _activeTab === 'browser';
         _activeTab = tab.dataset.infoTab || 'files';
         _syncChrome();
         _renderBody();
+        if (wasBrowser && _activeTab === 'attachments') return refreshAttachments(_cid);
       });
     });
     if (body && body.dataset.bound !== '1') {
@@ -1312,6 +1314,9 @@ const ConversationInfo = (() => {
   window.addEventListener('i18n-change', () => {
     _syncChrome();
     _renderBody();
+  });
+  window.orkas?.onPushEvent?.('web-assist:download-finished', (event) => {
+    if (event?.conversation_id) void refreshAttachments(event.conversation_id);
   });
 
   // External callers (chat header "详情" button, i18n-change listeners) read

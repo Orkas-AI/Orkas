@@ -3445,6 +3445,18 @@ describe('host-started task browser binding', () => {
       } finally { electronMock.renderer.send.mockReset(); }
     });
 
+    it.each(['tab closed', 'account switched'])('updates the attachment inventory only for its account when the %s', change => {
+      const { renderer } = electronMock;
+      const { item } = attempt('https://files.example/export', 'report.xls');
+      if (change === 'tab closed') closeWebAssist(renderer);
+      else vi.mocked(registerUserSwitchHook).mock.calls.find(([name]) => name === 'web-assist')![1]('u1', 'u2');
+      renderer.send.mockClear();
+      item.handlers.done({}, 'completed');
+      const updates = renderer.send.mock.calls.filter(([channel]: [string]) => channel === 'web-assist:download-finished');
+      expect(updates).toEqual(change === 'tab closed'
+        ? [['web-assist:download-finished', { conversation_id: cid }]] : []);
+    });
+
     it('cleans up the partial file when a download does not complete', () => {
       const tried = attempt('https://files.example.com/half.csv', 'half.csv');
       expect(tried.prevented.value).toBe(false);
