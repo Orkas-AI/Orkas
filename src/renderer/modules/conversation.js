@@ -13942,10 +13942,8 @@ function _finishStreamingMsg(cid) {
   // the cleaned content or is removed entirely if both process + final
   // were empty.
   if (cid === currentCid) {
-    // UI finalization and the primary send stream are independent terminal
-    // paths in group chat. Release the pin again at the shared run-settlement
-    // boundary so observer/recovery completion cannot leave the artificial
-    // spacer behind.
+    // Primary sends and observer recovery share this settlement path. Only
+    // the conversation that owns the mounted transcript may release its pin.
     _setChatScrollOffset(false, document.getElementById('chat-history'));
     const settling = _settleFinishedConversationDisplay(cid, wasAborted);
     _updateConvSendUI(cid);
@@ -14625,7 +14623,9 @@ function createChatController(config) {
       _clearOffViewGroupProcessEvents(id);
       pending = null;
       _updateSendUI();
-      if (features.scrollPin) _setChatScrollOffset(false, historyEl);
+      // Group chat shares its history element across conversations. Its
+      // settlement hook releases the pin after checking conversation ownership.
+      if (features.scrollPin && !features.actorIdentity) _setChatScrollOffset(false, historyEl);
       if (hooks.onDone) hooks.onDone(msgEl, id, terminalResult);
       // No re-pin at stream end — respect the user's scroll position
       // if they scrolled up mid-stream.
