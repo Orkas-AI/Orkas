@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 # severity → health-score weight (deducted from 100)
 _WEIGHT = {"critical": 25, "high": 12, "medium": 6, "low": 2}
@@ -28,10 +28,17 @@ def _norm_url(u: str) -> str:
     if not u:
         return ""
     s = urlsplit(u.strip())
+    scheme = s.scheme.lower()
     host = (s.hostname or "").lower()
+    # Keep the boundary between an IPv6 host and its port unambiguous.
+    if ":" in host:
+        host = "[{}]".format(host)
     path = (s.path or "/").rstrip("/") or "/"
-    port = "" if (not s.port or s.port in (80, 443)) else ":%d" % s.port
-    return "{}://{}{}{}".format(s.scheme.lower(), host, port, path)
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    port = "" if s.port is None or s.port == default_port else ":%d" % s.port
+    # Queries can identify different pages. Keep them verbatim: sorting or
+    # decoding parameters would assume server semantics we have not measured.
+    return urlunsplit((scheme, host + port, path, s.query, ""))
 
 
 def _page_of(crawl_obj: dict) -> tuple[dict, dict]:
