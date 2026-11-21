@@ -1670,19 +1670,12 @@ if (!gotLock) {
     });
     registerIpc(flushForShutdown, () => shutdown.quiescent);
     const stopTaskNotifications = taskNotifications.startTaskNotifications({
+      ...taskNotifications.createTaskNotificationForeground(app, () => BrowserWindow.getAllWindows()),
       getActiveUserId: () => users.getActiveUserId(),
       isEnabled: () => appConfig.getTaskNotificationsEnabled(),
-      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
-        !win.isDestroyed() && win.isFocused()
-      )),
       isSupported: () => Notification.isSupported(),
       resolveLanguageForUser: (userId) => appConfig.resolveLanguageForUser(userId),
       setBadgeCount: setTaskNotificationBadgeCount,
-      onDidFocus: (listener) => {
-        const onFocus = () => listener();
-        app.on('browser-window-focus', onFocus);
-        return () => { app.off('browser-window-focus', onFocus); };
-      },
       createNotification: (options) => {
         const notification = new Notification(options);
         notification.on('show', () => {

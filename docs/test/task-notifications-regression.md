@@ -3,7 +3,10 @@
 ## Scope
 
 Native notifications are an attention layer for tasks that reach a terminal
-state while Orkas is still running but no app window is focused. The app-level
+state while Orkas is still running in the background. On macOS, Orkas stays in
+the foreground while the app is active and a window is visible and not
+minimized, including while a native sheet has focus. On Windows and Linux,
+foreground detection uses app window focus. The app-level
 preference and the operating-system permission are independent authorities:
 the checkbox stores the user's choice, while the recovery row explains when the
 system prevents visible delivery. Notifications do not change task execution,
@@ -30,6 +33,11 @@ Unread task replies are a separate in-app attention layer. Their red dots are
 sidebar-only: next to the Tasks/Projects section labels, the owning project,
 and each unread task row. No project header, project tab, or content task list
 may mirror those dots.
+
+On macOS, confirm that no Dock badge appears when a task finishes while a
+native sheet is open in active Orkas. Then minimize or hide all windows and
+confirm that a background completion raises the badge. Restore a visible window
+and confirm the badge clears.
 
 ## Scenario matrix
 
