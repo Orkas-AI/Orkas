@@ -26,13 +26,54 @@ export interface TaskNotificationHandle {
 export interface TaskNotificationRuntime {
   getActiveUserId(): string;
   isEnabled(): boolean;
-  hasFocusedWindow(): boolean;
+  isForeground(): boolean;
   isSupported(): boolean;
   resolveLanguageForUser(userId: string): Lang;
   setBadgeCount(count: number): void;
-  onDidFocus(listener: () => void): () => void;
+  onDidEnterForeground(listener: () => void): () => void;
   createNotification(options: { title: string; body: string }): TaskNotificationHandle;
   openConversation(conversationId: string, status: TaskTerminalStatus, userId: string): void;
+}
+
+type ForegroundEvent = 'browser-window-focus' | 'did-become-active';
+interface TaskNotificationApp {
+  isActive(): boolean;
+  on(event: ForegroundEvent, listener: () => void): unknown;
+  off(event: ForegroundEvent, listener: () => void): unknown;
+}
+interface TaskNotificationWindow {
+  isDestroyed(): boolean;
+  isFocused(): boolean;
+  isVisible(): boolean;
+  isMinimized(): boolean;
+}
+
+export function createTaskNotificationForeground(
+  app: TaskNotificationApp,
+  getWindows: () => readonly TaskNotificationWindow[],
+  platform: NodeJS.Platform = process.platform,
+): Pick<TaskNotificationRuntime, 'isForeground' | 'onDidEnterForeground'> {
+  const isMac = platform === 'darwin';
+  const isForeground = isMac
+    // A native sheet can take window focus while Orkas stays active. An
+    // active app with only hidden or minimized windows still needs alerts.
+    ? () => app.isActive() && getWindows().some(win => !win.isDestroyed() && win.isVisible() && !win.isMinimized())
+    : () => getWindows().some(win => !win.isDestroyed() && win.isFocused());
+  return {
+    isForeground,
+    onDidEnterForeground(listener) {
+      const acknowledge = () => {
+        if (!isMac || isForeground()) listener();
+      };
+      // A window can also be restored while the macOS app is already active.
+      app.on('browser-window-focus', acknowledge);
+      if (isMac) app.on('did-become-active', acknowledge);
+      return () => {
+        app.off('browser-window-focus', acknowledge);
+        if (isMac) app.off('did-become-active', acknowledge);
+      };
+    },
+  };
 }
 
 type TaskTerminalSubscribe = (listener: TaskTerminalListener) => () => void;
@@ -126,7 +167,7 @@ export function startTaskNotifications(
 
   // Clear any stale OS-owned badge left behind by an unclean prior exit.
   updateBadge(0);
-  const stopFocusListener = runtime.onDidFocus(markNotificationsRead);
+  const stopForegroundListener = runtime.onDidEnterForeground(markNotificationsRead);
   const deliver = (event: TaskNotificationEvent, intervention = false): void => {
     if (appConversationOwner(event.conversation_id)) return;
     const key = eventKey(event);
@@ -137,7 +178,7 @@ export function startTaskNotifications(
     try {
       if (runtime.getActiveUserId() !== event.user_id) return;
       if (!runtime.isEnabled()) return;
-      if (runtime.hasFocusedWindow() || !runtime.isSupported()) return;
+      if (runtime.isForeground() || !runtime.isSupported()) return;
 
       // Read the originating account's persisted language at delivery time.
       // The process-global locale can be stale when another Orkas process or
@@ -265,7 +306,7 @@ export function startTaskNotifications(
     stopped = true;
     unsubscribeTerminals();
     unsubscribeInterventions();
-    stopFocusListener();
+    stopForegroundListener();
     markNotificationsRead();
   };
 }
