@@ -64,6 +64,78 @@ NOINDEX_HTML = """<html><head>
 </head><body><h1>x</h1><p>noindex appears here as body text too</p></body></html>"""
 
 
+class MalformedURLTest(unittest.TestCase):
+    def test_malformed_attributes_do_not_discard_page(self):
+        for bad in ("http://[", "https://[not-ipv6]/", "https://example.com：443/",
+                    "https://:443/path", "https://user@/path",
+                    "https://example.com:invalid/", "https://example.com:65536/"):
+            for tag in (
+                '<a href="{bad}">broken</a>',
+                '<link rel="canonical" href="{bad}">',
+                '<link rel="alternate" hreflang="en" href="{bad}">',
+                '<img src="{bad}" alt="described">',
+            ):
+                with self.subTest(bad=bad, tag=tag):
+                    page = extract_fields(
+                        '<title>Keep this page</title>' + tag.format(bad=bad)
+                        + '<a href="/valid">valid</a>', "https://example.com/")
+                    self.assertEqual(page["title"], "Keep this page")
+                    self.assertEqual(page["internal_links"], ["https://example.com/valid"])
+                    self.assertEqual(len(page["invalid_url_attributes"]), 1)
+                    self.assertEqual(page["invalid_url_attributes"][0]["value"], bad)
+
+    def test_invalid_links_do_not_replace_valid_metadata(self):
+        page = extract_fields(
+            '<link rel="canonical" href="/correct">'
+            '<link rel="canonical" href="http://[">'
+            '<link rel="alternate" hreflang="en" href="http://[">'
+            '<link rel="alternate" hreflang="fr" href="/fr">'
+            '<a href="http://[">broken</a>'
+            '<a href="https://other.example/ok">external</a>', "https://example.com/")
+        self.assertEqual(page["canonical"], "https://example.com/correct")
+        self.assertEqual(page["hreflang_tags"], [
+            {"hreflang": "fr", "href": "https://example.com/fr"}])
+        self.assertEqual(page["external_links"], ["https://other.example/ok"])
+        self.assertEqual(page["external_link_count"], 1)
+
+    def test_invalid_images_keep_alt_coverage(self):
+        page = extract_fields(
+            '<img src="http://[" alt="described"><img src="http://[">'
+            '<img src="/ok.png" alt="valid">', "https://example.com/")
+        self.assertEqual(page["images_total"], 3)
+        self.assertEqual(page["images_missing_alt"], 1)
+        self.assertEqual(page["images"][0], {"src": "", "alt": "described"})
+        self.assertEqual(page["images"][2]["src"], "https://example.com/ok.png")
+
+    def test_bad_metadata_before_valid_and_empty_attributes(self):
+        page = extract_fields(
+            '<link rel="canonical" href="http://[">'
+            '<link rel="canonical" href="../good">'
+            '<link rel="alternate" hreflang="en" href="http://[">'
+            '<link rel="alternate" hreflang="fr" href="">'
+            '<a href="">empty</a><img src="" alt="empty">', "https://example.com/dir/page")
+        self.assertEqual(page["canonical"], "https://example.com/good")
+        self.assertEqual(page["hreflang_tags"], [
+            {"hreflang": "fr", "href": "https://example.com/dir/page"}])
+        self.assertEqual(page["internal_link_count"], 0)
+        self.assertEqual(page["images"][0]["src"], "")
+        self.assertEqual(len(page["invalid_url_attributes"]), 2)
+
+    def test_valid_urls_and_lookalike_text_are_preserved(self):
+        page = extract_fields(
+            '<!-- <a href="http://[">comment</a> -->'
+            '<p>http://[ is body text</p>'
+            '<a href="https://[2001:db8::1]:8443/ok">IPv6</a>'
+            '<a href="/path?q=%5B">query</a>'
+            '<img src="data:image/png;base64,AAAA" alt="inline">'
+            '<link rel="canonical" href="/path?q=%5B">', "https://example.com/")
+        self.assertEqual(page["invalid_url_attributes"], [])
+        self.assertEqual(page["external_links"], ["https://[2001:db8::1]:8443/ok"])
+        self.assertEqual(page["internal_links"], ["https://example.com/path?q=%5B"])
+        self.assertEqual(page["canonical"], "https://example.com/path?q=%5B")
+        self.assertEqual(page["images"][0]["src"], "data:image/png;base64,AAAA")
+
+
 class ExtractTest(unittest.TestCase):
     def setUp(self):
         self.f = extract_fields(GOOD_HTML, "https://orkas.ai/", status=200)
