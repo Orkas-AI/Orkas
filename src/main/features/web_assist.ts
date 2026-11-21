@@ -695,6 +695,8 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
       at: Date.now(), origin, filename: path.basename(target), bytes: declared, state: 'downloading',
     });
     downloadPaths.set(entry, target);
+    const sender = record.owner.webContents;
+    const generation = accountGeneration;
     item.once('done', (_done, state) => {
       entry.bytes = received();
       if (state !== 'completed') {
@@ -705,6 +707,14 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
         entry.state = 'saved';
       }
       emitActivity(userId, conversationId);
+      // The inventory can still be open after the download's tab is closed.
+      if (generation === accountGeneration && !sender.isDestroyed()) {
+        try {
+          sender.send('web-assist:download-finished', { conversation_id: conversationId });
+        } catch (error) {
+          log.warn('download completion delivery failed', { error: logErrorRef(error) });
+        }
+      }
       emit(record);
     });
     emit(record);
