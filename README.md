@@ -90,8 +90,6 @@ One task is a good start. Orkas is built for the work that keeps going.
 > [!NOTE]
 > Shared projects, cloud sync and web-app publishing are only in the packaged app — the open-source build doesn't support them yet. To use them, **[download Orkas for macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (free, with 500 credits to start).
 
-Voice input also works in the source build. Configure an **Orkas API Key** in **Settings → Models**, then click the microphone beside a composer. Allow microphone access when prompted. Audio is sent to Orkas for recognition and uses the key owner’s Orkas credits. Click again to stop, review the text, and send it yourself. If access was denied, enable the microphone in your system settings.
-
 ---
 
 ## Run Claude Code, Codex, OpenCode, OpenClaw and Hermes-Agent together
@@ -233,7 +231,7 @@ See the [reflection scheduler](./src/main/features/reflection-orchestrator.ts) a
 ## FAQ
 
 **What is Orkas?**
-Orkas is an open-source (MIT), local-first multi-agent desktop app. Its Commander turns your goal into to-dos and coordinates 16 built-in specialist agents — plus Claude Code, Codex, OpenCode, OpenClaw and Hermes-Agent — to deliver finished files. Not a single chatbot, not a code framework, not a hosted SaaS.
+Orkas is an open-source (MIT), local-first multi-agent desktop app. Its Commander turns your goal into to-dos and coordinates 16 built-in specialist agents — plus Claude Code, Codex, OpenCode, OpenClaw and Hermes-Agent — to deliver finished files.
 
 **Do I need an API key?**
 No. The packaged app comes with 500 credits for the built-in Orkas model. After that, buy credits, choose a paid plan or add your own provider keys; provider charges are separate.
