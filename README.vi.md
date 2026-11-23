@@ -1,12 +1,12 @@
 # Orkas
 
-**Một nhóm nhân viên AI nguồn mở trên máy tính để bàn của bạn nó biến mục tiêu của bạn thành công việc hoàn thành và giữ cho nó di chuyển.**
+**Đội ngũ tác tử AI mã nguồn mở ngay trên máy tính của bạn — biến mục tiêu của bạn thành công việc hoàn tất và giữ cho công việc luôn tiến triển.**
 
-Orkas là một ứng dụng máy tính để bàn đa đại lý đầu tiên tại địa phương, nguồn mở (MIT)**Commander** những gì bạn cần: nó hoàn thành nhiều nhiệm vụ một mình, và cho công việc lớn hơn nó lên kế hoạch các bước và mang đến các đại lý chuyên môn cùng với các đại lý lập trình và cá nhân bạn đã sử dụng**Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent** √ để làm việc cùng nhau.
+Orkas là ứng dụng desktop đa tác tử mã nguồn mở (MIT), ưu tiên cục bộ — một trợ lý AI làm việc như một đội. Hãy cho **Commander** biết bạn cần gì: Commander tự hoàn thành nhiều tác vụ, còn với công việc lớn hơn, Commander lên kế hoạch các bước và huy động các tác tử chuyên môn cùng với các tác tử lập trình và tác tử cá nhân mà bạn đang dùng — **Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent** — để cùng nhau thực hiện.
 
-Orkas được xây dựng để giữ cho một dự án di chuyển, không chỉ trả lời một yêu cầu.**dự án** giữ mục tiêu, quy tắc, bộ nhớ và tập tin, vì vậy mỗi cuộc trò chuyện mới bắt đầu từ nơi mà cuộc trò chuyện trước đã dừng lại.**- Cần làm gì?** chia công việc giữa người và nhân viên,**Auto-advance** để cho nhóm tự làm việc tiếp theo, và**tự động hóa theo lịch trình** lặp lại công việc thường xuyên hàng giờ, hàng ngày, tuần hoặc hàng tháng. Tất cả dữ liệu của bạn vẫn ở trên máy tính của bạn, và công việc hoàn thành trở lại để xem xét của bạn
+Orkas được xây dựng để giữ cho dự án luôn tiến triển, chứ không chỉ trả lời một câu lệnh. Một **dự án** lưu giữ mục tiêu, quy tắc, bộ nhớ và tệp, nên mỗi cuộc trò chuyện mới đều tiếp tục từ chỗ cuộc trò chuyện trước dừng lại. Danh sách **Cần làm** chia việc giữa con người và tác tử, **Tự động tiến hành** cho phép đội tự nhận việc cần làm tiếp theo, và **tự động hóa theo lịch** lặp lại công việc thường kỳ theo giờ, ngày, tuần hoặc tháng. Mọi dữ liệu của bạn đều nằm trên máy tính của bạn, và công việc hoàn tất sẽ được gửi lại để bạn xem xét — nhờ đó bạn có thể yên tâm giao cho Orkas những công việc thường xuyên của doanh nghiệp mình.
 
-**[ — Tải Orkas cho macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — miễn phí, với 500 tín chỉ cho mô hình Orkas tích hợp, vì vậy bạn không cần một khóa API để bắt đầu. Bạn thích các khóa của riêng mình? Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao, hoặc một điểm cuối tương thích với OpenAI địa phương.
+**[⬇ Tải Orkas cho macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — miễn phí, kèm 500 tín dụng cho mô hình Orkas tích hợp sẵn, nên bạn không cần khóa API để bắt đầu. Muốn dùng khóa của riêng bạn? Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao, hoặc một endpoint cục bộ tương thích OpenAI.
 
 [![Download for macOS & Windows](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
 
@@ -22,151 +22,151 @@ Orkas được xây dựng để giữ cho một dự án di chuyển, không ch
 
 https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
-![Orkas desktop      cuộc trò chuyện nhiệm vụ và các kết quả](./resources/app-ui/task-en.png)
+![Orkas trên desktop — cuộc trò chuyện tác vụ và kết quả bàn giao](./resources/app-ui/task-en.png)
 
 ---
 
-## Những gì nhóm cung cấp
+## Đội ngũ bàn giao những gì
 
-- **Video, giọng nói và hình ảnh** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
-- **Báo cáo nghiên cứu, kiểm toán SEO và phân tích thị trường** — DeepResearcher, SeoGeoAgent, StockAnalyser
-- **Các bài đăng, bài báo, bản tin và slide decks** — ContentWriter, PptMaker
-- **Các trang web, UI và mã** — UIDesigner, ProductDeveloper
-- **Word, Excel, PowerPoint và PDF** — OfficeWorker
-- **Công việc thương mại điện tử** — Nghiên cứu sản phẩm, danh sách, phân tích đánh giá, phân tích bán hàng và thay đổi danh mục, từ năm đại lý thương mại điện tử
-- **Công việc phức tạp đòi hỏi nhiều nhân viên** — Commander chia nó ra, trao từng phần cho đại lý phù hợp và kết hợp kết quả; ví dụ, nghiên cứu thị trường trở thành một báo cáo, một slide deck và một video khởi động
+- **Video, giọng thuyết minh và hình ảnh** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
+- **Báo cáo nghiên cứu, kiểm tra SEO và phân tích thị trường** — DeepResearcher, SeoGeoAgent, StockAnalyser
+- **Bài đăng, bài viết, bản tin và bộ slide thuyết trình** — ContentWriter, PptMaker
+- **Website, giao diện và mã nguồn** — UIDesigner, ProductDeveloper
+- **Tệp Word, Excel, PowerPoint và PDF** — OfficeWorker
+- **Công việc thương mại điện tử** — nghiên cứu sản phẩm, tin đăng sản phẩm, phân tích đánh giá, phân tích doanh số và thay đổi danh mục, do năm tác tử thương mại điện tử đảm nhận
+- **Công việc phức tạp cần nhiều tác tử** — Commander chia nhỏ công việc, giao từng phần cho đúng tác tử rồi tổng hợp kết quả; ví dụ, một nghiên cứu thị trường được chuyển thành báo cáo, bộ slide và video ra mắt
 
-16 chuyên gia vận chuyển với ứng dụng, mỗi người có kỹ năng riêng của mình, bộ nhớ và công cụ.[thị trường đại lý](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas), hoặc mô tả vai trò bạn cần và chỉ huy sẽ xây dựng một đặc vụ tùy chỉnh cho bạn.
+Ứng dụng có sẵn 16 tác tử chuyên môn, mỗi tác tử có kỹ năng, bộ nhớ và công cụ riêng. Khám phá 30+ tác tử trong [kho tác tử](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas), hoặc mô tả vai trò bạn cần và Commander sẽ tạo một tác tử tùy chỉnh cho bạn.
 
 <details>
-<summary><b>Tất cả 16 đại lý tích hợp</b></summary>
+<summary><b>Toàn bộ 16 tác tử tích hợp sẵn</b></summary>
 
-| Khu vực | - Trưởng lý. | Điều nó mang lại |
+| Lĩnh vực | Tác tử | Kết quả bàn giao |
 | --- | --- | --- |
-| Nghiên cứu & phân tích | **DeepResearcher** | Nghiên cứu dựa trên bằng chứng với nguồn xác minh, những mâu thuẫn được đánh dấu và một báo cáo có thể kiểm toán |
-| | **SeoGeoAgent** | Đưa cho nó một URL — kiểm toán kỹ thuật, chất lượng nội dung, Core Web Vitals, AI-phản ứng (GEO) có thể trích dẫn, xếp hạng danh sách sửa chữa |
-| | **StockAnalyser** | Nghiên cứu cổ phiếu, màn hình nhân tố, kiểm tra hậu quả và kiểm tra rủi ro danh mục đầu tư, với bảng điều khiển có thể theo dõi |
-| Nội dung & phương tiện truyền thông | **ContentWriter** | Các bài đăng, bài báo, bản tin và nghiên cứu trường hợp sẵn sàng xuất bản từ mục tiêu, nguồn hoặc sơ đồ |
-| | **PptMaker** | Các gói PPTX có thể chỉnh sửa, có thể xem xét từ một chủ đề, phác thảo hoặc tài liệu |
-| | **ImageStudio** | Plak, bìa, hình ảnh xã hội và hình ảnh thông tin |
-| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Narration, AI presenters, caption và dubbing, highlight clip, địa phương hóa, và video tham khảo recreation với nội dung và hình ảnh của riêng bạn |
-| | **VoiceStudio** | Narration, multi-voice audio, transcripts và subtitles, chỉnh sửa và trộn âm thanh |
-| | **UIDesigner** | Đáp ứng đầu tiên HTML có thể chỉnh sửa từ mục tiêu sản phẩm, PRD, ảnh chụp màn hình hoặc tài liệu Figma |
-| xây dựng & văn phòng | **ProductDeveloper** | Kỹ thuật nhận thức về repo     implement a PRD, fix bugs, refactor, review, with verifiable results |
-| | **OfficeWorker** | Tạo, chỉnh sửa, kiểm tra và cung cấp các tệp Word / Excel / PowerPoint / PDF, một lần hoặc theo hàng |
-| Thương mại điện tử | **ECommerceResearcher** | Sự lựa chọn sản phẩmit theo ngân sách, giới hạn thị trường và nguồn cung ứng  ứng viên, lý do từ chối, kế hoạch xác thực |
-| | **ECommerceWriter** | Các tiêu đề, trang chi tiết, FAQ, bản sao hình ảnh và kịch bản video trong giọng nói thương hiệu của bạn |
-| | **ECommerceReviewer** | Phân tích đánh giá và danh tiếng  Chủ đề khách hàng, nguyên nhân gốc rễ của đánh giá xấu, ưu tiên |
-| | **ECommerceAnalyzer** | Các doanh số bán hàng, lợi nhuận, quảng cáo, hoàn lại và hàng tồn kho từ xuất khẩu của bạn |
-| | **ECommerceOperator** | Các kế hoạch danh mục, giá, khuyến mãi và hàng tồn kho thay đổi; chỉ thực hiện thông qua các công cụ bạn kết nối |
+| Nghiên cứu & phân tích | **DeepResearcher** | Nghiên cứu dựa trên bằng chứng, với nguồn đã xác minh, các điểm mâu thuẫn được đánh dấu và báo cáo có thể kiểm chứng |
+| | **SeoGeoAgent** | Chỉ cần đưa một URL — kiểm tra kỹ thuật, chất lượng nội dung, Core Web Vitals, khả năng được trích dẫn trong câu trả lời của AI (GEO), danh sách việc cần sửa theo thứ tự ưu tiên |
+| | **StockAnalyser** | Nghiên cứu cổ phiếu, sàng lọc theo yếu tố, backtest và kiểm tra rủi ro danh mục đầu tư, với bảng điều khiển có thể truy vết |
+| Nội dung & truyền thông | **ContentWriter** | Bài đăng, bài viết, bản tin và nghiên cứu điển hình sẵn sàng xuất bản, từ một mục tiêu, nguồn tham khảo hoặc bản nháp thô |
+| | **PptMaker** | Bộ slide PPTX có thể chỉnh sửa và dễ duyệt, từ một chủ đề, dàn ý hoặc tài liệu |
+| | **ImageStudio** | Poster, ảnh bìa, ảnh mạng xã hội và infographic |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Lời thuyết minh, người dẫn AI, phụ đề và lồng tiếng, clip nổi bật, bản địa hóa, và tái tạo video tham chiếu bằng nội dung và cảnh quay của chính bạn |
+| | **VoiceStudio** | Lời thuyết minh, âm thanh nhiều giọng, bản chép lời và phụ đề, chỉnh sửa và trộn âm thanh |
+| | **UIDesigner** | Giao diện có thể chỉnh sửa, xây dựng trên HTML, từ mục tiêu sản phẩm, PRD, ảnh chụp màn hình hoặc tư liệu Figma |
+| Phát triển & văn phòng | **ProductDeveloper** | Phát triển phần mềm nắm rõ cả repo — triển khai PRD, sửa lỗi, tái cấu trúc, review mã, với kết quả có thể kiểm chứng |
+| | **OfficeWorker** | Tạo, chỉnh sửa, kiểm tra và bàn giao tệp Word / Excel / PowerPoint / PDF, từng tệp một hoặc theo lô |
+| Thương mại điện tử | **ECommerceResearcher** | Chọn sản phẩm theo ngân sách, thị trường và giới hạn nguồn hàng — danh sách ứng viên, lý do loại, kế hoạch kiểm chứng |
+| | **ECommerceWriter** | Tiêu đề, trang chi tiết, câu hỏi thường gặp, chữ trên ảnh và kịch bản video theo giọng văn thương hiệu của bạn |
+| | **ECommerceReviewer** | Phân tích đánh giá và danh tiếng — các chủ đề khách hàng hay nhắc đến, nguyên nhân gốc của đánh giá xấu, thứ tự ưu tiên |
+| | **ECommerceAnalyzer** | Doanh số, lợi nhuận, quảng cáo, hoàn tiền và tồn kho từ dữ liệu bạn xuất ra — số liệu đã đối soát và các quyết định |
+| | **ECommerceOperator** | Lên kế hoạch thay đổi danh mục, giá, khuyến mãi và tồn kho; chỉ thực thi qua các công cụ bạn kết nối |
 
-Nhiều hơn về mỗi đại lý[orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
+Tìm hiểu thêm về từng tác tử → [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
 
 </details>
 
-### Tạo lại một video tham khảo với nội dung của riêng bạn
+### Tái tạo video tham chiếu bằng nội dung của chính bạn
 
-**VideoStudio** có thể tái tạo cấu trúc kể chuyện, phong cách trực quan và tốc độ chỉnh sửa của một video viral bằng cách sử dụng sản phẩm, kịch bản và cảnh quay của riêng bạn. Cung cấp một tệp video tham chiếu và tài sản của bạn: đại lý phân tích móc, trật tự thông tin, nhịp hình ảnh và kêu gọi hành động, sau đó đề xuất những gì để bảo tồn và thay thế trước khi sản xuất.
+**VideoStudio** có thể tái tạo cấu trúc kể chuyện, phong cách hình ảnh và nhịp dựng của một video viral bằng sản phẩm, kịch bản và cảnh quay của chính bạn. Hãy cung cấp tệp video tham chiếu cùng tư liệu của bạn: tác tử sẽ phân tích phần hook mở đầu, thứ tự thông tin, các nhịp hình ảnh và lời kêu gọi hành động, sau đó đề xuất phần nào giữ lại và phần nào thay thế trước khi sản xuất.
 
-Điều này hoạt động tốt nhất cho các trình giải thích hình ảnh chuyển động, SaaS hoặc demo ứng dụng và quảng cáo sản phẩm được xây dựng từ đoạn phim hiện có của bạn. Văn bản tác giả địa phương, tiêu đề, câu chuyện và clip có thể được sửa đổi riêng biệt; văn bản được nướng vào đoạn phim do AI tạo đòi hỏi phải thay đổi đoạn phim đó.
+Cách này hiệu quả nhất với video giải thích dạng motion graphic, video demo SaaS hoặc ứng dụng, và quảng cáo sản phẩm dựng từ cảnh quay sẵn có của bạn. Chữ, phụ đề, lời thuyết minh và clip được tạo cục bộ có thể chỉnh sửa riêng; còn chữ đã nằm sẵn trong cảnh quay do AI tạo thì phải thay chính cảnh quay đó.
 
-> "Cùng reference.mp4 để tham khảo một quảng cáo dọc 30 giây. Giữ cái nón, kiểu chữ và nhịp độ của nó, thay thế nội dung bằng sản phẩm và màn hình của tôi, và cho tôi thấy sự phân hủy và kế hoạch trước".
+> "Dùng reference.mp4 làm mẫu cho một video quảng cáo dọc dài 30 giây. Giữ phần hook, kiểu chữ và nhịp độ của video đó, thay nội dung bằng sản phẩm và các đoạn quay màn hình của tôi, và cho tôi xem bản phân tích cùng kế hoạch trước."
 
-Bắt đầu với một tệp video mà đại lý có thể đọc; tải xuống liên kết chia sẻ trên nền tảng xã hội không được tích hợp.[dòng công việc tham chiếu-tạo trí](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md).
+Hãy bắt đầu với một tệp video mà tác tử có thể đọc được; ứng dụng chưa có sẵn tính năng tải video từ liên kết chia sẻ của các nền tảng mạng xã hội. Không đảm bảo tái hiện chính xác chuyển động máy quay, diễn xuất của người thật hay khớp từng khung hình. Xem [quy trình tái tạo video tham chiếu](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md).
 
 ---
 
-## Cứ tiếp tục làm việc
+## Giữ công việc luôn tiến triển
 
-Một nhiệm vụ là một khởi đầu tốt. Orkas được xây dựng cho công việc tiếp tục.
+Một tác vụ là khởi đầu tốt. Orkas được xây dựng cho những công việc kéo dài liên tục.
 
-- **Các dự án** — mục tiêu và quy tắc, bộ nhớ và tệp mà mọi cuộc trò chuyện trong dự án bắt đầu từ, vì vậy bạn không bao giờ viết tắt từ đầu.
-- **Các nhiệm vụ và tự động tiến bộ** — mỗi dự án có một danh sách việc phải làm cho người và đại lý; với Auto-advance, nhóm tự chọn mục tiếp theo và mang lại công việc hoàn thành cho đánh giá của bạn.
-- **Tự động hóa theo lịch trình** — ✓ chạy bất kỳ nhiệm vụ nào hàng giờ, hàng ngày, hàng tuần hoặc hàng tháng. Orkas chạy trên máy tính của bạn. Từ phiên bản 1.9, mỗi tự động hóa sẽ bắt kịp lần chạy bị bỏ lỡ gần đây nhất trong vòng 12 hours khi máy tính thức dậy hoặc Orkas khởi động.
-- **Các kết nối** — ✓ Gmail, Google Calendar, Sheets and Drive, Notion, Slack, Shopify, Stripe và nhiều hơn nữa. Theo mặc định, Orkas hỏi trước khi gửi, đăng hoặc xóa bất cứ điều gì.
-- **Các ứng dụng** — mô tả một công cụ và Orkas xây dựng nó như là một ứng dụng địa phương bên trong ứng dụng máy tính để bàn. Trong ứng dụng đóng gói, các kế hoạch trả tiền cũng có thể xuất bản nó như một ứng dụng web với liên kết công cộng.
-- **Các dự án chung** — *(các ứng dụng đóng gói)*∙ mời một đồng đội hoặc VA, và trao mỗi việc làm cho một người hoặc một đại lý.
+- **Dự án** — mục tiêu & quy tắc, bộ nhớ và tệp là điểm xuất phát cho mọi cuộc trò chuyện trong dự án, nên bạn không bao giờ phải giải thích lại từ đầu.
+- **Cần làm và Tự động tiến hành** — mỗi dự án có một danh sách việc cần làm cho cả con người và tác tử; khi bật Tự động tiến hành, đội sẽ tự nhận mục tiếp theo và gửi lại công việc đã hoàn tất để bạn xem xét.
+- **Tự động hóa theo lịch** — chạy bất kỳ tác vụ nào theo giờ, ngày, tuần hoặc tháng. Orkas chạy trên máy tính của bạn. Từ v1.9, khi máy tính thoát chế độ ngủ hoặc Orkas khởi động, mỗi tự động hóa sẽ chạy bù lần chạy bị lỡ gần nhất trong vòng 12 giờ qua.
+- **Trình kết nối** — Gmail, Google Calendar, Sheets và Drive, Notion, Slack, Shopify, Stripe và nhiều dịch vụ khác. Theo mặc định, Orkas sẽ hỏi bạn trước khi gửi, đăng hoặc xóa bất cứ thứ gì.
+- **Ứng dụng** — mô tả một công cụ và Orkas sẽ xây dựng nó thành một ứng dụng cục bộ ngay trong ứng dụng desktop. Trong bản cài đặt, các gói trả phí còn có thể xuất bản nó thành ứng dụng web với liên kết công khai.
+- **Dự án dùng chung** *(bản cài đặt)* — mời đồng đội hoặc trợ lý ảo (VA), và giao từng việc cần làm cho một người hoặc một tác tử.
 
 > [!NOTE]
-> Các dự án chia sẻ, đồng bộ hóa đám mây và xuất bản ứng dụng web chỉ trong ứng dụng đóng gói  xây dựng nguồn mở vẫn không hỗ trợ chúng. Để sử dụng chúng,**[tải xuống Orkas cho macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (tự do, với 500 tín chỉ để bắt đầu).
+> Dự án dùng chung, đồng bộ đám mây và xuất bản ứng dụng web chỉ có trong bản cài đặt — bản mã nguồn mở chưa hỗ trợ các tính năng này. Để sử dụng, hãy **[tải Orkas cho macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (miễn phí, kèm 500 tín dụng để bắt đầu).
 
 ---
 
 ## Chạy Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent cùng nhau
 
-Orkas điều hành các đại lý CLI mà bạn đã cài đặt như các phiên bản địa phương, bên cạnh các chuyên gia của nó**Claude Code, Codex và OpenCode**, và các đại lý cá nhân** OpenClaw và Hermes-Agent**Commander trao cho mỗi người phần tốt nhất và giữ một kế hoạch trên tất cả chúng, để một cuộc trò chuyện duy nhất có thể khắc phục lỗi, xem xét thay đổi và thảo luận thông báo phát hành.
+Orkas chạy các tác tử CLI bạn đã cài đặt dưới dạng phiên cục bộ, bên cạnh các tác tử chuyên môn của chính Orkas — các tác tử lập trình **Claude Code, Codex và OpenCode**, cùng các tác tử cá nhân **OpenClaw và Hermes-Agent**. Commander giao cho mỗi tác tử phần việc nó làm tốt nhất và duy trì một kế hoạch chung cho tất cả, nhờ vậy chỉ trong một cuộc trò chuyện là có thể sửa lỗi, review thay đổi và soạn ghi chú phát hành. Các công cụ mã nguồn mở như HyperFrames cũng được kết nối theo cách tương tự.
 
-[Sử dụng Code Claude và Codex cùng nhau →](https://orkas.ai/blog/claude-code-codex-together/?source=gh-orkas)
+[Dùng Claude Code và Codex cùng nhau →](https://orkas.ai/blog/claude-code-codex-together/?source=gh-orkas)
 
 ---
 
-## Tại sao Orkas
+## Vì sao chọn Orkas
 
-- **Một chỉ huy có kế hoạch, ủy nhiệm và làm phần còn lại** — nó phân tích mục tiêu, chọn các đại lý, kỹ năng, kết nối và công cụ phù hợp, và tự xử lý phân tích, viết, nghiên cứu và tập tin khi không có chuyên gia nào phù hợp hơn.
-- **Địa điểm đầu tiên theo thiết kế** — ✓ Các cuộc trò chuyện, tập tin, cơ sở kiến thức và đại lý tùy chỉnh sẽ được lưu trữ trên đĩa của bạn theo mặc định. Truyền đồng đám mây là tùy chọn trong ứng dụng đóng gói. Với các khóa của riêng bạn, các cuộc gọi mô hình sẽ đi thẳng từ máy tính của bạn đến nhà cung cấp; mô hình Orkas tích hợp chạy thông qua dịch vụ mô hình quản lý của Orkas.
-- **Bất cứ mô hình nào, đổi bất cứ lúc nào** — Commander và các đại lý tích hợp chia sẻ một thiết lập mô hình: mô hình Orkas tích hợp, nhà cung cấp của bạn hoặc điểm cuối địa phương.
-- **Các đại lý sẽ tốt hơn** — mỗi đại lý giữ kỹ năng và trí nhớ riêng tư. Các đánh giá nền kiểm tra hoạt động mới khi ứng dụng không hoạt động và có thể tinh chỉnh tự đánh giá, các phương pháp tái sử dụng và kỹ năng học tập.
-- **Mã nguồn mở, không có hộp đen** — Đọc chính xác những gì Orkas và mọi nhân viên và kỹ năng làm.
+- **Một Commander biết lập kế hoạch, giao việc và tự làm phần còn lại** — Commander chia nhỏ mục tiêu, chọn đúng tác tử, kỹ năng, trình kết nối và công cụ, đồng thời tự xử lý việc phân tích, viết, nghiên cứu và làm việc với tệp khi không có tác tử chuyên môn nào phù hợp hơn.
+- **Ưu tiên cục bộ ngay từ thiết kế** — cuộc trò chuyện, tệp, cơ sở tri thức và tác tử tùy chỉnh được lưu trên ổ đĩa của bạn theo mặc định. Đồng bộ đám mây là tùy chọn trong bản cài đặt. Khi dùng khóa của riêng bạn, các lệnh gọi mô hình đi thẳng từ máy của bạn đến nhà cung cấp; mô hình Orkas tích hợp sẵn chạy qua dịch vụ mô hình do Orkas quản lý.
+- **Dùng mô hình nào cũng được, đổi bất cứ lúc nào** — Commander và các tác tử tích hợp sẵn dùng chung một cài đặt mô hình: mô hình Orkas tích hợp sẵn, nhà cung cấp riêng của bạn hoặc một endpoint cục bộ. Các tác tử CLI bên ngoài giữ cài đặt mô hình riêng của chúng.
+- **Tác tử ngày càng giỏi hơn** — mỗi tác tử có kỹ năng và bộ nhớ riêng. Các lượt đánh giá chạy nền sẽ xem xét hoạt động mới khi ứng dụng đang rảnh và có thể tinh chỉnh phần tự đánh giá, các phương pháp tái sử dụng được và các kỹ năng đã học.
+- **Mã nguồn mở, không có hộp đen** — giấy phép MIT. Bạn có thể đọc chính xác Orkas cùng từng tác tử và kỹ năng làm những gì.
 
-> ⭐ Nếu Orkas hữu ích cho bạn, một ngôi sao giúp nhiều người tìm thấy dự án.
+> ⭐ Nếu Orkas hữu ích với bạn, hãy tặng một sao để nhiều người hơn biết đến dự án.
 
 ---
 
 ## Tải xuống
 
-| | Ứng dụng đóng gói (được khuyến cáo) | Tiếp tục chạy từ nguồn |
+| | Bản cài đặt (khuyên dùng) | Chạy từ mã nguồn |
 | --- | --- | --- |
-| Các nền tảng | macOS 12+ (Apple Silicon & Intel), Windows 10+ | macOS, Windows, glibc 2.34+ Linux x64/arm64 |
-| Tài khoản | Đăng ký ₹ 500 tín dụng miễn phí | Không có |
-| Mô hình | Mô hình Orkas tích hợp, hoặc chìa khóa của riêng bạn | Chìa khóa của riêng bạn hoặc một điểm cuối địa phương |
-| Cũng bao gồm | Hợp tác dự án, xuất bản ứng dụng, đồng bộ hóa đám mây và nhiều hơn nữa | — |
-| Đưa đi. | **[Tải xuống Orkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [Bắt đầu nhanh](#bắt-đầu-nhanh) |
+| Nền tảng | macOS 12+ (Apple Silicon & Intel), Windows 10+ | macOS, Windows, Linux x64/arm64 với glibc 2.34+ |
+| Tài khoản | Đăng nhập — 500 tín dụng miễn phí | Không cần |
+| Mô hình | Mô hình Orkas tích hợp sẵn, hoặc khóa của riêng bạn | Khóa của riêng bạn hoặc endpoint cục bộ |
+| Có thêm | Cộng tác dự án, xuất bản ứng dụng, đồng bộ đám mây và nhiều tính năng khác | — |
+| Tải về | **[Tải Orkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [Bắt đầu nhanh](#bắt-đầu-nhanh) |
 
-Các liên kết tải xuống phát hiện hệ thống của bạn và khởi động cài đặt đúng.
+Liên kết tải xuống sẽ nhận diện hệ điều hành của bạn và tải đúng trình cài đặt.
 
 ---
 
-## Người ta dùng nó cho gì?
+## Mọi người dùng Orkas để làm gì
 
-- **Nội dung tiếp thị** — khởi động video, trang sản phẩm, bài đăng và bản tin bằng giọng nói của bạn.[Tác phẩm nội dung](https://orkas.ai/use/content-writing/?source=gh-orkas) · [Video](https://orkas.ai/use/make-videos/?source=gh-orkas)
-- **Hoạt động lưu trữ** — Thông tin bán hàng hàng tuần, phản hồi đánh giá, danh sách và kiểm tra đối thủ cạnh tranh.[Thương mại điện tử](https://orkas.ai/use/ecommerce/?source=gh-orkas)
-- **Nghiên cứu và báo cáo** — nguồn báo cáo và hàng, theo yêu cầu hoặc hàng tuần.[Nghiên cứu](https://orkas.ai/use/researchers/?source=gh-orkas) · [Phân tích dữ liệu](https://orkas.ai/use/data-analysis/?source=gh-orkas)
-- **Nói chuyện với tài liệu của bạn** — câu trả lời dựa trên các hồ sơ của riêng bạn, với trích dẫn trở lại các đoạn nguồn.[Nói chuyện với tài liệu](https://orkas.ai/use/chat-with-documents/?source=gh-orkas)
-- **Công việc khách hàng** — báo cáo họp, báo cáo khách hàng hàng tháng và cập nhật các gói trong mẫu của bạn.[Mô hình báo cáo khách hàng hàng tháng](https://orkas.ai/blog/monthly-client-report-template/?source=gh-orkas)
-- **Thỏa thuận sản phẩm** — trang đích, sửa lỗi với các thử nghiệm, sổ thay đổi và bài đăng khởi chạy.[Các nhà phát triển](https://orkas.ai/use/developers/?source=gh-orkas)
-- **Xây dựng ứng dụng** — máy tính giá trị, biểu mẫu đặt phòng, công cụ nội bộ.[Xây dựng ứng dụng](https://orkas.ai/use/build-apps/?source=gh-orkas)
-- **Các nhóm nhỏ** —  Một dự án cho người và các nhân viên.[Các nhóm nhỏ](https://orkas.ai/use/small-teams/?source=gh-orkas)
+- **Nội dung marketing** — video ra mắt, trang sản phẩm, bài đăng và bản tin theo giọng văn của bạn. [Viết nội dung](https://orkas.ai/use/content-writing/?source=gh-orkas) · [Video](https://orkas.ai/use/make-videos/?source=gh-orkas)
+- **Vận hành cửa hàng** — báo cáo doanh số hằng tuần, trả lời đánh giá, tin đăng sản phẩm và theo dõi đối thủ. [Thương mại điện tử](https://orkas.ai/use/ecommerce/?source=gh-orkas)
+- **Nghiên cứu và báo cáo** — báo cáo và bộ slide có dẫn nguồn, theo yêu cầu hoặc hằng tuần. [Nghiên cứu](https://orkas.ai/use/researchers/?source=gh-orkas) · [Phân tích dữ liệu](https://orkas.ai/use/data-analysis/?source=gh-orkas)
+- **Trò chuyện với tài liệu của bạn** — câu trả lời dựa trên chính các tệp của bạn, kèm trích dẫn dẫn về đúng đoạn nguồn. [Trò chuyện với tài liệu](https://orkas.ai/use/chat-with-documents/?source=gh-orkas)
+- **Công việc cho khách hàng** — tóm tắt cuộc họp, báo cáo khách hàng hằng tháng và bộ slide cập nhật theo mẫu của bạn. [Mẫu báo cáo khách hàng hằng tháng](https://orkas.ai/blog/monthly-client-report-template/?source=gh-orkas)
+- **Ra mắt sản phẩm** — landing page, sửa lỗi kèm kiểm thử, nhật ký thay đổi và bài đăng ra mắt. [Nhà phát triển](https://orkas.ai/use/developers/?source=gh-orkas)
+- **Xây dựng ứng dụng** — công cụ tính báo giá, biểu mẫu đặt lịch, công cụ nội bộ. [Xây dựng ứng dụng](https://orkas.ai/use/build-apps/?source=gh-orkas)
+- **Nhóm nhỏ** — một dự án chung cho cả con người và tác tử. [Nhóm nhỏ](https://orkas.ai/use/small-teams/?source=gh-orkas)
 
 ---
 
-## Orkas so sánh
+## So sánh Orkas
 
-| Công cụ | Nó là gì | Sự khác biệt giữa Orkas |
+| Công cụ | Đó là gì | Orkas khác ở điểm nào |
 | --- | --- | --- |
-| **Claude Code** | Công cụ mã hóa nhân sự của Anthropic      trong thiết bị kết nối, IDE, máy tính để bàn và web, được xây dựng dựa trên các mô hình Claude. | Không phải hoặc: Orkas điều hành Claude Code như một trong những đại lý của mình.[Orkas vs Claude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
-| **Codex** | Cơ quan lập trình của OpenAI ′′ trong đầu cuối, biên tập viên của bạn và đám mây. | Không có hoặc: Orkas chạy Codex như một trong những đại lý của mình, bên cạnh Claude Code và OpenCode.[Orkas vs Codex →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
-| **Claude Cowork** | Đại lý của Anthropic cho công việc hàng ngày, bây giờ là một phần của Claude — trên máy tính để bàn, web và di động với kế hoạch trả tiền Claude. Nó chạy trong đám mây của Anthropic theo mặc định và sử dụng mô hình Claude. | Một giải pháp thay thế mã nguồn mở (MIT) cho Claude Cowork miễn phí để bắt đầu, với 500 credits. Orkas chạy các đại lý của mình trên máy tính của bạn và giữ dữ liệu của bạn ở địa phương theo mặc định, với mô hình Orkas tích hợp, khóa nhà cung cấp riêng của bạn hoặc điểm cuối địa phương.[Claude Cowork thay thế →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
-| **Manus** | Một đại lý AI có thể lập kế hoạch và chạy các nhiệm vụ trong đám mây Manus theo mặc định. Ứng dụng máy tính để bàn Manus Studio (macOS và Windows) cũng có thể hoạt động trong thư mục bạn chọn, với các nhiệm vụ vẫn được lập kế hoạch trong đám mây. | Một giải pháp mã nguồn mở (MIT) thay thế cho Manus. Orkas chạy các đại lý của mình trên máy tính của bạn và giữ dữ liệu của bạn ở địa phương theo mặc định, với mô hình Orkas tích hợp, khóa nhà cung cấp riêng của bạn hoặc điểm cuối địa phương. Các dự án, công việc cần làm và tự động hóa giữ công việc trong chuyển động. Sự thỏa hiệp: Orkas cần máy tính của bạn tỉnh táo, trong khi các nhiệm vụ đám mây của Manus có thể tiếp tục chạy mà không có nó.[Manus thay thế nguồn mở →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
-| **LangChain** | Một framework/ thư viện để xây dựng các ứng dụng LLM và đại lý ¢ mã đầu tiên, được nhúng vào ứng dụng Python / JS của riêng bạn. | Orkas là một ứng dụng để bàn mà bạn chỉ đạo thông qua trò chuyện, không phải bằng cách viết mã dàn nhạc. Dữ liệu vẫn ở trong địa phương theo mặc định. |
-| **Đội ngũ** | Một framework Python để dàn xếp các nhân viên tự trị chơi vai trò  bạn xác định các đội ngũ và nhân viên trong mã. | Orkas mang lại sự dàn xếp đa đại lý vào một ứng dụng máy tính để bàn, với các dự án, công việc cần làm, tự động hóa và tự cải thiện cho mỗi đại lý. |
-| **OpenClaw** | Một nền tảng nhân viên-đại diện với tích hợp tin nhắn, định tuyến đa đại lý và phụ đại lý. | Orkas cung cấp một không gian làm việc máy tính để bàn cho các sản phẩm hoàn thành, với các chuyên gia tích hợp và phối hợp trên Claude Code, Codex, OpenCode và các đại lý CLI khác. |
-| **Hành động Hermes** | Cung cấp viên tự cải thiện của Nous Research  một đại lý có trí nhớ và kỹ năng, có sẵn như một CLI, một cửa ngõ nhắn tin và một ứng dụng máy tính để bàn. | Orkas phối hợp một đội: Commander chỉ đạo nhiều chuyên gia và các đặc vụ CLI khác, và Hermes-Agent tham gia như một trong số họ. |
+| **Claude Code** | Công cụ lập trình dạng tác tử của Anthropic — có trên terminal, IDE, desktop và web, xây dựng trên các mô hình Claude. | Không phải chọn một trong hai: Orkas chạy Claude Code như một trong các tác tử của mình. Xung quanh đó, Orkas bổ sung một đội ngũ không phụ thuộc vào mô hình nào cho những việc ngoài mã — nghiên cứu, nội dung, video và nhiều việc khác — cùng dự án, việc cần làm và tự động hóa giúp công việc luôn tiến triển. [Orkas vs Claude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
+| **Codex** | Tác tử lập trình của OpenAI — trên terminal, trình soạn thảo của bạn và đám mây. | Không phải chọn một trong hai: Orkas chạy Codex như một trong các tác tử của mình, bên cạnh Claude Code và OpenCode. Commander có thể giao phần viết mã cho Codex và phần review cho một tác tử khác, rồi đảm nhận nửa còn lại của một bản phát hành không liên quan đến mã — tài liệu, bài đăng ra mắt và video. [Orkas vs Codex →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
+| **Claude Cowork** | Tác tử của Anthropic dành cho công việc hằng ngày, nay là một phần của Claude — có trên desktop, web và di động với gói Claude trả phí. Theo mặc định, công cụ này chạy trên đám mây của Anthropic và dùng các mô hình Claude. | Một lựa chọn thay thế mã nguồn mở (MIT) cho Claude Cowork, bắt đầu miễn phí với 500 tín dụng. Orkas chạy các tác tử trên máy tính của bạn và theo mặc định giữ dữ liệu của bạn ở máy cục bộ, với mô hình Orkas tích hợp sẵn, khóa nhà cung cấp của riêng bạn hoặc một endpoint cục bộ. Commander cũng có thể huy động Claude Code, Codex và các tác tử CLI khác. Đánh đổi: Orkas cần máy tính của bạn đang bật và không ở chế độ ngủ, trong khi các tác vụ trên đám mây của Cowork vẫn có thể tiếp tục chạy mà không cần đến máy của bạn. [Các lựa chọn thay thế Claude Cowork →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
+| **Manus** | Một tác tử AI mặc định lập kế hoạch và chạy tác vụ trên đám mây của Manus. Ứng dụng desktop Manus Studio (macOS và Windows) cũng có thể làm việc trong một thư mục bạn chọn, nhưng tác vụ vẫn được lập kế hoạch trên đám mây. | Một lựa chọn thay thế mã nguồn mở (MIT) cho Manus. Orkas chạy các tác tử trên máy tính của bạn và theo mặc định giữ dữ liệu của bạn ở máy cục bộ, với mô hình Orkas tích hợp sẵn, khóa nhà cung cấp của riêng bạn hoặc một endpoint cục bộ. Dự án, việc cần làm và tự động hóa giúp công việc luôn tiến triển. Đánh đổi: Orkas cần máy tính của bạn đang bật và không ở chế độ ngủ, trong khi các tác vụ trên đám mây của Manus vẫn có thể tiếp tục chạy mà không cần đến máy của bạn. [Lựa chọn thay thế Manus mã nguồn mở →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
+| **LangChain** | Framework/thư viện dành cho nhà phát triển để xây dựng ứng dụng và tác tử LLM — lấy mã làm trọng tâm, nhúng vào ứng dụng Python/JS của chính bạn. | Orkas là ứng dụng desktop mà bạn điều khiển qua trò chuyện, không phải bằng cách viết mã điều phối. Dữ liệu mặc định được giữ cục bộ. |
+| **CrewAI** | Framework Python để điều phối các tác tử tự hành đóng vai — bạn định nghĩa các nhóm (crew) và tác tử bằng mã. | Orkas đưa khả năng điều phối đa tác tử vào một ứng dụng desktop, tích hợp sẵn dự án, việc cần làm, tự động hóa và khả năng tự cải thiện cho từng tác tử. |
+| **OpenClaw** | Nền tảng tác tử cá nhân với tích hợp nhắn tin, định tuyến đa tác tử và tác tử con. | Orkas cung cấp không gian làm việc trên desktop để tạo ra sản phẩm hoàn chỉnh, với các tác tử chuyên môn tích hợp sẵn và khả năng phối hợp giữa Claude Code, Codex, OpenCode và các tác tử CLI khác. OpenClaw có thể tham gia quy trình đó với vai trò một tác tử CLI. |
+| **Hermes-Agent** | Tác tử tự cải thiện của Nous Research — một tác tử duy nhất có bộ nhớ và kỹ năng, dùng được dưới dạng CLI, cổng nhắn tin và ứng dụng desktop. | Orkas điều phối cả một đội: Commander chỉ đạo nhiều tác tử chuyên môn và các tác tử CLI khác, và Hermes-Agent được kết nối vào như một thành viên trong số đó. |
 
-**Orkas là cho anh nếu** Bạn muốn một nhóm đại lý thay vì một trợ lý, công việc liên tục di chuyển qua nhiều ngày, và dữ liệu của bạn, chìa khóa và đại lý trên đĩa của riêng bạn.
+**Orkas dành cho bạn nếu** bạn muốn một đội tác tử thay vì một trợ lý, muốn công việc tiếp tục tiến triển qua nhiều ngày, và muốn dữ liệu, khóa và tác tử nằm trên ổ đĩa của chính mình.
 
-**Không phải cho anh nếu** bạn chỉ muốn một chatbot đa dụng, hoặc một thư viện mã tinh khiết để nhúng vào ứng dụng của riêng bạn.
+**Không dành cho bạn nếu** bạn chỉ cần một chatbot đa năng duy nhất, hoặc một thư viện mã thuần túy để nhúng vào ứng dụng của riêng bạn.
 
-**Chọn giữa các nhân viên lập trình?** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Các thay thế Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
+**Đang phân vân giữa các tác tử lập trình?** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Các lựa chọn thay thế Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**So sánh bên cạnh đầy đủ →** [Vâng Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [Vâng Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [Vận động](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [Vận động viên Hermes](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**So sánh chi tiết song song →** [so với Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [so với Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [so với Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [so với LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [so với ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [so với OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [so với Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
 
 ---
 
 ## Bắt đầu nhanh
 
-- Anh muốn cài đặt gói thay thế?[Tải xuống](#tải-xuống)Trên đây. để chạy từ nguồn hiện tại cách để chạy Orkas trên Linux:
+Bạn muốn dùng trình cài đặt đóng gói sẵn? Xem phần [Tải xuống](#tải-xuống) ở trên. Để chạy từ mã nguồn — hiện là cách để chạy Orkas trên Linux:
 
-**Yêu cầu**: Node 22.12+ · macOS / Windows 10+ / glibc 2.34+ Linux x64 hoặc arm64. Giữ Python 3 và một chuỗi công cụ xây dựng C / C ++ sẵn sàng cho sự trở lại nguồn gốc-module bản địa không phổ biến.
+**Yêu cầu**: Node 22.12+ · macOS / Windows 10+ / Linux x64 hoặc arm64 với glibc 2.34+. Hãy chuẩn bị sẵn Python 3 và bộ công cụ build C/C++ cho trường hợp dự phòng hiếm gặp khi phải build module native từ mã nguồn.
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -175,102 +175,102 @@ cd Orkas
 run.cmd            # Windows
 ```
 
-Linux chạy nguồn yêu cầu glibc 2.34+. Alpine và các phân phối dựa trên cơ bắp khác không được hỗ trợ.
+Chạy từ mã nguồn trên Linux yêu cầu glibc 2.34+. Alpine và các bản phân phối dựa trên musl khác không được hỗ trợ. Tính năng chép lời giọng nói cục bộ sẽ tải về và xác minh runtime whisper.cpp native cho nền tảng đích cùng mô hình đa ngôn ngữ trong lần khởi chạy đầu tiên từ mã nguồn.
 
-`run.sh` / `run.cmd`cài đặt cây phụ thuộc npm khóa và chuẩn bị cho Python, uv, Node, mô hình nhúng (~ 95 MB), OfficeCLI, FFmpeg, whisper.cpp và các nguồn mô hình thoại đa ngôn ngữ khi khởi động lần đầu tiên. khởi động Linux sau đó xác minh các mô-đun nền tảng bản địa và thời gian chạy Whisper dưới ABI của Electron trước khi mở ứng dụng.`~/.orkas/`(macOS / Linux) hoặc`<smallest non-system drive>:\.orkas\`(Windows).**Cài đặt → Nhà cung cấp AI** để thêm một khóa API hoặc OAuth.
+`run.sh` / `run.cmd` cài đặt cây phụ thuộc npm đã khóa phiên bản và chuẩn bị các tài nguyên đã ghim phiên bản gồm Python, uv, Node, mô hình embedding (~95 MB), OfficeCLI, FFmpeg, whisper.cpp và mô hình giọng nói đa ngôn ngữ trong lần khởi chạy đầu tiên. Sau đó, khi khởi động trên Linux, ứng dụng xác minh các module native của nền tảng và runtime Whisper theo ABI của Electron trước khi mở. Các gói Python cho OCR và cho từng kỹ năng cụ thể được cài vào môi trường cục bộ tách biệt khi các tính năng đó được dùng lần đầu. Lần khởi chạy đầu tiên sẽ tạo không gian làm việc tại `~/.orkas/` (macOS / Linux) hoặc `<smallest non-system drive>:\.orkas\` (Windows). Sau đó mở **Cài đặt → Nhà cung cấp AI** để thêm khóa API hoặc OAuth.
 
-Hầm lệ thuộc bản địa: sử dụng Node.js 24 LTS (ít nhất 22.12.0), sau đó chạy
-`npm run native:repair`Điều này phục hồi các gói tùy chọn,
-sửa chữa SQLite cho Electron, chuẩn bị nút kết hợp để xử lý hình ảnh riêng biệt,
-và kiểm tra SQL, sqlite-vec và sắc bén trước khi thành công.
-Sử dụng`npm run native:check`cho một kiểm tra mà không cài đặt.
-Xem các[kịch bản xác minh phụ thuộc tự nhiên](./scripts/verify-native-dependencies.cjs)cho các kiểm tra được thực hiện.
+Lỗi phụ thuộc native: dùng Node.js 24 LTS (tối thiểu 22.12.0), rồi chạy
+`npm run native:repair` trong thư mục mã nguồn này. Lệnh này khôi phục các gói tùy chọn,
+sửa SQLite cho Electron, chuẩn bị Node đi kèm cho việc xử lý ảnh tách biệt,
+và kiểm tra SQL, sqlite-vec và sharp trước khi báo thành công.
+Dùng `npm run native:check` để chỉ kiểm tra mà không cài đặt.
+Xem [script xác minh phụ thuộc native](./scripts/verify-native-dependencies.cjs) để biết các bước kiểm tra được thực hiện.
 
 ---
 
-## Làm thế nào nó hoạt động
+## Cách hoạt động
 
-### Định hướng nhiệm vụ
+### Định tuyến tác vụ
 
-Commander tự xử lý công việc chung và ủy quyền cho các chuyên gia làm việc thông qua ba công cụ:
+Commander tự xử lý công việc chung và giao công việc chuyên môn qua ba công cụ:
 
-- **`dispatch_to`** — chạy một đại lý được đặt tên và trả lại kết quả của nó cho việc tiếp tục. Nó có thể chờ kết quả hoặc chạy không đồng bộ và thông báo cho Commander khi nhiệm vụ hoàn thành.
-- **`hand_off_to`** — chuyển giao công việc còn lại cho một đặc vụ được đặt tên và kết thúc lượt chỉ huy hiện tại.
-- **`run_worker`** — chạy một nhiệm vụ phụ ẩn danh, cô lập và trả lại một kết quả riêng tư. Nó không nhận được lịch sử cuộc trò chuyện hoặc kỹ năng của một đại lý tên.
+- **`dispatch_to`** chạy một tác tử được chỉ định và trả kết quả về để tiếp tục công việc. Công cụ này có thể chờ kết quả, hoặc chạy bất đồng bộ và thông báo cho Commander khi tác vụ hoàn tất.
+- **`hand_off_to`** chuyển phần việc còn lại cho một tác tử được chỉ định và kết thúc lượt hiện tại của Commander. Tác tử đó tự gửi câu trả lời của mình; một bước tiếp nối tùy chọn cho phép Commander quay lại tiếp tục một tác vụ lớn hơn sau đó.
+- **`run_worker`** chạy một tác vụ con ẩn danh, tách biệt và trả về kết quả riêng. Tác vụ con này không nhận lịch sử cuộc trò chuyện hay kỹ năng của tác tử có tên.
 
-Các công việc của đại lý có tên và nhân viên ẩn danh có các kiểm soát đồng thời riêng biệt.[thực hiện xuất khẩu](./src/main/features/group_chat/bus.ts)và[khóa thực hiện](./src/main/util/locks.ts).
+Tác vụ của tác tử có tên và worker ẩn danh có cơ chế kiểm soát đồng thời riêng. Xem [phần triển khai điều phối](./src/main/features/group_chat/bus.ts) và [khóa thực thi](./src/main/util/locks.ts).
 
 ### Quản lý ngữ cảnh
 
-Các runtime budget context đối với dung lượng đầu vào có thể sử dụng của mô hình được chọn, tính toán cho các lời nhắc, công cụ và trạng thái runtime liên tục. Đối thoại hoàn thành sử dụng cửa sổ lịch sử gần đây bị giới hạn; các nhiệm vụ hoạt động dài sử dụng các điểm kiểm soát để thu hẹp các thông điệp quá trình trước đó trong khi giữ lại công việc gần đây. Đọc tập tin, thay đổi tập tin và thực thi lệnh cũng có các hồ sơ cấu trúc có thể tồn tại trong sự nén kết hợp.
+Runtime phân bổ ngân sách ngữ cảnh dựa trên dung lượng đầu vào khả dụng của mô hình đã chọn, có tính đến prompt, công cụ và trạng thái runtime lâu dài. Hội thoại đã hoàn tất dùng một cửa sổ lịch sử gần đây có giới hạn; các tác vụ đang chạy kéo dài dùng checkpoint để cô đọng các tin nhắn quy trình trước đó trong khi vẫn giữ lại công việc gần đây. Việc đọc tệp, thay đổi tệp và thực thi lệnh cũng có bản ghi có cấu trúc, vẫn được giữ lại sau khi nén ngữ cảnh.
 
-Nhìn xem[ngân sách trong bối cảnh](./src/core-agent/src/agent/context-budget.ts), [lịch sử phiên và các điểm kiểm soát](./src/core-agent/src/agent/session.ts)và[hồ sơ không gian làm việc](./src/core-agent/src/agent/workspace-state.ts).
+Xem [ngân sách ngữ cảnh](./src/core-agent/src/agent/context-budget.ts), [lịch sử phiên và checkpoint](./src/core-agent/src/agent/session.ts) và [bản ghi không gian làm việc](./src/core-agent/src/agent/workspace-state.ts).
 
-### Tưởng nhớ và thư viện
+### Bộ nhớ và Thư viện
 
-Các ghi chú bền giữ sở thích của người dùng, các dữ liệu dự án và kiến thức tái sử dụng của mỗi đại lý trong phạm vi riêng biệt.
+Các ghi chú lâu dài lưu sở thích của người dùng, thông tin dự án và kiến thức tái sử dụng được của từng tác tử trong các phạm vi riêng biệt. Các ghi chú này tách biệt với chỉ mục tài liệu của Thư viện và lịch sử trò chuyện đã lưu.
 
-Thư viện trích xuất tài liệu thành các đoạn và lưu trữ một chỉ số vector SQLite địa phương. mô hình nhúng của nó chạy trên máy tính của bạn;`library`công cụ có thể liệt kê các tệp, tìm kiếm các đoạn liên quan và đọc nội dung nguồn từ thư viện toàn cầu hoặc dự án hiện tại.`chat_history`.
+Thư viện tách tài liệu thành các đoạn văn và lưu một chỉ mục vector SQLite cục bộ. Mô hình embedding của Thư viện chạy trên máy của bạn; công cụ `library` có thể liệt kê tệp, tìm các đoạn liên quan và đọc nội dung nguồn từ Thư viện chung hoặc Thư viện của dự án hiện tại. Các cuộc trò chuyện trước đó được truy xuất riêng qua `chat_history`.
 
-Nhìn xem[bộ nhớ có phạm vi](./src/main/features/memory.ts), [thu thập tài liệu](./src/main/util/file_to_chunks.ts), [Công cụ thư viện](./src/main/model/core-agent/kb-tools.ts)và[thu hồi cuộc trò chuyện](./src/main/model/core-agent/chat-history-tools.ts).
+Xem [bộ nhớ theo phạm vi](./src/main/features/memory.ts), [trích xuất tài liệu](./src/main/util/file_to_chunks.ts), [công cụ Thư viện](./src/main/model/core-agent/kb-tools.ts) và [truy xuất cuộc trò chuyện](./src/main/model/core-agent/chat-history-tools.ts).
 
-### Các giới hạn thực hiện và thu hồi
+### Giới hạn thực thi và khôi phục
 
-Các khóa phiên và giới hạn đồng thời kết nối công việc song song. Ngân sách vòng công cụ, các điểmit kiểm tra tiến bộ, kiểm tra gọi lặp đi lặp lại và các chú chó giám sát vô hiệu thức giúp ngăn chặn các cuộc chạy mà trì hoãn hoặc lặp lại công việc. Các nhiệm vụ đại lý có tên có thể được theo dõi và hủy một cách riêng lẻ; một nhiệm vụ được chấp nhận hoặc xếp hàng không được coi là kết quả hoàn thành.
+Khóa phiên và giới hạn đồng thời kiểm soát công việc song song. Ngân sách vòng gọi công cụ, checkpoint tiến độ, kiểm tra lệnh gọi lặp lại và watchdog nhàn rỗi theo từng giai đoạn giúp kiềm chế các lượt chạy bị treo hoặc lặp lại công việc. Tác vụ của tác tử có tên có thể được theo dõi và hủy riêng lẻ; một tác vụ mới được tiếp nhận hoặc đang xếp hàng không được coi là kết quả đã hoàn tất.
 
-Nhìn xem[ngân sách của các diễn viên](./src/main/features/group_chat/actor-budgets.ts),[thời gian chạy của đại lý](./src/core-agent/src/agent/runner.ts)và[bộ chuyển đổi mô hình máy tính để bàn](./src/main/model/core-agent/client.ts).
+Xem [ngân sách actor](./src/main/features/group_chat/actor-budgets.ts), [runtime của tác tử](./src/core-agent/src/agent/runner.ts) và [bộ chuyển đổi mô hình cho desktop](./src/main/model/core-agent/client.ts).
 
-### Học hỏi từ hoạt động
+### Học từ hoạt động
 
-Các đánh giá nền kiểmit tra hoạt động của đại lý mới khi ứng dụng không hoạt động, có thể bị làm giảm và giới hạn thực hiện.`COMPETENCE.md`), các phương pháp tái sử dụng (`LEARNING_STRATEGIES.md`Các đánh giá phụ thuộc vào hoạt động mới hơn là số lượng công việc, và có thể kết luận rằng không có gì đáng tiết kiệm.
+Các lượt đánh giá chạy nền xem xét hoạt động mới của tác tử khi ứng dụng đang rảnh, tuân theo thời gian chờ giữa các lượt và giới hạn thực thi. Một lượt đánh giá có thể cập nhật phần tự đánh giá của tác tử (`COMPETENCE.md`), các phương pháp tái sử dụng được (`LEARNING_STRATEGIES.md`) hoặc các kỹ năng đã học. Việc đánh giá phụ thuộc vào hoạt động mới chứ không phải số lượng tác vụ, và có thể kết luận rằng không có gì đáng lưu lại.
 
-Xem các[trình lập kế hoạch phản xạ](./src/main/features/reflection-orchestrator.ts)và[nhanh chóng xem xét](./src/core-agent/src/evolution/metacognition.ts).
+Xem [bộ lập lịch phản tư](./src/main/features/reflection-orchestrator.ts) và [prompt đánh giá](./src/core-agent/src/evolution/metacognition.ts).
 
 ---
 
-## FAQ
+## Câu hỏi thường gặp
 
 **Orkas là gì?**
-Orkas là một ứng dụng máy tính để bàn nguồn mở (MIT), ứng dụng máy tính đa đại lý địa phương đầu tiên. Người chỉ huy của nó biến mục tiêu của bạn thành các công việc và phối hợp 16 đại lý chuyên môn tích hợp ¢ cộng với Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent ¢ để cung cấp các tệp hoàn chỉnh.
+Orkas là ứng dụng desktop đa tác tử mã nguồn mở (MIT), ưu tiên cục bộ. Commander của Orkas biến mục tiêu của bạn thành các việc cần làm và điều phối 16 tác tử chuyên môn tích hợp sẵn — cùng với Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent — để bàn giao các tệp hoàn chỉnh.
 
-**Tôi cần một chìa khóa API không?**
-Không. ứng dụng gói có 500 credits cho mô hình Orkas tích hợp. Sau đó, mua tín dụng, chọn một kế hoạch trả tiền hoặc thêm chìa khóa nhà cung cấp của riêng bạn; phí nhà cung cấp là riêng biệt.
+**Tôi có cần khóa API không?**
+Không. Bản cài đặt đi kèm 500 tín dụng cho mô hình Orkas tích hợp sẵn. Sau đó, bạn có thể mua thêm tín dụng, chọn gói trả phí hoặc thêm khóa nhà cung cấp của riêng bạn; phí của nhà cung cấp được tính riêng.
 
-**Orkas là một chuyên gia luật pháp địa phương?**
-Không. Orkas chạy trên máy của bạn và gọi các mô hình bạn chọn ∙ mô hình Orkas tích hợp, khóa API của riêng bạn hoặc điểm cuối mô hình địa phương. Nó dàn xếp các đại lý và công cụ; nó không phải là một mô hình.
+**Orkas có phải là một LLM chạy cục bộ không?**
+Không. Orkas chạy trên máy của bạn và gọi các mô hình bạn chọn — mô hình Orkas tích hợp sẵn, khóa API của riêng bạn hoặc một endpoint mô hình cục bộ. Orkas điều phối tác tử và công cụ; bản thân Orkas không phải là một mô hình.
 
-**Orkas có thể trả lời câu hỏi từ tài liệu của tôi, bằng các trích dẫn?**
-Có. Thêm PDF và tài liệu vào thư viện địa phương của bạn; Orkas có thể tìm kiếm chúng và trả lời bằng trích dẫn đến các đoạn nguồn, để bạn có thể mở gốc và kiểm tra. Chỉ mục được xây dựng trên máy của bạn.
+**Orkas có thể trả lời câu hỏi từ tài liệu của tôi, kèm trích dẫn không?**
+Có. Thêm tệp PDF và tài liệu vào Thư viện cục bộ của bạn; Orkas có thể tìm kiếm trong đó và trả lời kèm trích dẫn đến các đoạn nguồn, để bạn mở bản gốc và kiểm tra. Chỉ mục được xây dựng ngay trên máy của bạn.
 
-**Tôi có thể sử dụng các mô hình địa phương như Ollama hay LM Studio không?**
-- Được rồi.**Cài đặt tài khoản → Mô hình → Chat → Thêm mô hình → tùy chỉnh**, chọn** OpenAI tương thích**hoặc** Phụ hợp với loài người**, và nhập URL cơ sở, ID mô hình chính xác, và khóa API. Chọn mô hình được lưu trong kiểm soát mô hình của nhiệm vụ.
+**Tôi có thể dùng mô hình cục bộ như Ollama hoặc LM Studio không?**
+Có. Mở **Cài đặt tài khoản → Mô hình → Trò chuyện → Thêm mô hình → Tùy chỉnh**, chọn **Tương thích OpenAI** hoặc **Tương thích Anthropic**, rồi nhập URL gốc, ID mô hình chính xác và khóa API. Sau đó chọn mô hình đã lưu trong phần chọn mô hình của tác vụ.
 
-**Các khóa API và dữ liệu của tôi được lưu trữ ở đâu?**
-Trên đĩa của bạn mặc định. Các khóa nhà cung cấp của bạn được mã hóa tại địa phương và không được đồng bộ hóa đám mây. Với các khóa của bạn, các cuộc gọi mô hình sẽ đi thẳng từ máy tính của bạn đến nhà cung cấp; mô hình Orkas tích hợp sử dụng dịch vụ quản lý của Orkas. Mối đồng bộ hóa đám đông tùy chọn và dự án chia sẻ trong ứng dụng đóng gói lưu trữ dữ liệu đã chọn trên máy chủ Orkas.[An ninh và xử lý dữ liệu →](https://orkas.ai/security/?source=gh-orkas)
+**Khóa API và dữ liệu của tôi được lưu ở đâu?**
+Theo mặc định, trên ổ đĩa của bạn. Khóa nhà cung cấp của riêng bạn được mã hóa cục bộ và không được đưa vào đồng bộ đám mây. Khi dùng khóa riêng, các lệnh gọi mô hình đi thẳng từ máy của bạn đến nhà cung cấp; mô hình Orkas tích hợp sẵn dùng dịch vụ do Orkas quản lý. Tính năng đồng bộ đám mây (tùy chọn) và dự án dùng chung trong bản cài đặt sẽ lưu dữ liệu đã chọn trên máy chủ của Orkas. [Bảo mật và xử lý dữ liệu →](https://orkas.ai/security/?source=gh-orkas)
 
-**Orkas có hoạt động offline không?**
-Các nguồn xây dựng có thể chạy hoàn toàn offline với một điểm cuối mô hình địa phương. ứng dụng đóng gói cần phải đăng nhập, và các mô hình đám mây cần kết nối mạng.
+**Orkas có hoạt động ngoại tuyến không?**
+Bản chạy từ mã nguồn có thể chạy hoàn toàn ngoại tuyến với một endpoint mô hình cục bộ. Bản cài đặt cần đăng nhập, và các mô hình đám mây cần kết nối mạng.
 
-**Nó vẫn hoạt động khi máy tính của tôi tắt?**
-Không ️ Orkas chạy trên máy tính của bạn, vì vậy Auto-Advance và tự động hóa cần máy tính tỉnh táo và Orkas chạy. Từ v1.9, mỗi tự động hóa bắt lại lần chạy bị bỏ lỡ gần đây nhất trong vòng 12 hours khi máy tính tỉnh táu hoặc Orkas khởi động.
+**Orkas có tiếp tục làm việc khi máy tính của tôi tắt không?**
+Không — Orkas chạy trên máy tính của bạn, nên Tự động tiến hành và tự động hóa cần máy tính đang bật, không ở chế độ ngủ và Orkas đang chạy. Từ v1.9, khi máy tính thoát chế độ ngủ hoặc Orkas khởi động, mỗi tự động hóa sẽ chạy bù lần chạy bị lỡ gần nhất trong vòng 12 giờ qua.
 
 **Tôi có thể xây dựng và xuất bản ứng dụng không?**
-Có. Các ứng dụng địa phương chạy trong Orkas là miễn phí. Việc xuất bản một ứng dụng web cho một liên kết công cộng cần một kế hoạch trả tiền (Lite 5, Pro 8, Max 15 ứng dụng), và các ứng dụng web được xuất bản không bao gồm tất cả các khả năng có sẵn trong Orkas.
+Có. Ứng dụng cục bộ chạy bên trong Orkas là miễn phí. Xuất bản ứng dụng web ra một liên kết công khai cần gói trả phí (Lite 5, Pro 8, Max 15 ứng dụng), và ứng dụng web đã xuất bản không có đủ mọi khả năng sẵn có bên trong Orkas.
 
-**Tôi cần một tài khoản Orkas?**
-Ứng dụng máy tính để bàn đóng gói yêu cầu bạn đăng nhập khi bạn khởi động nó lần đầu tiên.
+**Tôi có cần tài khoản Orkas không?**
+Ứng dụng desktop dạng bản cài đặt sẽ yêu cầu bạn đăng nhập khi khởi chạy lần đầu. Bản chạy từ mã nguồn trong kho này hoàn toàn không có lớp tài khoản — ứng dụng khởi động thẳng vào giao diện chính.
 
-**Orkas có thể lái Claude Code và các nhân viên CLI khác không?**
-Có. Orkas có thể điều khiển năm đại lý CLI bên ngoài như các quy trình phụ địa phương  đại lý mã hóa Claude Code, Codex và OpenCode, cộng với các đại lý cá nhân OpenClaw và Hermes-Agent  và trên các dự án nguồn mở như HyperFrames, tất cả được hướng từ cùng một trò chuyện.
+**Orkas có thể điều khiển Claude Code và các tác tử CLI khác không?**
+Có. Orkas có thể điều khiển năm tác tử CLI bên ngoài dưới dạng tiến trình con cục bộ — các tác tử lập trình Claude Code, Codex và OpenCode, cùng các tác tử cá nhân OpenClaw và Hermes-Agent — và tích hợp các dự án mã nguồn mở như HyperFrames, tất cả đều được điều khiển từ cùng một cuộc trò chuyện.
 
-**Orkas khác với Claude Code / Codex / CrewAI / LangChain như thế nào?**
-Claude Code và Codex là các đại lý lập trình  Orkas chạy cả hai như là thành viên của nhóm của mình, vì vậy bạn không phải lựa chọn giữa họ; CrewAI và LangChain là khung code đầu tiên. Orkas là một ứng dụng máy tính để bàn nguồn mở nơi một Commander phối hợp một đội ngũ các đại lý chuyên môn và các đại lý CLI của bạn, với bất kỳ nhà cung cấp mô hình nào, và giữ dữ liệu và chìa khóa ở địa phương. Xem phần mềm[so sánh đầy đủ](https://orkas.ai/compare/?source=gh-orkas).
+**Orkas khác gì so với Claude Code / Codex / CrewAI / LangChain?**
+Claude Code và Codex là các tác tử lập trình — Orkas chạy cả hai như thành viên trong đội của mình, nên bạn không phải chọn một trong hai; CrewAI và LangChain là các framework lấy mã làm trọng tâm. Orkas là ứng dụng desktop mã nguồn mở, nơi Commander điều phối một đội tác tử chuyên môn cùng các tác tử CLI của bạn, với bất kỳ nhà cung cấp mô hình nào, và giữ dữ liệu cùng khóa ở máy cục bộ. Xem [các so sánh đầy đủ](https://orkas.ai/compare/?source=gh-orkas).
 
-**Orkas hỗ trợ các nền tảng nào?**
-macOS 12+ (Apple Silicon và Intel) và Windows 10+ đã có bộ cài đặt gói. glibc 2.34+ Linux x64/arm64 chạy từ nguồn ngày nay, không có bộ cài đặt nào. Bản sao thoại địa phương được hỗ trợ trên Linux thông qua thời gian chạy phầm phầm.cpp được chuẩn bị vào lần khởi động đầu tiên. Alpine và các phân phối dựa trên cơ bắp khác không được hỗ trợ. Bộ khởi động nguồn cần Node 22.12 +; Python 3 và một c / C ++ xây dựng chuỗi công cụ chỉ cần khi một npm bản gốc gói không có bộ nhị phân sẵn xây dựng tương thích và phải được xây dựng lại địa phương.
+**Orkas hỗ trợ những nền tảng nào?**
+macOS 12+ (Apple Silicon và Intel) và Windows 10+ có trình cài đặt đóng gói sẵn. Linux x64/arm64 với glibc 2.34+ hiện chạy từ mã nguồn, chưa có trình cài đặt. Tính năng chép lời giọng nói cục bộ được hỗ trợ trên Linux thông qua runtime whisper.cpp đã ghim phiên bản, được chuẩn bị trong lần khởi chạy đầu tiên. Alpine và các bản phân phối dựa trên musl khác không được hỗ trợ. Quá trình khởi tạo từ mã nguồn cần Node 22.12+; Python 3 và bộ công cụ build C/C++ chỉ cần khi một gói npm native không có bản dựng sẵn tương thích và phải build lại cục bộ.
 
-**Orkas có nguồn mở và miễn phí không?**
-✓ ứng dụng được cấp phép MIT và miễn phí để sử dụng. ứng dụng gói bao gồm 500 credits cho mô hình Orkas tích hợp; các kế hoạch trả tiền từ 11,99 USD / tháng thêm tín dụng hàng tháng, đồng bộ hóa đám mây, nhiều dự án chia sẻ hơn và xuất bản ứng dụng. Với các khóa của riêng bạn, việc sử dụng mô hình được tính toán bởi nhà cung cấp của bạn; Orkas không thêm điểm đánh dấu.[Giá](https://orkas.ai/pricing/?source=gh-orkas)
+**Orkas có miễn phí và mã nguồn mở không?**
+Có — ứng dụng được cấp phép MIT và miễn phí sử dụng. Bản cài đặt có sẵn 500 tín dụng cho mô hình Orkas tích hợp sẵn; các gói trả phí từ $11.99/tháng bổ sung tín dụng hằng tháng, đồng bộ đám mây, thêm dự án dùng chung và xuất bản ứng dụng. Khi dùng khóa riêng, việc sử dụng mô hình do nhà cung cấp của bạn tính phí; Orkas không cộng thêm phí chênh lệch. [Bảng giá →](https://orkas.ai/pricing/?source=gh-orkas)
 
 ---
 
