@@ -90,6 +90,8 @@ Một tác vụ là khởi đầu tốt. Orkas được xây dựng cho những 
 > [!NOTE]
 > Dự án dùng chung, đồng bộ đám mây và xuất bản ứng dụng web chỉ có trong bản cài đặt — bản mã nguồn mở chưa hỗ trợ các tính năng này. Để sử dụng, hãy **[tải Orkas cho macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (miễn phí, kèm 500 tín dụng để bắt đầu).
 
+Nhập bằng giọng nói cũng hoạt động trong bản chạy từ mã nguồn. Hãy cấu hình **Orkas API Key** trong **Cài đặt → Mô hình**, rồi nhấp vào biểu tượng micrô bên cạnh ô soạn tin. Cho phép truy cập micrô khi được hỏi. Âm thanh được gửi đến Orkas để nhận dạng và dùng tín dụng Orkas của chủ sở hữu khóa. Nhấp lần nữa để dừng, xem lại văn bản rồi tự gửi đi. Nếu bạn đã từ chối quyền truy cập, hãy bật micrô trong phần cài đặt hệ thống.
+
 ---
 
 ## Chạy Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent cùng nhau
@@ -231,7 +233,7 @@ Xem [bộ lập lịch phản tư](./src/main/features/reflection-orchestrator.t
 ## Câu hỏi thường gặp
 
 **Orkas là gì?**
-Orkas là ứng dụng desktop đa tác tử mã nguồn mở (MIT), ưu tiên cục bộ. Commander của Orkas biến mục tiêu của bạn thành các việc cần làm và điều phối 16 tác tử chuyên môn tích hợp sẵn — cùng với Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent — để bàn giao các tệp hoàn chỉnh.
+Orkas là ứng dụng desktop đa tác tử mã nguồn mở (MIT), ưu tiên cục bộ. Commander của Orkas biến mục tiêu của bạn thành các việc cần làm và điều phối 16 tác tử chuyên môn tích hợp sẵn — cùng với Claude Code, Codex, OpenCode, OpenClaw và Hermes-Agent — để bàn giao các tệp hoàn chỉnh. Không phải một chatbot đơn lẻ, không phải framework lập trình, cũng không phải một dịch vụ SaaS lưu trữ trên đám mây.
 
 **Tôi có cần khóa API không?**
 Không. Bản cài đặt đi kèm 500 tín dụng cho mô hình Orkas tích hợp sẵn. Sau đó, bạn có thể mua thêm tín dụng, chọn gói trả phí hoặc thêm khóa nhà cung cấp của riêng bạn; phí của nhà cung cấp được tính riêng.

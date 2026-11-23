@@ -90,6 +90,8 @@ Eine einzelne Aufgabe ist ein guter Anfang. Orkas ist für Arbeit gemacht, die w
 > [!NOTE]
 > Geteilte Projekte, Cloud-Synchronisierung und die Veröffentlichung von Web-Apps gibt es nur in der installierbaren App – der Open-Source-Build unterstützt sie noch nicht. Um sie zu nutzen, **[laden Sie Orkas für macOS & Windows herunter](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (kostenlos, mit 500 Credits für den Einstieg).
 
+Die Spracheingabe funktioniert auch im Quellcode-Build. Hinterlegen Sie unter **Einstellungen → Modelle** einen **Orkas API Key** und klicken Sie dann auf das Mikrofon neben dem Eingabefeld. Erlauben Sie den Mikrofonzugriff, wenn Sie danach gefragt werden. Die Aufnahme wird zur Erkennung an Orkas gesendet und verbraucht die Orkas-Credits des Schlüsselinhabers. Klicken Sie erneut, um die Aufnahme zu beenden, prüfen Sie den Text und senden Sie ihn selbst ab. Haben Sie den Zugriff verweigert, aktivieren Sie das Mikrofon in Ihren Systemeinstellungen.
+
 ---
 
 ## Claude Code, Codex, OpenCode, OpenClaw und Hermes-Agent gemeinsam ausführen
@@ -231,7 +233,7 @@ Siehe den [Reflexions-Scheduler](./src/main/features/reflection-orchestrator.ts)
 ## Häufige Fragen
 
 **Was ist Orkas?**
-Orkas ist eine Open-Source-Multi-Agenten-Desktop-App (MIT) nach dem Local-First-Prinzip. Der Commander macht aus Ihrem Ziel To-dos und koordiniert 16 integrierte Spezialagenten – dazu Claude Code, Codex, OpenCode, OpenClaw und Hermes-Agent –, um fertige Dateien zu liefern.
+Orkas ist eine Open-Source-Multi-Agenten-Desktop-App (MIT) nach dem Local-First-Prinzip. Der Commander macht aus Ihrem Ziel To-dos und koordiniert 16 integrierte Spezialagenten – dazu Claude Code, Codex, OpenCode, OpenClaw und Hermes-Agent –, um fertige Dateien zu liefern. Kein einzelner Chatbot, kein Code-Framework, kein gehostetes SaaS.
 
 **Brauche ich einen API-Schlüssel?**
 Nein. Die installierbare App enthält 500 Credits für das integrierte Orkas-Modell. Danach können Sie Credits kaufen, einen kostenpflichtigen Tarif wählen oder eigene Anbieter-Schlüssel hinzufügen; Gebühren der Anbieter werden separat berechnet.

@@ -90,6 +90,8 @@ Une tâche, c'est un bon début. Orkas est conçu pour le travail qui se poursui
 > [!NOTE]
 > Les projets partagés, la synchronisation cloud et la publication d'applications web sont réservés à l'application installable — la version open source ne les prend pas encore en charge. Pour les utiliser, **[téléchargez Orkas pour macOS et Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (gratuit, avec 500 crédits pour commencer).
 
+La saisie vocale fonctionne aussi dans la version source. Configurez une **Orkas API Key** dans **Paramètres → Modèles**, puis cliquez sur le micro à côté de la zone de saisie. Autorisez l'accès au micro lorsque le système vous le demande. L'audio est envoyé à Orkas pour la reconnaissance et consomme les crédits Orkas du propriétaire de la clé. Cliquez à nouveau pour arrêter, relisez le texte, puis envoyez-le vous-même. Si vous avez refusé l'accès, activez le micro dans les réglages de votre système.
+
 ---
 
 ## Faire travailler ensemble Claude Code, Codex, OpenCode, OpenClaw et Hermes-Agent
@@ -231,7 +233,7 @@ Voir le [planificateur de réflexion](./src/main/features/reflection-orchestrato
 ## Questions fréquentes
 
 **Qu'est-ce qu'Orkas ?**
-Orkas est une application de bureau multi-agents open source (MIT) qui privilégie le local. Son Commander transforme votre objectif en tâches à faire et coordonne 16 agents spécialisés intégrés — ainsi que Claude Code, Codex, OpenCode, OpenClaw et Hermes-Agent — pour livrer des fichiers finis.
+Orkas est une application de bureau multi-agents open source (MIT) qui privilégie le local. Son Commander transforme votre objectif en tâches à faire et coordonne 16 agents spécialisés intégrés — ainsi que Claude Code, Codex, OpenCode, OpenClaw et Hermes-Agent — pour livrer des fichiers finis. Ce n'est ni un chatbot unique, ni un framework de code, ni un SaaS hébergé.
 
 **Ai-je besoin d'une clé API ?**
 Non. L'application installable inclut 500 crédits pour le modèle Orkas intégré. Ensuite, vous pouvez acheter des crédits, choisir une offre payante ou ajouter vos propres clés de fournisseur ; les frais des fournisseurs sont facturés à part.

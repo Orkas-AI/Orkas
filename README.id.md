@@ -90,6 +90,8 @@ Satu tugas adalah awal yang baik. Orkas dibuat untuk pekerjaan yang terus berlan
 > [!NOTE]
 > Proyek bersama, sinkronisasi cloud, dan penerbitan aplikasi web hanya tersedia di aplikasi siap instal — versi sumber terbuka belum mendukungnya. Untuk menggunakannya, **[unduh Orkas untuk macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (gratis, dengan 500 kredit untuk memulai).
 
+Input suara juga berfungsi di versi kode sumber. Atur **Orkas API Key** di **Pengaturan → Model**, lalu klik ikon mikrofon di samping kolom pesan. Izinkan akses mikrofon saat diminta. Audio dikirim ke Orkas untuk dikenali dan memakai kredit Orkas milik pemilik kunci. Klik sekali lagi untuk berhenti, periksa teksnya, lalu kirim sendiri. Jika akses ditolak, aktifkan mikrofon di pengaturan sistem Anda.
+
 ---
 
 ## Jalankan Claude Code, Codex, OpenCode, OpenClaw, dan Hermes-Agent bersama-sama
@@ -231,7 +233,7 @@ Lihat [penjadwal refleksi](./src/main/features/reflection-orchestrator.ts) dan [
 ## Pertanyaan umum
 
 **Apa itu Orkas?**
-Orkas adalah aplikasi desktop multi-agen sumber terbuka (MIT) yang mengutamakan lokal. Komandan di Orkas mengubah tujuan Anda menjadi daftar tugas dan mengoordinasikan 16 agen spesialis bawaan — ditambah Claude Code, Codex, OpenCode, OpenClaw, dan Hermes-Agent — untuk menghasilkan file yang sudah jadi.
+Orkas adalah aplikasi desktop multi-agen sumber terbuka (MIT) yang mengutamakan lokal. Komandan di Orkas mengubah tujuan Anda menjadi daftar tugas dan mengoordinasikan 16 agen spesialis bawaan — ditambah Claude Code, Codex, OpenCode, OpenClaw, dan Hermes-Agent — untuk menghasilkan file yang sudah jadi. Bukan sekadar satu chatbot, bukan framework kode, dan bukan SaaS yang di-hosting.
 
 **Apakah saya memerlukan kunci API?**
 Tidak. Aplikasi siap instal sudah dilengkapi 500 kredit untuk model Orkas bawaan. Setelah itu, Anda dapat membeli kredit, memilih paket berbayar, atau menambahkan kunci penyedia Anda sendiri; biaya dari penyedia ditagih terpisah.

@@ -90,6 +90,8 @@ Una singola attività è un buon inizio. Orkas è fatto per il lavoro che contin
 > [!NOTE]
 > I progetti condivisi, la sincronizzazione cloud e la pubblicazione di web app sono disponibili solo nell'app installabile: la versione open source non li supporta ancora. Per usarli, **[scarica Orkas per macOS e Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (gratis, con 500 crediti per iniziare).
 
+La dettatura vocale funziona anche nella versione dal sorgente. Configura una **Orkas API Key** in **Impostazioni → Modelli**, poi fai clic sul microfono accanto alla casella di scrittura. Quando richiesto, consenti l'accesso al microfono. L'audio viene inviato a Orkas per il riconoscimento e consuma i crediti Orkas del titolare della chiave. Fai di nuovo clic per fermare la registrazione, rileggi il testo e invialo tu stesso. Se hai negato l'accesso, abilita il microfono nelle impostazioni di sistema.
+
 ---
 
 ## Esegui insieme Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent
@@ -231,7 +233,7 @@ Vedi lo [scheduler delle riflessioni](./src/main/features/reflection-orchestrato
 ## Domande frequenti
 
 **Che cos'è Orkas?**
-Orkas è un'app desktop multi-agente open source (MIT) con priorità al locale. Il suo Commander trasforma il tuo obiettivo in attività da fare e coordina 16 agenti specializzati integrati — oltre a Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent — per consegnare file finiti.
+Orkas è un'app desktop multi-agente open source (MIT) con priorità al locale. Il suo Commander trasforma il tuo obiettivo in attività da fare e coordina 16 agenti specializzati integrati — oltre a Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent — per consegnare file finiti. Non è un singolo chatbot, né un framework di codice, né un SaaS in hosting.
 
 **Mi serve una chiave API?**
 No. L'app installabile include 500 crediti per il modello Orkas integrato. Una volta esauriti, puoi acquistare crediti, scegliere un piano a pagamento o aggiungere le chiavi dei tuoi provider; i costi dei provider sono a parte.
