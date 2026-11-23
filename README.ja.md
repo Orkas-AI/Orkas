@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## チームがもたらすもの
 
-- **ビデオ,声伝達および画像** — 動画スタジオ,声スタジオ,ImageStudio
+- **ビデオ,声伝達および画像** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio),声スタジオ,ImageStudio
 - **調査報告,SEO監査および市場分析** — DeepResearcher,セオSeoGeoAgent,ストックアナライザー
 - **投稿,記事,ニュースレター,スライドデッキ** — 内容作家,PptMaker
 - **ウェブサイト,UIとコード** — UIDesigner,ProductDeveloper

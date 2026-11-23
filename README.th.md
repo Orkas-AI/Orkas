@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## สิ่งทีมงานส่ง
 
-- **วิดีโอ เสียงเสียงและภาพ** — ️ VideoStudio, VoiceStudio, ImageStudio
+- **วิดีโอ เสียงเสียงและภาพ** — ️ [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **รายงานการวิจัย, การตรวจสอบ SEO และการวิเคราะห์ตลาด** — ️ DeepResearcher, SeoGeoAgent, StockAnalyzer
 - **สถานะการเขียน บทความ ข่าวสารและกระจกภาพ** — ️ ContentWriter, PptMaker
 - **เว็บไซต์, UI และโค้ด** — ️ UIDesigner, ProductDeveloper

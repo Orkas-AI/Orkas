@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## Что команда доставляет
 
-- **Видео, голосовые сообщения и изображения** — VideoStudio, VoiceStudio, ИмельСтудия
+- **Видео, голосовые сообщения и изображения** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ИмельСтудия
 - **Отчеты о исследованиях, аудит SEO и анализ рынка** — DeepResearcher, SeoGeoAgent, StockAnalyzer
 - **Посты, статьи, информационные бюллетени и слайд-деки** — ContentWriter, PptMaker
 - **Сайты, пользовательский интерфейс и код** — UIDdesigner, ProductDeveloper

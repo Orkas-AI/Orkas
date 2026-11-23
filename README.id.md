@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## Apa yang tim memberikan
 
-- **Video, suara dan gambar** — VideoStudio, VoiceStudio, ImageStudio
+- **Video, suara dan gambar** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Laporan penelitian, audit SEO dan analisis pasar** — DeepResearcher, SeoGeoAgent, StockAnalyser
 - **Pos, artikel, newsletter dan slide decks** — ContentWriter, PptMaker
 - **Situs web, UI dan kode** — UIDdesigner, ProductDeveloper

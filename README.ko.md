@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## 팀에서 얻을 수 있는
 
-- **비디오, 음성 및 이미지** — VideoStudio, VoiceStudio, ImageStudio
+- **비디오, 음성 및 이미지** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **연구 보고서, SEO 감사 및 시장 분석** — ∙ DeepResearcher, SeoGeoAgent, 스톡 애널라이저
 - **게시물, 기자, 뉴스레터 및 슬라이드 데크** — 컨텐츠 작가, PptMaker
 - **웹사이트, UI 및 코드** — UIDesigner, ProductDeveloper

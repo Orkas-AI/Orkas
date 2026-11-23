@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## 团队能交付什么
 
-- **视频、配音与图片** —— VideoStudio、VoiceStudio、ImageStudio
+- **视频、配音与图片** —— [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)、VoiceStudio、ImageStudio
 - **研究报告、SEO 审计与市场分析** —— DeepResearcher、SeoGeoAgent、StockAnalyser
 - **帖子、文章、简报与幻灯片** —— ContentWriter、PptMaker
 - **网站、UI 与代码** —— UIDesigner、ProductDeveloper
