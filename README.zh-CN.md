@@ -90,6 +90,8 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 > [!NOTE]
 > 共享项目、云同步和网页应用发布目前只在安装版中提供，开源版暂不支持。需要这些功能，可以 **[下载 Orkas：macOS 与 Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)**（免费，赠送 500 积分）。
 
+源码版也支持语音输入。在 **设置 → 模型** 中配置 **Orkas API Key**，然后点击输入框旁的麦克风。出现提示时允许访问麦克风。音频会发送到 Orkas 进行识别，并消耗该 Key 所有者的 Orkas 积分。再次点击即可停止，检查文字后由你自己发送。如果之前拒绝了麦克风权限，请在系统设置中开启。
+
 ---
 
 ## 一起运行 Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent
@@ -229,7 +231,7 @@ sqlite-vec，并准备随包 Node、在独立进程中验证 sharp 后才报告�
 ## 常见问题（FAQ）
 
 **Orkas 是什么？**
-Orkas 是开源（MIT）、本地优先的多智能体桌面应用。指挥官将目标拆成待办，协调 16 个内置专业智能体，以及 Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent，交付成品文件。
+Orkas 是开源（MIT）、本地优先的多智能体桌面应用。指挥官将目标拆成待办，协调 16 个内置专业智能体，以及 Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent，交付成品文件。它不是单个聊天机器人，不是代码框架，也不是托管的 SaaS。
 
 **需要 API Key 吗？**
 不需要。安装版赠送 500 积分，可直接使用内置 Orkas 模型。用完后可购买积分、选择付费会员，或添加自己的模型服务商 Key；自有服务商的费用单独计算。

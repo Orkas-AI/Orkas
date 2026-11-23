@@ -90,6 +90,8 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 > [!NOTE]
 > 공유 프로젝트, 클라우드 동기화, 웹 앱 게시는 패키지 버전에서만 제공되며, 오픈소스 빌드는 아직 지원하지 않습니다. 이 기능을 사용하려면 패키지 버전을 받으세요: **[macOS 및 Windows용 Orkas 다운로드](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (무료, 시작 시 500 크레딧 제공).
 
+음성 입력은 소스 빌드에서도 사용할 수 있습니다. **설정 → 모델**에서 **Orkas API Key**를 설정한 뒤 입력창 옆의 마이크를 클릭하세요. 권한 요청이 표시되면 마이크 접근을 허용합니다. 음성은 인식을 위해 Orkas로 전송되며, 키 소유자의 Orkas 크레딧이 사용됩니다. 다시 클릭하면 녹음이 멈추니, 텍스트를 확인한 뒤 직접 보내세요. 접근을 거부했다면 시스템 설정에서 마이크를 켜세요.
+
 ---
 
 ## Claude Code, Codex, OpenCode, OpenClaw, Hermes-Agent를 하나의 팀으로 묶어 함께 실행하기
@@ -231,7 +233,7 @@ SQL, sqlite-vec, sharp를 점검한 뒤에 성공으로 마칩니다.
 ## 자주 묻는 질문
 
 **Orkas란 무엇인가요?**
-Orkas는 오픈소스(MIT) 로컬 우선 멀티 에이전트 데스크톱 앱입니다. 지휘 에이전트가 목표를 할 일로 바꾸고, 16개의 기본 제공 전문 에이전트에 더해 Claude Code, Codex, OpenCode, OpenClaw, Hermes-Agent까지 조율해 완성된 파일을 전달합니다.
+Orkas는 오픈소스(MIT) 로컬 우선 멀티 에이전트 데스크톱 앱입니다. 지휘 에이전트가 목표를 할 일로 바꾸고, 16개의 기본 제공 전문 에이전트에 더해 Claude Code, Codex, OpenCode, OpenClaw, Hermes-Agent까지 조율해 완성된 파일을 전달합니다. 단일 챗봇도, 코드 프레임워크도, 호스팅형 SaaS도 아닙니다.
 
 **API 키가 필요한가요?**
 아니요. 패키지 버전에는 내장 Orkas 모델용 500 크레딧이 포함되어 있습니다. 크레딧을 다 쓴 뒤에는 크레딧을 구매하거나, 유료 플랜을 선택하거나, 자신의 제공업체 키를 추가하면 됩니다. 제공업체 요금은 별도로 청구됩니다.

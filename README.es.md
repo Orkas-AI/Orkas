@@ -90,6 +90,8 @@ Una tarea es un buen comienzo. Orkas está pensado para el trabajo que continúa
 > [!NOTE]
 > Los proyectos compartidos, la sincronización en la nube y la publicación de aplicaciones web solo están en la aplicación instalable; la versión de código abierto todavía no los admite. Para usarlos, **[descarga Orkas para macOS y Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (gratis, con 500 créditos para empezar).
 
+La entrada de voz también funciona en la versión de código fuente. Configura una **Orkas API Key** en **Configuración → Modelos** y haz clic en el micrófono junto al cuadro de texto. Cuando se te pida, permite el acceso al micrófono. El audio se envía a Orkas para su reconocimiento y consume los créditos de Orkas del titular de la clave. Vuelve a hacer clic para detener la grabación, revisa el texto y envíalo tú mismo. Si has denegado el acceso, activa el micrófono en los ajustes del sistema.
+
 ---
 
 ## Ejecuta Claude Code, Codex, OpenCode, OpenClaw y Hermes-Agent juntos
@@ -231,7 +233,7 @@ Consulta el [planificador de reflexión](./src/main/features/reflection-orchestr
 ## Preguntas frecuentes
 
 **¿Qué es Orkas?**
-Orkas es una aplicación de escritorio multiagente, de código abierto (MIT) y con prioridad local. Su Commander convierte tu objetivo en pendientes y coordina 16 agentes especializados integrados, además de Claude Code, Codex, OpenCode, OpenClaw y Hermes-Agent, para entregar archivos terminados.
+Orkas es una aplicación de escritorio multiagente, de código abierto (MIT) y con prioridad local. Su Commander convierte tu objetivo en pendientes y coordina 16 agentes especializados integrados, además de Claude Code, Codex, OpenCode, OpenClaw y Hermes-Agent, para entregar archivos terminados. No es un único chatbot, ni un framework de código, ni un SaaS alojado.
 
 **¿Necesito una clave de API?**
 No. La aplicación instalable incluye 500 créditos para el modelo integrado de Orkas. Después, puedes comprar créditos, elegir un plan de pago o añadir las claves de tu propio proveedor; los cargos del proveedor se pagan aparte.

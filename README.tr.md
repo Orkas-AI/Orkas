@@ -90,6 +90,8 @@ Tek bir görev iyi bir başlangıçtır. Orkas ise süregelen işler için tasar
 > [!NOTE]
 > Paylaşılan projeler, bulut senkronizasyonu ve web uygulaması yayınlama yalnızca paketlenmiş uygulamada vardır; açık kaynaklı sürüm bunları henüz desteklemiyor. Bunları kullanmak için **[Orkas'ı macOS ve Windows için indirin](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (ücretsiz, başlangıç için 500 kredi ile).
 
+Sesle yazma, kaynak koddan derlenen sürümde de çalışır. **Ayarlar → Modeller** bölümünde bir **Orkas API Key** yapılandırın, ardından mesaj kutusunun yanındaki mikrofona tıklayın. İstendiğinde mikrofon erişimine izin verin. Ses, tanınması için Orkas'a gönderilir ve anahtar sahibinin Orkas kredilerini kullanır. Durdurmak için yeniden tıklayın, metni gözden geçirin ve kendiniz gönderin. Erişimi reddettiyseniz mikrofonu sistem ayarlarınızdan etkinleştirin.
+
 ---
 
 ## Claude Code, Codex, OpenCode, OpenClaw ve Hermes-Agent'ı birlikte çalıştırın
@@ -231,7 +233,7 @@ Arka plan değerlendirmeleri, bekleme süreleri ve yürütme sınırları çerç
 ## SSS
 
 **Orkas nedir?**
-Orkas, açık kaynaklı (MIT), yerel öncelikli, çok ajanlı bir masaüstü uygulamasıdır. Commander, hedefinizi yapılacaklara dönüştürür ve tamamlanmış dosyalar teslim etmek için 16 yerleşik uzman ajanı ve bunlara ek olarak Claude Code, Codex, OpenCode, OpenClaw ve Hermes-Agent'ı koordine eder.
+Orkas, açık kaynaklı (MIT), yerel öncelikli, çok ajanlı bir masaüstü uygulamasıdır. Commander, hedefinizi yapılacaklara dönüştürür ve tamamlanmış dosyalar teslim etmek için 16 yerleşik uzman ajanı ve bunlara ek olarak Claude Code, Codex, OpenCode, OpenClaw ve Hermes-Agent'ı koordine eder. Tek bir sohbet botu, bir kod çerçevesi ya da barındırılan bir SaaS değildir.
 
 **API anahtarına ihtiyacım var mı?**
 Hayır. Paketlenmiş uygulama, yerleşik Orkas modeli için 500 krediyle gelir. Sonrasında kredi satın alabilir, ücretli bir plan seçebilir veya kendi sağlayıcı anahtarlarınızı ekleyebilirsiniz; sağlayıcı ücretleri ayrıca alınır.

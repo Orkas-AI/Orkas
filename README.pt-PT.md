@@ -90,6 +90,8 @@ Uma tarefa é um bom começo. O Orkas foi concebido para o trabalho que continua
 > [!NOTE]
 > Os projetos partilhados, a sincronização na nuvem e a publicação de aplicações web só estão disponíveis na aplicação instalável; a versão de código aberto ainda não os suporta. Para os utilizar, **[transfira o Orkas para macOS e Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (gratuito, com 500 créditos para começar).
 
+A entrada de voz também funciona na versão do código-fonte. Configure uma **Orkas API Key** em **Definições → Modelos** e clique no microfone junto à caixa de mensagem. Quando lhe for pedido, permita o acesso ao microfone. O áudio é enviado para o Orkas para reconhecimento e consome os créditos do Orkas do titular da chave. Clique novamente para parar, reveja o texto e envie-o manualmente. Se recusou o acesso, ative o microfone nas definições do sistema.
+
 ---
 
 ## Executar Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent em conjunto
@@ -231,7 +233,7 @@ Consulte o [agendador de reflexão](./src/main/features/reflection-orchestrator.
 ## Perguntas frequentes
 
 **O que é o Orkas?**
-O Orkas é uma aplicação multiagente para computador, de código aberto (MIT), que dá prioridade ao funcionamento local. O Commander do Orkas transforma o seu objetivo em tarefas a fazer e coordena 16 agentes especialistas integrados — além do Claude Code, do Codex, do OpenCode, do OpenClaw e do Hermes-Agent — para entregar ficheiros concluídos.
+O Orkas é uma aplicação multiagente para computador, de código aberto (MIT), que dá prioridade ao funcionamento local. O Commander do Orkas transforma o seu objetivo em tarefas a fazer e coordena 16 agentes especialistas integrados — além do Claude Code, do Codex, do OpenCode, do OpenClaw e do Hermes-Agent — para entregar ficheiros concluídos. Não é um chatbot único, nem uma framework de código, nem um SaaS alojado.
 
 **Preciso de uma chave de API?**
 Não. A aplicação instalável inclui 500 créditos para o modelo integrado do Orkas. Depois disso, pode comprar créditos, escolher um plano pago ou adicionar as chaves do seu próprio fornecedor; os custos do fornecedor são cobrados à parte.

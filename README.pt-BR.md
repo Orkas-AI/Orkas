@@ -90,6 +90,8 @@ Uma tarefa é um bom começo. O Orkas foi feito para o trabalho que continua.
 > [!NOTE]
 > Projetos compartilhados, sincronização na nuvem e publicação de aplicativos web só estão disponíveis no aplicativo instalável; a versão de código aberto ainda não oferece esses recursos. Para usá-los, **[baixe o Orkas para macOS e Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (grátis, com 500 créditos para começar).
 
+A entrada por voz também funciona na versão do código-fonte. Configure uma **Orkas API Key** em **Configurações → Modelos** e clique no microfone ao lado da caixa de mensagem. Permita o acesso ao microfone quando for solicitado. O áudio é enviado ao Orkas para reconhecimento e consome os créditos do Orkas do dono da chave. Clique de novo para parar, revise o texto e envie você mesmo. Se você negou o acesso, ative o microfone nas configurações do sistema.
+
 ---
 
 ## Execute Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent juntos
@@ -231,7 +233,7 @@ Veja o [agendador de reflexão](./src/main/features/reflection-orchestrator.ts) 
 ## Perguntas frequentes
 
 **O que é o Orkas?**
-O Orkas é um aplicativo multiagente para desktop, de código aberto (MIT) e local-first. O Commander do Orkas transforma seu objetivo em tarefas a fazer e coordena 16 agentes especialistas integrados — além de Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent — para entregar arquivos prontos.
+O Orkas é um aplicativo multiagente para desktop, de código aberto (MIT) e local-first. O Commander do Orkas transforma seu objetivo em tarefas a fazer e coordena 16 agentes especialistas integrados — além de Claude Code, Codex, OpenCode, OpenClaw e Hermes-Agent — para entregar arquivos prontos. Não é um único chatbot, nem um framework de código, nem um SaaS hospedado.
 
 **Preciso de uma chave de API?**
 Não. O aplicativo instalável vem com 500 créditos para o modelo integrado do Orkas. Depois disso, compre créditos, escolha um plano pago ou adicione as chaves do seu próprio provedor; as cobranças do provedor são à parte.
