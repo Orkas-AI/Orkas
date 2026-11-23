@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | Contenido y medios | **Contenido** | Publicación de publicaciones, artículos, boletines y estudios de caso de un objetivo, fuentes o borrador aproximado |
 | | **PptMaker** | Los decks PPTX editables y revisables de un tema, esquema o documento |
 | | **ImageStudio** | Carteles, portadas, imágenes sociales e infografías |
-| | **VideoStudio** | Narrativa, presentadores de IA, títulos y doblaje, clips destacados, localización y recreación de video de referencia con su propio contenido y material |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Narrativa, presentadores de IA, títulos y doblaje, clips destacados, localización y recreación de video de referencia con su propio contenido y material |
 | | **VoiceStudio** | Narrativa, audio multivoz, transcripciones y subtítulos, edición de audio y mezcla |
 | | **UIDesigner** | Interfaz de usuario editable, HTML-primero a partir de objetivos de producto, PRDs, capturas de pantalla o material Figma |
 | Construir y oficina | **ProductDeveloper** | Ingeniería de re-consciencia      Implementar un PRD, corregir errores, refactor, revisión, con resultados verificables |

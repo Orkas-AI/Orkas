@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | Content & media | **ContentWriter** | Publish-ready posts, articles, newsletters and case studies from a goal, sources or a rough draft |
 | | **PptMaker** | Editable, reviewable PPTX decks from a topic, outline or document |
 | | **ImageStudio** | Posters, covers, social images and infographics |
-| | **VideoStudio** | Narration, AI presenters, captions and dubbing, highlight clips, localization, and reference-video recreation with your own content and footage |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Narration, AI presenters, captions and dubbing, highlight clips, localization, and reference-video recreation with your own content and footage |
 | | **VoiceStudio** | Narration, multi-voice audio, transcripts and subtitles, audio editing and mixing |
 | | **UIDesigner** | Editable, HTML-first UI from product goals, PRDs, screenshots or Figma material |
 | Build & office | **ProductDeveloper** | Repo-aware engineering — implement a PRD, fix bugs, refactor, review, with verifiable results |

@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | コンテンツ &メディア | **ContentWriter** | 目標,情報源または概要から出版準備が整った記事,ニュースレター,ケーススタディ |
 | | **PptMaker** | 編集可能でレビュー可能な PPTX デッキは,テーマ,概要または文書から |
 | | **ImageStudio** | ポスター,カバー,ソーシャル画像,インフォグラフィック |
-| | **VideoStudio** | 物語,AIプレゼンター,キャプションとダビング,ハイライトクリップ,ローカル化,そして参照ビデオリクリエーション |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | 物語,AIプレゼンター,キャプションとダビング,ハイライトクリップ,ローカル化,そして参照ビデオリクリエーション |
 | | **VoiceStudio** | 物語,多音声オーディオ,トランスクリプトと字幕,オーディオ編集およびミックス |
 | | **UIDesigner** | 編集可能,製品目標,PRD,スクリーンショットまたはFigma素材からHTML初級UI |
 | 建物 & オフィス | **ProductDeveloper** | 復習意識のエンジニアリング  PRD を実装し,バグを修正し,リファクター,レビューし,検証可能な結果 |

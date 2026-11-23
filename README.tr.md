@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | İçerik & medya | **ContentWriter** | Bir hedef, kaynak veya kaba bir taslaktan yayınlanabilir yayınlar, makaleler, haberletirler ve vaka çalışmaları |
 | | **PptMaker** | Bir konudan, çizelgesinden veya belgedeki düzenlenebilir ve gözden geçirilebilir PPTX güverteleri |
 | | **ImageStudio** | Posterler, kapaklar, sosyal görüntüler ve infografikler |
-| | **VideoStudio** | Hikaye, Yapay zeka sunucuları, başlıklar ve dublajlama, videoları vurgulamak, yerleştirmek ve kendi içerik ve görüntüleri ile referans video rekreasyonu |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Hikaye, Yapay zeka sunucuları, başlıklar ve dublajlama, videoları vurgulamak, yerleştirmek ve kendi içerik ve görüntüleri ile referans video rekreasyonu |
 | | **Ses Stüdyosu** | Hikaye, çok sesli ses, transkript ve altyazılar, ses düzenleme ve karıştırma |
 | | **UIDesigner** | Düzenlenebilir, ürün hedeflerinden, PRD'lerden, ekran görüntüleri veya Figma malzemesinden HTML-birinci UI |
 | Yapım ve ofis | **ProductDeveloper** | Repo-aware mühendisliği      PRD uygulamak, hataları düzeltmek, refactor, inceleme, doğrulanabilir sonuçlar ile |

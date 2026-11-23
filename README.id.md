@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | Konten & media | **ContentWriter** | Pos, artikel, newsletter dan studi kasus yang siap diterbitkan dari tujuan, sumber atau draf kasar |
 | | **PptMaker** | Deck PPTX yang dapat diedit, dapat ditinjau dari topik, garis besar atau dokumen |
 | | **ImageStudio** | Poster, sampul, gambar sosial dan infografis |
-| | **VideoStudio** | Narrasi, presentator AI, judul dan dubbing, sorot klip, lokalisasi, dan rekreasi video referensi dengan konten dan rekaman Anda sendiri |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Narrasi, presentator AI, judul dan dubbing, sorot klip, lokalisasi, dan rekreasi video referensi dengan konten dan rekaman Anda sendiri |
 | | **VoiceStudio** | Narrasi, audio multi-suara, transkrip dan subtitle, pengeditan audio dan pencampuran |
 | | **UIDesigner** | Editable, HTML-first UI dari tujuan produk, PRDs, screenshot atau materi Figma |
 | Bangunan & kantor | **ProductDeveloper** | Repo-aware engineering      implementasi PRD, memperbaiki bug, refactor, review, dengan hasil yang dapat diverifikasi |
