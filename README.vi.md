@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## Những gì nhóm cung cấp
 
-- **Video, giọng nói và hình ảnh** — VideoStudio, VoiceStudio, ImageStudio
+- **Video, giọng nói và hình ảnh** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Báo cáo nghiên cứu, kiểm toán SEO và phân tích thị trường** — DeepResearcher, SeoGeoAgent, StockAnalyser
 - **Các bài đăng, bài báo, bản tin và slide decks** — ContentWriter, PptMaker
 - **Các trang web, UI và mã** — UIDesigner, ProductDeveloper

@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## Takımın sağladığı
 
-- **Videolar, sesli yayınlar ve görüntüler** — VideoStudio, VoiceStudio, ImageStudio
+- **Videolar, sesli yayınlar ve görüntüler** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Araştırma raporları, SEO denetimleri ve pazar analizi** — DeepResearcher, SeoGeoAgent, StockAnalyzer
 - **Gösteriler, makaleler, haberletirler ve slaytlar** — ContentWriter, PptMaker
 - **Web siteleri, kullanıcı kullanımı ve kod** — UID tasarımcı, ProductDeveloper

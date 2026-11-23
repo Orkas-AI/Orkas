@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## ما يقدم الفريق
 
-- **مقاطع الفيديو والصوت والصور** — سديو الفيديو, صوتStudio, صورةStudio
+- **مقاطع الفيديو والصوت والصور** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), صوتStudio, صورةStudio
 - **تقارير البحث، تدقيقات السوق والتحليل** — DeepResearcher، سيو جيوجينت، StockAnalyser
 - **المشاركات والمقال، والشابات الإخبارية وخطوط السلائيد** — ‬ كتاب ContentWriter، PptMaker المعلومات
 - **مواقع الويب، واجهة المستخدم والرمز** — UIDdesigner، منتج مطور

@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## Ce que l'équipe fournit
 
-- **Vidéos, voix-offs et images** — VideoStudio, VoiceStudio, ImageStudio
+- **Vidéos, voix-offs et images** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Rapports de recherche, audits SEO et analyse du marché** — DeepResearcher, SeoGeoAgent, analyseur de stock
 - **Les articles, les newsletters et les tableaux de diapositives** — ContentWriter, PptMaker
 - **Site Web, interface utilisateur et code** — UIDdesigner, développeur de produits

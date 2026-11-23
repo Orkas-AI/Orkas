@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## Was das Team bringt
 
-- **Videos, Sprachübertragungen und Bilder** — VideoStudio, VoiceStudio, ImageStudio
+- **Videos, Sprachübertragungen und Bilder** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Forschungsberichte, SEO-Audits und Marktanalyse** — DeepResearcher, SeoGeoAgent, StockAnalyzer
 - **Artikel, Newsletter und Slides** — ContentWriter, PptMaker
 - **Websites, Benutzeroberfläche und Code** — UIDesigner, ProductDeveloper
