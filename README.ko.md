@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | 내용 & 미디어 | **ContentWriter** | 출판할 수 있는 게시물, 기자, 뉴스레터 및 목표, 출처 또는 대략적인 초안에서 사례 연구 |
 | | **PptMaker** | 편집 가능한, 검토 가능한 PPTX 덱은 주제, 스케줄 또는 문서에서 |
 | | **ImageStudio** | 포스터, 커버, 소셜 이미지 및 인포그래픽 |
-| | **VideoStudio** | 서술, AI 발표자, 제목 및 도빙, 클립을 강조하고, 현지화 및 자신의 콘텐츠와 영상으로 참조 비디오 재생 |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | 서술, AI 발표자, 제목 및 도빙, 클립을 강조하고, 현지화 및 자신의 콘텐츠와 영상으로 참조 비디오 재생 |
 | | **VoiceStudio** | 서사, 다음성 오디오, 전개 및 자막, 오디오 편집 및 혼합 |
 | | **UIDesigner** | 편집 가능한, HTML-초음 UI, 제품 목표, PRD, 스크린샷 또는 Figma 자료 |
 | 빌드 & 오피스 | **ProductDeveloper** | 리포-아웃 엔지니어링  PRD를 구현, 버그를 수정, 리팩터, 검토, 검증 가능한 결과 |

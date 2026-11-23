@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | 内容与媒体 | **ContentWriter** | 将目标、来源或初稿写成可发布的帖子、文章、简报与案例 |
 | | **PptMaker** | 从主题、大纲或文档制作可编辑、可审核的 PPTX 幻灯片 |
 | | **ImageStudio** | 海报、封面、社媒图片与信息图 |
-| | **VideoStudio** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取、本地化，以及用自己的内容和素材复刻参考视频 |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取、本地化，以及用自己的内容和素材复刻参考视频 |
 | | **VoiceStudio** | 旁白、多角色音频、转写与字幕、音频编辑和混音 |
 | | **UIDesigner** | 从产品目标、PRD、截图或 Figma 素材制作以 HTML 为主的可编辑 UI |
 | 开发与办公 | **ProductDeveloper** | 理解代码仓库，落实 PRD、修复缺陷、重构和审查代码，交付可验证的结果 |

@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | Nội dung & phương tiện truyền thông | **ContentWriter** | Các bài đăng, bài báo, bản tin và nghiên cứu trường hợp sẵn sàng xuất bản từ mục tiêu, nguồn hoặc sơ đồ |
 | | **PptMaker** | Các gói PPTX có thể chỉnh sửa, có thể xem xét từ một chủ đề, phác thảo hoặc tài liệu |
 | | **ImageStudio** | Plak, bìa, hình ảnh xã hội và hình ảnh thông tin |
-| | **VideoStudio** | Narration, AI presenters, caption và dubbing, highlight clip, địa phương hóa, và video tham khảo recreation với nội dung và hình ảnh của riêng bạn |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Narration, AI presenters, caption và dubbing, highlight clip, địa phương hóa, và video tham khảo recreation với nội dung và hình ảnh của riêng bạn |
 | | **VoiceStudio** | Narration, multi-voice audio, transcripts và subtitles, chỉnh sửa và trộn âm thanh |
 | | **UIDesigner** | Đáp ứng đầu tiên HTML có thể chỉnh sửa từ mục tiêu sản phẩm, PRD, ảnh chụp màn hình hoặc tài liệu Figma |
 | xây dựng & văn phòng | **ProductDeveloper** | Kỹ thuật nhận thức về repo     implement a PRD, fix bugs, refactor, review, with verifiable results |

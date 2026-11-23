@@ -49,7 +49,7 @@ Die App wird von 16 Spezialisten mit ihren eigenen Fähigkeiten, Speichern und W
 | Inhalt & Medien | **ContentWriter** | Veröffentlichungsbereite Beiträge, Artikel, Newsletter und Fallstudien aus einem Ziel, Quellen oder einem umfassenden Entwurf |
 | | **PptMaker** | Bearbeitbare, überprüfbare PPTX-Decks aus einem Thema, einer Skizze oder einem Dokument |
 | | **ImageStudio** | Poster, Abdeckungen, soziale Bilder und Infografiken |
-| | **VideoStudio** | Erzählung, AI-Präsentanten, Untertitel und Dubbing, Highlight-Clips, Lokalisierung und Referenz-Video-Rekreation mit Ihrem eigenen Inhalt und Aufnahmen |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Erzählung, AI-Präsentanten, Untertitel und Dubbing, Highlight-Clips, Lokalisierung und Referenz-Video-Rekreation mit Ihrem eigenen Inhalt und Aufnahmen |
 | | **VoiceStudio** | Erzählung, Mehr-Stimme-Audio, Transkripte und Untertitel, Audiobearbeitung und Mischung |
 | | **UIDesigner** | Bearbeitbare, HTML-erste Benutzeroberfläche aus Produktzielen, PRDs, Screenshots oder Figma-Material |
 | Gebäude und Büro | **ProductDeveloper** | Repo-Aware Engineering      Implementieren Sie eine PRD, beheben Sie Fehler, refactor, Überprüfung mit überprüfbaren Ergebnissen |
