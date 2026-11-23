@@ -106,7 +106,7 @@ Orkas, bilgisayarınızda zaten kurulu olan CLI ajanlarını kendi uzmanlarını
 
 - **Planlayan, görev dağıtan ve geri kalanını kendisi yapan bir Commander** — hedefleri parçalara ayırır; doğru ajanları, becerileri, bağlayıcıları ve araçları seçer; daha uygun bir uzman yoksa analiz, yazım, araştırma ve dosya işlerini kendisi üstlenir.
 - **Tasarımı gereği yerel öncelikli** — sohbetler, dosyalar, bilgi tabanları ve özel ajanlar varsayılan olarak diskinizde kalır. Bulut senkronizasyonu paketlenmiş uygulamada isteğe bağlıdır. Kendi anahtarlarınızla model çağrıları doğrudan bilgisayarınızdan sağlayıcıya gider; yerleşik Orkas modeli ise Orkas'ın yönetilen model hizmeti üzerinden çalışır.
-- **Her modelle çalışır, istediğiniz zaman değiştirebilirsiniz** — Commander ve yerleşik ajanlar tek bir model ayarını paylaşır: yerleşik Orkas modeli, kendi sağlayıcınız veya yerel bir uç nokta. Harici CLI ajanları kendi model ayarlarını korur.
+- **Modeli istediğiniz zaman değiştirebilirsiniz** — Commander ve yerleşik ajanlar tek bir model ayarını paylaşır: yerleşik Orkas modeli, kendi sağlayıcınız veya yerel bir uç nokta. Harici CLI ajanları kendi model ayarlarını korur.
 - **Gelişen ajanlar** — her ajanın kendine özel becerileri ve belleği vardır. Arka planda çalışan değerlendirmeler, uygulama boştayken yeni etkinliği inceler ve öz değerlendirmeyi, yeniden kullanılabilir yöntemleri ve öğrenilmiş becerileri iyileştirebilir.
 - **Açık kaynak, kara kutu yok** — MIT lisanslıdır. Orkas'ın ve her ajanla her becerinin tam olarak ne yaptığını okuyabilirsiniz.
 
