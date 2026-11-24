@@ -217,6 +217,76 @@ test.describe('agents and skills', () => {
     )).toContain("This is the Agent's default capability boundary");
   });
 
+  test('keeps Agent configuration after a truncated edit and retries on the original Agent', async ({ modelOrkas: app }) => {
+    const seed = {
+      name: 'ReleaseEditor',
+      description: 'Drafts concise release notes.',
+      workflow: 'Summarize the changes in order.',
+      icon: 'bot',
+      color: 'peach',
+    };
+    const { agent } = await app.invoke<{ agent: AgentDetail }>('agents.create', seed);
+    const agentId = agent.agent_id;
+    const readAgent = async () => (
+      await app.invoke<{ agent: AgentDetail }>('agents.get', { agent_id: agentId })
+    ).agent;
+    const agentIds = async () => (
+      await app.invoke<{ agents: AgentSummary[] }>('agents.list')
+    ).agents.map(item => item.agent_id).sort();
+    const before = await readAgent();
+    const originalIds = await agentIds();
+    expect(before).toMatchObject({ name: seed.name, workflow: seed.workflow });
+
+    const request = 'Add a rollback note to the release notes workflow.';
+    app.setModelMode('truncated');
+    let page = app.page!;
+    const openEditor = async () => {
+      await openSidebarEntry(page, '#agents-btn');
+      await page.locator(`.agent-card[data-id="${agentId}"]`).click();
+      await expect(page.locator('#agents-detail-name')).toHaveText(seed.name);
+      await page.locator('#agent-edit-btn').click();
+      await expect(page.locator('#agents-chat-input')).toBeVisible();
+    };
+    await openEditor();
+    await page.locator('#agents-chat-input').fill(request);
+    await page.locator('#agents-chat-send-btn').click();
+    await expect(page.locator('#agents-chat-messages .bubble-retry-btn')).toHaveCount(1, { timeout: 30_000 });
+    expect(await readAgent()).toEqual(before);
+
+    page = await app.relaunch();
+    await openEditor();
+    const history = page.locator('#agents-chat-messages');
+    const failed = history.locator('.chat-message.assistant').filter({ has: page.locator('.bubble-retry-btn') });
+    await expect(failed).toHaveCount(1);
+    await expect(history.locator('.chat-message.user')).toContainText(request);
+    expect(await readAgent()).toEqual(before);
+
+    const recoveredWorkflow = `${seed.workflow} End with a rollback note.`;
+    app.setModelMode('success');
+    app.setModelTextReplies([`Rollback note added.\n\n<agent><workflow>${recoveredWorkflow}</workflow></agent>`]);
+    const requestsBeforeRetry = app.modelRequests.length;
+    await failed.hover();
+    await failed.locator('.bubble-retry-btn').click();
+    await expect(history.locator('.chat-message.assistant [data-role="final"]').last()).toContainText('Rollback note added.');
+    const recovered = await readAgent();
+    expect(recovered).toMatchObject({
+      agent_id: agentId, name: before.name, description_zh: before.description_zh,
+      description_en: before.description_en, workflow: recoveredWorkflow,
+    });
+    expect(await agentIds()).toEqual(originalIds);
+    expect(app.modelRequests).toHaveLength(requestsBeforeRetry + 1);
+    const { messages } = app.modelRequests[requestsBeforeRetry];
+    const resent = Array.isArray(messages) ? messages.filter(message => message?.role === 'user').at(-1) : null;
+    const resentText = Array.isArray(resent?.content)
+      ? resent.content.map(part => (part as { text?: string })?.text ?? '').join('')
+      : resent?.content;
+    expect(resentText).toContain(request);
+    const { messages: savedMessages } = await app.invoke<{ messages: Array<{ role: string; content: string }> }>(
+      'agents.chat.history', { agent_id: agentId },
+    );
+    expect(savedMessages.filter(message => message.role === 'user').at(-1)?.content).toBe(request);
+  });
+
   test('creates an agent, persists its enabled state, and deletes it', async ({ modelOrkas: orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
