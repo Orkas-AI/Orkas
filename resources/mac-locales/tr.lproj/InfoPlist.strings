@@ -1,3 +1,3 @@
 "NSMicrophoneUsageDescription" = "Orkas, sesli giriş ve izin verdiğiniz siteler için mikrofonu kullanır.";
-"NSCameraUsageDescription" = "Orkas, izin verdiğiniz web sitelerinin kamerayı kullanmasını sağlar.";
+"NSCameraUsageDescription" = "Orkas, izninizle sitelerin kamerayı kullanmasına olanak tanır.";
 "NSBluetoothAlwaysUsageDescription" = "Orkas, geçiş anahtarınızın bulunduğu telefonun yakında olduğunu doğrulamak için Bluetooth kullanır.";
