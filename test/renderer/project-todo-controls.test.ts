@@ -335,7 +335,8 @@ describe('project to-do controls', () => {
     const element = (tag: string): any => {
       const node: any = { tag, children: [] as any[], dataset: {}, attributes: {} as Record<string, string>,
         handlers: {} as Record<string, () => void>, className: '', hidden: false, innerHTML: '', textContent: '',
-        appendChild(child: any) { this.children.push(child); return child; },
+        appendChild(child: any) { child.parentElement = this; this.children.push(child); return child; },
+        querySelector(selector: string) { return cardNodes(this).find(node => node.className === selector.slice(1)); },
         setAttribute(key: string, value: string) { this.attributes[key] = value; },
         addEventListener(key: string, handler: () => void) { this.handlers[key] = handler; } };
       node.classList = { toggle(name: string, enabled: boolean) {

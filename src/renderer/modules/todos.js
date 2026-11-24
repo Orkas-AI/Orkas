@@ -526,10 +526,7 @@ function _applyGlobalTodoPendingFocus() {
   // Reveal it even when the user had collapsed its column; this does not
   // change the remembered collapse state.
   const body = row.closest('.todo-column-body');
-  if (body && body.hidden) {
-    body.hidden = false;
-    body.parentElement?.querySelector('.todo-collapse')?.setAttribute('aria-expanded', 'true');
-  }
+  if (body?.hidden) _setTodoColumnCollapsed(body, false);
   row.classList.add('is-highlighted');
   row.scrollIntoView({ block: 'center' });
   setTimeout(() => row.classList.remove('is-highlighted'), 2500);

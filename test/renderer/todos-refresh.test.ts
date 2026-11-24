@@ -19,8 +19,10 @@ function harness(invoke: (channel: string, args: any) => Promise<any>) {
     window: { orkas: { invoke } },
     t: (key: string) => key,
     _bindProjectTodos() {},
-    _projectDetailLog: { warn: (message: string) => warnings.push(message) },
+    createLogger: () => ({ warn: (message: string) => warnings.push(message) }),
   });
+  vm.runInContext(projectSource, context);
+  context._bindProjectTodos = () => {};
   vm.runInContext(source, context);
   // This layer owns request ordering/state; real rendering and IPC are covered
   // by todos_e2e_board. Do not let the fixture supply computed task data.
@@ -350,10 +352,15 @@ describe('opening a to-do from a shortcut', () => {
   function todoRow(tid: string, columnHidden = false) {
     const classes = new Set<string>();
     const toggle = { expanded: '', setAttribute: (_: string, value: string) => { toggle.expanded = value; } };
-    const body = { hidden: columnHidden, parentElement: { querySelector: () => toggle } };
+    const columnClasses = new Set(columnHidden ? ['is-collapsed'] : []);
+    const body = { hidden: columnHidden, parentElement: {
+      querySelector: () => toggle,
+      classList: { toggle: (name: string, enabled: boolean) => enabled ? columnClasses.add(name) : columnClasses.delete(name) },
+    } };
     return {
       dataset: { tid },
       classes,
+      columnClasses,
       toggle,
       body,
       scrolled: 0,
@@ -388,6 +395,7 @@ describe('opening a to-do from a shortcut', () => {
     expect(target.scrolled).toBe(1);
     expect(target.body.hidden).toBe(false);
     expect(target.toggle.expanded).toBe('true');
+    expect(target.columnClasses.has('is-collapsed')).toBe(false);
     expect(other.classes.size).toBe(0);
 
     // Applied once: a later reload of the page does not jump back to it.
