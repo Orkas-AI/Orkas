@@ -1669,6 +1669,11 @@ if (!gotLock) {
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
     registerIpc(flushForShutdown, () => shutdown.quiescent);
+    // Register cleanup before starting services so partial startup can quit too.
+    const startupDisposers: Array<() => void> = [];
+    app.once('will-quit', () => {
+      for (const dispose of startupDisposers) dispose();
+    });
     const stopTaskNotifications = taskNotifications.startTaskNotifications({
       ...taskNotifications.createTaskNotificationForeground(app, () => BrowserWindow.getAllWindows()),
       getActiveUserId: () => users.getActiveUserId(),
@@ -1709,12 +1714,12 @@ if (!gotLock) {
       },
       openConversation: openConversationFromTaskNotification,
     });
-    app.once('will-quit', stopTaskNotifications);
+    startupDisposers.push(stopTaskNotifications);
     const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
-    app.once('will-quit', stopTaskTerminalUi);
+    startupDisposers.push(stopTaskTerminalUi);
     // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
     const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
-    app.once('will-quit', idleSleepGuard.stop);
+    startupDisposers.push(idleSleepGuard.stop);
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
       if (keys.includes('connectors.catalog') || keys.includes('connectors.dcr_catalog')) {
@@ -1771,7 +1776,7 @@ if (!gotLock) {
       // write lifecycle reports. Normal source and packaged runs behave alike.
       enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
     });
-    app.once('will-quit', () => {
+    startupDisposers.push(() => {
       openLifecycleTracking?.stop();
       openLifecycleTracking = null;
     });
@@ -1790,7 +1795,7 @@ if (!gotLock) {
         },
         warn: message => log.warn(message),
       });
-      app.once('will-quit', stopTaskUnreadTray);
+      startupDisposers.push(stopTaskUnreadTray);
     }
     // A scheduled fire or driver advance can reach the task browser with every
     // window closed, which is routine on macOS. Hand Web Assist the ability to
