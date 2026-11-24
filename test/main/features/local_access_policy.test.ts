@@ -172,6 +172,16 @@ describe('local_access_policy', () => {
     )).toEqual(['external_mutation']);
   });
 
+  it.skipIf(process.platform !== 'win32')('guards writes into the Windows Startup folder', async () => {
+    const policy = await import('../../../src/main/features/local_access_policy');
+    const bs = String.fromCharCode(92);
+    const startup = ['C:', 'Users', 'Someone', 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'];
+    expect(policy.sensitivePathReasons([...startup, 'run.bat'].join(bs), 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons([...startup, 'run.bat'].join('/'), 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons([...startup, 'run.bat'].join(bs), 'read')).toEqual([]);
+    expect(policy.sensitivePathReasons(['C:', 'Users', 'Someone', 'Documents', 'Start Menu', 'note.txt'].join(bs), 'write')).toEqual([]);
+  });
+
   it('uses structural defaults without disabling custom server rules', async () => {
     const { clientConfig } = await import('../../../src/main/features/client_config');
     const policy = await import('../../../src/main/features/local_access_policy');

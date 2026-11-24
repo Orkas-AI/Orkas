@@ -168,14 +168,19 @@ function compile(pattern: string): RegExp | null {
 }
 
 function pathHaystacks(absPath: string): string[] {
-  const resolved = path.resolve(absPath).split(path.sep).join('/');
+  const native = path.resolve(absPath);
+  const resolved = native.split(path.sep).join('/');
   const home = os.homedir() ? path.resolve(os.homedir()).split(path.sep).join('/') : '';
   const tilde = home && (resolved === home || resolved.startsWith(`${home}/`))
     ? `~${resolved.slice(home.length)}`
     : '';
   // Test both forms independently so anchored absolute server patterns and
   // anchored default `^~/...` patterns remain compatible.
-  return tilde ? [resolved, tilde] : [resolved];
+  const forms = tilde ? [resolved, tilde] : [resolved];
+  // Server and default patterns may spell Windows separators as backslashes
+  // (for example the Startup folder), so match the native form too.
+  if (native !== resolved) forms.push(native);
+  return forms;
 }
 
 function patternsMatch(patterns: readonly string[], haystack: string): boolean {
