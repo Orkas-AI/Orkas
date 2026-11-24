@@ -2,7 +2,7 @@
 
 **開源的 AI 智能體團隊，就在你的桌面上——把目標變成交付成果，並持續推進。**
 
-Orkas 是一個開源（MIT）、本地優先的多智能體桌面應用，也是一支協同工作的 AI 助手團隊。把要做的事告訴**指揮官**（Commander）：很多工它自己就能直接完成；遇到更大的工作，它會拆分步驟，調動專業智能體，以及你已在使用的程式設計與個人智能體——**Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent**——一起協作完成。
+Orkas 是一個開源（MIT）、本地優先的多智能體桌面應用，也是一支協同工作的 AI 助手團隊。把要做的事告訴**指揮官**（Commander）：許多任務它自己就能完成；遇到更大的工作，它會拆分步驟，調動專業智能體，以及你已在使用的程式設計與個人智能體——**Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent**——一起協作完成。
 
 Orkas 為持續推進的專案而設計，而不只是回答一次提問。**專案**彙集目標、規則、記憶和檔案，每次新對話都能接著上次繼續；**待辦事項**把工作分給人和智能體；**Auto-advance**（自動推進）讓團隊自己接手下一項待辦事項；**定時自動化**按小時、每天、每週或每月重複例行工作。所有資料都儲存在你的電腦上，完成的成果交回給你稽核——生意上需要持續推進的事，可以放心交給 Orkas。
 
@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 - **電商工作** —— 5 個電商智能體負責選品、商品文案、評價分析、經營分析與商品運營
 - **需要多個智能體配合的複雜任務** —— 指揮官拆分任務，把每一部分交給合適的智能體，再把結果整合起來；比如一次市場調研，最後交付報告、幻燈片和釋出影片
 
-16 個專業智能體隨應用內建，各有自己的技能、記憶和工具。[智能體庫](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas)中有 30+ 個智能體可供選擇；也可以描述所需角色，讓指揮官為你建立自定義智能體。
+16 個專業智能體隨應用內建，各有自己的技能、記憶和工具。[智能體庫](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas)中有 30+ 個智能體可供選擇；也可以描述所需角色，讓指揮官為你建立自訂智能體。
 
 <details>
 <summary><b>全部 16 個內建智能體</b></summary>
@@ -105,7 +105,7 @@ Orkas 將你已安裝的 CLI 智能體作為本地會話執行，與內建專業
 ## 為什麼選擇 Orkas
 
 - **會規劃、分工，也會親自完成工作的指揮官** —— 拆解目標，選擇合適的智能體、技能、聯結器與工具；沒有更合適的專業智能體時，親自處理分析、寫作、研究和檔案工作。
-- **本地優先** —— 對話、檔案、知識庫和自定義智能體預設儲存在本機，安裝版可選擇開啟雲同步。使用自己的 Key 時，模型呼叫從本機直連服務商；內建 Orkas 模型透過 Orkas 託管服務執行。
+- **本地優先** —— 對話、檔案、知識庫和自訂智能體預設儲存在本機，安裝版可選擇開啟雲同步。使用自己的 Key 時，模型呼叫從本機直連服務商；內建 Orkas 模型透過 Orkas 託管服務執行。
 - **模型隨時可切換** —— 指揮官與內建智能體共用一個模型設定，可選擇內建 Orkas 模型、自有服務商或本地端點；外接 CLI 智能體保留各自的模型設定。
 - **能積累經驗的智能體** —— 各自保留私有技能與記憶；後臺覆盤在應用空閒時檢查新活動，可改進自我評估、可複用方法與學習到的技能。
 - **開源、可審查** —— MIT 許可證，可以檢視 Orkas、智能體與技能的具體實現。
@@ -119,7 +119,7 @@ Orkas 將你已安裝的 CLI 智能體作為本地會話執行，與內建專業
 | | 安裝版（推薦） | 原始碼版 |
 | --- | --- | --- |
 | 平臺 | macOS 12+（Apple Silicon 與 Intel）、Windows 10+ | macOS、Windows、glibc 2.34+ Linux x64/arm64 |
-| 賬號 | 登入即送 500 積分 | 無需賬號 |
+| 帳號 | 登入即送 500 積分 | 無需帳號 |
 | 模型 | 內建 Orkas 模型，或使用自己的 Key | 自己的 Key，或本地模型端點 |
 | 另含 | 專案協作、應用釋出、雲端同步等 | — |
 | 獲取方式 | **[下載 Orkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [快速開始](#快速開始) |
@@ -168,7 +168,7 @@ Orkas 將你已安裝的 CLI 智能體作為本地會話執行，與內建專業
 
 想直接用安裝包？見上方 [下載](#下載)。以下是從原始碼執行的方式 —— 也是目前在 Linux 上執行 Orkas 的方式：
 
-**環境要求**：Node 22.12+ · macOS / Windows 10+ / 基於 glibc 2.34+ 的 Linux x64 或 arm64。建議保留 Python 3 與 C/C++ 構建工具鏈，用於少數原生模組需要原始碼編譯的兜底場景。
+**環境要求**：Node 22.12+ · macOS / Windows 10+ / 基於 glibc 2.34+ 的 Linux x64 或 arm64。建議保留 Python 3 與 C/C++ 建置工具鏈，用於少數原生模組需要原始碼編譯的兜底場景。
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -179,7 +179,7 @@ run.cmd            # Windows
 
 Linux 原始碼執行需要 glibc 2.34+，不支援 Alpine 及其他基於 musl 的發行版。本地語音轉寫會在首次原始碼啟動時下載並校驗目標架構對應的 whisper.cpp 執行時及多語言模型。
 
-`run.sh` / `run.cmd` 會在首次啟動時安裝 lockfile 固定的 npm 依賴，並準備固定版本的 Python、uv、Node、嵌入模型（約 95 MB）、OfficeCLI、FFmpeg、whisper.cpp 與多語言語音模型。Linux 啟動還會在 Electron ABI 下驗證平臺原生模組及 Whisper 執行時後再開啟應用。OCR 與 Skill 專屬 Python 包會在首次使用對應功能時安裝到隔離的本地環境。首次啟動會在 `~/.orkas/`（macOS / Linux）或 `<最小的非系統盤>:\.orkas\`（Windows）下建立工作區。隨後進入 **設定 → AI 服務商** 配置 API key 或 OAuth。
+`run.sh` / `run.cmd` 會在首次啟動時安裝 lockfile 固定的 npm 依賴，並準備固定版本的 Python、uv、Node、嵌入模型（約 95 MB）、OfficeCLI、FFmpeg、whisper.cpp 與多語言語音模型。Linux 啟動還會在 Electron ABI 下驗證平臺原生模組及 Whisper 執行時後再開啟應用。OCR 與 Skill 專屬 Python 套件會在首次使用對應功能時安裝到隔離的本地環境。首次啟動會在 `~/.orkas/`（macOS / Linux）或 `<最小的非系統盤>:\.orkas\`（Windows）下建立工作區。隨後進入 **設定 → AI 服務商** 配置 API key 或 OAuth。
 
 遇到原生依賴錯誤時，請使用 Node.js 24 LTS（最低 22.12.0），在此原始碼目錄執行
 `npm run native:repair`。它會恢復可選依賴、修復 Electron 對應的 SQLite，並驗證 SQL、
@@ -257,8 +257,8 @@ Orkas 是開源（MIT）、本地優先的多智能體桌面應用。指揮官�
 **能做應用和釋出應用嗎？**
 可以。在 Orkas 內執行的本地應用免費。將網頁應用釋出為公開連結需要付費會員，Lite、Pro、Max 分別可釋出 5、8、15 個；公開網頁應用不包含 Orkas 桌面應用內的全部能力。
 
-**需要 Orkas 賬號嗎？**
-安裝版首次啟動時需要登入。本倉庫的原始碼版沒有賬號模組，啟動後直接進入應用。
+**需要 Orkas 帳號嗎？**
+安裝版首次啟動時需要登入。本倉庫的原始碼版沒有帳號模組，啟動後直接進入應用。
 
 **能驅動 Claude Code 等 CLI 智能體嗎？**
 可以。Orkas 能將五個外部 CLI 智能體作為本地子程序執行：Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent；也可接入 HyperFrames 等開源工具，在同一個對話中協調工作。
@@ -267,7 +267,7 @@ Orkas 是開源（MIT）、本地優先的多智能體桌面應用。指揮官�
 Claude Code 和 Codex 是程式設計智能體，Orkas 可以把它們都作為團隊成員來執行，不必二選一；CrewAI 和 LangChain 是程式碼優先的框架。Orkas 是開源桌面應用，由指揮官協調專業智能體與 CLI 智能體，可選擇不同模型服務商，資料與 Key 預設儲存在本地。[檢視完整對比](https://orkas.ai/compare/?source=gh-orkas)。
 
 **支援哪些平臺？**
-macOS 12+（Apple Silicon 與 Intel）和 Windows 10+ 提供安裝包。glibc 2.34+ Linux x64/arm64 目前透過原始碼執行，尚無安裝包；首次啟動會準備固定版本的 whisper.cpp 執行時，支援本地語音轉寫。不支援 Alpine 等基於 musl 的發行版。原始碼啟動需要 Node 22.12+；只有原生 npm 包缺少相容的預編譯檔案、需要本地重建時，才需要 Python 3 和 C/C++ 構建工具鏈。
+macOS 12+（Apple Silicon 與 Intel）和 Windows 10+ 提供安裝包。glibc 2.34+ Linux x64/arm64 目前透過原始碼執行，尚無安裝包；首次啟動會準備固定版本的 whisper.cpp 執行時，支援本地語音轉寫。不支援 Alpine 等基於 musl 的發行版。原始碼啟動需要 Node 22.12+；只有原生 npm 套件缺少相容的預編譯檔案、需要本地重建時，才需要 Python 3 和 C/C++ 建置工具鏈。
 
 **Orkas 免費且開源嗎？**
 是的，應用採用 MIT 許可證，可免費使用。安裝版贈送 500 積分；付費會員每月 $11.99 起，增加月度積分、雲同步、更多共享專案和網頁應用釋出能力。使用自己的 Key 時，模型用量由服務商計費，Orkas 不加價。[價格 →](https://orkas.ai/pricing/?source=gh-orkas)

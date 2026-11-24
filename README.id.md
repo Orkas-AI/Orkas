@@ -196,7 +196,7 @@ Lihat [skrip verifikasi dependensi native](./scripts/verify-native-dependencies.
 
 Komandan menangani sendiri pekerjaan umum dan mendelegasikan pekerjaan spesialis melalui tiga alat:
 
-- **`dispatch_to`** menjalankan agen tertentu dan mengembalikan hasilnya agar pekerjaan bisa dilanjutkan. Alat ini dapat menunggu hasilnya, atau berjalan secara asinkron lalu memberi tahu Komandan saat tugas selesai.
+- **`dispatch_to`** menjalankan agen yang ditentukan berdasarkan namanya dan mengembalikan hasilnya agar pekerjaan bisa dilanjutkan. Alat ini dapat menunggu hasilnya, atau berjalan secara asinkron lalu memberi tahu Komandan saat tugas selesai.
 - **`hand_off_to`** mengalihkan sisa pekerjaan kepada agen yang disebutkan namanya dan mengakhiri giliran Komandan saat ini. Agen tersebut menyampaikan balasannya sendiri; kelanjutan opsional memungkinkan Komandan melanjutkan tugas yang lebih luas sesudahnya.
 - **`run_worker`** menjalankan subtugas anonim yang terisolasi dan mengembalikan hasil privat. Subtugas ini tidak menerima riwayat percakapan maupun keterampilan agen bernama.
 
