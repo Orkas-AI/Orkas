@@ -199,6 +199,33 @@ test('task inventory keeps new files and attachments across full and partial ref
   }
 });
 
+test('opens a confirmed attachment when task detail history is unavailable', async ({ orkas }) => {
+  const page = orkas.page!;
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Attachment recovery' })).conversation.conversation_id;
+  const attachment = { cid, name: 'brief.txt', data: Buffer.from('Saved brief contents').toString('base64') };
+  expect(await orkas.invoke('conversations.attachments.upload', attachment)).toMatchObject({ ok: true });
+  await page.evaluate(async id => {
+    const win = window as any;
+    await win.loadConversations();
+    await win.setView('conversation', id);
+    const originalFetch = win.apiFetch;
+    win.apiFetch = (url: string, ...args: unknown[]) => url.includes('/history?limit=10')
+      ? Promise.resolve({ json: async () => ({ ok: false, error: 'History unavailable' }) })
+      : originalFetch(url, ...args);
+  }, cid);
+
+  await page.locator('#conversation-info-toggle').click();
+  const panel = page.locator('#conversation-info-panel');
+  await expect(panel.locator('.conversation-info-empty.is-error')).toBeVisible();
+  await panel.locator('[data-info-tab="attachments"]').click();
+  const row = panel.getByRole('button', { name: /brief\.txt/ });
+  await expect(row).toBeVisible();
+  await expect(page.locator('#conversation-info-tab-count-attachments')).toHaveText('1');
+  const preview = await orkas.openPreview(() => row.click());
+  await expect(preview.locator('body')).toContainText('Saved brief contents');
+  await orkas.closePreview(preview);
+});
+
 test('task details remembers open and closed panels and each selected tab across navigation', async ({ orkas }) => {
   const page = orkas.page!;
   const first = (await orkas.invoke<any>('conversations.create', { title: 'Details state first' })).conversation.conversation_id;
