@@ -8,13 +8,13 @@ Orkas, yalnızca tek bir isteme yanıt vermek için değil, bir projeyi ilerletm
 
 **[⬇ Orkas'ı macOS ve Windows için indirin](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — ücretsizdir ve yerleşik Orkas modeli için 500 kredi içerir; yani başlamak için API anahtarına ihtiyacınız yok. Kendi anahtarlarınızı mı tercih edersiniz? Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao veya yerel, OpenAI uyumlu bir uç nokta.
 
-[![Download for macOS & Windows](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
+[![macOS ve Windows için indir](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=flat&logo=github&label=Stars&color=yellow)](https://github.com/Orkas-AI/Orkas/stargazers)
-[![Release](https://img.shields.io/github/v/release/Orkas-AI/Orkas?color=blue)](https://github.com/Orkas-AI/Orkas/releases)
+[![Lisans: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![GitHub yıldızları](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=flat&logo=github&label=Stars&color=yellow)](https://github.com/Orkas-AI/Orkas/stargazers)
+[![Sürüm](https://img.shields.io/github/v/release/Orkas-AI/Orkas?color=blue)](https://github.com/Orkas-AI/Orkas/releases)
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
-[![Website: orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
+[![Web sitesi: orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
 
 [English](./README.en.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md) · [한국어](./README.ko.md) · [Español](./README.es.md) · [Bahasa Indonesia](./README.id.md) · [Español (Latinoamérica)](./README.es-419.md) · [Русский](./README.ru.md) · [Português (Brasil)](./README.pt-BR.md) · [Türkçe](./README.tr.md) · [繁體中文](./README.zh-TW.md) · [Tiếng Việt](./README.vi.md) · [Deutsch](./README.de.md) · [ไทย](./README.th.md) · [Français](./README.fr.md) · [Italiano](./README.it.md) · [Português (Portugal)](./README.pt-PT.md) · [العربية](./README.ar.md)
 
@@ -66,11 +66,11 @@ Her ajan hakkında daha fazlası → [orkas.ai/agents](https://orkas.ai/agents/?
 
 ### Referans bir videoyu kendi içeriğinizle yeniden oluşturun
 
-**VideoStudio**, viral bir videonun anlatı yapısını, görsel stilini ve kurgu temposunu kendi ürününüz, senaryonuz ve görüntülerinizle yeniden oluşturabilir. Referans video dosyasını ve materyallerinizi verin: ajan, açılıştaki kancayı, bilgi sırasını, görsel ritmi ve harekete geçirici mesajı analiz eder, ardından üretime geçmeden önce neyin korunacağını ve neyin değiştirileceğini önerir.
+**VideoStudio**, viral bir videonun anlatı yapısını, görsel stilini ve kurgu temposunu kendi ürününüz, senaryonuz ve görüntülerinizle yeniden oluşturabilir. Referans video dosyasını ve materyallerinizi verin: ajan, dikkat çeken açılışı, bilgi sırasını, görsel ritmi ve harekete geçirici mesajı analiz eder, ardından üretime geçmeden önce neyin korunacağını ve neyin değiştirileceğini önerir.
 
 Bu yöntem en iyi sonucu hareketli grafikli açıklayıcı videolarda, SaaS veya uygulama demolarında ve mevcut görüntülerinizden hazırlanan ürün reklamlarında verir. Yerelde hazırlanan metinler, altyazılar, anlatım ve klipler ayrı ayrı düzenlenebilir; yapay zekâ ile üretilmiş görüntülere gömülü metni değiştirmek için o görüntünün kendisini değiştirmek gerekir.
 
-> "reference.mp4 dosyasını referans alarak 30 saniyelik dikey bir tanıtım videosu hazırla. Kancasını, tipografisini ve temposunu koru; içeriği kendi ürünüm ve ekran kayıtlarımla değiştir ve önce bana videonun çözümlemesini ve planı göster."
+> "reference.mp4 dosyasını referans alarak 30 saniyelik dikey bir tanıtım videosu hazırla. Dikkat çeken açılışını, yazı stilini ve temposunu koru; içeriği kendi ürünüm ve ekran kayıtlarımla değiştir ve önce bana videonun çözümlemesini ve planı göster."
 
 Ajanın okuyabileceği bir video dosyasıyla başlayın; sosyal medya platformlarındaki paylaşım bağlantılarından video indirme özelliği yerleşik değildir. Kamera hareketlerinin birebir aynısı, oyuncuların performansı ve kare kare eşleşme garanti edilmez. [Referans videoyu yeniden oluşturma iş akışına](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md) bakın.
 
@@ -90,7 +90,7 @@ Tek bir görev iyi bir başlangıçtır. Orkas ise süregelen işler için tasar
 > [!NOTE]
 > Paylaşılan projeler, bulut senkronizasyonu ve web uygulaması yayınlama yalnızca paketlenmiş uygulamada vardır; açık kaynaklı sürüm bunları henüz desteklemiyor. Bunları kullanmak için **[Orkas'ı macOS ve Windows için indirin](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (ücretsiz, başlangıç için 500 kredi ile).
 
-Sesle yazma, kaynak koddan derlenen sürümde de çalışır. **Ayarlar → Modeller** bölümünde bir **Orkas API Key** yapılandırın, ardından mesaj kutusunun yanındaki mikrofona tıklayın. İstendiğinde mikrofon erişimine izin verin. Ses, tanınması için Orkas'a gönderilir ve anahtar sahibinin Orkas kredilerini kullanır. Durdurmak için yeniden tıklayın, metni gözden geçirin ve kendiniz gönderin. Erişimi reddettiyseniz mikrofonu sistem ayarlarınızdan etkinleştirin.
+Sesle yazma, kaynak koddan derlenen sürümde de çalışır. **Ayarlar → Modeller** bölümünde bir **Orkas API anahtarı** yapılandırın, ardından mesaj kutusunun yanındaki mikrofona tıklayın. İstendiğinde mikrofon erişimine izin verin. Ses, tanınması için Orkas'a gönderilir ve anahtar sahibinin Orkas kredilerini kullanır. Durdurmak için yeniden tıklayın, metni gözden geçirin ve kendiniz gönderin. Erişimi reddettiyseniz mikrofonu sistem ayarlarınızdan etkinleştirin.
 
 ---
 
