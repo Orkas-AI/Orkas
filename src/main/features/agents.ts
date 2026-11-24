@@ -2900,7 +2900,22 @@ async function saveAgentChatMeta(userId: string, agentId: string, meta: AgentCha
 }
 
 export async function getAgentChatMessages(userId: string, agentId: string, limit = 500): Promise<any[]> {
-  return readJsonl(agentChatMsgsPath(userId, agentId), limit);
+  const messages = await readJsonl(agentChatMsgsPath(userId, agentId), limit);
+  return messages.map(message => {
+    if (message?.role !== 'assistant' || message.failed !== undefined || !Array.isArray(message.process)) {
+      return message;
+    }
+    // Older edit replies saved the runtime receipt but lacked the retry flag.
+    for (let index = message.process.length - 1; index >= 0; index -= 1) {
+      const event = message.process[index]?.event;
+      if (event?.stream === 'runtime' && event.data?.phase === 'end') {
+        return event.data.errored === true && event.data.aborted !== true
+          ? { ...message, failed: true }
+          : message;
+      }
+    }
+    return message;
+  });
 }
 
 async function _appendAgentChatMessage(userId: string, agentId: string, record: any): Promise<void> {
@@ -3122,7 +3137,7 @@ export async function sendToAgentEditChat(
     const partial = String(result.text || '').trim();
     const content = partial ? `${result.text}\n\n${errMsg}` : errMsg;
     await _appendAgentChatMessage(userId, agentId,
-      { time: nowIso(), role: 'assistant', content });
+      { time: nowIso(), role: 'assistant', content, failed: !result.aborted });
     return { ok: false, message: content, error: result.error || '' };
   }
 
@@ -3182,6 +3197,7 @@ export async function* streamSendToAgentEditChat(
   const { streamChatWithModel } = await import('../model/client');
   let finalText: string | null = null;
   let errMsg: string | null = null;
+  let streamAborted = false;
   let waitingForInput = false;
   // Running assistant delta buffer. On user abort the IPC layer's `break`
   // triggers `return()` at the current yield, which skips the post-loop
@@ -3281,6 +3297,7 @@ export async function* streamSendToAgentEditChat(
         event = { type: 'final', text: cleanText, updated };
       } else if (etype === 'error') {
         errMsg = `Model response failed: ${event.text || 'unknown'}`;
+        streamAborted ||= event.aborted === true;
       }
 
       for (const text of synthesizedProgress) {
@@ -3314,9 +3331,10 @@ export async function* streamSendToAgentEditChat(
     // append placed after the loop. Keeping it here covers normal finish,
     // caught errors, and abort-driven returns alike.
     const hadProcessItems = processItems.length > 0;
+    const aborted = streamAborted || opts.abortSignal?.aborted === true;
     ensureEditChatRuntimeProcessItem(processItems, runStartedAt, {
-      aborted: opts.abortSignal?.aborted,
-      errored: !!errMsg,
+      aborted,
+      errored: !!errMsg && !aborted,
     });
     const saved = sanitizeEditChatCommentaryProcessItems(
       processItems,
@@ -3331,7 +3349,7 @@ export async function* streamSendToAgentEditChat(
         const partial = _visibleAgentEditText(streamingText).trim();
         const content = partial ? `${partial}\n\n${errMsg}` : errMsg;
         await _appendAgentChatMessage(userId, agentId,
-          { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+          { time: nowIso(), role: 'assistant', content, failed: !aborted, ...(saved ? { process: saved } : {}) });
       } else if (waitingForInput && !opts.abortSignal?.aborted) {
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content: '', process: saved });

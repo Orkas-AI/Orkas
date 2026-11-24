@@ -1,12 +1,12 @@
 # Orkas
 
-**An açık kaynak ekibi AI ajanlarını masaüstünde - hedeflerinizi bitirmeye ve hareket etmeye devam ediyor. **
+**Masaüstünüzde açık kaynaklı bir yapay zekâ ajan ekibi: hedeflerinizi tamamlanmış işe dönüştürür ve işin durmadan ilerlemesini sağlar.**
 
-OrkasBir açık kaynaktır(MIT), yerel-ilk multi-agent masaüstü uygulaması - anAIBir takım olarak çalışan asistan. Söyleyin**Commander**İhtiyacınız olan şey: Kendi başına birçok görevi bitirin ve daha büyük işler için adımları planlar ve zaten kullandığınız kodlama ve kişisel ajanlarla birlikte uzman ajanlar getiriyor -**Claude Code, Codex, OpenCode, OpenClawveHermes-Agent**- birlikte çalışmak.
+Orkas, açık kaynaklı (MIT), yerel öncelikli, çok ajanlı bir masaüstü uygulamasıdır; ekip olarak çalışan bir yapay zekâ asistanıdır. **Commander**'a ne istediğinizi söyleyin: pek çok görevi kendi başına tamamlar; daha büyük işlerde ise adımları planlar ve uzman ajanları, zaten kullandığınız kodlama ve kişisel ajanlarla — **Claude Code, Codex, OpenCode, OpenClaw ve Hermes-Agent** — birlikte bu iş üzerinde çalışmak üzere devreye sokar.
 
-OrkasBir projeyi hareket ettirmek için inşa edilmiş, sadece bir tane hızlı cevap vermiyor. A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A**Proje projesi**Hedefi, kuralları, hafıza ve dosyaları tutar, bu yüzden her yeni sohbet, son bir kişinin nerede bıraktığını alır.**To-dost**İnsanlar ve ajanlar arasındaki çalışmayı bölmek,**Auto-advance**Ekibin kendisi tarafından bir sonraki to-do'ya girmesine izin verin ve**planlanan otomasyonlar**Tekrar rutin iş saati, günlük, haftalık veya aylık. Tüm verileriniz bilgisayarınızda kalır ve çalışmayı bitirin - bu yüzden güvenebileceğinizOrkasİşinizin devam eden çalışmaları ile.
+Orkas, yalnızca tek bir isteme yanıt vermek için değil, bir projeyi ilerletmek için tasarlandı. Bir **proje** hedefi, kuralları, belleği ve dosyaları barındırır; böylece her yeni sohbet, bir öncekinin kaldığı yerden devam eder. **Yapılacaklar** işi insanlar ve ajanlar arasında paylaştırır, **Otomatik ilerleme** ekibin sıradaki yapılacak işi kendiliğinden üstlenmesini sağlar, **zamanlanmış otomasyonlar** ise rutin işleri saatlik, günlük, haftalık veya aylık olarak tekrarlar. Tüm verileriniz bilgisayarınızda kalır ve tamamlanan işler incelemeniz için size geri gelir; böylece işletmenizin süregelen işlerini gönül rahatlığıyla Orkas'a emanet edebilirsiniz.
 
-**[DownloadOrkasÇünkümacOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)**- ücretsiz, inşa edilen için 500 kredi ileOrkasModel, bu yüzden bir şeye ihtiyacınız yokAPIBaşlamak için anahtar. Kendi anahtarlarınızı mı tercih edin?Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao, ya da yerel bir OpenAI uyumlu uç noktası.
+**[⬇ Orkas'ı macOS ve Windows için indirin](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — ücretsizdir ve yerleşik Orkas modeli için 500 kredi içerir; yani başlamak için API anahtarına ihtiyacınız yok. Kendi anahtarlarınızı mı tercih edersiniz? Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao veya yerel, OpenAI uyumlu bir uç nokta.
 
 [![Download for macOS & Windows](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
 
@@ -22,155 +22,153 @@ OrkasBir projeyi hareket ettirmek için inşa edilmiş, sadece bir tane hızlı 
 
 https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
-![Orkas desktop — task conversation and deliverables](./resources/app-ui/task-en.png)
+![Orkas masaüstü uygulaması — görev sohbeti ve teslim edilen çıktılar](./resources/app-ui/task-en.png)
 
 ---
 
-## Takım ne sunar
+## Ekip neler teslim eder
 
-- **Videos, ses-overs ve görüntüler** - VideoStudio, VoiceStudio, ImageStudio
+- **Videolar, seslendirmeler ve görseller** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Araştırma raporları, SEO denetimleri ve pazar analizi** — DeepResearcher, SeoGeoAgent, StockAnalyser
-- **Posts, makaleler, haber ve slayt güverteleri** - ContentWriter, PptMaker
-- **Web siteleri, UI ve kod** - UIDesigner, ProductDeveloper
-- **Word, Excel, PowerPoint ve PDF dosyaları** - OfficeWorker
-- **E-ticaret çalışması** - ürün araştırma, listeler, inceleme analizi, satış analizi ve katalog değişiklikleri, beş e-ticaret ajanlarından
-- **Complex çalışması, birkaç ajan alır** - Commander onu bölmek, her bir parçası doğru ajana bölüyor ve sonuçları birleştirir; örneğin, bir slayt güverte ve bir fırlatma videosu
+- **Gönderiler, makaleler, bültenler ve sunumlar** — ContentWriter, PptMaker
+- **Web siteleri, arayüzler ve kod** — UIDesigner, ProductDeveloper
+- **Word, Excel, PowerPoint ve PDF dosyaları** — OfficeWorker
+- **E-ticaret işleri** — ürün araştırması, ürün listelemeleri, yorum analizi, satış analizi ve katalog değişiklikleri; bunları beş e-ticaret ajanı üstlenir
+- **Birkaç ajan gerektiren karmaşık işler** — Commander işi parçalara ayırır, her parçayı doğru ajana verir ve sonuçları birleştirir; örneğin bir rapora, bir sunuma ve bir lansman videosuna dönüşen bir pazar araştırması
 
-Uygulama ile 16 uzman gemisi, her biri kendi becerileri, hafıza ve araçları ile. [agent pazarında 30+ ajanlara göz atın](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas), ihtiyacınız olan rolü ve Commander sizin için özel bir ajan oluşturuyor.
+Uygulamayla birlikte 16 uzman gelir; her birinin kendi becerileri, belleği ve araçları vardır. [Ajan mağazasında](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas) 30+ ajana göz atın ya da ihtiyacınız olan rolü tarif edin; Commander sizin için özel bir ajan oluşturur.
 
 <details>
-<summary><b> Tüm 16 yerleşik ajanlar</b></summary>XZ
+<summary><b>16 yerleşik ajanın tamamı</b></summary>
 
-| Alan Alanı | Agent Agent | Ne sunar |
+| Alan | Ajan | Ne teslim eder |
 | --- | --- | --- |
-| Araştırma ve analiz | **DeepResearcher** | Doğrulanmış kaynaklarla Kanıtlanmış araştırmalar, bayraklı çelişkiler ve denetim edilebilir bir rapor |
-|  | **SeoGeoAgent** | Bir URL'ye verin - teknik denetim, içerik kalitesi,Core Web VitalsAI-answer(GEO)citability, sıralanan düzeltme listesi |
-|  | **StockAnalyser** | Eşit araştırma, faktör ekranları, arka testler ve portföy riski kontrolleri, izlenebilir panolar ile |
-| İçerik & medya | **ContentWriter** | Publish-ready posts, makaleler, haber ve vaka çalışmaları bir hedef, kaynaklar veya kaba bir taslak |
-|  | **PptMaker** | Editable, yorumlanabilirPPTXBir konudan güverteler, taslak veya belge |
-|  | **ImageStudio** | Posterler, kapaklar, sosyal görüntüler ve infografikler |
-|  | **VideoStudio** | Anlatım,AIAdlar, altyazılar ve seslendirme, klipler, yerelleştirme ve referans-video rekreasyon kendi içerik ve görüntülerle |
-|  | **VoiceStudio** | Anlatım, çok sesli, transkriptler ve alt başlıklar, ses düzenleme ve karıştırma |
-|  | **UIDesigner** | Editable, HTML-first UI from product Goals, PRDs, ekran görüntüleri veya Figma materyali |
-| Build & Office | **ProductDeveloper** | Repo-aware mühendisliği - bir farkındalıkPRD, düzeltme böcekleri, refaksiyon, inceleme, doğrulanabilir sonuçlarla |
-|  | **OfficeWorker** | Oluşturun, düzenleme, kontrol edin ve Word / Excel / PowerPoint /PDFdosyaları, bir seferde veya toplularda |
-| E-ticaret | **ECommerceResearcher** | Bütçe, piyasa ve tedarik limitleri ile ürün seçimi - adaylar, reddedilme nedenleri, geçerlilik planları |
-|  | **ECommerceWriter** | Başlıklar, ayrıntılı sayfalar, FAQs, görüntü kopyaları ve video senaryoları markanızın ses ses sesinde |
-|  | **ECommerceReviewer** | İnceleme ve itibar analizi - müşteri temaları, kötü yorumların kök nedenleri, öncelikler |
-|  | **ECommerceAnalyzer** | Satışlar, kâr, reklamlar, ihracatlarınızdan geri ödeme ve envanter - metrikleri ve kararları uzlaştırma |
-|  | **ECommerceOperator** | Planlar kataloğu, fiyat, promosyon ve envanter değişiklikleri; sadece bağlantınız aracılığıyla yapılır |
+| Araştırma ve analiz | **DeepResearcher** | Doğrulanmış kaynaklar, işaretlenmiş çelişkiler ve denetlenebilir bir raporla kanıta dayalı araştırma |
+| | **SeoGeoAgent** | Bir URL verin — teknik denetim, içerik kalitesi, Core Web Vitals, yapay zekâ yanıtlarında (GEO) alıntılanabilirlik, önceliğe göre sıralanmış düzeltme listesi |
+| | **StockAnalyser** | Hisse senedi araştırması, faktör taramaları, geriye dönük testler ve portföy risk kontrolleri; izlenebilir panolarla |
+| İçerik ve medya | **ContentWriter** | Bir hedeften, kaynaklardan veya kaba bir taslaktan yayına hazır gönderiler, makaleler, bültenler ve vaka çalışmaları |
+| | **PptMaker** | Bir konu, ana hat veya belgeden düzenlenebilir, incelenebilir PPTX sunumlar |
+| | **ImageStudio** | Afişler, kapaklar, sosyal medya görselleri ve infografikler |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Anlatım, yapay zekâ sunucuları (avatarlar), altyazılar ve dublaj, öne çıkan anlardan klipler, yerelleştirme ve kendi içeriğiniz ve görüntülerinizle referans videoyu yeniden oluşturma |
+| | **VoiceStudio** | Anlatım, çok seslendiricili ses kayıtları, transkriptler ve altyazılar, ses düzenleme ve miksaj |
+| | **UIDesigner** | Ürün hedeflerinden, PRD'lerden, ekran görüntülerinden veya Figma materyallerinden düzenlenebilir, HTML tabanlı arayüzler |
+| Geliştirme ve ofis | **ProductDeveloper** | Deponuzu tanıyan mühendislik — PRD'yi hayata geçirme, hata düzeltme, yeniden düzenleme (refactoring), kod inceleme; doğrulanabilir sonuçlarla |
+| | **OfficeWorker** | Word / Excel / PowerPoint / PDF dosyalarını tek tek veya toplu olarak oluşturma, düzenleme, kontrol etme ve teslim etme |
+| E-ticaret | **ECommerceResearcher** | Bütçe, pazar ve tedarik kısıtlarına göre ürün seçimi — aday ürünler, eleme gerekçeleri, doğrulama planları |
+| | **ECommerceWriter** | Marka dilinizle başlıklar, ürün detay sayfaları, SSS, görsel metinleri ve video senaryoları |
+| | **ECommerceReviewer** | Yorum ve itibar analizi — müşterilerin öne çıkardığı konular, olumsuz yorumların kök nedenleri, öncelikler |
+| | **ECommerceAnalyzer** | Dışa aktardığınız verilerle satış, kâr, reklam, iade ve stok analizi — mutabakatı yapılmış metrikler ve kararlar |
+| | **ECommerceOperator** | Katalog, fiyat, promosyon ve stok değişikliklerini planlar; yalnızca bağladığınız araçlar üzerinden uygular |
 
-Her ajandada daha fazla →[orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
+Her ajan hakkında daha fazlası → [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
 
 </details>
 
-### Kendi içerikinizle bir referans videoyu yeniden yarat
+### Referans bir videoyu kendi içeriğinizle yeniden oluşturun
 
-**VideoStudio**, kendi ürün, senaryo ve görüntüleri kullanarak viral bir videonun anlatı yapısını, görsel tarzı ve düzenleme hızını yeniden yaratabilir. Bir referans video dosyası ve varlıklarınızı tedarik edin: ajan kancayı, bilgi siparişini analiz eder ve harekete geçmeyi arar, sonra üretimden önce neyin korunması ve değiştirilmesini önerir.
+**VideoStudio**, viral bir videonun anlatı yapısını, görsel stilini ve kurgu temposunu kendi ürününüz, senaryonuz ve görüntülerinizle yeniden oluşturabilir. Referans video dosyasını ve materyallerinizi verin: ajan, açılıştaki kancayı, bilgi sırasını, görsel ritmi ve harekete geçirici mesajı analiz eder, ardından üretime geçmeden önce neyin korunacağını ve neyin değiştirileceğini önerir.
 
-Bu, hareket-grafik açıklamalar için en iyi çalışır, SaaS veya uygulama demoları ve mevcut görüntülerinizden inşa edilen ürün reklamları. Yerel olarak yazılmış metin, altyazılar, narrasyon ve klipler ayrı olarak revize edilebilir; AI tarafından üretilen görüntülere kopyalanan metin bu görüntüleri değiştirmek gerektirir.
+Bu yöntem en iyi sonucu hareketli grafikli açıklayıcı videolarda, SaaS veya uygulama demolarında ve mevcut görüntülerinizden hazırlanan ürün reklamlarında verir. Yerelde hazırlanan metinler, altyazılar, anlatım ve klipler ayrı ayrı düzenlenebilir; yapay zekâ ile üretilmiş görüntülere gömülü metni değiştirmek için o görüntünün kendisini değiştirmek gerekir.
 
-> "Use reference.mp4 30 saniyelik dikey promo için bir referans olarak. kancasını, tipografiyi ve picing'i tutun, içeriğimi ürün ve ekran kayıtlarımla değiştirin ve ilk önce beni parçalayın."
+> "reference.mp4 dosyasını referans alarak 30 saniyelik dikey bir tanıtım videosu hazırla. Kancasını, tipografisini ve temposunu koru; içeriği kendi ürünüm ve ekran kayıtlarımla değiştir ve önce bana videonun çözümlemesini ve planı göster."
 
-Ajanı bir video dosyasıyla başlayın; sosyal platform payı-link indirmesi yapılmaz. Exact kamera hareket eder, insan performansları ve çerçeve-by-frame eşleştirme garanti edilmez. Görmeye bakın[referans kayıt akışı](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md).
+Ajanın okuyabileceği bir video dosyasıyla başlayın; sosyal medya platformlarındaki paylaşım bağlantılarından video indirme özelliği yerleşik değildir. Kamera hareketlerinin birebir aynısı, oyuncuların performansı ve kare kare eşleşme garanti edilmez. [Referans videoyu yeniden oluşturma iş akışına](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md) bakın.
 
 ---
 
-## İş hareket ettirin
+## İş durmadan ilerlesin
 
-Bir görev iyi bir başlangıçtır. Orkas, devam eden iş için inşa edilmiştir.
+Tek bir görev iyi bir başlangıçtır. Orkas ise süregelen işler için tasarlandı.
 
-- **Projects** - Hedefler ve kurallar, projedeki her konuşmanın sıfırdan kısa sürede başladığınız hafıza ve dosyalar.
-- **To-dos ve Auto-advance** - her proje insanlar ve ajanlar için bir to-do listesine sahiptir; Auto-advance ile birlikte, ekip kendi başına bir sonraki öğeyi alır ve incelemeniz için çalışmayı geri getirir.
-- **Scheduled otomasyonlar** - herhangi bir görev saati, günlük, haftalık veya aylık olarak çalıştırın. Orkas bilgisayarınızın üzerinde çalışır. v1.9'tan itibaren, her otomasyon en son 12 saat içinde bilgisayar uyanır veya Orkas başlar.
-- **Kazımlar** — Gmail, Google Calendar, SheetsveDrive, Notion, Slack, Shopify, StripeVe daha fazlası. Varsayılan olarak,Orkasgöndermeden önce, mesajları veya herhangi bir şeyi sil.
-- **Apps** - bir araç ve Orkas masaüstü uygulamasında yerel bir uygulama olarak inşa eder. Paketli uygulamada, ücretli planlar ayrıca bir kamu bağlantısı ile bir web uygulaması olarak yayınlayabilir.
-- **Shared projeler** *(packaged app)* - bir takım arkadaşı veya VA davet edin ve her bir kişiye veya bir ajana verin.
+- **Projeler** — hedefler ve kurallar, bellek ve dosyalar; projedeki her sohbet bunlarla başlar, böylece hiçbir zaman her şeyi sıfırdan anlatmanız gerekmez.
+- **Yapılacaklar ve Otomatik ilerleme** — her projede insanlar ve ajanlar için bir yapılacaklar listesi vardır; Otomatik ilerleme açıkken ekip sıradaki maddeyi kendiliğinden alır ve tamamlanan işi incelemeniz için size geri getirir.
+- **Zamanlanmış otomasyonlar** — herhangi bir görevi saatlik, günlük, haftalık veya aylık çalıştırın. Orkas bilgisayarınızda çalışır. v1.9'dan itibaren her otomasyon, bilgisayar uyandığında veya Orkas başladığında, son 12 saat içinde kaçırdığı en son çalıştırmayı telafi eder.
+- **Bağlayıcılar** — Gmail, Google Calendar, Sheets ve Drive, Notion, Slack, Shopify, Stripe ve çok daha fazlası. Orkas varsayılan olarak herhangi bir şeyi göndermeden, yayınlamadan veya silmeden önce size sorar.
+- **Uygulamalar** — bir araç tarif edin; Orkas onu masaüstü uygulamasının içinde yerel bir uygulama olarak oluşturur. Paketlenmiş uygulamada, ücretli planlarla bu uygulamayı herkese açık bağlantısı olan bir web uygulaması olarak da yayınlayabilirsiniz.
+- **Paylaşılan projeler** *(paketlenmiş uygulama)* — bir ekip arkadaşınızı veya sanal asistanınızı davet edin ve her yapılacak işi bir kişiye ya da bir ajana atayın.
 
 > [!NOTE]
-> Ortak projeler, bulut senkronizasyonu ve web-app yayıncısı sadece paketlenmiş uygulamadadır - açık kaynak inşa henüz onları desteklemiyor. Onları kullanmak için,**[download indirOrkasÇünkümacOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (Ücretsiz, başlamak için 500 kredi ile).
+> Paylaşılan projeler, bulut senkronizasyonu ve web uygulaması yayınlama yalnızca paketlenmiş uygulamada vardır; açık kaynaklı sürüm bunları henüz desteklemiyor. Bunları kullanmak için **[Orkas'ı macOS ve Windows için indirin](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** (ücretsiz, başlangıç için 500 kredi ile).
 
-Ses girişi de kaynak yapımında çalışır. Configure an**Orkas APIAnahtar Anahtar Anahtar Anahtar**in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in in**Ayarlar**Sonra bir bestecinin yanında mikrofonu tıklayın. Doğduğunda mikrofon erişimine izin verin. Audio gönderilirOrkasTanık ve anahtar sahibinin kullanırOrkaskrediler. Durmak için tekrar tıklayın, metni gözden geçirin ve kendiniz gönderin. Eğer erişim reddedilirse, mikrofonu sistem ayarlarınızda etkinleştirin.
-
----
-
-## Run Run RunClaude Code, Codex, OpenCode, OpenClawveHermes-AgentBirlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte bir araya birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte birlikte
-
-OrkasİşliyorCLIZaten yerel seanslar olarak kurdunuz, kendi uzmanlarının yanında - kodlama ajanları**Claude Code, CodexveOpenCode**, ve kişisel ajanlar**OpenClawveHermes-Agent**.CommanderHer bir bölümü en iyi olduğu ve hepsini bir plan tutar, bu yüzden tek bir sohbet bug'i düzeltebilir, değişikliği gözden geçirebilir ve sürüm notunu draft edebilir. Açık kaynak araçları gibiHyperFramesAynı şekilde yapıştırın.
-
-[Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using Using UsingClaude CodeveCodexBirlikte →](https://orkas.ai/blog/claude-code-codex-together/?source=gh-orkas)
+Sesle yazma, kaynak koddan derlenen sürümde de çalışır. **Ayarlar → Modeller** bölümünde bir **Orkas API Key** yapılandırın, ardından mesaj kutusunun yanındaki mikrofona tıklayın. İstendiğinde mikrofon erişimine izin verin. Ses, tanınması için Orkas'a gönderilir ve anahtar sahibinin Orkas kredilerini kullanır. Durdurmak için yeniden tıklayın, metni gözden geçirin ve kendiniz gönderin. Erişimi reddettiyseniz mikrofonu sistem ayarlarınızdan etkinleştirin.
 
 ---
 
-## Neden Neden Neden Neden Neden?Orkas
+## Claude Code, Codex, OpenCode, OpenClaw ve Hermes-Agent'ı birlikte çalıştırın
 
-- **A Commander bu planları, delegeleri ve geri kalanını yapar** - bu hedefleri kırıyor, doğru ajanları, becerileri, konektörleri ve araçları seçin ve analizleri ele alıyor, yazma, araştırma ve dosya kendisi de uzman olmadığı zaman çalışır.
-- **Local-first by design** - konuşmalar, dosyalar, bilgi üsleri ve özel ajanlar diskinizde varsayılan olarak kalır. Bulut senkronizasyonu paketlenmiş uygulamada isteğe bağlıdır. Kendi anahtarlarınızla, model aramalar doğrudan makinenizden sağlayıcıya gider; yerleşik Orkas modeli Orkas'in yönetilen model servisi aracılığıyla çalışır.
-- ** Herhangi bir model, herhangi bir zaman değiştirir: ** - Commander ve yerleşik ajanlar bir model oluşturuyor: yerleşik Orkas modeli, kendi sağlayıcınız veya yerel bir son noktanız. Dış CLI ajanlar kendi model ayarlarını tutar.
-- **Agents that get better** - Her ajan özel beceriler ve hafıza tutar. Plan incelemeleri, uygulama boş olduğunda yeni aktiviteyi inceler ve kendini değerlendirme, yeniden uygulanabilir yöntemler ve öğrenilen becerileri geliştirebilir.
-- **Open kaynağı, kara kutu** - MIT lisanslı. Orkas ve her ajan ve becerinin ne yaptığını tam olarak okuyun.
+Orkas, bilgisayarınızda zaten kurulu olan CLI ajanlarını kendi uzmanlarının yanında yerel oturumlar olarak çalıştırır: kodlama ajanları **Claude Code, Codex ve OpenCode** ile kişisel ajanlar **OpenClaw ve Hermes-Agent**. Commander her birine en iyi yaptığı kısmı verir ve hepsi için tek bir plan yürütür; böylece tek bir sohbette hatayı düzeltebilir, değişikliği gözden geçirebilir ve sürüm notunun taslağını hazırlayabilirsiniz. HyperFrames gibi açık kaynaklı araçlar da aynı şekilde bağlanır.
 
-> ⭐ Orkas sizin için yararlıysa, bir yıldız daha fazla insanın projeyi bulmasına yardımcı olur.
+[Claude Code ve Codex'i birlikte kullanmak →](https://orkas.ai/blog/claude-code-codex-together/?source=gh-orkas)
 
 ---
 
-<a id="download"></a>
-## Download Download Download Download Download
+## Neden Orkas
 
-|  | Paketli uygulama(önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen önerilen) | Kaynak: Run from source |
+- **Planlayan, görev dağıtan ve geri kalanını kendisi yapan bir Commander** — hedefleri parçalara ayırır; doğru ajanları, becerileri, bağlayıcıları ve araçları seçer; daha uygun bir uzman yoksa analiz, yazım, araştırma ve dosya işlerini kendisi üstlenir.
+- **Tasarımı gereği yerel öncelikli** — sohbetler, dosyalar, bilgi tabanları ve özel ajanlar varsayılan olarak diskinizde kalır. Bulut senkronizasyonu paketlenmiş uygulamada isteğe bağlıdır. Kendi anahtarlarınızla model çağrıları doğrudan bilgisayarınızdan sağlayıcıya gider; yerleşik Orkas modeli ise Orkas'ın yönetilen model hizmeti üzerinden çalışır.
+- **Modeli istediğiniz zaman değiştirebilirsiniz** — Commander ve yerleşik ajanlar tek bir model ayarını paylaşır: yerleşik Orkas modeli, kendi sağlayıcınız veya yerel bir uç nokta. Harici CLI ajanları kendi model ayarlarını korur.
+- **Gelişen ajanlar** — her ajanın kendine özel becerileri ve belleği vardır. Arka planda çalışan değerlendirmeler, uygulama boştayken yeni etkinliği inceler ve öz değerlendirmeyi, yeniden kullanılabilir yöntemleri ve öğrenilmiş becerileri iyileştirebilir.
+- **Açık kaynak, kara kutu yok** — MIT lisanslıdır. Orkas'ın ve her ajanla her becerinin tam olarak ne yaptığını okuyabilirsiniz.
+
+> ⭐ Orkas işinize yarıyorsa, vereceğiniz bir yıldız projenin daha fazla kişi tarafından bulunmasına yardımcı olur.
+
+---
+
+## İndir
+
+| | Paketlenmiş uygulama (önerilen) | Kaynak koddan çalıştırma |
 | --- | --- | --- |
-| Platformlar | macOS 12+ (Apple Silikon & Intel), Windows 10+ | macOS, Windows, glibc 2.34+Linuxx64/arm64 |
-| Hesap Hesabı | Sign in - 500 ücretsiz kredi | Hiçbir şey yok |
-| Model modelleri | İnşa Edilmiş -inOrkasModel veya kendi anahtarlarınız | Kendi anahtarlarınız veya yerel bir uç noktası |
-| Ayrıca da içerir | Proje işbirliği, uygulama yayını, bulut senkronizasyonu ve daha fazlası | — |
-| Get it | **[Download Download Download Download DownloadOrkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [Hızlı başlangıç](#quick-start) |
+| Platformlar | macOS 12+ (Apple Silicon ve Intel), Windows 10+ | macOS, Windows, glibc 2.34+ Linux x64/arm64 |
+| Hesap | Oturum açmak gerekir — 500 ücretsiz kredi | Gerekmez |
+| Modeller | Yerleşik Orkas modeli veya kendi anahtarlarınız | Kendi anahtarlarınız veya yerel bir uç nokta |
+| Ayrıca içerir | Proje iş birliği, uygulama yayınlama, bulut senkronizasyonu ve daha fazlası | — |
+| Edinin | **[Orkas'ı indirin](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [Hızlı başlangıç](#hızlı-başlangıç) |
 
-İndirme linki sisteminizi algılar ve doğru taksit başlar.
-
----
-
-## Hangi insanlar onu kullanıyor
-
-- **Pazarlama içeriği**Videoları, ürün sayfaları, mesajları ve haberlerinizi sesinizde başlatın.[İçerik yazmak](https://orkas.ai/use/content-writing/?source=gh-orkas) · [Videolar](https://orkas.ai/use/make-videos/?source=gh-orkas)
-- ** Mağaza operasyonları** - haftalık satış kısaları, yorum yanıtları, listeleri ve rakip kontrolleri. [E-ticaret](https://orkas.ai/use/ecommerce/?source=gh-orkas)XZ
-- **Araştırma ve raporlar**- kaynaklanmış raporlar ve güverteler, talep veya her hafta.[Araştırma Araştırma Araştırma Araştırma](https://orkas.ai/use/researchers/?source=gh-orkas) · [Data analysis](https://orkas.ai/use/data-analysis/?source=gh-orkas)
-- **Chat with your documents** - kendi dosyalarınızda yer alan cevaplar, kaynak pasajlarına geri yükler. [Chat with documents](https://orkas.ai/use/chat-with-documents/?source=gh-orkas)XZ
-- **Müşteri Çalışması**- kısa toplantı, aylık müşteri şablonlarınızda rapor ve güncelleme güverteleri.[Aylık müşteri raporu şablon](https://orkas.ai/blog/monthly-client-report-template/?source=gh-orkas)
-- **Ürün lansmanı** - iniş sayfaları, testlerle tamirler, değişimlogları ve mesajları başlatmak. [Developers](https://orkas.ai/use/developers/?source=gh-orkas)XZ
-- ** Bir uygulama** - alıntılar, rezervasyon formları, iç araçlar. [Build apps](https://orkas.ai/use/build-apps/?source=gh-orkas)XZ
-- **Küçük takımlar** - insanlar ve ajanlar için bir proje. [Küçük Takımlar](https://orkas.ai/use/small-teams/?source=gh-orkas)XZ
+İndirme bağlantısı sisteminizi algılar ve doğru yükleyicinin indirilmesini başlatır.
 
 ---
 
-## Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl NasılOrkasKarşılaştırmalar
+## İnsanlar ne için kullanıyor
 
-| Tool Tool Tool | Nedir? | Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl Nasıl NasılOrkasFarklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı farklı |
+- **Pazarlama içeriği** — sizin üslubunuzla lansman videoları, ürün sayfaları, gönderiler ve bültenler. [İçerik yazımı](https://orkas.ai/use/content-writing/?source=gh-orkas) · [Videolar](https://orkas.ai/use/make-videos/?source=gh-orkas)
+- **Mağaza operasyonları** — haftalık satış özetleri, yorum yanıtları, ürün listelemeleri ve rakip kontrolleri. [E-ticaret](https://orkas.ai/use/ecommerce/?source=gh-orkas)
+- **Araştırma ve raporlar** — kaynak gösteren raporlar ve sunumlar, istendiğinde ya da her hafta. [Araştırma](https://orkas.ai/use/researchers/?source=gh-orkas) · [Veri analizi](https://orkas.ai/use/data-analysis/?source=gh-orkas)
+- **Belgelerinizle sohbet** — kendi dosyalarınıza dayanan ve kaynak pasajlara atıf yapan yanıtlar. [Belgelerle sohbet](https://orkas.ai/use/chat-with-documents/?source=gh-orkas)
+- **Müşteri işleri** — toplantı özetleri, aylık müşteri raporları ve kendi şablonunuzla hazırlanan durum güncelleme sunumları. [Aylık müşteri raporu şablonu](https://orkas.ai/blog/monthly-client-report-template/?source=gh-orkas)
+- **Ürün lansmanı** — açılış sayfaları, testli hata düzeltmeleri, değişiklik günlükleri ve lansman gönderileri. [Geliştiriciler](https://orkas.ai/use/developers/?source=gh-orkas)
+- **Uygulama oluşturun** — fiyat teklifi hesaplayıcıları, rezervasyon formları, şirket içi araçlar. [Uygulama oluşturma](https://orkas.ai/use/build-apps/?source=gh-orkas)
+- **Küçük ekipler** — insanlar ve ajanlar için tek bir proje. [Küçük ekipler](https://orkas.ai/use/small-teams/?source=gh-orkas)
+
+---
+
+## Orkas'ın diğer araçlardan farkı
+
+| Araç | Nedir | Orkas'ın farkı |
 | --- | --- | --- |
-| **Claude Code** | Anthropic's agentic kodlama aracı - terminalde, IDE, masaüstü ve web'de, üzerine inşa edilmiştirClaudemodeller. | Ya da:Orkasrun run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run runClaude Codeajanlarından biri olarak. Etrafında,OrkasKod dışındaki çalışma için bir model-agnostic ekibi ekliyor - araştırma, içerik, video ve daha fazlası - projelerle, hareket eden oyuncak ve otomasyonlarla.[Orkasvs vsClaude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
-| **Codex** | OpenAI's kodlama ajanı - terminalde, editörünüz ve bulut. | Ya da:Orkasrun run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run run runCodexajanlarından biri olarak, bir sonrakiClaude CodeveOpenCode.Commanderkodlamayı kodlamayı elleştirebilirCodexVe başka bir ajana yapılan inceleme, o zaman bir serbest bırakmanın yarısını kaplayın - docs, fırlatma mesajları ve videoları.[Orkasvs vsCodex →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
-| **ClaudeCowork** | Anthropic“Günlük iş için ajan, şimdi bir parçasıClaude- masaüstü, web ve mobil bir ücretli ileClaudePlan. İçinde çalışırAnthropic'In cloud by default and usesClaudemodeller. | Bir açık kaynak(MIT)Alternatife alternatifClaudeBaşlamak için özgür olan iş, 500 kredi ile.OrkasAjanslarınızı bilgisayarınızın üzerinde çalıştırın ve verinizi varsayılan olarak tutar, yerleşik ileOrkasModel, kendi sağlayıcı anahtarlarınız veya yerel bir uç noktası. The The The The The The The TheCommanderAyrıca içeri getirebilirClaude Code, CodexVe diğer veCLIajanlar. Ticaret:OrkasBilgisayarınızın uyanık olması gerekirken, Cowork'in bulut görevleri olmadan devam edebilir.[ClaudeCowork alternatifler →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
-| **Manus** | An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An An AnAIAjan bu planları planlar ve görevleri yürütmekManus“Demir tarafından bulut. The The The The The The The TheManus Studiomasaüstü uygulaması(macOSveWindows)Ayrıca seçtiğiniz bir klasörde çalışabilir, görevler hala bulutta planlanır. | Bir açık kaynak(MIT)Alternatife alternatifManus. OrkasAjanslarınızı bilgisayarınızın üzerinde çalıştırın ve verinizi varsayılan olarak tutar, yerleşik ileOrkasModel, kendi sağlayıcı anahtarlarınız veya yerel bir uç noktası. Projeler, to-dos ve otomasyonlar iş hareket ettiriyor. Ticaret:OrkasBilgisayarınızın uyanık olması gerekir, oysaManusBulut görevleri olmadan koşmaya devam edebilir.[Open-sourceManusAlternatif](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
-| **LangChain** | Bina için geliştirici çerçevesi/libraryLLMuygulamalar ve ajanlar - kod-ilk, kendi içinde gömülüPython/JS uygulaması. | OrkasSohbet yoluyla doğrudan yaptığınız bir masaüstü uygulaması, orkestration kodu yazarak değil. Veriler varsayılan olarak yerel kalır. |
-| **CrewAI** | A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A A APythonRol oynayan bağımsız ajanlar için çerçeve - mürettebatları ve ajanları kodda tanımlarsınız. | OrkasBir masaüstü uygulamasında, projeler, to-dostlar, otomasyonlar ve per-agent self-improvement içinde inşa edilmiştir. |
-| **OpenClaw** | mesajlaşma entegrasyonları, multi-agent routing ve sub-agents ile kişisel bir platform. | OrkasBitilebilirler için bir masaüstü iş alanı sağlar, yerleşik uzmanlar ve koordinasyon ile birlikteClaude Code, Codex, OpenCodeVe diğer veCLIajanlar.OpenClawBu iş akışına bir şekilde katılabilirCLIAjan. |
-| **Hermes-Agent** | Nous Research'in kendini geliştirme ajanı – hafıza ve becerileri olan bir ajan, mevcutCLI, bir mesajlaşma ağ geçidi ve bir masaüstü uygulaması. | OrkasBir takım koordinatörleri:CommanderBirçok uzman ve diğerCLIajanlar veHermes-AgentOnlardan biri olarak yapıştırın. |
+| **Claude Code** | Anthropic'in ajan tabanlı kodlama aracı; terminalde, IDE'de, masaüstünde ve web'de çalışır, Claude modelleri üzerine kuruludur. | Birini seçmek zorunda değilsiniz: Orkas, Claude Code'u ajanlarından biri olarak çalıştırır. Orkas bunun etrafına, kodun ötesindeki işler (araştırma, içerik, video ve daha fazlası) için modelden bağımsız bir ekip ekler; işin ilerlemesini sağlayan projeler, yapılacaklar ve otomasyonlarla birlikte. [Orkas ile Claude Code karşılaştırması →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
+| **Codex** | OpenAI'ın kodlama ajanı; terminalde, düzenleyicinizde ve bulutta çalışır. | Birini seçmek zorunda değilsiniz: Orkas, Codex'i Claude Code ve OpenCode'un yanında ajanlarından biri olarak çalıştırır. Commander kodlamayı Codex'e, incelemeyi başka bir ajana verebilir, ardından sürümün kod dışı yarısını (dokümantasyon, lansman gönderileri ve videolar) üstlenebilir. [Orkas ile Codex karşılaştırması →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
+| **Claude Cowork** | Anthropic'in günlük işler için geliştirdiği ajan, artık Claude'un bir parçası; ücretli bir Claude planıyla masaüstünde, web'de ve mobilde kullanılabilir. Varsayılan olarak Anthropic'in bulutunda çalışır ve Claude modellerini kullanır. | Claude Cowork için açık kaynaklı (MIT) bir alternatif; 500 krediyle ücretsiz başlayabilirsiniz. Orkas ajanlarını bilgisayarınızda çalıştırır ve verilerinizi varsayılan olarak yerelde tutar; yerleşik Orkas modeli, kendi sağlayıcı anahtarlarınız veya yerel bir uç nokta ile. Commander ayrıca Claude Code, Codex ve diğer CLI ajanlarını da devreye alabilir. Dezavantajı: Orkas için bilgisayarınızın uyanık olması gerekir; Cowork'ün bulut görevleri ise bilgisayar olmadan da çalışmaya devam edebilir. [Claude Cowork alternatifleri →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
+| **Manus** | Görevleri varsayılan olarak Manus'un bulutunda planlayan ve yürüten bir yapay zekâ ajanı. Manus Studio masaüstü uygulaması (macOS ve Windows) seçtiğiniz bir klasörde de çalışabilir, ancak görevler yine bulutta planlanır. | Manus için açık kaynaklı (MIT) bir alternatif. Orkas ajanlarını bilgisayarınızda çalıştırır ve verilerinizi varsayılan olarak yerelde tutar; yerleşik Orkas modeli, kendi sağlayıcı anahtarlarınız veya yerel bir uç nokta ile. Projeler, yapılacaklar ve otomasyonlar işin ilerlemesini sağlar. Dezavantajı: Orkas için bilgisayarınızın uyanık olması gerekir; Manus'un bulut görevleri ise bilgisayar olmadan da çalışmaya devam edebilir. [Açık kaynaklı Manus alternatifi →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
+| **LangChain** | LLM uygulamaları ve ajanlar oluşturmak için geliştiricilere yönelik bir framework/kütüphane; kod odaklıdır ve kendi Python/JS uygulamanıza gömülür. | Orkas, orkestrasyon kodu yazarak değil, sohbet yoluyla yönettiğiniz bir masaüstü uygulamasıdır. Veriler varsayılan olarak yerelde kalır. |
+| **CrewAI** | Rol üstlenen otonom ajanları orkestre etmek için bir Python framework'ü; ekipleri ve ajanları kodda tanımlarsınız. | Orkas, çok ajanlı orkestrasyonu bir masaüstü uygulamasına taşır; projeler, yapılacaklar, otomasyonlar ve her ajanın kendini geliştirmesi yerleşik olarak gelir. |
+| **OpenClaw** | Mesajlaşma entegrasyonları, çok ajanlı yönlendirme ve alt ajanlar sunan bir kişisel ajan platformu. | Orkas, tamamlanmış çıktılar için bir masaüstü çalışma alanı sunar; yerleşik uzmanlar içerir ve Claude Code, Codex, OpenCode ile diğer CLI ajanları arasında koordinasyon sağlar. OpenClaw bu iş akışına bir CLI ajanı olarak katılabilir. |
+| **Hermes-Agent** | Nous Research'ün kendini geliştiren ajanı; bellek ve becerilere sahip tek bir ajandır ve CLI, mesajlaşma ağ geçidi ve masaüstü uygulaması olarak kullanılabilir. | Orkas bir ekibi koordine eder: Commander birçok uzmanı ve diğer CLI ajanlarını yönetir, Hermes-Agent de bunlardan biri olarak sisteme katılır. |
 
-**Orkas sizin içindir, eğer** bir asistan yerine bir takım ajanlar istiyorsunuz, günler boyunca hareket eden iş ve verileriniz, anahtarlar ve ajanlar kendi diskinizde.
+**Şunları istiyorsanız Orkas tam size göre:** tek bir asistan yerine bir ajan ekibi, günler boyunca ilerlemeye devam eden işler ve kendi diskinizde duran verileriniz, anahtarlarınız ve ajanlarınız.
 
-** için değil, eğer** için sadece tek bir tüm amaçlı sohbetbot veya kendi uygulamanıza sahip olmak için saf bir kod kütüphanesi istiyorsunuz.
+**Tek istediğiniz şunlardan biriyse size göre değil:** çok amaçlı tek bir sohbet botu ya da kendi uygulamanıza gömeceğiniz saf bir kod kütüphanesi.
 
-**kodlama ajanları arasında seçim yapın?** [Codexvs vsOpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Codevs vsCodexvs vsOpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude CodeAlternatif alternatifler alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif alternatifler alternatif](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
+**Kodlama ajanları arasında seçim mi yapıyorsunuz?** [Codex mi, OpenCode mu?](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code mu, Codex mi, OpenCode mu?](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code alternatifleri](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**Full side-by-side Karşılaştırmalar →** [vs vsClaude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [vs vsCodex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs vsCline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs vsLangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs vsChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [vs vsOpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [vs vsHermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**Yan yana ayrıntılı karşılaştırmalar →** [Claude Code ile](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [Codex ile](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [Cline ile](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [LangChain ile](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [ChatGPT ile](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [OpenClaw ile](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [Hermes-Agent ile](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
 
 ---
 
-<a id="quick-start"></a>
 ## Hızlı başlangıç
 
-Bunun yerine paketlenmiş bir taksit ister misiniz? [Download](#download) yukarıda. Kaynaktan kaçmak için - şu anda Orkas'i Linux'te çalıştırmanın yolu:
+Bunun yerine paketlenmiş bir yükleyici mi istiyorsunuz? Yukarıdaki [İndir](#i̇ndir) bölümüne bakın. Kaynak koddan çalıştırmak için (Orkas'ı Linux'ta çalıştırmanın şu anki yolu budur):
 
-**Gereksinimler Gereksinimler**: Node 22.12+ · macOS / Windows10+ / glibc 2.34+Linuxx64 veya kol64. Keep Keep Keep KeepPython3 ve C/C++ nadir yerli-module kaynak-build geri çekilme için mevcut bir araç zinciri inşa ediyor.
+**Gereksinimler**: Node 22.12+ · macOS / Windows 10+ / glibc 2.34+ Linux x64 veya arm64. Platforma özgü bir modülün kaynaktan derlenmesi gereken nadir durumlar için Python 3 ve bir C/C++ derleme araç zincirini hazır bulundurun.
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -179,105 +177,105 @@ cd Orkas
 run.cmd            # Windows
 ```
 
-Linux kaynağı çalışır glibc 2.34+ gerektirir. Alp ve diğer musl bazlı dağıtımlar desteklenmez. Yerel konuşma transkripto indirmek ve hedef-native whisper.cpp ilk kaynak lansmanı sırasında zaman ve dilsel model.
+Linux'ta kaynaktan çalıştırmak için glibc 2.34+ gerekir. Alpine ve musl tabanlı diğer dağıtımlar desteklenmez. Yerel konuşma transkripsiyonu, kaynaktan ilk başlatma sırasında hedef platforma özgü whisper.cpp çalışma zamanını ve çok dilli modeli indirip doğrular.
 
-`run.sh` / `run.cmd`Kilitli npm bağımlılık ağacı yüklemek ve pined hazırlamakPython, uv,Node, gömülme modeli(~95 MB), OfficeCLI, FFmpeg, whisper.cpp, ve ilk başlangıçta çok dilli konuşma modeli kaynakları.LinuxDaha sonra platformun-natif modüllerini ve Whisper runtime'u genişletinElectronUygulamayı açmadan önce ABI. OCR ve Skill-specificPythonpaketler, bu özelliklerin ilk kullanıldığı zaman izole yerel ortamlara yüklenir. İlk başlangıç, bir iş alanı altında yaratır`~/.orkas/` (macOS / Linux)veya`<smallest non-system drive>:\.orkas\` (Windows)Sonra açık.**AyarlarAISağlayıcılar**eklemek içinAPIanahtar veya anahtarOAuth.
+`run.sh` / `run.cmd`, ilk başlatmada kilitli npm bağımlılık ağacını kurar; sabitlenmiş Python, uv, Node, embedding modeli (~95 MB), OfficeCLI, FFmpeg, whisper.cpp ve çok dilli konuşma modeli kaynaklarını hazırlar. Ardından Linux'ta başlangıçta, uygulama açılmadan önce platforma özgü modüller ve Whisper çalışma zamanı Electron'un ABI'si altında doğrulanır. OCR ve belirli becerilere özgü Python paketleri, bu özellikler ilk kez kullanıldığında yalıtılmış yerel ortamlara kurulur. İlk başlatma, `~/.orkas/` (macOS / Linux) veya `<smallest non-system drive>:\.orkas\` (Windows) altında bir çalışma alanı oluşturur. Ardından bir API anahtarı veya OAuth eklemek için **Ayarlar → Yapay zekâ sağlayıcıları** bölümünü açın.
 
-Yerli bağımlılık hataları: kullanımıNode.js 24 LTS(minimum 22.12.0)Sonra koş
-`npm run native:repair` bu çekten. Bu restoreler opsiyonel paketler,
-onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarım onarımSQLiteÇünküElectron, paketler hazırlarNodeizole görüntü işleme için,
-ve başarıdan önce SQL, sqlite-vec ve keskin kontrol edin.
-`npm run native:check`'i yüklemeden kontrol için kullanın.
-[native bağımlılık doğrulama senaryosu](./scripts/verify-native-dependencies.cjs)'i yapılan çekler için arayın.
+Platforma özgü bağımlılık hatalarında: Node.js 24 LTS kullanın (en az 22.12.0), ardından
+bu çalışma kopyasında `npm run native:repair` komutunu çalıştırın. Bu komut isteğe bağlı paketleri geri yükler,
+SQLite'ı Electron için onarır, yalıtılmış görüntü işleme için uygulamayla gelen Node'u hazırlar
+ve başarılı olduğunu bildirmeden önce SQL, sqlite-vec ve sharp'ı kontrol eder.
+Kurulum yapmadan yalnızca kontrol için `npm run native:check` kullanın.
+Yapılan kontroller için [platforma özgü bağımlılık doğrulama betiğine](./scripts/verify-native-dependencies.cjs) bakın.
 
 ---
 
 ## Nasıl çalışır
 
-### Görevi
+### Görev yönlendirme
 
-Commander, genel olarak kendisini ve delege uzman çalışmalarını üç araçla idare eder:
+Commander genel işleri kendisi yürütür, uzmanlık gerektiren işleri ise üç araçla devreder:
 
-- **`dispatch_to`** bir isim ajanı çalıştırıyor ve devam eden iş için sonucu geri dönüyor. Sonuç için bekleyebilir veya bir şekilde çalıştırılabilir ve görevi bitirdiğinde Commander'i bilgilendirebilir.
-- **`hand_off_to`**, mevcut Commander dönüşüne son verdi. Ajan kendi cevaplarını sunar; opsiyonel bir devam Commander daha sonra daha geniş bir görev başlatacaktır.
-- **`run_worker`** anonim, izole sub-task çalışır ve özel bir sonuç döndürür. Konuşma tarihi veya bir isim ajanın becerileri almaz.
+- **`dispatch_to`** adı belirtilen bir ajanı çalıştırır ve işe devam etmek için sonucunu döndürür. Sonucu bekleyebilir ya da eşzamansız çalışıp görev bittiğinde Commander'a bildirim gönderebilir.
+- **`hand_off_to`** kalan işi adı belirtilen bir ajana devreder ve Commander'ın mevcut turunu sonlandırır. Yanıtı ajanın kendisi verir; isteğe bağlı bir devam adımı, Commander'ın daha sonra daha geniş bir göreve geri dönmesini sağlar.
+- **`run_worker`** anonim, yalıtılmış bir alt görev çalıştırır ve yalnızca kendisine özel bir sonuç döndürür. Bu alt görev, sohbet geçmişini veya adı belirtilen bir ajanın becerilerini almaz.
 
-Adlı ajan görevleri ve anonim işçiler ayrı tebrik kontrolleri vardır. Görmeye bakın[İşlem](./src/main/features/group_chat/bus.ts)ve[infaz kilitleri](./src/main/util/locks.ts).
+Adı belirtilen ajan görevlerinin ve anonim çalışanların ayrı eşzamanlılık denetimleri vardır. [Görev dağıtımının koduna](./src/main/features/group_chat/bus.ts) ve [yürütme kilitlerine](./src/main/util/locks.ts) bakın.
 
-### Context management
+### Bağlam yönetimi
 
-Seçilen modelin kullanılabilir giriş kapasitesine karşı runtime bütçeleri bağlamı, hızlı, araçlar ve kalıcı runtime eyalet için muhasebe. Tamamlanmış diyalog, son tarih dışı pencereyi kullanır; uzun aktif görevler, son işi korurken daha önceki süreç mesajları için kontrol noktaları kullanır. Dosya okur, dosya değişiklikleri ve komut infazları da bağlamı kompaktlaştırabilecek yapısal kayıtlara sahiptir.
+Çalışma zamanı; istemleri, araçları ve kalıcı çalışma zamanı durumunu hesaba katarak bağlam bütçesini seçilen modelin kullanılabilir girdi kapasitesine göre belirler. Tamamlanmış diyaloglarda sınırlı bir yakın geçmiş penceresi kullanılır; uzun süren etkin görevlerde ise kontrol noktaları, son çalışmaları korurken önceki süreç mesajlarını özetler. Dosya okumaları, dosya değişiklikleri ve komut çalıştırmaları için ayrıca bağlam sıkıştırmasından sonra da korunabilen yapılandırılmış kayıtlar tutulur.
 
-See See See See See[bağlam bütçeleri](./src/core-agent/src/agent/context-budget.ts), [Oturum tarihi ve kontrol noktaları](./src/core-agent/src/agent/session.ts)ve[workspace Records](./src/core-agent/src/agent/workspace-state.ts).
+[Bağlam bütçelerine](./src/core-agent/src/agent/context-budget.ts), [oturum geçmişi ve kontrol noktalarına](./src/core-agent/src/agent/session.ts) ve [çalışma alanı kayıtlarına](./src/core-agent/src/agent/workspace-state.ts) bakın.
 
-### Hafıza ve Kütüphane
+### Bellek ve Kütüphane
 
-Dayanıklı notlar kullanıcı tercihlerini, proje gerçeklerini ve her ajanın ayrı alanlarda yeniden uygulanabilir bilgilerini tutar. Bu notlar Kütüphane'nin belge indeksinden ve depolanan konuşma tarihinden farklıdır.
+Kalıcı notlar; kullanıcı tercihlerini, proje bilgilerini ve her ajanın yeniden kullanılabilir bilgisini ayrı kapsamlarda tutar. Bu notlar, Kütüphane'nin belge dizininden ve saklanan sohbet geçmişinden ayrıdır.
 
-Kütüphane, yerel bir SQLite vektör indeksine geçiş yapar. Bitkisel model makinenizde çalışır; `library` aracı dosyaları listeleyebilir, ilgili pasajlar arayabilir ve kaynak içeriğini küresel veya mevcut proje kütüphanesinden okuyabilirsiniz. Daha önceki konuşmalar `chat_history` aracılığıyla ayrı olarak alınır.
+Kütüphane, belgeleri pasajlara ayırır ve yerel bir SQLite vektör dizini saklar. Embedding modeli bilgisayarınızda çalışır; `library` aracı genel Kütüphane'de veya geçerli projeye ait Kütüphane'de dosyaları listeleyebilir, ilgili pasajları arayabilir ve kaynak içeriği okuyabilir. Önceki sohbetler ise ayrı olarak `chat_history` üzerinden getirilir.
 
-See See See See See[Şekillenmiş hafıza](./src/main/features/memory.ts), [Ekstraksiyon](./src/main/util/file_to_chunks.ts), [Kütüphane araçları](./src/main/model/core-agent/kb-tools.ts)ve[Konuşma tekrartrieval](./src/main/model/core-agent/chat-history-tools.ts).
+[Kapsamlara ayrılmış belleğe](./src/main/features/memory.ts), [belge ayrıştırmaya](./src/main/util/file_to_chunks.ts), [Kütüphane araçlarına](./src/main/model/core-agent/kb-tools.ts) ve [sohbet geçmişinden getirmeye](./src/main/model/core-agent/chat-history-tools.ts) bakın.
 
-### Execution limitleri ve kurtarma
+### Yürütme sınırları ve kurtarma
 
-Oturum kilitleri ve tutarlılık sınırları paralel çalışmadır. Tool-round bütçeleri, ilerleme kontrolleri, tekrarlanan çekler ve faz-aware idle watchdogs yardım bu tezgahları veya tekrarlanan çalışmayı kapsar. Adlı ajan görevleri takip edilebilir ve bireysel olarak iptal edilebilir; kabul edilen veya kuyruklı bir görev tamamlanmamış bir sonuç olarak tedavi edilmez.
+Oturum kilitleri ve eşzamanlılık sınırları paralel işlere sınır koyar. Araç turu bütçeleri, ilerleme kontrol noktaları, tekrarlanan çağrı denetimleri ve aşamayı dikkate alan boşta kalma bekçileri, takılan veya işi tekrarlayan çalıştırmaları kontrol altında tutmaya yardımcı olur. Adı belirtilen ajan görevleri tek tek izlenebilir ve iptal edilebilir; kabul edilmiş veya kuyruğa alınmış bir görev, tamamlanmış bir sonuç olarak değerlendirilmez.
 
-See See See See See[aktör bütçeleri](./src/main/features/group_chat/actor-budgets.ts),[Ajan runtime](./src/core-agent/src/agent/runner.ts)ve[masaüstü model adaptörü](./src/main/model/core-agent/client.ts).
+[Aktör bütçelerine](./src/main/features/group_chat/actor-budgets.ts), [ajan çalışma zamanına](./src/core-agent/src/agent/runner.ts) ve [masaüstü model bağdaştırıcısına](./src/main/model/core-agent/client.ts) bakın.
 
-### aktiviteden öğrenmek
+### Etkinlikten öğrenme
 
-Arka plan incelemeleri, uygulama boş olduğunda yeni ajan aktivitesini inceler, soğuk ve yürütme sınırlarına tabi. Bir inceleme, bir ajanın kendi değerlendirmelerini güncelleyebilir(`COMPETENCE.md`), reusable methods(`LEARNING_STRATEGIES.md`)veya öğrenilen beceriler. Yorumlar, görev sayımı yerine yeni aktiviteye bağlıdır ve tasarrufa değer bir şey olmadığını sonucuna varabilir.
+Arka plan değerlendirmeleri, bekleme süreleri ve yürütme sınırları çerçevesinde, uygulama boştayken yeni ajan etkinliğini inceler. Bir değerlendirme, ajanın öz değerlendirmesini (`COMPETENCE.md`), yeniden kullanılabilir yöntemlerini (`LEARNING_STRATEGIES.md`) veya öğrenilmiş becerilerini güncelleyebilir. Değerlendirmeler görev sayısına değil yeni etkinliğe bağlıdır ve kaydetmeye değer bir şey olmadığı sonucuna da varabilir.
 
-Görmeye bakın[yansıma zamanlamar](./src/main/features/reflection-orchestrator.ts)ve[İnceleme Hızlı](./src/core-agent/src/evolution/metacognition.ts).
-
----
-
-## SSS SSS
-
-** What is Orkas?**
-OrkasBir açık kaynaktır(MIT), yerel-ilk multi-agent masaüstü uygulaması. OnunCommanderAmacınızı to-dostlara dönüştürür ve 16 yerleşik uzman ajanlarını koordine eder - artıClaude Code, Codex, OpenCode, OpenClawveHermes-Agent- bitmiş dosyaları sunmak için. Tek bir chatbot değil, bir kod çerçevesi değil, barındırılan bir ev değilSaaS.
-
-** Bir API anahtarına ihtiyacım var mı? **
-Hayır. Paketli uygulama, yerleşik Orkas modeli için 500 kredi ile geliyor. Bundan sonra kredi satın alın, ücretli bir plan seçin veya kendi sağlayıcı anahtarlarınızı ekleyin; sağlayıcı suçlamaları ayrıdır.
-
-**Is Orkas yerel bir LLM?**
-Hayır. Orkas makinenizde çalışır ve seçtiğiniz modelleri çağırır - yerleşik Orkas modeli, kendi API anahtarlarınızı veya yerel bir model uç noktası. Bu orkestralar ajanlar ve araçlar; kendi bir model değildir.
-
-** Can Orkas belgelerimden sorular cevaplayabilir, alıntılarla? **
-Evet. PDF'leri ve belgelerinizi yerel kütüphanenize ekleyin; Orkas onları arayarak ve kaynak pasajlarına atıflarla cevap verebilir, böylece orijinal ve kontrol edebilirsiniz. indeks makinenizde inşa edilmiştir.
-
-** Can Ollama veya LM Studio?**
-Evet. Open **Account ayarları → Modeller → Chat → Model ekleyin → Özel**, **OpenAI-compatible** veya **Anthth-compatible** ve temel URL'ye girin, tam model ID ve API anahtar. Görevin model kontrolünden kurtarılan modeli seçin.
-
-** API anahtarları ve verileri nerede depolanır? **
-Diskinizde varsayılan olarak. Kendi sağlayıcı anahtarlarınız yerel olarak şifrelenir ve bulut senkronizasyonundan dışlanır. Kendi anahtarlarınızla, model aramaları doğrudan makinenizden sağlayıcıya gider; yerleşik-inOrkasModel kullanımı kullanırOrkas“ yönetilen hizmet. Seçmeli bulut senkronizasyonu ve paketlenmiş uygulama mağazasındaki projeler, seçilen verileriOrkassunucular.[Güvenlik ve veriler →](https://orkas.ai/security/?source=gh-orkas)
-
-**, Orkas çevrimdışı çalışıyor mu? **
-Kaynak yapısı yerel bir model uç noktasına karşı tamamen çevrimdışı koşabilir. Paketlenmiş uygulama oturum açmalı ve bulut modellerinin bir ağ bağlantısına ihtiyacı vardır.
-
-** Bilgisayarım bittiğinde çalışmaya devam ediyor mu? **
-Hayır - Orkas bilgisayarınızda çalışır, bu yüzden Auto-advance ve otomasyonlar bilgisayar uyanıklığı ve Orkas koşmaya ihtiyaç duyar. v1.9'tan itibaren, her otomasyon en son 12 saat içinde bilgisayar uyanır veya Orkas başlar.
-
-** Can Uygulamaları inşa ediyorum ve yayınlıyorum? **
-Evet. içeride çalışan yerel uygulamalarOrkasücretsizdir. Bir kamu bağlantısına bir web uygulaması yayınlamak ücretli bir plana ihtiyaç duyar(Lite 5, Pro 8, Max 15 uygulamalar), ve yayınlanan web uygulamaları içeride mevcut her yeteneği içermezOrkas.
-
-** Bir Orkas hesabına ihtiyacım var mı? **
-Paketli masaüstü uygulaması, ilk kez başlatdığınızda oturum açmanızı ister. Bu depoda inşa edilen kaynak hiçbir hesap katmanına sahip değildir - doğrudan uygulamaya girer.
-
-**Can Can Can Can Can Can CanOrkassürücü sürüşClaude CodeVe diğer veCLIajanlar?**
-Evet.OrkasBeş dış dış yolu sürebilirCLIYerel alt işlemler olarak ajanlar - kodlama ajanlarıClaude Code, CodexveOpenCode, artı kişisel ajanlarOpenClawveHermes-Agent- ve açık kaynak projeleri gibiHyperFramesTüm aynı sohbetten yönlendirildi.
-
-**Nasıl olur?OrkasFarklıdan farklıClaude Code / Codex / CrewAI / LangChain?**
-Claude Code ve Codex kodlama ajanlarıdır - Orkas her iki takımın üyeleri olarak çalışır, bu yüzden aralarında seçim yapmak zorunda değilsiniz; CrewAI ve LangChain kod-ilk çerçeveler. Orkas, bir Commander bir uzman ajanlar ve CLI ajanlar, herhangi bir model sağlayıcı ile ve verileri yerel tutar. [full Karşılaştırmalar](https://orkas.ai/compare/?source=gh-orkas).
-
-** Hangi platformlar Orkas desteği yapar? **
-macOS 12+ ( Apple Silikon ve Intel) ve Windows 10+ paketler kurdu. glibc 2.34+ Linux x64/arm64 bugün kaynaktan çalışır, henüz yüklemez. Yerel konuşma transkriptasyonu Linux üzerinde ilk başlangıçta hazırlanan pinned whisper.cpp runtime ile desteklenmiştir. Alp ve diğer musl bazlı dağıtımlar desteklenmez. Kaynak botları Node 22.12+'ya ihtiyaç duyar; Python 3 ve C/C++, yerel bir npm paketinin uyumlu bir şekilde inşa edilmesi ve yerel olarak yeniden inşa edilmesi gerekir.
-
-**, Orkas özgür ve açık kaynak mı? **
-Evet – uygulamadırMITKullanımı için lisanslı ve ücretsiz. Paketli uygulama, yerleşik için 500 kredi içerirOrkasModel; $ 1.99 / aydan itibaren aylık krediler, bulut senkronizasyonu, daha paylaşılan projeler ve uygulama yayınları. Kendi anahtarlarınızla, model kullanımı sağlayıcınız tarafından faturalanır;OrkasBir işaret eklemez.[Fiyatlar →](https://orkas.ai/pricing/?source=gh-orkas)
+[Yansıtma zamanlayıcısına](./src/main/features/reflection-orchestrator.ts) ve [değerlendirme istemine](./src/core-agent/src/evolution/metacognition.ts) bakın.
 
 ---
 
-## Lisans Lisans Lisans Lisans Lisans Lisans Lisans
+## SSS
+
+**Orkas nedir?**
+Orkas, açık kaynaklı (MIT), yerel öncelikli, çok ajanlı bir masaüstü uygulamasıdır. Commander, hedefinizi yapılacaklara dönüştürür ve tamamlanmış dosyalar teslim etmek için 16 yerleşik uzman ajanı ve bunlara ek olarak Claude Code, Codex, OpenCode, OpenClaw ve Hermes-Agent'ı koordine eder. Tek bir sohbet botu, bir kod çerçevesi ya da barındırılan bir SaaS değildir.
+
+**API anahtarına ihtiyacım var mı?**
+Hayır. Paketlenmiş uygulama, yerleşik Orkas modeli için 500 krediyle gelir. Sonrasında kredi satın alabilir, ücretli bir plan seçebilir veya kendi sağlayıcı anahtarlarınızı ekleyebilirsiniz; sağlayıcı ücretleri ayrıca alınır.
+
+**Orkas yerel bir LLM mi?**
+Hayır. Orkas bilgisayarınızda çalışır ve seçtiğiniz modelleri çağırır: yerleşik Orkas modeli, kendi API anahtarlarınız veya yerel bir model uç noktası. Ajanları ve araçları yönetir; kendisi bir model değildir.
+
+**Orkas belgelerimdeki bilgilere dayanarak, kaynak göstererek soruları yanıtlayabilir mi?**
+Evet. PDF'leri ve belgeleri yerel Kütüphanenize ekleyin; Orkas bunlarda arama yapabilir ve kaynak pasajlara atıflarla yanıt verebilir, böylece orijinali açıp kontrol edebilirsiniz. Dizin bilgisayarınızda oluşturulur.
+
+**Ollama veya LM Studio gibi yerel modelleri kullanabilir miyim?**
+Evet. **Hesap ayarları → Modeller → Sohbet → Model ekle → Özel** yolunu açın, **OpenAI uyumlu** veya **Anthropic uyumlu** seçeneğini belirleyin ve temel URL'yi, tam model kimliğini ve API anahtarını girin. Kaydedilen modeli görevin model seçicisinden seçin.
+
+**API anahtarlarım ve verilerim nerede saklanıyor?**
+Varsayılan olarak diskinizde. Kendi sağlayıcı anahtarlarınız yerelde şifrelenir ve bulut senkronizasyonuna dahil edilmez. Kendi anahtarlarınızla model çağrıları doğrudan bilgisayarınızdan sağlayıcıya gider; yerleşik Orkas modeli Orkas'ın yönetilen hizmetini kullanır. Paketlenmiş uygulamadaki isteğe bağlı bulut senkronizasyonu ve paylaşılan projeler, seçilen verileri Orkas sunucularında saklar. [Güvenlik ve veri işleme →](https://orkas.ai/security/?source=gh-orkas)
+
+**Orkas çevrimdışı çalışır mı?**
+Kaynak koddan derlenen sürüm, yerel bir model uç noktasıyla tamamen çevrimdışı çalışabilir. Paketlenmiş uygulamada oturum açmak gerekir; bulut modelleri ise ağ bağlantısı gerektirir.
+
+**Bilgisayarım kapalıyken de çalışmaya devam eder mi?**
+Hayır. Orkas bilgisayarınızda çalışır; bu yüzden Otomatik ilerleme ve otomasyonlar için bilgisayarın uyanık ve Orkas'ın çalışıyor olması gerekir. v1.9'dan itibaren her otomasyon, bilgisayar uyandığında veya Orkas başladığında, son 12 saat içinde kaçırdığı en son çalıştırmayı telafi eder.
+
+**Uygulama oluşturup yayınlayabilir miyim?**
+Evet. Orkas içinde çalışan yerel uygulamalar ücretsizdir. Bir web uygulamasını herkese açık bir bağlantıda yayınlamak için ücretli plan gerekir (Lite 5, Pro 8, Max 15 uygulama) ve yayınlanan web uygulamaları Orkas içinde kullanılabilen tüm yetenekleri içermez.
+
+**Orkas hesabına ihtiyacım var mı?**
+Paketlenmiş masaüstü uygulaması, ilk kez başlattığınızda oturum açmanızı ister. Bu depodaki kaynak kod sürümünde hiçbir hesap katmanı yoktur; doğrudan uygulamayı açar.
+
+**Orkas, Claude Code'u ve diğer CLI ajanlarını yönetebilir mi?**
+Evet. Orkas beş harici CLI ajanını yerel alt süreçler olarak yönetebilir: kodlama ajanları Claude Code, Codex ve OpenCode ile kişisel ajanlar OpenClaw ve Hermes-Agent. Ayrıca HyperFrames gibi açık kaynaklı projeleri de sisteme dahil edebilir; hepsi aynı sohbetten yönetilir.
+
+**Orkas'ın Claude Code / Codex / CrewAI / LangChain'den farkı nedir?**
+Claude Code ve Codex kodlama ajanlarıdır; Orkas ikisini de ekibinin üyeleri olarak çalıştırır, böylece aralarında seçim yapmak zorunda kalmazsınız. CrewAI ve LangChain ise kod odaklı framework'lerdir. Orkas; bir Commander'ın uzman ajanlardan oluşan bir ekibi ve sizin CLI ajanlarınızı herhangi bir model sağlayıcısıyla koordine ettiği, verileri ve anahtarları yerelde tutan açık kaynaklı bir masaüstü uygulamasıdır. [Tüm karşılaştırmalara](https://orkas.ai/compare/?source=gh-orkas) bakın.
+
+**Orkas hangi platformları destekler?**
+macOS 12+ (Apple Silicon ve Intel) ve Windows 10+ için paketlenmiş yükleyiciler vardır. glibc 2.34+ Linux x64/arm64 bugün kaynak koddan çalışır; henüz yükleyicisi yoktur. Linux'ta yerel konuşma transkripsiyonu, ilk başlatmada hazırlanan sabitlenmiş whisper.cpp çalışma zamanıyla desteklenir. Alpine ve musl tabanlı diğer dağıtımlar desteklenmez. Kaynaktan başlatma için Node 22.12+ gerekir; Python 3 ve bir C/C++ derleme araç zinciri yalnızca platforma özgü bir npm paketinin uyumlu, önceden derlenmiş bir ikili dosyası olmadığında ve paketin yerelde yeniden derlenmesi gerektiğinde gerekir.
+
+**Orkas ücretsiz ve açık kaynaklı mı?**
+Evet. Uygulama MIT lisanslıdır ve ücretsiz kullanılabilir. Paketlenmiş uygulama, yerleşik Orkas modeli için 500 kredi içerir; aylık $11.99'dan başlayan ücretli planlar aylık kredi, bulut senkronizasyonu, daha fazla paylaşılan proje ve uygulama yayınlama ekler. Kendi anahtarlarınızı kullandığınızda model kullanımı sağlayıcınız tarafından faturalandırılır; Orkas üzerine ek ücret koymaz. [Fiyatlandırma →](https://orkas.ai/pricing/?source=gh-orkas)
+
+---
+
+## Lisans
 
 [MIT](./LICENSE)

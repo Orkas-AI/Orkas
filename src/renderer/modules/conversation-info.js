@@ -23,6 +23,8 @@ const ConversationInfo = (() => {
   let _seq = 0;
   let _fileSeq = 0;
   let _attachmentSeq = 0;
+  let _appliedAttachmentSeq = 0;
+  let _attachmentInventoryConfirmed = false;
   const _locallyDeletedPaths = new Set();
   const _expandedDirectoryPaths = new Set();
   let _loading = false;
@@ -259,7 +261,7 @@ const ConversationInfo = (() => {
 
   async function _load(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, filesData, attachmentData] = await Promise.all([
+    const [historyData, filesData] = await Promise.all([
       _fetchJson(typeof _historyRequestUrl === 'function'
         ? _historyRequestUrl(cid)
         : `/api/conversations/${enc}/history?limit=10`),
@@ -267,10 +269,7 @@ const ConversationInfo = (() => {
         _infoLog.warn('file list load failed', { cid, error: err && err.message });
         return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
       }),
-      _fetchJson(`/api/conversations/${enc}/attachments?scope=all`).catch((err) => {
-        _infoLog.warn('attachment load failed', { cid, error: err && err.message });
-        return { items: [] };
-      }),
+      _refreshAttachmentInventory(cid),
     ]);
     return {
       conversation: historyData.conversation || null,
@@ -279,7 +278,6 @@ const ConversationInfo = (() => {
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
-      attachments: Array.isArray(attachmentData.items) ? attachmentData.items : [],
     };
   }
 
@@ -622,12 +620,13 @@ const ConversationInfo = (() => {
       _refreshTabCounts();
       return;
     }
-    if (_loading) {
+    const showConfirmedAttachments = _activeTab === 'attachments' && _attachmentInventoryConfirmed;
+    if (_loading && !showConfirmedAttachments) {
       body.innerHTML = `<div class="conversation-info-empty">${escapeHtml(_label('common.loading', 'Loading…'))}</div>`;
       _refreshTabCounts();
       return;
     }
-    if (_error) {
+    if (_error && !showConfirmedAttachments) {
       body.innerHTML = `<div class="conversation-info-empty is-error">${escapeHtml(_label('conversation_info.load_failed', 'Could not load conversation info', { reason: _error }))}</div>`;
       _refreshTabCounts();
       return;
@@ -694,10 +693,8 @@ const ConversationInfo = (() => {
     const target = cid || _cid;
     if (!target || target !== _cid || !_open) return;
     const seq = ++_seq;
-    // Full and partial reads share ownership of each resource. A later read
-    // supersedes only its slice, without discarding the rest of a full load.
+    // A later file read supersedes only the file portion of this load.
     const fileSeq = ++_fileSeq;
-    const attachmentSeq = ++_attachmentSeq;
     const silent = !!opts.silent;
     if (silent && _loadingSource === 'full') {
       _clearLoading('full', seq, { clearAnyForSource: true });
@@ -718,7 +715,7 @@ const ConversationInfo = (() => {
           filesCount: _snapshot.filesCount,
           filesScanSkipped: _snapshot.filesScanSkipped,
         } : {}),
-        ...(attachmentSeq !== _attachmentSeq ? { attachments: _snapshot.attachments } : {}),
+        attachments: _snapshot.attachments,
       };
       _error = '';
     } catch (err) {
@@ -737,14 +734,19 @@ const ConversationInfo = (() => {
     if (!target || target !== _cid || !_open) return;
     // Composer selections contain only unsent files. Always refresh the task
     // inventory so sending/clearing a selection cannot erase earlier uploads.
+    await _refreshAttachmentInventory(target);
+  }
+
+  async function _refreshAttachmentInventory(target) {
     const seq = ++_attachmentSeq;
     try {
       const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments?scope=all`);
-      if (seq !== _attachmentSeq || target !== _cid) return;
-      _snapshot = {
-        ..._snapshot,
-        attachments: Array.isArray(data.items) ? data.items : [],
-      };
+      if (!Array.isArray(data.items)) throw new Error('Invalid attachment inventory');
+      // Only a successful read supersedes confirmed inventory in this task.
+      if (seq <= _appliedAttachmentSeq || target !== _cid) return;
+      _appliedAttachmentSeq = seq;
+      _attachmentInventoryConfirmed = true;
+      _snapshot = { ..._snapshot, attachments: data.items };
       if (_activeTab === 'attachments') _renderBody();
       else _refreshTabCounts();
     } catch (err) {
@@ -800,7 +802,8 @@ const ConversationInfo = (() => {
     _resetLoading();
     _seq++;
     _fileSeq++;
-    _attachmentSeq++;
+    _appliedAttachmentSeq = ++_attachmentSeq;
+    _attachmentInventoryConfirmed = false;
     _syncChrome();
     _renderBody();
     if (_open && _cid) refresh(_cid);

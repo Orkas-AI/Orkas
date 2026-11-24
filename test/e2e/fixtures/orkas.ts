@@ -328,6 +328,7 @@ for (const candidate of [
   'E2E_CLI_SEND_NOW_ACTIVE',
   'E2E_CLI_SEND_NOW_FOLLOWUP',
   'E2E_OPENCODE_CUSTOM_PROJECT_DIR',
+  'E2E_OPENCODE_FAILED_FILE_EDIT',
 ]) {
   if (prompt.includes(candidate)) marker = candidate;
 }
@@ -364,6 +365,18 @@ if (marker === 'E2E_CLI_SEND_NOW_ACTIVE') {
   writeState(state);
   process.stderr.write('deterministic failure before a new session is observed\n');
   process.exitCode = 7;
+} else if (marker === 'E2E_OPENCODE_FAILED_FILE_EDIT') {
+  state.invocations.push(invocation);
+  writeState(state);
+  fs.writeFileSync('new-report.txt', 'Report written before the task stopped.');
+  const edit = (callID, filePath, state) => emit({
+    type: 'tool_use', sessionID: sessionId,
+    part: { tool: 'edit', callID, state: { input: { filePath }, ...state } },
+  });
+  edit('e2e-new-report', 'new-report.txt', { status: 'completed', output: 'Saved the report' });
+  edit('e2e-failed-revision', 'new-report.txt', { status: 'error', error: 'Revision failed' });
+  edit('e2e-failed-edit', 'existing-report.txt', { status: 'error', error: 'Edit failed' });
+  emit({ type: 'error', sessionID: sessionId, error: { message: 'The CLI could not continue the task.' } });
 } else if (marker === 'E2E_OPENCODE_CUSTOM_PROJECT_DIR') {
   state.invocations.push(invocation);
   writeState(state);

@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## 团队能交付什么
 
-- **视频、配音与图片** —— VideoStudio、VoiceStudio、ImageStudio
+- **视频、配音与图片** —— [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)、VoiceStudio、ImageStudio
 - **研究报告、SEO 审计与市场分析** —— DeepResearcher、SeoGeoAgent、StockAnalyser
 - **帖子、文章、简报与幻灯片** —— ContentWriter、PptMaker
 - **网站、UI 与代码** —— UIDesigner、ProductDeveloper
@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | 内容与媒体 | **ContentWriter** | 将目标、来源或初稿写成可发布的帖子、文章、简报与案例 |
 | | **PptMaker** | 从主题、大纲或文档制作可编辑、可审核的 PPTX 幻灯片 |
 | | **ImageStudio** | 海报、封面、社媒图片与信息图 |
-| | **VideoStudio** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取、本地化，以及用自己的内容和素材复刻参考视频 |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取、本地化，以及用自己的内容和素材复刻参考视频 |
 | | **VoiceStudio** | 旁白、多角色音频、转写与字幕、音频编辑和混音 |
 | | **UIDesigner** | 从产品目标、PRD、截图或 Figma 素材制作以 HTML 为主的可编辑 UI |
 | 开发与办公 | **ProductDeveloper** | 理解代码仓库，落实 PRD、修复缺陷、重构和审查代码，交付可验证的结果 |
@@ -89,6 +89,8 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 > [!NOTE]
 > 共享项目、云同步和网页应用发布目前只在安装版中提供，开源版暂不支持。需要这些功能，可以 **[下载 Orkas：macOS 与 Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)**（免费，赠送 500 积分）。
+
+源码版也支持语音输入。在 **设置 → 模型** 中配置 **Orkas API Key**，然后点击输入框旁的麦克风。出现提示时允许访问麦克风。音频会发送到 Orkas 进行识别，并消耗该 Key 所有者的 Orkas 积分。再次点击即可停止，检查文字后由你自己发送。如果之前拒绝了麦克风权限，请在系统设置中开启。
 
 ---
 
@@ -229,7 +231,7 @@ sqlite-vec，并准备随包 Node、在独立进程中验证 sharp 后才报告�
 ## 常见问题（FAQ）
 
 **Orkas 是什么？**
-Orkas 是开源（MIT）、本地优先的多智能体桌面应用。指挥官将目标拆成待办，协调 16 个内置专业智能体，以及 Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent，交付成品文件。
+Orkas 是开源（MIT）、本地优先的多智能体桌面应用。指挥官将目标拆成待办，协调 16 个内置专业智能体，以及 Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent，交付成品文件。它不是单个聊天机器人，不是代码框架，也不是托管的 SaaS。
 
 **需要 API Key 吗？**
 不需要。安装版赠送 500 积分，可直接使用内置 Orkas 模型。用完后可购买积分、选择付费会员，或添加自己的模型服务商 Key；自有服务商的费用单独计算。
