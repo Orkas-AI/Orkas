@@ -11465,21 +11465,21 @@ async function _runCliAgentTurn(opts: {
           }
           break;
         case 'tool-event':
-          if ((e as any).phase === 'use') {
-            const callId = String((e as any).callId || '');
-            const paths = extractWritablePathsFromCliTool(e as any, opts.workingDir);
+          if (e.phase === 'use') {
+            const callId = String(e.callId || '');
+            const paths = extractWritablePathsFromCliTool(e, opts.workingDir);
             if (callId && paths.length) pendingToolPaths.set(callId, paths);
-          } else if ((e as any).phase === 'result') {
-            const callId = String((e as any).callId || '');
-            // Session replay and some CLIs may deliver only the terminal tool
-            // event. Prefer paths correlated from the live `use` event, but
-            // also extract the result's own safe write/edit input so these
-            // files still enter conversation ownership.
-            const paths = [
-              ...(callId ? pendingToolPaths.get(callId) || [] : []),
-              ...extractWritablePathsFromCliTool(e as any, opts.workingDir),
-            ];
-            for (const p of paths) produced.add(p);
+          } else if (e.phase === 'result') {
+            const callId = String(e.callId || '');
+            if (!e.isError && !e.error) {
+              // Some CLIs report only a terminal event with the write input.
+              const paths = [
+                ...(callId ? pendingToolPaths.get(callId) || [] : []),
+                ...extractWritablePathsFromCliTool(e, opts.workingDir),
+              ];
+              for (const p of paths) produced.add(p);
+            }
+            // Retire tentative paths while keeping earlier write evidence.
             if (callId) pendingToolPaths.delete(callId);
           }
           opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });

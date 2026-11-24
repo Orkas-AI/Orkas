@@ -4182,6 +4182,68 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     });
   });
 
+  it.each(['result only', 'start and result', 'partial write'] as const)(
+    'keeps OpenCode failure separate from file delivery: %s', async scenario => {
+      const paths = await import('../../../../src/main/paths');
+      const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+      spec.runtime = { kind: 'cli', cli: 'opencode' };
+      fs.writeFileSync(agentFile, JSON.stringify(spec));
+      const workdir = path.join(tmpDir, 'workspace');
+      const agents = await import('../../../../src/main/features/agents');
+      fs.mkdirSync(workdir, { recursive: true });
+      expect(await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, workdir)).toMatchObject({ path: workdir });
+      const oldFile = path.join(workdir, 'existing-report.txt');
+      const newFile = path.join(workdir, 'new-report.txt');
+      fs.writeFileSync(oldFile, 'Original content');
+      const { mapOpencodeEvent } = await import('../../../../src/main/features/local_agents/backends/opencode');
+      const { redactPrivateLocalAgentEvent } = await vi.importActual<typeof import(
+        '../../../../src/main/features/local_agents/runner'
+      )>('../../../../src/main/features/local_agents/runner');
+      const input = scenario === 'partial write'
+        ? { files: [{ filePath: newFile }, { filePath: oldFile }] }
+        : { filePath: oldFile };
+      const event = (status: string, payload: Record<string, unknown> = {}) => {
+        const mapped = mapOpencodeEvent({
+          type: 'tool_use', part: { tool: 'edit', callID: 'edit-report', state: { status, input, ...payload } },
+        })?.event;
+        return redactPrivateLocalAgentEvent(mapped!, workdir);
+      };
+      if (scenario !== 'result only') cliRunMock.nextEvents.push(event('running'));
+      if (scenario === 'partial write') {
+        cliRunMock.afterEvent = ({ phase }) => {
+          if (phase === 'use') {
+            fs.writeFileSync(newFile, 'Verified partial result');
+            cliRunMock.calls[0].onEvent({ type: 'file-change', paths: [newFile] });
+          }
+        };
+      }
+      cliRunMock.nextEvents.push(event('error', { error: 'Edit could not be completed' }));
+      cliRunMock.nextResult = {
+        runId: 'opencode-failed-edit', status: 'failed', output: '',
+        error: 'Could not continue the report', failureCategory: 'cli_failed_after_output',
+      };
+      const group = await import('../../../../src/main/features/group_chat');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const cid = 'cid-opencode-failed-edit';
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} update the report` });
+      await waitForQuiescent(TEST_UID, cid);
+
+      const reply = (await group.readMessages(TEST_UID, cid)).find(row => row.from === AGENT_ID);
+      expect(reply?.failure_code).toBe('cli_failed_after_output');
+      expect(reply?.text).toContain('Could not continue the report');
+      expect(reply?.process).toContainEqual({
+        type: 'event', event: { stream: 'cli', data: expect.objectContaining({ phase: 'result', isError: true }) },
+      });
+      expect(reply?.produced ?? []).toEqual(scenario === 'partial write' ? [newFile] : []);
+      expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(oldFile)).toBe(false);
+      expect(fs.readFileSync(oldFile, 'utf8')).toBe('Original content');
+      if (scenario === 'partial write') {
+        expect(fs.readFileSync(newFile, 'utf8')).toBe('Verified partial result');
+      }
+    },
+  );
+
   it('publishes a CLI shell-created file from this turn but not an existing workspace file', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
