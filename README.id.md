@@ -106,7 +106,7 @@ Orkas menjalankan agen CLI yang sudah Anda instal sebagai sesi lokal, berdamping
 
 - **Komandan yang merencanakan, mendelegasikan, dan mengerjakan sisanya** — Komandan memecah tujuan, memilih agen, keterampilan, konektor, dan alat yang tepat, serta menangani sendiri analisis, penulisan, riset, dan pekerjaan file jika tidak ada spesialis yang lebih cocok.
 - **Dirancang untuk mengutamakan lokal** — percakapan, file, basis pengetahuan, dan agen kustom secara default tersimpan di disk Anda. Sinkronisasi cloud bersifat opsional di aplikasi siap instal. Dengan kunci Anda sendiri, panggilan model dikirim langsung dari perangkat Anda ke penyedia; model Orkas bawaan berjalan melalui layanan model terkelola milik Orkas.
-- **Model apa pun, bisa diganti kapan saja** — Komandan dan agen bawaan berbagi satu pengaturan model: model Orkas bawaan, penyedia Anda sendiri, atau endpoint lokal. Agen CLI eksternal tetap memakai pengaturan modelnya masing-masing.
+- **Model bisa diganti kapan saja** — Komandan dan agen bawaan berbagi satu pengaturan model: model Orkas bawaan, penyedia Anda sendiri, atau endpoint lokal. Agen CLI eksternal tetap memakai pengaturan modelnya masing-masing.
 - **Agen yang terus berkembang** — setiap agen menyimpan keterampilan dan memori pribadinya. Tinjauan di latar belakang memeriksa aktivitas baru saat aplikasi sedang tidak digunakan dan dapat menyempurnakan penilaian diri, metode yang dapat dipakai ulang, serta keterampilan yang telah dipelajari.
 - **Sumber terbuka, tanpa kotak hitam** — berlisensi MIT. Anda bisa membaca persis apa yang dilakukan Orkas serta setiap agen dan keterampilannya.
 
@@ -196,8 +196,8 @@ Lihat [skrip verifikasi dependensi native](./scripts/verify-native-dependencies.
 
 Komandan menangani sendiri pekerjaan umum dan mendelegasikan pekerjaan spesialis melalui tiga alat:
 
-- **`dispatch_to`** menjalankan agen tertentu dan mengembalikan hasilnya agar pekerjaan bisa dilanjutkan. Alat ini dapat menunggu hasilnya, atau berjalan secara asinkron lalu memberi tahu Komandan saat tugas selesai.
-- **`hand_off_to`** mengalihkan sisa pekerjaan kepada agen tertentu dan mengakhiri giliran Komandan saat ini. Agen tersebut menyampaikan balasannya sendiri; kelanjutan opsional memungkinkan Komandan melanjutkan tugas yang lebih luas sesudahnya.
+- **`dispatch_to`** menjalankan agen yang ditentukan berdasarkan namanya dan mengembalikan hasilnya agar pekerjaan bisa dilanjutkan. Alat ini dapat menunggu hasilnya, atau berjalan secara asinkron lalu memberi tahu Komandan saat tugas selesai.
+- **`hand_off_to`** mengalihkan sisa pekerjaan kepada agen yang disebutkan namanya dan mengakhiri giliran Komandan saat ini. Agen tersebut menyampaikan balasannya sendiri; kelanjutan opsional memungkinkan Komandan melanjutkan tugas yang lebih luas sesudahnya.
 - **`run_worker`** menjalankan subtugas anonim yang terisolasi dan mengembalikan hasil privat. Subtugas ini tidak menerima riwayat percakapan maupun keterampilan agen bernama.
 
 Tugas agen bernama dan pekerja anonim memiliki kontrol konkurensi masing-masing. Lihat [implementasi dispatch](./src/main/features/group_chat/bus.ts) dan [kunci eksekusi](./src/main/util/locks.ts).

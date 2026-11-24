@@ -196,8 +196,8 @@ Xem [script xác minh phụ thuộc native](./scripts/verify-native-dependencies
 
 Commander tự xử lý công việc chung và giao công việc chuyên môn qua ba công cụ:
 
-- **`dispatch_to`** chạy một tác tử được chỉ định và trả kết quả về để tiếp tục công việc. Công cụ này có thể chờ kết quả, hoặc chạy bất đồng bộ và thông báo cho Commander khi tác vụ hoàn tất.
-- **`hand_off_to`** chuyển phần việc còn lại cho một tác tử được chỉ định và kết thúc lượt hiện tại của Commander. Tác tử đó tự gửi câu trả lời của mình; một bước tiếp nối tùy chọn cho phép Commander quay lại tiếp tục một tác vụ lớn hơn sau đó.
+- **`dispatch_to`** chạy một tác tử được chỉ định theo tên và trả kết quả về để tiếp tục công việc. Công cụ này có thể chờ kết quả, hoặc chạy bất đồng bộ và thông báo cho Commander khi tác vụ hoàn tất.
+- **`hand_off_to`** chuyển phần việc còn lại cho một tác tử được chỉ định theo tên và kết thúc lượt hiện tại của Commander. Tác tử đó tự gửi câu trả lời của mình; một bước tiếp nối tùy chọn cho phép Commander quay lại tiếp tục một tác vụ lớn hơn sau đó.
 - **`run_worker`** chạy một tác vụ con ẩn danh, tách biệt và trả về kết quả riêng. Tác vụ con này không nhận lịch sử cuộc trò chuyện hay kỹ năng của tác tử có tên.
 
 Tác vụ của tác tử có tên và worker ẩn danh có cơ chế kiểm soát đồng thời riêng. Xem [phần triển khai điều phối](./src/main/features/group_chat/bus.ts) và [khóa thực thi](./src/main/util/locks.ts).

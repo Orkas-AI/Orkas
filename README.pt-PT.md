@@ -247,7 +247,7 @@ Sim. Adicione PDF e outros documentos à sua Biblioteca local; o Orkas pode pesq
 **Posso utilizar modelos locais como o Ollama ou o LM Studio?**
 Sim. Abra **Definições da conta → Modelos → Conversa → Adicionar modelo → Personalizado**, selecione **Compatível com OpenAI** ou **Compatível com Anthropic** e introduza o URL base, o ID exato do modelo e a chave de API. Escolha o modelo guardado no seletor de modelos da tarefa.
 
-**Onde são guardados as minhas chaves de API e os meus dados?**
+**Onde ficam as minhas chaves de API e os meus dados?**
 No seu disco, por predefinição. As chaves do seu próprio fornecedor são encriptadas localmente e excluídas da sincronização na nuvem. Com as suas próprias chaves, as chamadas aos modelos vão diretamente do seu computador para o fornecedor; o modelo integrado do Orkas utiliza o serviço gerido do Orkas. A sincronização na nuvem opcional e os projetos partilhados da aplicação instalável guardam os dados selecionados nos servidores do Orkas. [Segurança e tratamento de dados →](https://orkas.ai/security/?source=gh-orkas)
 
 **O Orkas funciona sem ligação à Internet?**
