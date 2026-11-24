@@ -389,6 +389,12 @@ async function initUser() {
 
 function setView(view, cid, opts = {}) {
   if (view !== 'agents' && typeof clearAgentCardHighlights === 'function') clearAgentCardHighlights();
+  if (view === 'conversation' && currentView === 'conversation' && cid && cid !== currentCid
+      && (opts.skipLoad || !pendingConvs.get(cid)?.loadingEl?.isConnected)) {
+    // Detach old frames before panel and composer relayout can send Chromium
+    // a geometry update for a frame that the history replacement will remove.
+    document.querySelectorAll('#chat-history iframe.chat-artifact-frame').forEach(frame => frame.remove());
+  }
   const restoreTaskCleanup = window.TaskCleanupNavigation?.beforeNavigate(view, cid, opts) === true;
   // A resource detail opened from another page is only a transient overlay.
   // Any explicit sidebar/programmatic navigation dismisses it first, so a

@@ -962,7 +962,20 @@ test('local SDK form results reach their original conversation from the card and
   const artifact = await orkas.electronApp!.evaluate(async (_electron, args) =>
     (process as any).mainModule.require(args.module).createArtifact('account-e2e', args.cid, 'commander', {
       title: 'Travel form', files: [
-        { path: 'index.html', content: '<!doctype html><script src="/__orkas/sdk.js"></script><h1>Travel form</h1><button id="submit">Send preferences</button><script>document.querySelector("button").onclick=async()=>{await orkasApp.storage.set({key:"city",value:"Kyoto"});orkasArtifact.send({city:"Kyoto",budget:1200});};</script>' },
+        { path: 'index.html', content: `<!doctype html>
+          <script src="/__orkas/sdk.js"></script>
+          <h1>Travel form</h1><button id="submit" disabled>Send preferences</button>
+          <script>
+            const submit = document.querySelector('#submit');
+            submit.onclick = async () => {
+              await orkasApp.storage.set({ key: 'city', value: 'Kyoto' });
+              orkasArtifact.send({ city: 'Kyoto', budget: 1200 });
+            };
+            window.addEventListener('load', async () => {
+              await orkasApp.host.getContext();
+              submit.disabled = false;
+            }, { once: true });
+          </script>` },
         { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }) },
       ],
     }), { module: path.resolve(__dirname, '../../src/main/features/chat_artifacts.ts'), cid });
@@ -975,7 +988,12 @@ test('local SDK form results reach their original conversation from the card and
     .filter(message => message.from === 'user' && String(message.text).includes('<artifact-result'));
   await orkas.page.evaluate(async cid => { await (window as any).loadConversations(); await (window as any).setView('conversation', cid); }, cid);
   const card = orkas.page.locator('#chat-history .chat-artifact-card');
-  await card.locator('iframe').contentFrame().getByRole('button', { name: 'Send preferences' }).click();
+  const inlineFrame = card.locator('iframe');
+  const inlineSubmit = inlineFrame.contentFrame().getByRole('button', { name: 'Send preferences' });
+  await expect(inlineSubmit).toBeEnabled();
+  // The chat can still reposition the outer iframe after its button is ready.
+  await inlineFrame.scrollIntoViewIfNeeded();
+  await inlineSubmit.click();
   await expect.poll(() => results(transcript).length).toBe(1);
   expect(results(transcript)[0].text).toContain('"city":"Kyoto"');
   await expect.poll(() => orkas.modelRequests.length).toBe(1);
@@ -984,10 +1002,26 @@ test('local SDK form results reach their original conversation from the card and
   // Use the actual controls so native iframe focus changes before navigation.
   await card.locator('.chat-artifact-more').click();
   const preview = await orkas.openPreview(() => orkas.page.locator('.chat-artifact-menu [data-action="open"]').click());
+  const previewSubmit = preview.locator('iframe.chat-artifact-frame').contentFrame().getByRole('button', { name: 'Send preferences' });
+  // The preview shell can load before the app frame's SDK is ready.
+  await expect(previewSubmit).toBeEnabled();
   const otherTask = orkas.page.locator(`#conversation-list .conv-item[data-cid="${otherCid}"]`);
+  await orkas.page.evaluate(expectedCid => {
+    const page = window as any;
+    const bindComposer = page.composerBindOwner;
+    page.composerBindOwner = function (input: string, owner: string) {
+      if (input === 'chat-input' && owner === expectedCid) {
+        page.composerBindOwner = bindComposer;
+        page.inlineFramesAtNavigation = document.querySelectorAll('#chat-history iframe.chat-artifact-frame').length;
+      }
+      return bindComposer.call(this, input, owner);
+    };
+  }, otherCid);
   await otherTask.click();
   await expect(otherTask).toHaveClass(/\bactive\b/);
-  await preview.locator('iframe.chat-artifact-frame').contentFrame().getByRole('button', { name: 'Send preferences' }).click();
+  expect(await orkas.page.evaluate(() => (window as any).inlineFramesAtNavigation)).toBe(0);
+  await expect(inlineFrame).toHaveCount(0);
+  await previewSubmit.click();
   await expect.poll(() => results(transcript).length).toBe(2);
   expect(results(foreignTranscript)).toEqual([]);
   await expect.poll(() => orkas.modelRequests.length).toBe(2);
@@ -995,6 +1029,9 @@ test('local SDK form results reach their original conversation from the card and
   await expect.poll(() => readFileSync(transcript, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
     .filter(message => message.from === 'commander' && message.text === 'Hello from the local E2E model.').length).toBe(2);
   await expect(orkas.page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+  await orkas.page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+  await expect(inlineSubmit).toBeEnabled();
+  expect(results(transcript)).toHaveLength(2);
 });
 
 
