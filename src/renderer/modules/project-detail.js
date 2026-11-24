@@ -1360,6 +1360,13 @@ function _restoreTodoScroll(host, snapshot) {
   }
 }
 
+function _setTodoColumnCollapsed(body, collapsed) {
+  const column = body.parentElement;
+  body.hidden = collapsed;
+  column.classList.toggle('is-collapsed', collapsed);
+  column.querySelector('.todo-collapse').setAttribute('aria-expanded', String(!collapsed));
+}
+
 function _renderTodoBoard(tasks, context, scope) {
   const board = document.createElement('div');
   board.className = 'todo-board';
@@ -1388,10 +1395,9 @@ function _renderTodoBoard(tasks, context, scope) {
     body.className = 'todo-column-body';
     body.hidden = collapsed;
     toggle.addEventListener('click', () => {
-      body.hidden = !body.hidden;
-      _todoCollapsed.set(key, body.hidden);
-      toggle.setAttribute('aria-expanded', String(!body.hidden));
-      column.classList.toggle('is-collapsed', body.hidden);
+      const nextCollapsed = !body.hidden;
+      _setTodoColumnCollapsed(body, nextCollapsed);
+      _todoCollapsed.set(key, nextCollapsed);
     });
     header.appendChild(toggle);
     for (const task of items) {
