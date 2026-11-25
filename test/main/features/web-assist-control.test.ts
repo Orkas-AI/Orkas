@@ -367,6 +367,7 @@ import {
   fitWebAssistObservation,
 } from '../../../src/main/features/web_assist';
 import { estimateToolResultTokens } from '../../../src/main/util/tool-result-cap';
+import { installWindowPresentationEvents } from '../../../src/main/util/window-presentation';
 import {
   beginBrowserTaskRun, finishBrowserTaskRun,
 } from '../../../src/main/features/web_assist_lifecycle';
@@ -1562,6 +1563,78 @@ describe('Web Assist controlled connector lifecycle', () => {
       await vi.advanceTimersByTimeAsync(599_999);
       expect(page.isDestroyed()).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
+      expect(page.isDestroyed()).toBe(true);
+    });
+
+    it.each([['hide', 'show'], ['minimize', 'restore']])(
+      'reclaims an idle page after native %s and recreates it on %s', async (background, foreground) => {
+        const { tabId, page } = await open();
+        const owner = electronMock.owner;
+        installWindowPresentationEvents(owner);
+        const bounds = { x: 0, y: 0, width: 600, height: 400 };
+        layoutWebAssist(electronMock.renderer, bounds);
+        await vi.advanceTimersByTimeAsync(1_200_000);
+        expect(page.isDestroyed()).toBe(false);
+
+        owner.emit(background);
+        await vi.advanceTimersByTimeAsync(599_999);
+        expect(page.isDestroyed()).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(page.isDestroyed()).toBe(true);
+        expect(webAssistState(electronMock.renderer).state.tabs).toMatchObject([{ tab_id: tabId, suspended: true }]);
+        layoutWebAssist(electronMock.renderer, bounds);
+        expect(electronMock.page).toBe(page);
+
+        owner.emit(foreground);
+        activateWebAssistTab(electronMock.renderer, tabId);
+        expect(electronMock.page).not.toBe(page);
+        expect(webAssistState(electronMock.renderer).state.tabs[0].suspended).toBeUndefined();
+        expect(electronMock.page.getURL()).toBe('https://example.com/work?item=1');
+      },
+    );
+
+    it('keeps a page when a window is shown during its idle safety check', async () => {
+      const { page } = await open();
+      const owner = electronMock.owner;
+      installWindowPresentationEvents(owner);
+      layoutWebAssist(electronMock.renderer, { x: 0, y: 0, width: 600, height: 400 });
+      owner.emit('hide');
+      let finish!: (safe: boolean) => void;
+      const probe = vi.spyOn(page, 'executeJavaScriptInIsolatedWorld')
+        .mockImplementation(() => new Promise<boolean>(resolve => { finish = resolve; }));
+      const checking = reclaimIdleWebAssistPages(Date.now() + 600_000);
+      expect(probe).toHaveBeenCalledOnce();
+      owner.emit('show');
+      finish(true);
+      await checking;
+      expect(page.isDestroyed()).toBe(false);
+    });
+
+    it('keeps an unanswered site permission while the native window is hidden', async () => {
+      const { tabId, page } = await open();
+      const { owner, renderer } = electronMock;
+      installWindowPresentationEvents(owner);
+      setActiveWebAssistConversation(renderer, 'c-idle');
+      layoutWebAssist(renderer, { x: 0, y: 0, width: 600, height: 400 });
+      const handler = vi.mocked(session.fromPath('/tmp/fixture').setPermissionRequestHandler).mock.calls.at(-1)![0]!;
+      const reply = vi.fn();
+      const response = new Promise<boolean>(resolve => {
+        reply.mockImplementation(resolve);
+        handler(page, 'notifications', reply, { requestingUrl: page.getURL(), isMainFrame: true });
+      });
+      const request = webAssistState(renderer).state.tabs[0].permission_request!;
+      expect(request).toMatchObject({ permission: 'notifications' });
+
+      owner.emit('hide');
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(page.isDestroyed()).toBe(false);
+      expect(reply).not.toHaveBeenCalled();
+
+      owner.emit('show');
+      expect(answerWebAssistPermission(renderer, { tabId, requestId: request.id, allowed: false })).toEqual({ handled: true });
+      expect(await response).toBe(false);
+      owner.emit('hide');
+      await vi.advanceTimersByTimeAsync(600_000);
       expect(page.isDestroyed()).toBe(true);
     });
 
