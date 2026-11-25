@@ -174,12 +174,22 @@ describe('local_access_policy', () => {
 
   it.skipIf(process.platform !== 'win32')('guards writes into the Windows Startup folder', async () => {
     const policy = await import('../../../src/main/features/local_access_policy');
-    const bs = String.fromCharCode(92);
-    const startup = ['C:', 'Users', 'Someone', 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'];
-    expect(policy.sensitivePathReasons([...startup, 'run.bat'].join(bs), 'write')).toEqual(['sensitive_path']);
-    expect(policy.sensitivePathReasons([...startup, 'run.bat'].join('/'), 'write')).toEqual(['sensitive_path']);
-    expect(policy.sensitivePathReasons([...startup, 'run.bat'].join(bs), 'read')).toEqual([]);
-    expect(policy.sensitivePathReasons(['C:', 'Users', 'Someone', 'Documents', 'Start Menu', 'note.txt'].join(bs), 'write')).toEqual([]);
+    const programs = path.join(tmpDir, 'Start Menu', 'Programs');
+    const startup = path.join(programs, 'Startup');
+    const target = path.join(startup, 'note.txt');
+    const neighboringFile = path.join(programs, 'Startup Archive', 'note.txt');
+
+    expect(policy.sensitivePathReasons(startup, 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(target, 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(target.split(path.sep).join('/'), 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(target, 'read')).toEqual([]);
+    expect(policy.sensitivePathReasons(neighboringFile, 'write')).toEqual([]);
+  });
+
+  it.skipIf(process.platform === 'win32')('leaves Windows Startup look-alike paths alone on POSIX', async () => {
+    const policy = await import('../../../src/main/features/local_access_policy');
+    const target = path.join(tmpDir, 'Start Menu', 'Programs', 'Startup', 'note.txt');
+    expect(policy.sensitivePathReasons(target, 'write')).toEqual([]);
   });
 
   it('uses structural defaults without disabling custom server rules', async () => {

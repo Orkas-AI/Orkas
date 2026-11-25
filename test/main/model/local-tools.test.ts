@@ -3711,6 +3711,39 @@ fs.writeFileSync(args[at + 1], 'downloaded');
 // ── Access mode + onFileWritten: write_file ─────────────────────────────
 
 describe('local-tools › write_file', () => {
+  it.skipIf(process.platform !== 'win32')('writes into a Windows Startup fixture only after approval', async () => {
+    const { lt, perm } = await loadModules();
+    const approvals = await import('../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'Start Menu', 'Programs', 'Startup', 'note.txt');
+    const write = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' })
+      .find(tool => tool.name === 'write_file')!;
+    const observed: Array<{ operation: string; reasons: string[]; alreadyWritten: boolean }> = [];
+    let decision: 'deny' | 'allow_once' = 'deny';
+    approvals._setBroadcastForTest((_channel, payload) => {
+      const request = payload as { request_id: string; operation: string; reasons: string[] };
+      observed.push({ operation: request.operation, reasons: request.reasons, alreadyWritten: fs.existsSync(target) });
+      approvals.respond(request.request_id, decision);
+    });
+    try {
+      const denied = await write.execute({ path: target, content: 'fixture' }, makeCtx());
+      expect(denied.isError).toBe(true);
+      expect(denied.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(fs.existsSync(target)).toBe(false);
+
+      decision = 'allow_once';
+      const allowed = await write.execute({ path: target, content: 'fixture' }, makeCtx());
+      expect(allowed.isError, allowed.content).toBeFalsy();
+      expect(fs.readFileSync(target, 'utf8')).toBe('fixture');
+      const prompt = { operation: 'write_file', reasons: ['sensitive_path'], alreadyWritten: false };
+      expect(observed).toEqual([prompt, prompt]);
+    } finally {
+      approvals._setBroadcastForTest(null);
+      approvals._resetForTest();
+    }
+  });
+
   it('refuses and does NOT create the file when no workspace scope is available', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('workspace_approval');
