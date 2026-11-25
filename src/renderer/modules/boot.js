@@ -387,6 +387,19 @@ async function initUser() {
 
 // ─── View routing ───
 
+function _syncTaskReturnButtons(view, returnToConversation) {
+  const sourceCid = returnToConversation && currentView === 'conversation' ? currentCid : null;
+  const sourceUser = currentUserId;
+  for (const button of document.querySelectorAll('[data-task-return-view]')) {
+    const canReturn = !!sourceCid && button.dataset.taskReturnView === view;
+    button.hidden = !canReturn;
+    button.onclick = canReturn ? () => {
+      if (currentView === view && currentUserId === sourceUser) setView('conversation', sourceCid);
+      else button.hidden = true;
+    } : null;
+  }
+}
+
 function setView(view, cid, opts = {}) {
   if (view !== 'agents' && typeof clearAgentCardHighlights === 'function') clearAgentCardHighlights();
   if (view === 'conversation' && currentView === 'conversation' && cid && cid !== currentCid
@@ -414,6 +427,7 @@ function setView(view, cid, opts = {}) {
   composerBindOwner('chat-input', view === 'conversation' ? cid : null);
   composerBindOwner('new-chat-input', view === 'new-chat' ? 'new-chat' : null);
   composerBindOwner('project-chat-input', view === 'project' ? cid : null);
+  _syncTaskReturnButtons(view, opts.returnToConversation);
   currentView = view;
   window.WebAssist?.setContext(view, cid);
   _saveLastView(view, cid);

@@ -700,6 +700,7 @@
                 </div>
                 <button class="btn btn-sm" id="todos-add-btn" type="button" data-i18n="todo.add_short">+ Create</button>
                 <button type="button" class="btn btn-sm" id="todos-cleanup-btn" data-i18n="settings.cleanup.clean">Clean up</button>
+                <button class="btn btn-sm" type="button" data-task-return-view="todos" data-i18n="common.back" hidden>Back</button>
               </div>
             </header>
             <div class="todos-workarea">
@@ -1097,11 +1098,14 @@
       <section class="panel" id="panel-auto">
         <div class="auto-view">
           <header class="project-detail-header">
-            <div class="project-detail-header-title-row">
+            <div class="project-detail-header-main project-detail-header-title-row">
               <h1 class="project-detail-title" data-i18n="auto.title">Auto</h1>
               <span class="auto-header-count" id="auto-header-count"></span>
             </div>
-            <button type="button" class="btn btn-sm auto-header-add" id="auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
+            <div class="project-detail-actions">
+              <button type="button" class="btn btn-sm" id="auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
+              <button type="button" class="btn btn-sm" data-task-return-view="auto" data-i18n="common.back" hidden>Back</button>
+            </div>
           </header>
           <div class="auto-scroll">
             <div class="auto-list" id="auto-list"></div>

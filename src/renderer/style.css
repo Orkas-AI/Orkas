@@ -17165,9 +17165,6 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   color: var(--muted);
 }
 .auto-header-count:empty { display: none; }
-.auto-header-add {
-  margin-left: auto;
-}
 
 .auto-scroll {
   flex: 1;
