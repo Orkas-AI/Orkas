@@ -5583,21 +5583,28 @@ function _bindSavedTaskChipNavigation(button, task) {
     event.stopPropagation();
     if (button.disabled) return;
     button.disabled = true;
+    const automation = task.kind === 'automation';
+    const viewOptions = { returnToConversation: true };
+    const user = currentUserId;
+    let navigation = _composerNavigationEpoch;
+    const stillHere = () => user === currentUserId && navigation === _composerNavigationEpoch;
     try {
-      if (task.kind === 'automation') {
-        await _appNavOpenFeatureView('auto', 'auto', () => {
-          if (typeof window.focusAutoTaskById !== 'function') return false;
-          return window.focusAutoTaskById(task.task_id);
-        });
-      } else {
-        await _appNavLoadFeature('project', () => {
-          if (typeof focusTodo !== 'function') return false;
-          focusTodo(task.project_id || '', task.task_id);
-          return true;
-        });
+      if (automation) {
+        setView('auto', null, viewOptions);
+        navigation = _composerNavigationEpoch;
       }
+      await _appNavLoadFeature(automation ? 'auto' : 'project', async () => {
+        if (!stillHere()) return;
+        if (automation) {
+          const focused = await window.focusAutoTaskById?.(task.task_id);
+          return !stillHere() || focused === true;
+        }
+        if (typeof focusTodo !== 'function') return false;
+        focusTodo(task.project_id || '', task.task_id, viewOptions);
+        return true;
+      });
     } catch (error) {
-      _appNavReportFailure(task.kind === 'automation' ? 'auto' : 'todos', 'open', error);
+      if (stillHere()) _appNavReportFailure(automation ? 'auto' : 'todos', 'open', error);
     } finally { button.disabled = false; }
   });
 }

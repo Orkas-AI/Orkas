@@ -509,7 +509,9 @@ function focusTodo(scope, taskId, opts = {}) {
   if (id) {
     _globalTodoActiveScope = pid;
   }
-  setView('todos', null, opts.entryPoint ? { entryPoint: opts.entryPoint } : {});
+  const viewOptions = opts.entryPoint ? { entryPoint: opts.entryPoint } : {};
+  if (opts.returnToConversation === true) viewOptions.returnToConversation = true;
+  setView('todos', null, viewOptions);
 }
 
 function _applyGlobalTodoPendingFocus() {

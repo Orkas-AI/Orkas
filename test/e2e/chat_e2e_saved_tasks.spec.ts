@@ -173,6 +173,8 @@ test('shows clickable task content previews without changing code examples, link
   }, { cid: conversation.conversation_id, content });
   await message.locator('button.chat-task-reference').nth(1).click();
   await expect(page.locator(`#auto-list [data-task-id="${automation}"]`)).toHaveClass(/\bis-highlighted\b/);
+  await page.locator('#panel-auto').getByRole('button', { name: '返回', exact: true }).click();
+  await expect(page.locator('#chat-header-title')).toHaveText('Task reference display');
 });
 
 test('recovers the completed reply without leaving the page when terminal delivery is lost', async ({ modelOrkas: app }) => {
@@ -318,8 +320,11 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   await expect(todoCard).toHaveCSS('box-shadow', restingStyle.shadow);
   await expect(page.locator('[data-todo-group="status"]')).toHaveAttribute('aria-pressed', 'true');
   // Reopening the shortcut should reveal the highlight again in a narrow window.
+  await page.locator('#panel-todos').getByRole('button', { name: 'Back', exact: true }).click();
+  await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body'))
+    .toContainText('The tasks have been saved.');
   await page.setViewportSize({ width: 1024, height: 720 });
-  await page.evaluate((id) => { (window as any).setLang('zh'); (window as any).setView('conversation', id); }, cid);
+  await page.evaluate(() => (window as any).setLang('zh'));
   await page.locator('#chat-history [data-saved-task-key]', { hasText: 'Review release notes' }).click();
   await expect(todoCard).toBeInViewport();
   await expect(todoCard).not.toHaveCSS('background-color', restingStyle.background, { timeout: 1500 });
@@ -412,13 +417,46 @@ test('shows conversation source icons and header shortcuts together without crow
     await expect(page.locator('#conversation-info-toggle')).toBeInViewport();
     await page.screenshot({ path: testInfo.outputPath(`conversation-task-links-${locale}.png`) });
   }
-  await page.locator(`#chat-header [data-header-task-id="${todo.id}"]`).focus();
+  const draft = page.locator('#chat-input');
+  const draftText = 'Changes to review before release';
+  await draft.fill(draftText);
+  const sourceRow = page.locator(`#today-list .conv-item[data-cid="${cid}"]`);
+  const todoShortcut = page.locator(`#chat-header [data-header-task-id="${todo.id}"]`);
+  const automationShortcut = page.locator(`#chat-header [data-header-task-id="${automation.id}"]`);
+  const todoBack = page.locator('#panel-todos').getByRole('button', { name: '返回', exact: true });
+  await todoShortcut.focus();
   await page.keyboard.press('Enter');
   await expect(page.locator(`#todos-content [data-tid="${todo.id}"]`)).toHaveClass(/\bis-highlighted\b/);
-  await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
-  await page.locator(`#chat-header [data-header-task-id="${automation.id}"]`).click();
+  await expect(todoBack).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('todo-return-zh-narrow.png') });
+  await todoBack.focus();
+  await page.keyboard.press('Enter');
+  await expect(sourceRow).toHaveClass(/\bactive\b/);
+  await expect(draft).toBeVisible();
+  await expect(draft).toHaveText(draftText);
+  await openSidebarEntry(page, '#todos-btn');
+  await expect(page.locator('#panel-todos')).toBeVisible();
+  await expect(todoBack).toBeHidden();
+
+  await sourceRow.click();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.evaluate(() => (window as any).setLang('en'));
+  const autoBack = page.locator('#panel-auto').getByRole('button', { name: 'Back', exact: true });
+  await automationShortcut.click();
   await expect(page.locator(`#auto-list [data-task-id="${automation.id}"]`)).toHaveClass(/\bis-highlighted\b/);
-  await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
+  await expect(autoBack).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('automation-return-en-wide.png') });
+  await autoBack.click();
+  await expect(sourceRow).toHaveClass(/\bactive\b/);
+  await expect(draft).toBeVisible();
+  await expect(draft).toHaveText(draftText);
+  await automationShortcut.click();
+  await expect(autoBack).toBeVisible();
+  await openSidebarEntry(page, '#auto-btn');
+  await expect(page.locator('#panel-auto')).toBeVisible();
+  await expect(autoBack).toBeHidden();
+
+  await sourceRow.click();
   await app.invoke('projects.tasks.delete', { taskId: todo.id });
   await expect(links).toHaveCount(1);
   await expect(page.locator('#chat-header [data-header-task-id]')).toHaveAttribute('data-header-task-id', automation.id);
