@@ -511,12 +511,12 @@ test('idle task pages release native contents and lazily restore cookies, storag
     const ownerWindow = await orkas.electronApp!.browserWindow(orkas.page!);
     await ownerWindow.evaluate(win => win.showInactive());
     await expect.poll(() => ownerWindow.evaluate(win => win.isVisible())).toBe(true);
-    const drawerVisible = await orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
+    const drawerVisible = () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
       const owner = BrowserWindow.getAllWindows()[0];
       const view = owner.contentView.children.find(v => v instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
       return view.getVisible();
     });
-    expect(drawerVisible).toBe(true);
+    await expect.poll(drawerVisible).toBe(true);
     await ownerWindow.evaluate(win => win.hide());
     await expect.poll(() => ownerWindow.evaluate(win => win.isVisible())).toBe(false);
     await expect.poll(() => orkas.page!.evaluate<boolean>('_conversationWindowActive')).toBe(false);
