@@ -53,6 +53,7 @@ import {
   type BrowserTabLifetime, type BrowserTabRetention,
 } from './web_assist_lifecycle';
 import { hardenedWebPreferences, safeExternalHttpUrl } from '../util/window-security';
+import { getWindowHiddenSince } from '../util/window-presentation';
 import {
   buildWebAssistActionScript,
   buildWebAssistTextConditionScript,
@@ -80,10 +81,9 @@ const { MAX_PAGE_ACTION_TEXT_LENGTH } = require('../../../bin/browser-tool-contr
 };
 const MAX_LABEL_LENGTH = 120;
 const MAX_SEARCH_INPUT_LENGTH = 2048;
-/** Raised from 10 on 2026-09-18. Idle reclamation, not this ceiling, governs
- *  live renderer count: `reclaimIdleWebAssistPages` closes any tab that is not
- *  visible and has been idle for ten minutes, so steady-state cost follows
- *  recent use. Ten was too low for a research session. */
+/** Raised from 10 on 2026-09-18 for research sessions. The idle scan reclaims
+ *  safely restorable pages after ten minutes out of view, including when the
+ *  native window is hidden. */
 export const MAX_TABS_PER_CONVERSATION = 30;
 const IDLE_PAGE_TIMEOUT_MS = 10 * 60_000;
 const IDLE_PAGE_SCAN_MS = 30_000;
@@ -1027,16 +1027,20 @@ export const webAssistIdleSafetyScript = `(() => {
 })()`;
 
 function canUnloadTab(record: WebAssistRecord, tab: WebAssistTabRecord, now: number): boolean {
+  const hiddenSince = tab.visible ? getWindowHiddenSince(record.owner) : tab.lastUsedAt;
+  const contents = tab.view?.webContents;
   return records.get(record.owner.id) === record && record.tabs.get(tab.id) === tab
-    && !!tab.view && !tab.view.webContents.isDestroyed() && !tab.suspended
-    && !tab.visible && now - tab.lastUsedAt >= IDLE_PAGE_TIMEOUT_MS
+    && !!contents && !contents.isDestroyed() && !tab.suspended
+    && hiddenSince !== undefined && now - Math.max(hiddenSince, tab.lastUsedAt) >= IDLE_PAGE_TIMEOUT_MS
     && !tab.userControlled && !tab.inputBusy
-    && !tab.loading && !tab.view.webContents.isLoading() && !tab.activeOperations
+    && !tab.loading && !contents.isLoading() && !tab.activeOperations
     && !tab.assistantAction && !tab.edited && tab.replayable
     && tab.lifetime.retention !== 'handoff' && tab.controlContext?.scope !== 'connector_setup'
     && !tab.authorizationPopups.size
     && ![...tab.relatedTabs].some(id => record.tabs.has(id))
-    && !tab.view.webContents.isCurrentlyAudible();
+    && !contents.isCurrentlyAudible()
+    && !webAssistDialogs(contents)?.pending() && !webAssistPermissionRequest(contents)
+    && !webAssistNativeSelection(contents) && !webAssistPasskeyRequest(contents) && !webAssistFileChooser(contents);
 }
 
 /** Host maintenance only. Listing tabs never calls this or wakes a page. */
@@ -3456,6 +3460,8 @@ export function layoutWebAssist(
   if (!bounds) return { ok: false, code: 'invalid_bounds', error: 'Web Assist could not be positioned.' };
   const tab = activeTab(record);
   if (!tab) return { ok: false, code: 'not_open', error: 'Web Assist is not open.' };
+  // A layout queued before native hide must not wake an unloaded page.
+  if (tab.suspended && getWindowHiddenSince(record.owner) !== undefined) return { ok: true, state: rendererSnapshot(record) };
   if (!ensureTabLoaded(record, tab)) return { ok: true, state: rendererSnapshot(record) };
   for (const candidate of record.tabs.values()) {
     if (candidate !== tab) setTabVisible(candidate, false);
