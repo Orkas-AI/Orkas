@@ -1386,13 +1386,34 @@ function compileMatcher(query: string): (target: { abs: string; root: string }) 
     const [glob] = compileGrepGlobs(q);
     return (target) => targetMatchesGrepGlob(target, glob);
   }
-  const hasGlob = /[*?[]/.test(q);
-  if (hasGlob) {
-    const re = new RegExp(
-      '^' + q.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$',
-      'i',
-    );
-    return (target) => re.test(path.basename(target.abs));
+  if (/[*?[]/.test(q)) {
+    const globSource = (part: string) => part.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+    const literalBrackets = (part: string) => globSource(part).replace(/[[\]]/g, '\\$&');
+    const lastClose = q.lastIndexOf(']');
+    let source = '';
+    let offset = 0;
+    let hasClass = false;
+    // Consume complete classes once. A malformed class is filename text and
+    // does not change any other class or wildcard in the query.
+    for (let open = q.indexOf('['); open >= 0 && open < lastClose; open = q.indexOf('[', offset)) {
+      const close = q.indexOf(']', open + 1);
+      const token = q.slice(open, close + 1);
+      source += literalBrackets(q.slice(offset, open));
+      const candidate = globSource(token);
+      try {
+        new RegExp(candidate);
+        source += candidate;
+        hasClass = true;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        source += literalBrackets(token);
+      }
+      offset = close + 1;
+    }
+    if (hasClass || /[*?]/.test(q)) {
+      const matcher = new RegExp('^' + source + literalBrackets(q.slice(offset)) + '$', 'i');
+      return target => matcher.test(path.basename(target.abs));
+    }
   }
   const lower = q.toLowerCase();
   return (target) => path.basename(target.abs).toLowerCase().includes(lower);
