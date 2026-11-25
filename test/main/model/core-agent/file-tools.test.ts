@@ -3176,6 +3176,34 @@ describe('file-tools › search_files', () => {
     } finally { process.env.PATH = originalPath; }
   });
 
+  it.each(['default', 'fallback'])('handles literal filename brackets and valid ranges in the same search (%s)', async backend => {
+    const { tools, wsDir } = await buildTools();
+    for (const name of ['invoice [draft.txt', 'invoice 1.txt', 'invoice 7.txt',
+      'invoice 1 [draft.txt', 'invoice 7 [draft.txt', 'invoice 2 final.txt',
+      'invoice 1 [7-4].txt', 'invoice 7 [7-4].txt']) {
+      fs.writeFileSync(path.join(wsDir, name), '');
+    }
+    const search = getTool(tools, 'search_files');
+    const originalPath = process.env.PATH;
+    if (backend === 'fallback') process.env.PATH = tmpDir;
+    try {
+      for (const [query, expected] of [
+        ['[draft', ['invoice [draft.txt', 'invoice 1 [draft.txt', 'invoice 7 [draft.txt']],
+        ['*[draft.txt', ['invoice [draft.txt', 'invoice 1 [draft.txt', 'invoice 7 [draft.txt']],
+        ['invoice [1-3].txt', ['invoice 1.txt']],
+        ['invoice [1-3] [draft.txt', ['invoice 1 [draft.txt']],
+        ['invoice [1-3] [d*.txt', ['invoice 1 [draft.txt']],
+        ['invoice [1-3] [7-4].txt', ['invoice 1 [7-4].txt']],
+      ] as const) {
+        const result = await run(search, { root: wsDir, query });
+        expect(result.isError, query).toBeFalsy();
+        expect(result.content, query).toContain('complete=true');
+        if (backend === 'fallback') expect(result.content, query).toContain('backend=walk');
+        expect(searchResults(result.content).files.map(file => file.name).sort(), query).toEqual([...expected].sort());
+      }
+    } finally { process.env.PATH = originalPath; }
+  });
+
   it('reports cancellation as incomplete without scanning or claiming no matches', async () => {
     const { tools, wsDir } = await buildTools();
     fs.writeFileSync(path.join(wsDir, 'present.ts'), 'needle');
