@@ -525,26 +525,36 @@ function isPrivateReferenceHost(hostname: string): boolean {
   ) return true;
 
   const ipVersion = isIP(host);
-  if (ipVersion === 4) {
-    const octets = host.split('.').map(Number);
-    const [a, b] = octets;
-    return a === 0
-      || a === 10
-      || a === 127
-      || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168)
-      || a >= 224;
-  }
+  if (ipVersion === 4) return isPrivateReferenceIpv4(host);
   if (ipVersion === 6) {
+    // WHATWG URL rewrites `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`, so the
+    // mapped address arrives as two hex groups. Judge the IPv4 it carries.
+    const mapped = /^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(host);
+    if (mapped) {
+      if (mapped[1]) return isPrivateReferenceIpv4(mapped[1]);
+      const high = parseInt(mapped[2], 16);
+      const low = parseInt(mapped[3], 16);
+      return isPrivateReferenceIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+    }
     return host === '::'
       || host === '::1'
       || host.startsWith('fc')
       || host.startsWith('fd')
-      || /^fe[89ab]/.test(host)
-      || /^::ffff:(?:0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host);
+      || /^fe[89ab]/.test(host);
   }
   return false;
+}
+
+function isPrivateReferenceIpv4(host: string): boolean {
+  const [a, b] = host.split('.').map(Number);
+  return a === 0
+    || a === 10
+    || (a === 100 && b >= 64 && b <= 127)
+    || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || a >= 224;
 }
 
 function isLoopbackReferenceHost(hostname: string): boolean {
