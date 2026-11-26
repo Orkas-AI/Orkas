@@ -47,7 +47,75 @@ function presentationTree(background: string = '#0F172A') {
   };
 }
 
+function layeredSlide(...objects: Array<Record<string, unknown>>) {
+  const tree = presentationTree('#101010');
+  Object.assign(tree.data.children[0], { children: objects });
+  return tree;
+}
+
+function panel(order: number, properties: Record<string, unknown> = {}) {
+  return {
+    type: 'shape',
+    path: `/slide[1]/shape[@id=${order}]`,
+    format: { geometry: 'rect', zorder: order,
+      x: '1in', y: '2.54cm', width: '152.4mm', height: '216pt', fill: '#F5C14E', ...properties },
+  };
+}
+
+const layeredText = {
+  type: 'shape',
+  path: '/slide[1]/shape[@id=20]',
+  text: 'Fixture title',
+  format: { geometry: 'rect', zorder: 20, x: '5.08cm', y: '5.08cm', width: '10.16cm', height: '2.54cm',
+    fill: 'none', color: '#101010', size: '28pt' },
+};
+
 describe('PPTX deterministic contrast audit', () => {
+  it('does not block text on an opaque covering panel, even when the tree lists it after the text', () => {
+    const upstream = { issues: [
+      { id: 'contrast', subtype: 'low_contrast', path: layeredText.path, severity: 'blocker' },
+      { id: 'unrelated', subtype: 'shape_out_of_bounds', path: layeredText.path, severity: 'warning' },
+    ] };
+    const result = auditPptxContrast(upstream, layeredSlide(layeredText, panel(10), panel(5, { width: '2in', rotation: '20' })));
+    expect(result).toMatchObject({ issues: { issues: [upstream.issues[1]] }, findingCount: 0, scannedTextCount: 1 });
+  });
+
+  it('blocks genuinely low contrast on the closest opaque panel over a brighter one', () => {
+    const result = auditPptxContrast({ issues: [] }, layeredSlide(panel(10, { fill: '#202020' }), layeredText, panel(5)));
+    expect(result.issues).toMatchObject({ issues: [{
+      path: layeredText.path, severity: 'blocker', subtype: 'low_contrast', background: '#202020', contrast_ratio: 1.17,
+    }] });
+  });
+
+  it.each([
+    ['partial coverage', panel(10, { width: '3in' })],
+    ['half-opacity fill', panel(10, { opacity: '0.5' })],
+    ['an alpha color', panel(10, { fill: '#F5C14E80' })],
+    ['rotation', panel(10, { rotation: '20' })],
+    ['rounded corners', panel(10, { geometry: 'roundRect' })],
+    ['another text box', { ...panel(10), text: 'Other content in the backing shape' }],
+    ['a front layer', panel(30)],
+    ['unknown order', panel(10, { zorder: undefined })],
+    ['conflicting order', panel(10, { zorder: 20 })],
+  ])('flags %s for visual review without guessing a ratio', (_label, obstacle) => {
+    const result = auditPptxContrast({ issues: [
+      { id: 'old-guess', subtype: 'low_contrast', severity: 'blocker', path: layeredText.path },
+    ] }, layeredSlide(panel(5), layeredText, obstacle));
+    const issues = (result.issues as { issues: Array<Record<string, unknown>> }).issues;
+    expect(issues).toEqual([expect.objectContaining({
+      subtype: 'contrast_needs_visual_review', path: layeredText.path, severity: 'warning',
+      message: expect.stringContaining('Render slide 1'),
+    })]);
+    expect(issues[0]).not.toHaveProperty('contrast_ratio');
+  });
+
+  it('leaves the slide background authoritative when the nearby panel is outside the text bounds', () => {
+    const result = auditPptxContrast({ issues: [] }, layeredSlide(layeredText, panel(10, { x: '8in' })));
+    expect(result.issues).toMatchObject({ issues: [{
+      path: layeredText.path, severity: 'blocker', background: '#101010', contrast_ratio: 1,
+    }] });
+  });
+
   it('audits the native title type without treating paragraph containers as separate objects', () => {
     const tree = presentationTree('#10243A');
     tree.data.format['theme.color.dk1'] = '#10243A';

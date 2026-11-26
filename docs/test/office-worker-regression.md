@@ -35,6 +35,13 @@ before another native creation. Reservation precedes dispatch, so concurrent
 calls and actor rebuilds cannot replenish it. This does not retry a model or
 automatically choose corrected values.
 
+A malformed `retry_of` tells a first-time caller to omit the field. For the same
+original path with an eligible correction, the refusal includes the existing
+receipt. These refusals do not dispatch the engine or consume an attempt.
+DOCX creation also returns a field-specific `E_BAD_INPUT` for malformed
+paragraph, table-row, and image structure before reserving the destination.
+Omitted content, blank paragraphs, and empty table cells are supported.
+
 Successful publication closes recovery permanently for that operation, even
 when its receipt fails, or the requested/collision-safe file is later removed.
 PPTX/XLSX corrections use `edit_office`. Ordinary replacement of an existing
@@ -52,6 +59,11 @@ corrects it once, opens the native chart XML and validates the recovered PPTX,
 then deletes it and verifies that recreation dispatches nothing. Its native
 locale-inference note is explicitly classified as informational. Run this on
 Windows too before claiming native Windows recovery verification.
+
+`office-creation_e2e_protocol.test.ts` replays both custom OpenAI-compatible
+protocols with real OfficeCLI. It checks field-specific rejection before any
+write, recovers one native rejection from the returned receipt, and verifies
+the saved Word body and absence of a second write on repeat.
 
 ### Saved output followed by failure
 
@@ -197,13 +209,19 @@ The focused Office tool suite must prove all of the following independently:
    and does not register an output.
 4. A conversation-produced artifact can still be refined at its path, but the
    edit is built and validated in a temporary file before atomic replacement.
-5. Sandboxed image paths are normalized; out-of-scope paths, URI media sources,
-   and active link schemes are rejected before editing.
+5. Image paths are normalized; one outside the workspace follows the user's
+   access setting (refused under workspace-only access, allowed by default with
+   the standard prompt for sensitive places), and URI media sources and active
+   link schemes are rejected before editing.
 6. Invalid OpenXML is a fatal `office_review` structural result while warning-only issue
    findings remain publishable with disclosure.
 7. Successful create results report logical paragraphs, cells, or slides from
    the caller input; extra batch operations for styles, shapes, charts, tables,
    or pictures never inflate those user-visible counts.
+8. A document or PDF the user names elsewhere on the computer is read by the
+   same setting (2026-11-23): an `edit_office` working copy of it is created in
+   the workspace, a PDF from elsewhere renders, an edit of it writes only inside,
+   and the source folder is left as it was.
 
 ## PDF Smoke
 
