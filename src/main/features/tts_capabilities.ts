@@ -343,7 +343,7 @@ export async function resolveTtsSelection(input: {
       ok: false,
       errorCode: input.routeRef ? 'E_TTS_ROUTE_UNRESOLVED' : 'E_TTS_NO_PROVIDER',
       message: input.routeRef
-        ? `The signed TTS route is no longer configured: ${input.routeRef}. Revise the narration plan and reopen Gate B.`
+        ? `The speech route ${input.routeRef} is no longer configured. Pick a route_ref from speech.capabilities and run it again.`
         : 'No speech provider is available.',
     };
   }
@@ -354,7 +354,7 @@ export async function resolveTtsSelection(input: {
     return {
       ok: false,
       errorCode: 'E_TTS_LANGUAGE_INVALID',
-      message: `Invalid narration language tag: ${requestedLanguageRaw}. Refresh speech.capabilities and revise the Gate B plan.`,
+      message: `${requestedLanguageRaw} is not a language tag. Use one such as zh-CN or en-US, as speech.capabilities lists them, and run it again.`,
     };
   }
 
@@ -370,10 +370,11 @@ export async function resolveTtsSelection(input: {
           !requestedLanguage || ttsVoiceIsEligibleForLanguage(candidate, requestedLanguage)
         ));
   if (!voice) {
+    const exampleVoiceRef = route.defaultVoiceRef || route.voices[0]?.voiceRef;
     return {
       ok: false,
       errorCode: 'E_TTS_VOICE_UNRESOLVED',
-      message: `The requested voice is not present in the current ${route.displayName} capability catalog. Query speech.capabilities and revise the signed narration selection.`,
+      message: `${requestedVoiceRef ? `The voice_ref ${requestedVoiceRef}` : legacyVoice ? `The voice ${legacyVoice}` : 'The requested voice'} is not one of the ${route.displayName} voices. Copy a voice_ref exactly as speech.capabilities lists it${exampleVoiceRef ? `, for example ${exampleVoiceRef},` : ''} and run it again.`,
     };
   }
 
@@ -383,14 +384,14 @@ export async function resolveTtsSelection(input: {
     return {
       ok: false,
       errorCode: 'E_TTS_LANGUAGE_UNSUPPORTED',
-      message: `${voice.displayName} does not support ${language} as the narration language. Choose a compatible voice from speech.capabilities.`,
+      message: `${voice.displayName} does not speak ${language}. Choose a voice that speech.capabilities lists for ${language} and run it again.`,
     };
   }
   if (languageDeclared && !ttsVoiceLanguageIsVerified(voice, language)) {
     return {
       ok: false,
       errorCode: 'E_TTS_LANGUAGE_UNVERIFIED',
-      message: `${voice.displayName} advertises ${language} only as a candidate capability. Choose a verified voice from speech.capabilities.`,
+      message: `${voice.displayName} lists ${language} only as untested. Choose a voice that speech.capabilities lists as verified for ${language} and run it again.`,
     };
   }
 

@@ -1,5 +1,6 @@
 import {afterEach,beforeEach,expect,it} from 'vitest';
 import fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createRequire} from 'node:module';
@@ -42,6 +43,8 @@ it('extracts a video audio stream without re-encoding and rejects a video withou
   ff(['-f','lavfi','-i','color=size=32x32:duration=2:rate=10','-i',path.join(root,'source.wav'),'-c:v','mpeg4','-c:a','aac','-shortest',path.join(root,'video.mp4')]);
   const original=await fs.readFile(path.join(root,'video.mp4'));
   const result=await call('extract',{input_path:'video.mp4',export:{normalize_loudness:false}});
+  expect(result.absolute_files).toEqual([output(result), path.join(path.dirname(output(result)), 'receipt.json')]);
+  expect(await fs.readFile(result.absolute_files[0])).toEqual(await fs.readFile(output(result)));
   expect(probe(output(result)).streams.map((s:any)=>s.codec_type)).toEqual(['audio']);
   expect(probe(output(result)).streams[0].codec_name).toBe('aac');
   expect(pcm(output(result))).toEqual(pcm(path.join(root,'video.mp4')));
@@ -55,25 +58,28 @@ it.each(['mp3','m4a','aac','ogg','opus'])('converts to %s with one audio stream 
   const meta=probe(output(result));expect(meta.streams).toHaveLength(1);
   expect(meta.streams[0].codec_type).toBe('audio');expect(Number(meta.format.duration)).toBeCloseTo(2,0);
 });
-it.each(['flac','m4a','aac','ogg','opus'])('renders a project with normal loudness processing into %s',async format=>{
+it.each(['flac','m4a','aac','ogg','opus'])('preserves mono when rendering a single recording into %s',async format=>{
   await save({segments:[{id:'source',path:'source.wav'}],export:{format}});
   const result=await call('render'),meta=probe(output(result));
   expect(meta.streams).toHaveLength(1);expect(meta.streams[0].sample_rate).toBe('48000');
-  expect(meta.streams[0].channels).toBe(2);expect(Number(meta.format.duration)).toBeCloseTo(2,0);
+  expect(meta.streams[0].channels).toBe(1);expect(Number(meta.format.duration)).toBeCloseTo(2,0);
 });
-it('honors explicit export specifications while retaining legacy defaults',async()=>{
+it('honors explicit export specifications and retains default MP3 encoding for a mono recording',async()=>{
   await save({segments:[{id:'source',path:'source.wav'}],export:{format:'wav',sample_rate:24000,channels:1,bit_depth:24,normalize_loudness:false}});
   const result=await call('render');
   expect(probe(output(result)).streams[0]).toMatchObject({sample_rate:'24000',channels:1,codec_name:'pcm_s24le'});
   await save({segments:[{id:'source',path:'source.wav'}]});
-  const legacy=await call('render');expect(probe(output(legacy)).streams[0]).toMatchObject({codec_name:'mp3',sample_rate:'48000',channels:2,bit_rate:'192000'});
+  const implicit=await call('render');expect(probe(output(implicit)).streams[0]).toMatchObject({codec_name:'mp3',sample_rate:'48000',channels:1,bit_rate:'192000'});
 });
-it('attenuates music during speech and restores it during a pause, only when ducking is enabled',async()=>{
+it.each(['legacy','timeline'])('attenuates music during speech and restores it during a pause in the %s mixer',async mixer=>{
   ff(['-f','lavfi','-i',"aevalsrc='if(between(t,1,3),0.3*sin(2*PI*660*t),0)':s=48000:d=4",'-c:a','pcm_s16le',path.join(root,'speech.wav')]);
   ff(['-f','lavfi','-i','sine=frequency=220:sample_rate=48000:duration=4','-c:a','pcm_s16le',path.join(root,'music.wav')]);
   const plan={segments:[{id:'speech',path:'speech.wav'}],music:{path:'music.wav',volume:1,duck:false},export:{format:'wav',normalize_loudness:false}};
-  await save(plan);const plain=output(await call('render'));
-  plan.music.duck=true;await save(plan);const ducked=output(await call('render'));
+  const saved = mixer === 'legacy' ? plan : { ...plan, schema_version:3, music:undefined, tracks:[{ id:'bg',kind:'music',...plan.music }] };
+  await save(saved);const plain=output(await call('render'));
+  expect(probe(plain).streams[0].channels).toBe(2);
+  if(mixer === 'legacy') plan.music.duck=true; else (saved as any).tracks[0].duck=true;
+  await save(saved);const ducked=output(await call('render'));
   const amplitude=(file:string,start:number)=>{
     const b=ff(['-ss',String(start),'-i',file,'-t','0.3','-ac','1','-ar','48000','-f','s16le','-']);let a=0,c=0,n=b.length/2;
     for(let i=0;i<n;i++){const s=b.readInt16LE(i*2);a+=s*Math.cos(i*2*Math.PI*220/48000);c+=s*Math.sin(i*2*Math.PI*220/48000);}
@@ -218,3 +224,39 @@ it('allows one-off export overrides without rewriting the saved export profile',
   const reopened=await call('render');expect(probe(output(reopened)).streams[0]).toMatchObject({codec_name:'pcm_s24le',sample_rate:'24000',channels:1});
   expect(await fs.readFile(project)).toEqual(plan);
 });
+
+it.each([[16000, 16], [24000, 24], [44100, 32], [48000, 32]])(
+  'preserves untreated PCM trim samples at the requested source rate and precision: %sHz %s-bit', async (rate, bits) => {
+    const width = bits / 8, frames = rate * 2, pcm = Buffer.alloc(frames * width);
+    for (let i = 0; i < frames; i++) pcm.writeIntLE(Math.round(Math.sin(i * .41) * (2 ** (bits - 3))) + i % 17 - 8, i * width, width);
+    const header = Buffer.alloc(44);
+    header.write('RIFF'); header.writeUInt32LE(pcm.length + 36, 4); header.write('WAVEfmt ', 8);
+    header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(rate, 24); header.writeUInt32LE(rate * width, 28); header.writeUInt16LE(width, 32);
+    header.writeUInt16LE(bits, 34); header.write('data', 36); header.writeUInt32LE(pcm.length, 40);
+    const source = Buffer.concat([header, pcm]), sourcePath = path.join(root, 'recording.wav');
+    fsSync.writeFileSync(sourcePath, source);
+    const project = path.join(root, 'voice-project.json');
+    const plan = { schema_version: 1, roles: {}, segments: [{ id: 'excerpt', path: 'recording.wav', start_sec: .2, end_sec: 1.6, volume: 1, speed: 1 }],
+      export: { format: 'wav', ...(rate === 48000 ? {} : { sample_rate: rate }), channels: 1, bit_depth: bits, normalize_loudness: false } };
+    fsSync.writeFileSync(project, JSON.stringify(plan));
+    const decode = (file: string) => {
+      const p = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, ['-v', 'error', '-nostdin', '-i', file,
+        '-c:a', `pcm_s${bits}le`, '-f', `s${bits}le`, '-'], { timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
+      expect(p.status).toBe(0); expect(p.stderr.length).toBe(0); return p.stdout;
+    };
+    const first = await audio.execute('render', { project });
+    const output = path.join(root, first.files[0]), observed = decode(output);
+    const expected = pcm.subarray(rate * .2 * width, rate * 1.6 * width);
+    expect(observed.length).toBe(expected.length);
+    expect(observed.equals(expected), 'a neutral same-rate trim must not introduce intermediate resampling or quantization').toBe(true);
+    expect(fsSync.readFileSync(sourcePath)).toEqual(source);
+    const second = await audio.execute('render', { project });
+    expect(decode(path.join(root, second.files[0])).equals(expected)).toBe(true);
+    expect(fsSync.existsSync(output)).toBe(true);
+    plan.segments[0].volume = .5; fsSync.writeFileSync(project, JSON.stringify(plan));
+    const treated = await audio.execute('render', { project });
+    const changed = decode(path.join(root, treated.files[0]));
+    expect(changed.equals(expected), 'explicit gain remains a treatment').toBe(false);
+    expect(fsSync.readFileSync(sourcePath)).toEqual(source);
+  }, 30000);

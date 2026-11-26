@@ -522,6 +522,35 @@ it('does not dispatch queued narration under a different local user', async () =
   expect(existsSync(path.join(root, 'old-user-queued.mp3'))).toBe(false);
 });
 
+it('rejects queued narration after switching away and back, while allowing a fresh request', async () => {
+  state.provider = 'custom'; state.owner = 'first-account';
+  const { notifyUserSwitch } = await import('../../../src/main/features/user-switch-hooks');
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let sends = 0;
+  const fetch = vi.fn(async () => {
+    if (++sends <= 2) await gate;
+    return new Response('complete', { headers: { 'Content-Type': 'audio/mpeg' } });
+  });
+  vi.stubGlobal('fetch', fetch);
+  const make = (name: string) => generateSpeech({ text: name, outputAbsPath: path.join(root, `${name}.mp3`) });
+  const active = [make('first'), make('second')];
+  let queued: ReturnType<typeof generateSpeech> | undefined;
+  try {
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    queued = make('stale-after-return');
+    notifyUserSwitch('first-account', 'second-account'); state.owner = 'second-account';
+    notifyUserSwitch('second-account', 'first-account'); state.owner = 'first-account';
+    release(); await Promise.all(active);
+    expect.soft(await queued).toMatchObject({ ok: false, requestDisposition: 'not_sent', chargeStatus: 'not_charged' });
+    expect.soft(fetch).toHaveBeenCalledTimes(2);
+    expect.soft(existsSync(path.join(root, 'stale-after-return.mp3'))).toBe(false);
+    expect(await make('fresh-after-return')).toMatchObject({ ok: true });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(readFileSync(path.join(root, 'fresh-after-return.mp3'), 'utf8')).toBe('complete');
+  } finally { release(); await Promise.allSettled([...active, ...(queued ? [queued] : [])]); }
+});
+
 it('compares six serial versus concurrent complete narrations with bounded payloads', async () => {
   state.provider = 'custom';
   const records: Array<Record<string, number | string>> = [];

@@ -396,3 +396,172 @@ are unchanged. Managed separation/music, official credits, private model cohort
 history and monorepo retained logs are excluded. Local effects and supplied BGM
 remain available. No document update marks model behavior, paid suppliers,
 packaging, Windows/Linux native paths or perceptual listening accepted.
+
+## Timed narration estimates and bounded fills
+
+Chinese estimates use 4.5 Han characters per second. Uncalibrated estimates refuse only beyond 20% of the target; measured per-voice pace uses the existing 5% measured tolerance. Estimates do not guarantee output length. A short line may replace its own file at most twice per turn, only after its result requests a fill; a refused estimate preserves that opening. Fitting/long lines and uncertain dispatched requests do not gain an automatic retry. Verify independent files, changed targets, turn reset and unchanged ledger identity with `generate-speech-tool.test.ts` and `tts_fit.test.ts`. No live synthesis is required by these deterministic cases.
+
+### Untreated same-rate PCM cuts (2026-11-17)
+
+VoiceStudio 1.0.26 preserves integer PCM samples when a recorded-only WAV cut
+keeps the source rate, precision and channels, uses unit speed/gain, and disables
+normalization without processing, fades, gaps, word edits or mixing. The renderer
+previously resampled every clip through 48 kHz/16-bit PCM even for this untreated
+path. A real 16 kHz excerpt required an actor-side waveform workaround; its saved
+project reproduced the altered samples. The owning `voice_studio_e2e_delivery.test.ts`
+cases compare decoded output with an independent original byte slice at 16 kHz/16-bit,
+24 kHz/24-bit and 44.1 kHz/32-bit, rerender the saved project, preserve earlier exports
+and sources, and check that requested nonunit gain remains a treatment. Default
+normalization and processed/composed/retimed routes keep their existing pipeline.
+This is deterministic local sample preservation, not a listening-quality or
+Windows codec verification claim.
+
+### Background music at compressor EOF (2026-11-17)
+
+Legacy and timeline ducking now feed complete, aligned 1024-sample frames to
+both compressor inputs. Some FFmpeg builds otherwise drop background music
+before the narration ends. Final-frame padding is bounded below one frame;
+the voice duration or final timeline trim still owns the exact export length.
+The owning delivery case covers attenuation, silence recovery and unchanged
+leading music in both mixers. This is a local codec repair, with no provider,
+model instruction or generation changes.
+
+The same EOF repair applies to VideoStudio's packaged edit core and shared native
+render/remux audio graph. `test/main/features/video_ducking_e2e_frames.test.ts`
+uses whole-file waveform windows to verify leading music, attenuation and release
+in both paths; source and packaged graph equality is checked before real codecs.
+
+### Source-aware VoiceStudio loudness defaults (2026-11-21)
+
+VoiceStudio 1.0.35 resolves omitted loudness settings at render time. Local files
+and mixed-source projects preserve their gain through the export stage. Projects
+containing only synthesized speech still default to normalization. Explicit
+project and request settings retain their precedence. Standalone managed music
+is delivered as the verified provider file. Older projects with saved loudness
+settings replay as saved. To reproduce a delivery that used the former implicit
+default, pass the original receipt's export settings. This reproduces the prior
+trimmed PCM exactly in the retained comparison.
+
+The native cases compare the trimmed samples and mixed track gain with the input,
+verify the normalization override, and measure de-essing and undo on the saved
+projects. Recorded-speech compression uses a threshold suited to those fixtures
+and must still satisfy the same loud-to-quiet ratio and content checks without
+export normalization. No objective acceptance thresholds were changed.
+
+Two scoped `voice-trim-edges` production attempts used the Codex `gpt-6-luna`
+Actor and `gpt-6.2-sol` Judge. The first omitted the proposed project marker,
+leaving the quiet passage 4.448 dB louder. With the current renderer, the second
+used the original project path and delivered 4.2 seconds of untrimmed audio at
+the original level. Both attempts failed the delivery check. Independently
+rendering the second attempt's saved revision gives 3.499917 seconds with all
+167,996 retained stereo frames unchanged. Scores, timing, token use, log review
+and waveform proof are in [the retained results](voice-studio-loudness-default-20261121.retained.json).
+
+### VoiceStudio project revision handoff (2026-11-21)
+
+VoiceStudio 1.0.36 uses the actual write receipt to locate the saved project and
+the command request. A render returns the editable `project_path` alongside its
+outputs. The project snapshot records the exact plan applied to that export.
+The collision test writes through the real workspace tool with an existing
+`voice-project.json`, renders the suffixed revision, and checks its snapshot,
+audio, original project and previous output. The edge-trim evaluator also
+replays the delivered editable project. Its calibration rejects the original
+project, a missing project and a published audit snapshot.
+
+One `voice-trim-edges` production attempt passed at 99/100 with the Codex
+`gpt-6-luna` Actor and `gpt-6.2-sol` Judge. The Actor rendered and delivered
+`voice-project-2.json`. The delivered 3.499917 s WAV matches all retained
+samples, and the editable project replays it with zero measured sample error.
+An initial probe pointed at the directory and recovered after the Actor passed
+the project JSON. The existing tool-description budget warning was also
+observed. [Retained result and evidence](voice-studio-project-revision-20261121.retained.json).
+
+### VoiceStudio render request recovery in evaluation
+
+The evaluator can link a missing-request `E_REQUEST` to a later render when
+the same actor removes one extra directory from the request path. The observed
+write attests the corrected request. The render must create the receipts for the
+WAV the actor delivers, and the receipt must match the delivered file's hash.
+The original failure remains in the trace. Independent waveform and delivery
+checks still decide whether the audio meets the task.
+
+Replaying the original `voice-deess` tool trace links the failed request to its
+successful retry. With the delivery evidence removed, the error stays
+unresolved. The historical audio result still fails for unwanted gain change.
+[Original assessment and waveform evidence](voice-studio-objective-recheck-20261121.retained.json).
+
+### Source channels for single recorded segments (2026-11-21)
+
+VoiceStudio 1.0.37 uses the source channel count for a single mono or stereo
+file-backed segment with one audio stream and no background music or timed
+tracks. The resolved layout is used for clip preparation, processing and
+encoding. Saved or request channel settings take precedence. Multiple
+segments, mixes and synthesized narration retain the stereo default.
+
+The original rumble-undo project stored only the WAV format. With export
+normalization off, the previous renderer still produced stereo and read back
+3.0103 dB quieter when decoded to mono. The same project now produces mono
+48 kHz PCM16 with all 384,000 samples unchanged. Using the original receipt's
+loudness and measured channel settings reproduces its stereo samples.
+
+The live `voice-recorded-rumble-zh` rerun used the Codex `gpt-6-luna` Actor and
+`gpt-6.2-sol` Judge. The undo turn passed at 99/100 with identical source
+samples and a replayable delivered project. The first turn's audio passed
+its objective checks and its saved project reproduced the audio on disk.
+The reply provided the editable JSON as a local file link. At the time, the
+evaluator looked for the project in host attachments and recorded failed
+delivery checks for the first turn and the combined case. [Original results and waveform proof](voice-studio-source-channels-20261121.retained.json).
+
+### VoiceStudio project link evidence in evaluation
+
+The recorded-audio evaluator accepts valid workspace JSON links from the
+Agent's visible reply alongside host attachments. The desktop file viewer
+opens those links as text files. The existing project replay still verifies
+that the linked editable revision reproduces the delivered WAV. The check
+rejects missing targets, wrong revisions and run snapshots.
+
+Replaying the original messages and artifacts resolves the first turn's two
+failed objective checks. Both turns have zero sample error on project replay.
+The original 86.5/100 score remains in its historical run. A fresh
+`voice-recorded-rumble-zh` run on the fixed evaluator passed at 96.3/100
+with the Codex `gpt-6-luna` Actor and `gpt-6.2-sol` Judge. The report also
+preserves an earlier rerun whose source-stability gate returned a nonzero exit.
+[Reassessment and validation evidence](voice-studio-project-link-reevaluation-20261121.retained.json).
+
+### De-essing and pause preservation follow-up (2026-11-21)
+
+Two targeted runs on VoiceStudio 1.0.37 used the Codex `gpt-6-luna` Actor
+and `gpt-6.2-sol` Judge. Both de-essing deliveries applied standard
+de-essing with normalization disabled. The sibilance-to-voice ratio fell
+56.8% and the two measured voice-only windows had zero level change. An
+independent render with explicit normalization on reproduced the historical
+6.86% level drop.
+
+Both format-only conversions retained all 201,600 stereo PCM frames. The
+WAV hashes differ from the source because the container was rewritten.
+Both model replies accurately described content and pause preservation.
+The case passed at 97 and 94. Each run created a redundant equivalent WAV
+while checking the saved project, and delivered one final WAV.
+
+The first run passed both cases and returned a nonzero exit because concurrent
+repository edits changed its source fingerprint. The confirmation run had a
+stable fingerprint. Its de-essing audio passed objective checks and scored
+100, while the strict execution check failed. The actor combined preflight
+with a probe before saving its request, then saved that request and retried
+the probe successfully. The evaluator at the time recognized corrected
+render requests and left that probe error unresolved. The native and evaluator suites passed
+113 deterministic checks. [Retained results and measurements](voice-studio-deess-pauses-followup-20261121.retained.json).
+
+### VoiceStudio probe request recovery in evaluation
+
+The evaluator recognizes a missing probe request when the same actor saves
+the exact request after the failure and then probes it successfully. It checks
+the host write receipt against the saved request, scopes the project and audio
+input, and requires valid probe metadata. This covers the direct probe and the
+observed preflight followed by a probe. The compound form requires complete
+stdout with both JSON results.
+
+Replaying the retained de-essing trace passes the execution gate and preserves
+the original failure, its diagnostic warning and the independent waveform
+checks. Removing the host write receipt makes the same trace fail again.
+[Retained replay and calibration evidence](voice-studio-probe-recovery-20261121.retained.json).
