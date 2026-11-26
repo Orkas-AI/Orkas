@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 import type {
   ProgrammaticToolAuthorization,
   ProgrammaticToolPolicy,
@@ -171,8 +173,12 @@ function stringArg(value: unknown): string {
 function isLocalOrPrivateHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
-  if (host === '::' || host === '::1' || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80:')) {
-    return true;
+  if (host === '::' || host === '::1') return true;
+  // Only an IPv6 literal can be a unique-local, link-local or IPv4-mapped address.
+  // A hostname such as fda.gov or fcbarcelona.com must not match these prefixes.
+  if (isIP(host) === 6) {
+    const first = Number.parseInt(host.split(':')[0] || '0', 16);
+    if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || host.startsWith('::ffff:')) return true;
   }
   const parts = host.split('.');
   if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part))) return false;
