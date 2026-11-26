@@ -218,6 +218,8 @@ async function loadImageReferenceBuffersWithinBudget(
         label: 'reference image download',
         signal: composed.signal,
         maxBytes: MAX_REFERENCE_DOWNLOAD_BYTES,
+        isAllowedDirectAddress: address => isIP(address) !== 0 && !isPrivateReferenceHost(address),
+        validateRedirectUrl: isPublicHttpsReferenceUrl,
         validate: (body) => {
           if (!body.length) throw new Error('reference image download returned an empty body');
         },
@@ -475,6 +477,10 @@ function normalizePath(value?: string): string {
   return s ? path.resolve(s) : '';
 }
 
+function isPublicHttpsReferenceUrl(url: URL): boolean {
+  return url.protocol === 'https:' && !url.username && !url.password && !isPrivateReferenceHost(url.hostname);
+}
+
 function normalizeUrl(value?: string): string {
   const s = String(value || '').trim();
   if (!s) return '';
@@ -487,12 +493,7 @@ function normalizeUrl(value?: string): string {
   }
   try {
     const parsed = new URL(s);
-    if (
-      parsed.protocol === 'https:'
-      && !parsed.username
-      && !parsed.password
-      && !isPrivateReferenceHost(parsed.hostname)
-    ) {
+    if (isPublicHttpsReferenceUrl(parsed)) {
       return s;
     }
   } catch { /* rejected below */ }

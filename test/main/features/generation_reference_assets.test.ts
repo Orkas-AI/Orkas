@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from 'undici';
 
 const refOwner = vi.hoisted(() => ({ id: 'open-device-id' }));
 vi.mock('../../../src/main/features/machine_device_id', () => ({
@@ -30,6 +31,17 @@ async function writeTinyMp4(fileName = 'reference.mp4', suffix = ''): Promise<st
   return filePath;
 }
 
+let previousDispatcher: Dispatcher | undefined;
+
+async function routeReferenceFixtureThroughProxy(): Promise<void> {
+  previousDispatcher = getGlobalDispatcher();
+  vi.stubEnv('HTTPS_PROXY', 'http://proxy.example.test:8080');
+  vi.stubEnv('NO_PROXY', '');
+  vi.stubEnv('no_proxy', '');
+  const proxy = await import('../../../src/main/util/proxy-dispatcher');
+  expect(await proxy.installEnvProxyDispatcher()).toBe(true);
+}
+
 beforeEach(async () => {
   refOwner.id = 'open-device-id';
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-generation-reference-'));
@@ -39,6 +51,13 @@ beforeEach(async () => {
 afterEach(async () => {
   const proxy = await import('../../../src/main/util/proxy-dispatcher');
   proxy._resetProxyRoutingForTests();
+  if (previousDispatcher) {
+    const fixtureDispatcher = getGlobalDispatcher();
+    setGlobalDispatcher(previousDispatcher);
+    previousDispatcher = undefined;
+    await fixtureDispatcher.close();
+    vi.unstubAllEnvs();
+  }
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
@@ -46,6 +65,30 @@ afterEach(async () => {
 });
 
 describe('generation reference assets', () => {
+  it('follows safe CDN redirects and rejects disallowed redirect URLs before another request', async () => {
+    const start = 'https://source.example.test/reference.png';
+    const cdn = 'https://cdn.example.test/reference.png';
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      expect(init.redirect).toBe('manual');
+      if (url === start) return new Response(null, { status: 302, headers: { location: cdn } });
+      if (url === cdn) return new Response(new Uint8Array([1, 2, 3]));
+      if (url === 'https://source.example.test/rejected.png') {
+        return new Response(null, { status: 302, headers: { location: 'http://cdn.example.test/reference.png' } });
+      }
+      throw new Error('unexpected reference request');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await routeReferenceFixtureThroughProxy();
+    const { loadImageReferenceBuffers } = await import('../../../src/main/features/generation_reference_assets');
+
+    await expect(loadImageReferenceBuffers([start])).resolves.toEqual([Buffer.from([1, 2, 3])]);
+    await expect(loadImageReferenceBuffers(['https://source.example.test/rejected.png']))
+      .rejects.toThrow(/disallowed URL/);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      start, cdn, 'https://source.example.test/rejected.png',
+    ]);
+  });
+
   it.each(['empty', 'local', 'remote', 'mixed'])('preserves reference identity and progress for %s image inputs', async (mode) => {
     const localBytes = [Buffer.from('local identity'), Buffer.from('local composition')];
     const remoteBytes = [Buffer.from('remote style'), Buffer.from('remote content')];
@@ -58,6 +101,7 @@ describe('generation reference assets', () => {
       return new Response(remoteBytes[index], { status: 200 });
     });
     vi.stubGlobal('fetch', fetchMock);
+    await routeReferenceFixtureThroughProxy();
     const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
     const hasLocal = mode === 'local' || mode === 'mixed';
     const hasRemote = mode === 'remote' || mode === 'mixed';
@@ -83,6 +127,7 @@ describe('generation reference assets', () => {
     if (failure !== 'missing') await fs.writeFile(localPath, Buffer.from('local identity'));
     const fetchMock = vi.fn(async () => new Response('reference unavailable', { status: 403 }));
     vi.stubGlobal('fetch', fetchMock);
+    await routeReferenceFixtureThroughProxy();
     const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
     const controller = new AbortController();
     const loading = referenceAssets.loadImageReferenceBuffersWithProgress(
@@ -108,6 +153,7 @@ describe('generation reference assets', () => {
       return new Response(png, { status: 200 });
     });
     vi.stubGlobal('fetch', fetchMock);
+    await routeReferenceFixtureThroughProxy();
     vi.useFakeTimers();
     const referenceAssets = await import('../../../src/main/features/generation_reference_assets');
 
@@ -309,6 +355,7 @@ describe('generation reference assets', () => {
 describe('reference image transfer guards', () => {
   it('rejects an empty successful response', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(0))));
+    await routeReferenceFixtureThroughProxy();
     const { loadImageReferenceBuffersWithProgress } = await import('../../../src/main/features/generation_reference_assets');
     await expect(loadImageReferenceBuffersWithProgress(['https://cdn.example/empty.png'], [], {})).rejects.toThrow(/empty body/);
   });
