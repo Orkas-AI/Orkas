@@ -165,9 +165,9 @@ function _isConnectTimeout(errLike) {
   return _connectorStructuredErrorCode(errLike) === 'e_network_timeout' || _connectorErrorType(errLike) === 'timeout';
 }
 
-function _handleConnectFailure(errLike) {
+function _handleConnectFailure(errLike, entry) {
   if (_isConnectCancel(errLike) || _isConnectTimeout(errLike)) return;
-  uiAlert(_formatConnectError(errLike));
+  _showConnectorOAuthError(errLike, entry);
 }
 
 let _connectorsState = {
@@ -503,12 +503,16 @@ function _connectorDisplayName(entry) {
 let _connectorNavCatalog = null;
 let _connectorNavCatalogLoad = null;
 
+// The shipped raster is resolved by a fixed renderer-owned asset identifier.
+const _OPENSEO_ICON_HTML = '<img src="assets/connectors/openseo.png" alt="">';
+
 function _connectorNavTargetIn(catalog, id) {
   const find = (key) => catalog.find((entry) => entry && entry.id === key) || null;
   let entry = find(id);
   if (entry && entry.catalog_parent_id) entry = find(entry.catalog_parent_id) || entry;
   const name = _connectorDisplayName(entry);
   if (!name) return null;
+  if (entry.id === 'openseo' && entry.icon_asset === 'openseo') return { name, iconHtml: _OPENSEO_ICON_HTML };
   const iconSvg = typeof sanitizeSvgIconHtml === 'function' ? sanitizeSvgIconHtml(entry.icon_svg) : '';
   return { name, iconSvg };
 }
@@ -1238,7 +1242,9 @@ function _renderCatalogCard(entry, instance) {
   // surface instead.
   const brandTint = _CONNECTOR_BRAND_TINT[e.id] || '#16181d';
   const safeIconSvg = typeof sanitizeSvgIconHtml === 'function' ? sanitizeSvgIconHtml(e.icon_svg) : '';
-  const iconHtml = safeIconSvg
+  const iconHtml = e.id === 'openseo' && e.icon_asset === 'openseo'
+    ? `<div class="connector-card-icon">${_OPENSEO_ICON_HTML}</div>`
+    : safeIconSvg
     ? `<div class="connector-card-icon is-svg">${safeIconSvg}</div>`
     : `<div class="connector-card-icon is-fallback" style="background:${brandTint}">${escapeHtml((displayName || '?').slice(0, 1).toUpperCase())}</div>`;
   // Custom cards have no authored description — show the server summary
@@ -1738,12 +1744,12 @@ async function _runConnect(entry, entryPoint = 'form') {
       setTimeout(() => input && input.focus(), 0);
       if (typeof uiToast === 'function') uiToast(t('connectors.errors.api_key_required'));
     } else if (res && !res.ok) {
-      _handleConnectFailure(res);
+      _handleConnectFailure(res, entry);
     } else {
-      _handleConnectFailure({ code: 'empty_response' });
+      _handleConnectFailure({ code: 'empty_response' }, entry);
     }
   } catch (err) {
-    _handleConnectFailure(err);
+    _handleConnectFailure(err, entry);
   } finally {
     if (!accepted) _finishOAuthLaunchFeedback(entry.id, launchToken);
   }
@@ -1833,7 +1839,9 @@ function _handleOAuthConnectResult(info) {
     // failure here too. Other transports retain the resulting error on their connector card.
     if (!cancelled && !_isConnectTimeout(errLike)
         && (errLike.code !== 'mcp_connect_failed' || entry.auth_mode === 'local_cli')) {
-      uiAlert(_formatConnectError(errLike));
+      const display = info.display_name ? info
+        : _catalogEntryById(uiCatalogId) || _instanceById(uiCatalogId);
+      _showConnectorOAuthError(errLike, display);
     }
   }
   if (currentView === 'connectors') loadConnectors();
@@ -2090,10 +2098,10 @@ async function _authorizeCustom(entry, instance) {
       launch.attemptId = res.attempt_id;
       _pendingConnectAttempts.set(res.attempt_id, { uiCatalogId: instance.id });
     } else {
-      _handleConnectFailure(res || { code: 'empty_response' });
+      _handleConnectFailure(res || { code: 'empty_response' }, entry);
     }
   } catch (err) {
-    _handleConnectFailure(err);
+    _handleConnectFailure(err, entry);
   } finally {
     if (!accepted) _finishOAuthLaunchFeedback(entry.id, launch.token);
   }
@@ -2104,6 +2112,12 @@ function _connectorStructuredErrorCode(errLike) {
   if (!errLike || typeof errLike !== 'object') return '';
   const nested = errLike.error && typeof errLike.error === 'object' ? errLike.error : null;
   return String(errLike.code || errLike.error_code || (nested && nested.code) || '').trim().toLowerCase();
+}
+
+function _showConnectorOAuthError(errLike, entry) {
+  const name = _connectorDisplayName(entry);
+  const detail = _formatConnectError(errLike);
+  uiAlert(name ? t('connectors.errors.named_authorization', { name, detail }) : detail);
 }
 
 function _formatConnectError(errLike, fallbackKey = 'connectors.errors.connect_failed') {

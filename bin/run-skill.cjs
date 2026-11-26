@@ -353,6 +353,7 @@ function locateSkillScript(skillId, scriptBase) {
   const skillDirs = collectSkillDirs(skillId);
   const scriptExts = scriptExtsForPlatform();
   const candidates = [];
+  const available = new Set();
   for (const dir of skillDirs) {
     let realScriptsDir;
     try {
@@ -365,6 +366,14 @@ function locateSkillScript(skillId, scriptBase) {
       if (lhs !== rhs) continue;
     } catch {
       continue;
+    }
+    try {
+      for (const entry of fs.readdirSync(realScriptsDir, { withFileTypes: true })) {
+        const ext = path.extname(entry.name).slice(1);
+        if (entry.isFile() && scriptExts.includes(ext)) available.add(entry.name.slice(0, -(ext.length + 1)));
+      }
+    } catch {
+      /* an unreadable scripts/ lists nothing */
     }
     for (const ext of scriptExts) {
       candidates.push(path.join(dir, 'scripts', `${scriptBase}.${ext}`));
@@ -384,7 +393,9 @@ function locateSkillScript(skillId, scriptBase) {
   }
   die(66, `skill script not found: ${skillId}/${scriptBase}.{${scriptExts.join(',')}}`, {
     searched: candidates.map((candidate) => `${skillId}/scripts/${path.basename(candidate)}`),
-    hint: 'check skill id/display name and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
+    hint: available.size
+      ? `${skillId} has these scripts: ${[...available].sort().join(', ')}. Pass one of these as the script name and its options after --.`
+      : 'check skill id/display name and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
   });
 }
 

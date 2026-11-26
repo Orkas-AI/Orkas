@@ -21,7 +21,7 @@ Measure whether AI answer engines surface a brand. Split because a skill can't r
 
 ## Preconditions
 
-- `queries`: a `seo-crawl` JSON. `score`: an answers payload (below). Python 3.9+ stdlib only. The agent provides model answers between the two ops.
+- `queries`: a `seo-crawl` JSON. `score`: an answers payload (below). The agent provides model answers between the two ops.
 
 ## How to call
 

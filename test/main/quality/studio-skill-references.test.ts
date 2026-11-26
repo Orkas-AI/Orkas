@@ -77,6 +77,32 @@ describe('Studio document dependency reads', () => {
     }
   });
 
+  it('reads the linked VoiceStudio guide by its full address even when the workspace contains its name', async () => {
+    const bindings = bindingsFor('5f890bd72ac4');
+    const userId = 'studio-reference-test';
+    const { setWorkspacePath } = await import('../../../src/main/features/user_workspace');
+    const workingDir = path.join(workspace, 'project');
+    fs.mkdirSync(workingDir);
+    expect(setWorkspacePath(userId, workingDir).ok).toBe(true);
+    fs.writeFileSync(path.join(workingDir, 'timeline-mixing.md'), 'workspace timeline notes');
+
+    const { createFileTools } = await import('../../../src/main/model/core-agent/file-tools');
+    const reader = createFileTools({ userId, skillRuntimeBindings: bindings })
+      .find(tool => tool.name === 'read_files')!;
+    const context = { workingDir } as Parameters<typeof reader.execute>[1];
+    const read = async (address: string): Promise<string> => {
+      const result = await reader.execute({ paths: [{ path: address }], raw_text: true }, context);
+      expect(result.isError, address).toBeFalsy();
+      return JSON.parse(result.content).files[0].content;
+    };
+
+    expect(await read('@skill/voice-project/references/project-format.md')).toContain('](timeline-mixing.md)');
+    expect(await read('@skill/voice-project/references/timeline-mixing.md')).toBe(fs.readFileSync(
+      path.join(bindings.get('voice-project')!.root, 'references', 'timeline-mixing.md'), 'utf8',
+    ));
+    expect(await read('timeline-mixing.md')).toBe('workspace timeline notes');
+  });
+
   it('rejects wrong owners, nonexistent targets and sibling traversal rather than guessing another root', async () => {
     const bindings = bindingsFor('79df9cc89f5f');
     const entry = bindings.get('video-studio')!.entry;

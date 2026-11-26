@@ -21,7 +21,7 @@ Score how citable/ready a page is for AI answer engines, from crawl facts. Pure 
 
 ## Preconditions
 
-- A `seo-crawl` JSON (uses first_paragraph, headings, images/alt, structured_data + sameAs, indexability, https, word_count, and site robots.txt). Python 3.9+ stdlib only.
+- A `seo-crawl` JSON (uses first_paragraph, headings, images/alt, structured_data + sameAs, indexability, https, word_count, and site robots.txt).
 
 ## How to call
 

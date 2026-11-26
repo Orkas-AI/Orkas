@@ -1025,18 +1025,34 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     const reason = '该组织尚未开启 CLI 数据访问权限，请联系管理员开启';
     const outcome = {
       attempt_id: 'attempt-dingtalk-denied', catalog_id: 'dingtalk', result: 'failure',
+      display_name: 'DingTalk', display_name_zh: '钉钉',
       code: 'local_cli_authorization_failed', error: 'local_cli_authorization_failed:dingtalk',
       authorization_detail: reason, duration_ms: 14_000,
     };
     ctx.__emitPush('connectors:oauth-result', outcome);
     ctx.__emitPush('connectors:oauth-result', outcome);
-    expect(ctx.__alerts).toEqual([`授权失败：${reason}`]);
+    expect(ctx.__alerts).toEqual([`钉钉 连接器\n授权失败：${reason}`]);
     expect(JSON.stringify([ctx.__events, ctx.__errors])).not.toContain(reason);
     // Provider words such as "network" must not override an explicit detailed result.
     expect(ctx._formatConnectError({ ...outcome, authorization_detail: 'Network policy blocks this application.' }))
       .toBe('授权失败：Network policy blocks this application.');
     expect(ctx._formatConnectError({ code: 'oauth_failed', authorization_detail: 'untrusted detail' }))
       .toBe(table['connectors.errors.connect_failed']);
+  });
+
+  it('identifies the connector in a global authorization alert without a loaded catalog', () => {
+    const ctx = loadConnectorsRenderer();
+    ctx.currentView = 'conversation';
+    const table = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/zh.json'), 'utf8'));
+    ctx.t = (key: string, params: Record<string, unknown> = {}) => String(table[key] || key)
+      .replace(/\{(\w+)\}/g, (match: string, name: string) => String(params[name] ?? match));
+    const outcome = {
+      attempt_id: 'attempt-openseo', catalog_id: 'openseo', display_name: 'OpenSEO',
+      result: 'failure', code: 'exchange_failed', duration_ms: 12085,
+    };
+    ctx.__emitPush('connectors:oauth-result', outcome);
+    ctx.__emitPush('connectors:oauth-result', outcome);
+    expect(ctx.__alerts).toEqual([`OpenSEO 连接器\n${table['connectors.errors.authorization_failed']}`]);
   });
 
   it('shows a device-key recovery message without mislabeling it as expired authorization', () => {

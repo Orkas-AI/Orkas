@@ -396,3 +396,39 @@ describe('Commander project-task prompt gating', () => {
     }
   });
 });
+
+describe('Commander shell context', () => {
+  it.each([
+    { platform: 'win32', override: undefined, interpreter: 'Windows PowerShell 5.1' },
+    { platform: 'win32', override: 'cmd.exe', interpreter: 'Windows Command Prompt (`cmd.exe`)' },
+    { platform: 'win32', override: 'C:\\Program Files\\Git\\bin\\bash.exe', interpreter: 'Bash' },
+    { platform: 'win32', override: 'pwsh.exe', interpreter: 'PowerShell (`pwsh`)' },
+    { platform: 'win32', override: 'C:\\Private\\custom-shell.exe', interpreter: 'the configured Windows shell' },
+    { platform: 'darwin', override: 'cmd.exe', interpreter: null },
+    { platform: 'linux', override: 'cmd.exe', interpreter: null },
+  ] as const)('matches the command tool on $platform with override $override', async ({ platform, override, interpreter }) => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const chats = await import('../../../../src/main/features/chats');
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    await chats.createConversation(TEST_UID, { conversationId: 'shell-context', title: 'Run a local command' });
+
+    const host = vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
+    vi.stubEnv('ORKAS_WINDOWS_SHELL', override);
+    try {
+      const prompt = await bus._buildCommanderSystemPromptForTest(TEST_UID, 'shell-context', undefined, 'en');
+      if (interpreter) {
+        const bash = createLocalTools({ hostPlatform: platform }).find(tool => tool.name === 'bash');
+        expect(bash?.description).toContain(interpreter);
+        const osContext = prompt.split('### OS\n')[1].split('### Environment')[0];
+        expect(osContext).toContain(interpreter);
+        expect(osContext).not.toContain('do not use POSIX `&&`');
+        if (override?.includes('\\')) expect(prompt).not.toContain(override);
+      } else {
+        expect(prompt).not.toContain('Host command shell');
+      }
+    } finally {
+      host.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});

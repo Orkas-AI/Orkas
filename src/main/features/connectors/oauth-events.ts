@@ -6,6 +6,9 @@ export interface OAuthConnectOutcome {
   duration_ms: number;
   code?: string;
   error?: string;
+  /** Identify the connector even when the renderer has no catalog loaded. */
+  display_name?: string;
+  display_name_zh?: string;
   /** Sanitized official CLI cause for the local UI only; excluded from logs. */
   authorization_detail?: string;
 }
