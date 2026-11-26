@@ -22,6 +22,8 @@ import {
   ProviderCandidateChangedError,
   classifyRetryableError,
   isProviderRateLimitError,
+  isProviderLegalRestrictionError,
+  isProviderSafetyError,
   isRetryableError,
   providerHttpStatusOf,
   TimeoutError,
@@ -35,6 +37,8 @@ import type { CoreAgentConfig } from "../config/schema.js";
 import type { EvolutionConfig } from "../evolution/types.js";
 import type {
   LLMProvider,
+  CandidateContextRecovery,
+  CandidateContextDraft,
   ProviderContextBudget,
   CompletionParams,
   CompletionResult,
@@ -100,6 +104,7 @@ import {
   boundStructuredSummaryTokens,
   estimateTextTokens,
   mergeUsage,
+  type ActiveCheckpointCandidate,
 } from "./session.js";
 import {
   DEFAULT_CONTEXT_BUDGET,
@@ -234,6 +239,7 @@ export const CONTEXT_COMPACTION_TIMEOUT_MS = 10 * 60 * 1000;
 export const CONTEXT_COMPACTION_IDLE_TIMEOUT_CODE = "CONTEXT_COMPACTION_IDLE_TIMEOUT";
 export const CONTEXT_COMPACTION_TIMEOUT_CODE = "CONTEXT_COMPACTION_TIMEOUT";
 export const CONTEXT_COMPACTION_EMPTY_SUMMARY_CODE = "CONTEXT_COMPACTION_EMPTY_SUMMARY";
+const CONTEXT_COMPACTION_INCOMPLETE_SUMMARY_CODE = "CONTEXT_COMPACTION_INCOMPLETE_SUMMARY";
 
 class ContextCompactionIdleTimeoutError extends Error {
   readonly code = CONTEXT_COMPACTION_IDLE_TIMEOUT_CODE;
@@ -260,6 +266,22 @@ class ContextCompactionEmptySummaryError extends Error {
     super(message);
     this.name = "ContextCompactionEmptySummaryError";
   }
+}
+
+class ContextCompactionIncompleteSummaryError extends Error {
+  readonly code = CONTEXT_COMPACTION_INCOMPLETE_SUMMARY_CODE;
+
+  constructor(outcome: "truncated" | "incomplete") {
+    super(outcome === "truncated"
+      ? "Active checkpoint summary reached the output limit"
+      : "Active checkpoint summary did not end normally");
+    this.name = "ContextCompactionIncompleteSummaryError";
+  }
+}
+
+function activeCheckpointFingerprint(candidate: ActiveCheckpointCandidate): string {
+  const groups = candidate.groups.map((group) => `${group.startIndex}-${group.endIndex}`).join(",");
+  return `active:${candidate.checkpointThroughMessageIndex}:${candidate.tokensBefore}:${groups}`;
 }
 
 /**
@@ -1017,7 +1039,7 @@ function outputLimitToolRetryControl(maxChunkChars: number): string {
     "The preceding response reached the output-token limit before completing a valid tool call. No tool call from that response was executed or saved.",
     "Retry the intended action now as one complete, concise tool call; do not repeat explanatory prose before it.",
     `For a long new text file, keep this file-content chunk at or below ${maxChunkChars} characters, use write_file only for the first chunk, and copy its returned revision into append_file.base_revision for later chunks.`,
-    "For an existing file, prefer a targeted edit_file or apply_patch call instead of rewriting the whole file.",
+    "For an existing file, use a targeted apply_patch call.",
   ].join("\n");
 }
 
@@ -1578,15 +1600,15 @@ export class AgentRunner {
    *  deferring the user input to a separate follow-up turn. */
   private async foldSteer(
     params: AgentRunParams,
-    appliedIds: Set<string>,
+    appliedSteers: Map<string, WeakRef<Message> | undefined>,
   ): Promise<number> {
-    return this.appendSteerMessages(await this.drainSteer(params), false, appliedIds, params.signal);
+    return this.appendSteerMessages(await this.drainSteer(params), false, appliedSteers, params.signal);
   }
 
   private async appendSteerMessages(
     steered: AgentRunSteerInput[],
     startNewTurn: boolean,
-    appliedIds: Set<string>,
+    appliedSteers: Map<string, WeakRef<Message> | undefined>,
     signal?: AbortSignal,
   ): Promise<number> {
     let folded = 0;
@@ -1595,30 +1617,37 @@ export class AgentRunner {
       const content: MessageContent[] = typeof input === "string"
         ? [{ type: "text", text: input }]
         : input.content.map((item) => ({ ...item }));
-      const alreadyApplied = !!structured && appliedIds.has(structured.id);
+      const alreadyApplied = !!structured && appliedSteers.has(structured.id);
+      let acceptedMessage = structured ? appliedSteers.get(structured.id)?.deref() : undefined;
 
       if (!alreadyApplied) {
         this.session.withContextMutationBatch(() => {
           if (startNewTurn && folded === 0) {
             this.session.beginUserTurn(content);
           } else {
-            this.session.addMessage("user", content);
+            const message = this.session.addMessage("user", content);
+            if (structured && !startNewTurn) acceptedMessage = message;
           }
           for (const resource of structured?.historyResources ?? []) {
             this.session.addHistoryResource(resource);
           }
         });
-        if (structured) appliedIds.add(structured.id);
+        if (structured) appliedSteers.set(structured.id, acceptedMessage && new WeakRef(acceptedMessage));
         folded++;
       }
 
       await this.session.flushPending(signal);
       if (structured?.onApplied) {
+        const activeToolsBefore = acceptedMessage && this.isToolActive ? this.activeToolNameSet() : undefined;
         try { await structured.onApplied(); }
         catch (err) {
           // The message is already durable in Session. Keep the id in the
           // applied set so a host acknowledgement retry cannot duplicate it.
           log.warn("interrupt-steer acknowledgement failed", { error: logErrorRef(err) });
+        } finally {
+          if (acceptedMessage && activeToolsBefore) {
+            this.session.recordSteerToolAdditions(acceptedMessage, this.newlyActiveToolNames(activeToolsBefore));
+          }
         }
       }
     }
@@ -1633,10 +1662,10 @@ export class AgentRunner {
 
   private hasUnappliedSteer(
     steered: AgentRunSteerInput[],
-    appliedIds: Set<string>,
+    appliedSteers: ReadonlyMap<string, WeakRef<Message> | undefined>,
   ): boolean {
     return steered.some((input) => (
-      typeof input === "string" || !appliedIds.has(input.id)
+      typeof input === "string" || !appliedSteers.has(input.id)
     ));
   }
 
@@ -1689,7 +1718,7 @@ export class AgentRunner {
       : evolvedSystemPrompt;
 
     let toolLoops = 0;
-    const appliedSteerIds = new Set<string>();
+    const appliedSteers = new Map<string, WeakRef<Message> | undefined>();
     let compactionCount = 0;
     let lastUsage: import("../shared/types.js").Usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 };
     // Real-usage anchor for request-level context decisions. Set after each
@@ -1710,6 +1739,7 @@ export class AgentRunner {
     // blocks. Total recoveries stay bounded by the tool-loop budget (each
     // re-arm requires a completed call, and those are capped).
     let overflowRecoveryAttempted = false;
+    let candidateCompactionAttempted = false;
     // One re-preparation when the provider's first candidate changes after
     // preparation; re-armed by a completed call like overflow recovery.
     let candidateRepreparationAttempted = false;
@@ -1754,7 +1784,7 @@ export class AgentRunner {
       guards.resetCompletedRepeats();
       progressEvidenceEpoch = this.session.contentEpoch();
     };
-    let progressSteerCount = appliedSteerIds.size;
+    let progressSteerCount = appliedSteers.size;
     const inspectProgressRead = (call: { name: string; input: unknown }) => {
       const tool = this.isToolActive?.(call.name) === false ? undefined : this.tools.get(call.name);
       return tool?.inspectReadContinuation?.(call.input as Record<string, unknown>, {
@@ -1777,7 +1807,7 @@ export class AgentRunner {
       if (toolLoopLimitNudgeSent) signals.push("tool_loop_limit_nudge");
       if (elapsedConvergenceNudgeSent) signals.push("elapsed_convergence_nudge");
       if (spinConvergenceNudgeSent) signals.push("spin_convergence_nudge");
-      if (guards.noProgressNudgeSent) signals.push("no_progress_nudge");
+      if (guards.noProgressNudgeSent || progressEvidence.browserAdvisorySent) signals.push("no_progress_nudge");
       if (guards.discoveryStallNudgeSent) signals.push("discovery_stall_nudge");
       if (toolLoopLimitReached) signals.push("tool_loop_limit");
       if (guards.repetitiveToolCallsDetected) signals.push("repetitive_tool_calls");
@@ -1839,8 +1869,8 @@ export class AgentRunner {
       }
       try {
         if (this.session.contentEpoch() !== progressEvidenceEpoch) resetProgressEvidence();
-        if (appliedSteerIds.size !== progressSteerCount) {
-          progressSteerCount = appliedSteerIds.size;
+        if (appliedSteers.size !== progressSteerCount) {
+          progressSteerCount = appliedSteers.size;
           resetProgressEvidence();
           guards.observeRoundOutcome({ progress: "neutral", freshEpisode: true });
         }
@@ -1877,10 +1907,9 @@ export class AgentRunner {
             ...(toolBoundarySynthesisPending ? [toolBoundarySynthesisControl] : []),
           ];
         };
-        const requestMessagesNow = (controls = requestControlsNow()): Message[] => {
-          const persisted = this.session.getMessagesForModel(
-            params.turnEphemeral ? { turnContext: params.turnEphemeral } : undefined,
-          );
+        const messageOptions = { turnContext: params.turnEphemeral, markStableCacheHistory: params.cacheRetention === "long" };
+        const requestMessagesNow = (controls = requestControlsNow(),
+          persisted = this.session.getMessagesForModel(messageOptions)): Message[] => {
           const messages: Message[] = outputContinuationDraft?.content.length
             ? [...persisted, ...(outputContinuationDraft.replayContents ?? [outputContinuationDraft.content])
                 .map((content): Message => ({ role: "assistant", content }))]
@@ -1958,7 +1987,6 @@ export class AgentRunner {
           yield* this.prepareContextBeforeModelCall(
             provider,
             modelId,
-            params.cacheRetention,
             compactionControl,
             (usage) => { lastUsage = mergeUsage(lastUsage, usage); },
             () => { compactionCount++; },
@@ -2009,7 +2037,8 @@ export class AgentRunner {
         // `CompletionResult`-shaped object at the end for the tool loop.
         const pendingControlCount = pendingRequestControls.length;
         const completedRepeatNudge = guards.pendingCompletedRepeatNudge();
-        const requestMessages = requestMessagesNow();
+        const controls = requestControlsNow();
+        let requestMessages = requestMessagesNow(controls);
         await this.session.flushPending(params.signal);
         activeProviderStartedAt = Date.now();
         providerOutput = { terminalSeen: false, textChars: 0, thinkingChars: 0, toolCalls: 0 };
@@ -2062,6 +2091,26 @@ export class AgentRunner {
           ...preparedTokens,
           ...(candidateBudget ? { budget: candidateBudget } : {}),
         };
+        if (provider.contextBudget && !candidateCompactionAttempted && !committedRateLimitRecovery) {
+          completionParams.recoverCandidateContext = this.candidateContextRecovery({
+            request: completionParams,
+            budget: callContextBudget,
+            control: compactionControl,
+            project: (summary, through, limit) => requestMessagesNow(controls,
+              this.session.previewActiveCheckpointMessages(summary, through, limit, messageOptions)),
+            onAttempt: () => { candidateCompactionAttempted = true; },
+            onUsage: (usage, durationMs) => {
+              lastUsage = mergeUsage(lastUsage, usage);
+              timings.compactionMs += durationMs;
+              if (activeProviderStartedAt !== undefined) activeProviderStartedAt += durationMs;
+            },
+            onCommit: (messages) => {
+              requestMessages = messages;
+              compactionCount++;
+              resetProgressEvidence();
+            },
+          });
+        }
         const streamIter = provider.stream(completionParams);
 
         let streamText = "";
@@ -2079,7 +2128,14 @@ export class AgentRunner {
         let streamingToolSeq = 0;
         let streamingTool: { id: string; name?: string; inputBytes: number } | null = null;
         for await (const ev of streamIter) {
-          if (ev.type === "text_delta") {
+          if (ev.type === "compaction") {
+            yield { type: "context_status", phase: "active_process_compaction_done", data: {
+              candidateRecovery: true, modelViewTokensBefore: ev.tokensBefore, modelViewTokensAfter: ev.tokensAfter,
+            } };
+            yield ev;
+          } else if (ev.type === "context_status") {
+            yield ev;
+          } else if (ev.type === "text_delta") {
             streamText += ev.text;
             providerOutput.textChars += ev.text.length;
             // The original partial text is already visible. Buffer each
@@ -2237,6 +2293,7 @@ export class AgentRunner {
         // growth with fresh foldable content: re-arm the one-shot recovery
         // (see the declaration comment for the bound).
         overflowRecoveryAttempted = false;
+        candidateCompactionAttempted = false;
         candidateRepreparationAttempted = false;
 
         // Fall back to a text-only content block if the provider didn't
@@ -2427,7 +2484,7 @@ export class AgentRunner {
         // work.
         if (toolCalls.length > 0) {
           const preExecutionSteer = await this.drainSteer(params);
-          if (this.hasUnappliedSteer(preExecutionSteer, appliedSteerIds)) {
+          if (this.hasUnappliedSteer(preExecutionSteer, appliedSteers)) {
             const skipped = "Tool call skipped because a newer user instruction arrived before execution.";
             for (const call of toolCalls as ReadonlyArray<ToolUseCall>) {
               yield { type: "tool_start", id: call.id, name: call.name, input: call.input, skipped: true };
@@ -2452,7 +2509,7 @@ export class AgentRunner {
               };
             }
             toolBoundarySynthesisPending = false;
-            await this.appendSteerMessages(preExecutionSteer, false, appliedSteerIds, params.signal);
+            await this.appendSteerMessages(preExecutionSteer, false, appliedSteers, params.signal);
             log.info("interrupt-steer: skipped stale proposed tool calls before execution", {
               toolCalls: toolCalls.length,
             });
@@ -2463,7 +2520,7 @@ export class AgentRunner {
           // was already accepted on an earlier boundary. Retry only the ACK;
           // do not suppress this tool batch or duplicate the user message.
           if (preExecutionSteer.length > 0) {
-            await this.appendSteerMessages(preExecutionSteer, false, appliedSteerIds, params.signal);
+            await this.appendSteerMessages(preExecutionSteer, false, appliedSteers, params.signal);
           }
         }
 
@@ -2524,12 +2581,12 @@ export class AgentRunner {
           // new tracked turn. Keeping the steer in the finished turn would make
           // later model calls replay that turn's raw tool/result transcript.
           const terminalSteer = await this.drainSteer(params);
-          if (this.hasUnappliedSteer(terminalSteer, appliedSteerIds)) {
+          if (this.hasUnappliedSteer(terminalSteer, appliedSteers)) {
             // A new real user message supersedes the old wait boundary. Let
             // the next inference act on it with the normal tool catalog.
             toolBoundarySynthesisPending = false;
             await this.completePersistedTurn(params.signal);
-            await this.appendSteerMessages(terminalSteer, true, appliedSteerIds, params.signal);
+            await this.appendSteerMessages(terminalSteer, true, appliedSteers, params.signal);
             attempt = -1;
             continue;
           }
@@ -2537,7 +2594,7 @@ export class AgentRunner {
           // a structured message. Retry the host ACK without replaying the
           // message or starting a phantom turn.
           if (terminalSteer.length > 0) {
-            await this.appendSteerMessages(terminalSteer, false, appliedSteerIds, params.signal);
+            await this.appendSteerMessages(terminalSteer, false, appliedSteers, params.signal);
           }
           // No tool calls — we're done
           const final: AgentRunResult = {
@@ -3136,9 +3193,9 @@ export class AgentRunner {
         // THIS run (as user turns) after the committed tool results and before
         // the next LLM call, so the agent course-corrects instead of finishing a
         // now-stale task. (The no-tool terminal path above drains the same way.)
-        const steerCountBeforeFold = appliedSteerIds.size;
-        await this.foldSteer(params, appliedSteerIds);
-        const userSteeredThisRound = appliedSteerIds.size > steerCountBeforeFold;
+        const steerCountBeforeFold = appliedSteers.size;
+        await this.foldSteer(params, appliedSteers);
+        const userSteeredThisRound = appliedSteers.size > steerCountBeforeFold;
 
         if (userSteeredThisRound && toolBoundarySynthesisPending) {
           // The person already supplied the input the old boundary was waiting
@@ -3197,10 +3254,12 @@ export class AgentRunner {
         if (userSteeredThisRound) resetProgressEvidence();
         const observedStall = roundProgress === "none"
           && guards.consecutiveNoProgressRounds >= RUN_NO_PROGRESS_NUDGE_ROUNDS;
-        if (governor.nudge?.kind === "no_progress") {
-          pendingRequestControls.push(buildProgressNudge("no_progress", governor.nudge.rounds));
+        const browserAdvisory = progressEvidence.takeBrowserAdvisory(roundProgress, toolBoundarySynthesisPending);
+        const noProgressAdvisory = governor.nudge?.kind === "no_progress" ? governor.nudge.rounds : browserAdvisory;
+        if (noProgressAdvisory !== undefined) {
+          pendingRequestControls.push(buildProgressNudge("no_progress", noProgressAdvisory));
           log.warn("run_progress: nudged model after repeated information or unchanged results", {
-            noProgressRounds: governor.nudge.rounds,
+            noProgressRounds: noProgressAdvisory,
             toolLoops,
           });
         } else if (governor.nudge?.kind === "discovery") {
@@ -3830,7 +3889,6 @@ export class AgentRunner {
   private async *prepareContextBeforeModelCall(
     provider: LLMProvider,
     model: string,
-    cacheRetention?: "none" | "short" | "long",
     control?: CompactionControl,
     onUsage?: (usage: import("../shared/types.js").Usage) => void,
     onCompaction?: () => void,
@@ -3872,9 +3930,7 @@ export class AgentRunner {
       }
     }
     const activeCandidate = activeSelection.candidate;
-    const activeFingerprint = activeCandidate
-      ? `active:${activeCandidate.checkpointThroughMessageIndex}:${activeCandidate.tokensBefore}:${activeCandidate.groups.map((g) => `${g.startIndex}-${g.endIndex}`).join(",")}`
-      : "";
+    const activeFingerprint = activeCandidate ? activeCheckpointFingerprint(activeCandidate) : "";
     if (activeCandidate && this.claimCompactionCandidate(compactionControl, activeFingerprint)) {
       const activeCompactionStartedAt = Date.now();
       const modelViewTokensBefore = this.session.estimateModelTokens();
@@ -3882,17 +3938,20 @@ export class AgentRunner {
       const activeCostFields = costContext
         ? compactionCostFields(this.session, compactionControl, budget, costContext.usableInputTokens, costContext.fixedOverheadTokens)
         : {};
+      const checkpointFields = (candidate: ActiveCheckpointCandidate) => ({
+        groups: candidate.groups.length,
+        checkpointInputTokens: candidate.inputTokens,
+        checkpointInputTokenBudget: candidate.inputTokenBudget,
+        checkpointInputCapacityLimited: candidate.capacityLimited,
+        activeProcessTokensBefore: candidate.tokensBefore,
+        projectedActiveProcessTokensAfter: candidate.estimatedTokensAfter,
+        checkpointThroughMessageIndex: candidate.checkpointThroughMessageIndex,
+      });
       const activeLog = {
         phase: "active_checkpoint",
         sessionId: this.session.getSessionId(),
-        groups: activeCandidate.groups.length,
-        checkpointInputTokens: activeCandidate.inputTokens,
-        checkpointInputTokenBudget: activeCandidate.inputTokenBudget,
-        checkpointInputCapacityLimited: activeCandidate.capacityLimited,
-        activeProcessTokensBefore: activeCandidate.tokensBefore,
-        projectedActiveProcessTokensAfter: activeCandidate.estimatedTokensAfter,
+        ...checkpointFields(activeCandidate),
         modelViewTokensBefore,
-        checkpointThroughMessageIndex: activeCandidate.checkpointThroughMessageIndex,
         estimatorCalibration: this.session.getEstimatorCalibration(),
         ...activeCostFields,
       };
@@ -3911,35 +3970,71 @@ export class AgentRunner {
           ...rereadEventFields(activeCostFields),
         },
       };
-      try {
-        const initialSummary = await this.summarizeContextMessages({
+      let selectedCandidate = activeCandidate;
+      let summaryUsage = usageFromStreamPartial(undefined);
+      const summarize = (candidate: ActiveCheckpointCandidate) => {
+        return this.summarizeContextMessages({
           provider,
           model,
-          messages: activeCandidate.messages,
+          messages: candidate.messages,
           prompt: ACTIVE_CHECKPOINT_PROMPT,
-          cacheRetention,
           signal,
           retryContext,
+          onUsage: (usage) => {
+            summaryUsage = mergeUsage(summaryUsage, usage);
+            onUsage?.(usage);
+          },
           onProviderEmpty: (event) => noteCompactionProviderEmpty(activeProviderEmpty, event),
           deadlineAt: compactionDeadlineAt,
           summaryTargetTokens: budget.summaryTargetTokens,
         });
-        if (!initialSummary.text.trim()) {
+      };
+      try {
+        let summary = await summarize(activeCandidate);
+        const retryGroupCount = Math.floor(activeCandidate.groups.length / 2);
+        if (summary.outcome === "truncated" && retryGroupCount > 0 && Date.now() < compactionDeadlineAt) {
+          const retry = this.session.selectPendingActiveCheckpoint(
+            budget, activeCheckpointInputBudget, retryGroupCount,
+          ).candidate;
+          // Only the exact oldest prefix of the original complete groups is eligible.
+          if (retry?.groups.length === retryGroupCount && retry.groups.every((group, index) => {
+            const original = activeCandidate.groups[index];
+            return group.startIndex === original.startIndex && group.endIndex === original.endIndex;
+          })) {
+            const retryFingerprint = activeCheckpointFingerprint(retry);
+            throwIfAborted(signal);
+            if (!compactionControl.attemptedFingerprints.has(retryFingerprint)
+              && Date.now() < compactionDeadlineAt
+              && this.session.claimActiveCheckpointLengthRetry()
+              && this.claimCompactionCandidate(compactionControl, retryFingerprint)) {
+              selectedCandidate = retry;
+              log.info("context compaction retrying the oldest groups after output truncation", {
+                ...activeLog,
+                ...checkpointFields(retry),
+                phase: "active_checkpoint_length_retry",
+              });
+              summary = await summarize(retry);
+            }
+          }
+        }
+        if (summary.outcome !== "complete") {
+          throw new ContextCompactionIncompleteSummaryError(summary.outcome);
+        }
+        if (!summary.text) {
           throw new ContextCompactionEmptySummaryError("active checkpoint summary was empty");
         }
-        const summaryText = initialSummary.text;
-        const summaryUsage = initialSummary.usage;
+        const summaryText = summary.text;
         const summaryTextTokens = estimateTextTokens(summaryText);
-        if (summaryUsage) onUsage?.(summaryUsage);
         if (summaryTextTokens > budget.summaryTargetTokens) {
           log.warn("context compaction summary exceeded soft target", {
             ...activeLog,
+            ...checkpointFields(selectedCandidate),
             summaryTextTokens,
           });
         }
         const tokensAfter = this.session.previewActiveCheckpointTokens(
           summaryText,
-          activeCandidate.checkpointThroughMessageIndex,
+          selectedCandidate.checkpointThroughMessageIndex,
           budget.summaryHardTokens,
         );
         const savings = modelViewTokensBefore - tokensAfter;
@@ -3948,7 +4043,7 @@ export class AgentRunner {
         }
         const appliedSummary = this.session.applyActiveCheckpointSummary(
           summaryText,
-          activeCandidate.checkpointThroughMessageIndex,
+          selectedCandidate.checkpointThroughMessageIndex,
           budget.summaryHardTokens,
         );
         const appliedCheckpointTokens = estimateTextTokens(appliedSummary);
@@ -3959,6 +4054,7 @@ export class AgentRunner {
         onCompaction?.();
         log.info("context compaction done", {
           ...activeLog,
+          ...checkpointFields(selectedCandidate),
           modelViewTokensAfter: tokensAfter,
           summaryTextTokens,
           appliedCheckpointTokens,
@@ -3970,12 +4066,7 @@ export class AgentRunner {
           type: "context_status",
           phase: "active_process_compaction_done",
           data: {
-            groups: activeCandidate.groups.length,
-            checkpointInputTokens: activeCandidate.inputTokens,
-            checkpointInputTokenBudget: activeCandidate.inputTokenBudget,
-            checkpointInputCapacityLimited: activeCandidate.capacityLimited,
-            activeProcessTokensBefore: activeCandidate.tokensBefore,
-            projectedActiveProcessTokensAfter: activeCandidate.estimatedTokensAfter,
+            ...checkpointFields(selectedCandidate),
             modelViewTokensBefore,
             modelViewTokensAfter: tokensAfter,
             summaryTextTokens,
@@ -4002,6 +4093,7 @@ export class AgentRunner {
         const providerEmptyFields = compactionProviderEmptyFields(activeProviderEmpty);
         log.warn("context compaction failed", {
           ...activeLog,
+          ...checkpointFields(selectedCandidate),
           error: logErrorRef(err),
           errorCode,
           ...providerEmptyFields,
@@ -4055,24 +4147,122 @@ export class AgentRunner {
     return true;
   }
 
-  private async summarizeContextMessages(opts: {
-    provider: LLMProvider;
+  private candidateContextRecovery(opts: {
+    request: CompletionParams;
+    budget: ContextBudget;
+    control: CompactionControl;
+    project: (summary: string, through: number, limit: number) => Message[];
+    onAttempt: () => void;
+    onUsage: (usage: Usage, durationMs: number) => void;
+    onCommit: (messages: Message[]) => void;
+  }): CandidateContextRecovery {
+    const { request, budget, control } = opts;
+    const epoch = this.session.contentEpoch();
+    const project = (summary: string, through: number) => opts.project(summary, through, budget.summaryHardTokens);
+    const runner = this;
+    const before = request.requestTokenEstimate!.tokens;
+    let plan: {
+      checkpoint: ActiveCheckpointCandidate;
+      request: CompletionParams;
+      summaryTokens: number;
+      projectedTokens: number;
+    } | null | undefined;
+    let attempted = false;
+    let draft: CandidateContextDraft | undefined;
+    return async function* (limits, provider) {
+      if (runner.session.contentEpoch() !== epoch) return;
+      if (draft) return draft.inputTokens <= limits.main ? draft : undefined;
+      if (attempted || control.disabledReason || control.consecutiveFailures >= MAX_CONSECUTIVE_COMPACTION_FAILURES) return;
+      if (plan === undefined) {
+        plan = null;
+        const summaryRequest = runner.contextSummaryRequest({
+          model: request.model, messages: [], prompt: ACTIVE_CHECKPOINT_PROMPT,
+          summaryTargetTokens: budget.summaryTargetTokens, signal: request.signal, retryContext: request.retryContext,
+        });
+        const inputBudget = Math.min(MAX_ACTIVE_CHECKPOINT_INPUT_TOKENS,
+          limits.maxSummary - estimateCompletionRequestInputTokens(summaryRequest));
+        if (inputBudget <= 0) return;
+        const { candidate: checkpoint } = runner.session.selectPendingActiveCheckpoint(
+          { ...budget, activeProcessTrigger: 0, activeRetainTokens: 0 }, inputBudget, undefined, false,
+        );
+        if (!checkpoint) return;
+        summaryRequest.messages = [...checkpoint.messages, ...summaryRequest.messages];
+        const mandatory = estimateCompletionRequestInputTokens({ ...request,
+          messages: project("Checkpoint", checkpoint.checkpointThroughMessageIndex) });
+        plan = { checkpoint, request: summaryRequest,
+          summaryTokens: estimateCompletionRequestInputTokens(summaryRequest),
+          projectedTokens: mandatory + budget.summaryTargetTokens };
+      }
+      if (!plan || plan.summaryTokens > limits.summary || plan.projectedTokens > limits.main
+        || plan.projectedTokens >= before) return;
+      const { checkpoint, request: summaryRequest, summaryTokens, projectedTokens } = plan;
+      const fingerprint = `candidate:${activeCheckpointFingerprint(checkpoint)}`;
+      if (!runner.claimCompactionCandidate(control, fingerprint)) return;
+      attempted = true;
+      opts.onAttempt();
+      const data = { candidateRecovery: true, groups: checkpoint.groups.length, summaryTokens, projectedTokens };
+      yield { type: "context_status", phase: "active_process_compaction_start", data };
+      const startedAt = Date.now();
+      let usage = usageFromStreamPartial(undefined);
+      let summary: string;
+      let durationMs: number;
+      try {
+        const result = await runner.readContextSummary(provider, summaryRequest, startedAt + CONTEXT_COMPACTION_TIMEOUT_MS,
+          (receipt) => { usage = mergeUsage(usage, receipt); });
+        if (result.outcome !== "complete") throw new ContextCompactionIncompleteSummaryError(result.outcome);
+        if (!result.text) throw new ContextCompactionEmptySummaryError("active checkpoint summary was empty");
+        summary = result.text;
+      } catch (err) {
+        throwIfAborted(request.signal);
+        if (err instanceof SessionPersistenceError || errorCodeForMeta(err) === "TASK_TOKEN_LIMIT_REACHED"
+          || isProviderLegalRestrictionError(err) || isProviderSafetyError(err)) throw err;
+        control.failures++;
+        control.consecutiveFailures++;
+        control.disabledReason = compactionCircuitReason(err) ?? control.disabledReason;
+        log.warn("candidate context compaction failed", { ...data, error: logErrorRef(err) });
+        yield { type: "context_status", phase: "active_process_compaction_failed",
+          data: { ...data, errorCode: errorCodeForLog(err) } };
+        return;
+      } finally {
+        durationMs = Math.max(0, Date.now() - startedAt);
+        opts.onUsage(usage, durationMs);
+      }
+      if (runner.session.contentEpoch() !== epoch) return;
+      const through = checkpoint.checkpointThroughMessageIndex;
+      const messages = project(summary, through);
+      const inputTokens = estimateCompletionRequestInputTokens({ ...request, messages });
+      if (inputTokens >= before) {
+        yield { type: "context_status", phase: "active_process_compaction_failed",
+          data: { ...data, errorCode: "no_context_savings" } };
+        return;
+      }
+      draft = {
+        messages, inputTokens,
+        async commit() {
+          throwIfAborted(request.signal);
+          const applied = runner.session.applyActiveCheckpointSummary(summary, through, budget.summaryHardTokens);
+          control.consecutiveFailures = 0;
+          control.readCursor = runner.session.workspaceObservationCursor();
+          opts.onCommit(messages);
+          await runner.session.flushPending(request.signal);
+          return { type: "compaction", tokensBefore: before, tokensAfter: inputTokens,
+            summary: applied, usage, durationMs };
+        },
+      };
+      yield { type: "context_status", phase: "candidate_summary_done", data: { ...data, inputTokens } };
+      return inputTokens <= limits.main ? draft : undefined;
+    };
+  }
+
+  private contextSummaryRequest(opts: {
     model: string;
-    messages: import("../shared/types.js").Message[];
+    messages: Message[];
     prompt: string;
-    cacheRetention?: "none" | "short" | "long";
     signal?: AbortSignal;
     retryContext?: CompletionParams["retryContext"];
-    onProviderEmpty?: (event: Extract<StreamEvent, { type: "provider_empty" }>) => void;
-    deadlineAt: number;
-    /** Size the summary is asked to stay under; the floor when omitted. */
     summaryTargetTokens?: number;
-  }): Promise<{ text: string; usage?: import("../shared/types.js").Usage }> {
-    throwIfAborted(opts.signal);
-    await this.session.flushPending(opts.signal);
-    const remainingMs = opts.deadlineAt - Date.now();
-    if (remainingMs <= 0) throw new ContextCompactionTimeoutError(CONTEXT_COMPACTION_TIMEOUT_MS);
-    const result = await streamCompletionWithDeadline(opts.provider, {
+  }): CompletionParams {
+    return {
       model: opts.model,
       messages: [
         ...opts.messages,
@@ -4080,21 +4270,50 @@ export class AgentRunner {
       ],
       systemPrompt: compactionSystemPromptFor(opts.summaryTargetTokens ?? CONTEXT_COMPACTION_SUMMARY_PREFERRED_MAX_TOKENS),
       reasoning: "off",
-      cacheRetention: opts.cacheRetention,
+      // A checkpoint summarizes a one-off slice outside the main turn's prompt cache.
+      cacheRetention: "none",
       sessionId: this.session.getSessionId(),
       signal: opts.signal,
       firstEventTimeoutMs: CONTEXT_COMPACTION_FIRST_EVENT_TIMEOUT_MS,
       retryContext: opts.retryContext,
       providerTurnContext: this.session.getProviderTurnContext(),
       requestMetadata: { outputLimitSource: "provider_default" },
-    }, remainingMs, opts.onProviderEmpty, this.idleNow);
-    throwIfAborted(opts.signal);
+    };
+  }
+
+  private summarizeContextMessages(opts: Parameters<AgentRunner["contextSummaryRequest"]>[0] & {
+    provider: LLMProvider;
+    onUsage: (usage: Usage) => void;
+    onProviderEmpty?: (event: Extract<StreamEvent, { type: "provider_empty" }>) => void;
+    deadlineAt: number;
+  }) {
+    return this.readContextSummary(opts.provider, this.contextSummaryRequest(opts), opts.deadlineAt, opts.onUsage, opts.onProviderEmpty);
+  }
+
+  private async readContextSummary(provider: Pick<LLMProvider, "stream">, request: CompletionParams, deadlineAt: number,
+    onUsage: (usage: Usage) => void,
+    onProviderEmpty?: (event: Extract<StreamEvent, { type: "provider_empty" }>) => void,
+  ): Promise<{ text: string; outcome: "complete" | "truncated" | "incomplete" }> {
+    throwIfAborted(request.signal);
+    await this.session.flushPending(request.signal);
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) throw new ContextCompactionTimeoutError(CONTEXT_COMPACTION_TIMEOUT_MS);
+    const result = await streamCompletionWithDeadline(provider, request, remainingMs, onUsage, onProviderEmpty, this.idleNow);
+    throwIfAborted(request.signal);
     const text = result.content
       .filter((c) => c.type === "text")
       .map((c) => (c as { text: string }).text)
       .join("")
       .trim();
-    return { text, usage: result.usage };
+    const { stopReason, providerTermination } = result.terminal ?? {};
+    const category = providerTermination?.category;
+    const truncated = category === "length" || (category === undefined && stopReason === "max_tokens");
+    const completed = (category === undefined || category === "normal")
+      && (stopReason === "end_turn" || stopReason === "stop_sequence");
+    return {
+      text,
+      outcome: truncated ? "truncated" : completed ? "complete" : "incomplete",
+    };
   }
 
   /** Get the skill store (if evolution is enabled). */
@@ -4651,12 +4870,16 @@ function usageFromStreamPartial(usage: Partial<Usage> | undefined): Usage {
 }
 
 async function streamCompletionWithDeadline(
-  provider: LLMProvider,
+  provider: Pick<LLMProvider, "stream">,
   params: CompletionParams,
   timeoutMs: number,
+  onUsage: (usage: Usage) => void,
   onProviderEmpty: ((event: Extract<StreamEvent, { type: "provider_empty" }>) => void) | undefined,
   idleNow: () => number,
-): Promise<CompletionResult> {
+): Promise<{
+  content: MessageContent[];
+  terminal?: Pick<Extract<StreamEvent, { type: "message_end" }>, "stopReason" | "providerTermination">;
+}> {
   throwIfAborted(params.signal);
   const parentSignal = params.signal;
   const controller = new AbortController();
@@ -4692,9 +4915,7 @@ async function streamCompletionWithDeadline(
     iterator = provider.stream({ ...params, signal: controller.signal })[Symbol.asyncIterator]();
     let text = "";
     let content: MessageContent[] | undefined;
-    let stopReason: CompletionResult["stopReason"] = "end_turn";
-    let usage = usageFromStreamPartial(undefined);
-    let model = params.model;
+    let terminal: Pick<Extract<StreamEvent, { type: "message_end" }>, "stopReason" | "providerTermination"> | undefined;
 
     while (true) {
       const step = await Promise.race([iterator.next(), gate]);
@@ -4707,13 +4928,12 @@ async function streamCompletionWithDeadline(
         text += event.text;
         if (event.text.trim()) refreshIdleTimer();
       } else if (event.type === "provider_empty") {
-        usage = mergeUsage(usage, usageFromStreamPartial(event.usage));
+        if (event.usage) onUsage(usageFromStreamPartial(event.usage));
         onProviderEmpty?.(event);
       } else if (event.type === "message_end") {
-        stopReason = event.stopReason;
-        usage = mergeUsage(usage, usageFromStreamPartial(event.usage));
+        terminal = { stopReason: event.stopReason, providerTermination: event.providerTermination };
+        if (event.usage) onUsage(usageFromStreamPartial(event.usage));
         if (event.content?.length) content = event.content;
-        if (event.model) model = event.model;
         break;
       } else if (event.type === "error") {
         throw event.error;
@@ -4722,9 +4942,7 @@ async function streamCompletionWithDeadline(
 
     return {
       content: content?.length ? content : (text ? [{ type: "text", text }] : []),
-      stopReason,
-      usage,
-      model,
+      terminal,
     };
   } catch (error) {
     throwIfAborted(parentSignal);

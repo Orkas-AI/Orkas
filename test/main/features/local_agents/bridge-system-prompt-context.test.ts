@@ -19,6 +19,23 @@ describe('local_agents/runner › supplied conversation context contract', () =>
     expect(prompt).not.toContain('unresolved local reference');
   });
 
+  it('routes web pages to the Orkas browser and keeps Computer Use for native apps', () => {
+    const prompt = buildBridgeSystemPrompt(['browser']);
+
+    expect(prompt).toContain('Orkas built-in browser (inner_browser)');
+    expect(prompt).toContain('Use inner_browser for every web page task');
+    expect(prompt).toContain('including signed-in sites');
+    expect(prompt).toContain('Do not drive Chrome, Safari or any other web browser through Computer Use');
+    expect(prompt).toContain('unless the user explicitly asks for their own browser');
+    expect(prompt).toContain('Use Computer Use only for native desktop apps that are not web browsers.');
+  });
+
+  it('does not advertise the browser without the bridge grant', () => {
+    const prompt = buildBridgeSystemPrompt(['skills.read', 'chat.read', 'connectors']);
+    expect(prompt).not.toContain('inner_browser');
+    expect(prompt).not.toContain('Computer Use');
+  });
+
   it('does not advertise history retrieval without the bridge grant', () => {
     const prompt = buildBridgeSystemPrompt(['skills.read']);
     expect(prompt).not.toContain('chat_history');

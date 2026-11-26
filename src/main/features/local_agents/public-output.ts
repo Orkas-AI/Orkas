@@ -215,6 +215,10 @@ export function persistedCodexOutputCitationPaths(
   text: string,
   workingDir?: string,
 ): string[] {
+  return resolveCodexOutputCitationPaths(persistedCodexOutputCitations(text), workingDir);
+}
+
+export function persistedCodexOutputCitations(text: string): string[] {
   const source = String(text || '');
   if (!source.includes(CODEX_FILE_CITATION_PREFIX)) return [];
 
@@ -230,10 +234,24 @@ export function persistedCodexOutputCitationPaths(
     if (openFence) continue;
     const parsed = parseCodexFileCitationPresentationLine(line);
     if (!parsed || parsed.citation.purpose !== 'output') continue;
-    const resolved = resolveCitationPath(parsed.citation.path, workingDir);
+    found.add(parsed.citation.path);
+  }
+  return Array.from(found);
+}
+
+export function resolveCodexOutputCitationPaths(citations: readonly string[], workingDir?: string): string[] {
+  const found = new Set<string>();
+  for (const citation of citations) {
+    const resolved = resolveCitationPath(citation, workingDir);
     if (resolved) found.add(path.resolve(resolved));
   }
   return Array.from(found);
+}
+
+export function storedProducedPaths(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && !!item.trim())
+    : [];
 }
 
 /**

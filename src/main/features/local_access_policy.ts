@@ -83,7 +83,7 @@ const DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY: LocalAccessSensitivePolicy = {
     '/etc/cron',
     '/etc/systemd',
     '(^|/)\\.config/autostart(/|$)',
-    '\\\\Start Menu\\\\Programs\\\\Startup',
+    ...(process.platform === 'win32' ? ['(^|/)Start Menu/Programs/Startup(/|$)'] : []),
     '^/etc/',
   ],
   sensitive_command_patterns: [
@@ -160,6 +160,15 @@ export function getLocalAccessSensitivePolicy(): LocalAccessSensitivePolicy {
     'local_access.sensitive_policy',
     DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY,
   ) || DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY;
+}
+
+export function localAccessHasCustomPathPatterns(): boolean {
+  const policy = getLocalAccessSensitivePolicy();
+  if (!policy.enabled_categories.includes('sensitive_path')) return false;
+  const defaults = DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY;
+  return policy.sensitive_path_patterns.some(pattern => pattern !== LEGACY_LIBRARY_LOCATION_PATTERN
+    && !defaults.sensitive_path_patterns.includes(pattern))
+    || policy.sensitive_write_path_patterns.some(pattern => !defaults.sensitive_write_path_patterns.includes(pattern));
 }
 
 function compile(pattern: string): RegExp | null {

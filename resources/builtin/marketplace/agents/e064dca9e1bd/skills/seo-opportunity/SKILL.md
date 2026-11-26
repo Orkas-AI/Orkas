@@ -32,7 +32,6 @@ Ownership evidence invariant: a verified Search Console property is not evidence
 
 ## Preconditions
 
-- Python 3.9+ (stdlib only).
 - At least one `seo-crawl` JSON. GSC/Bing/GEO inputs are optional.
 
 ## Connector evidence acquisition

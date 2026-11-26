@@ -25,8 +25,8 @@ for (const locale of ['en', 'zh'] as const) {
         await page.locator('#settings-video-provider .ai-select-trigger').click();
         const menu = page.locator('.ai-select-popover:visible');
         await expect(menu.locator('.ai-select-item[data-value="doubao:doubao-seedance-2-5-flash"] .ai-select-item-label'))
-          .toHaveText('Doubao Seedance 2.5 Flash');
-        await expect(menu).toContainText('Google Gemini Omni 1.1 Flash');
+          .toHaveText('Seedance 2.5 Flash');
+        await expect(menu).toContainText('Gemini Omni 1.1 Flash');
         await expect(menu).toContainText('MiniMax H3 Highspeed');
         await page.screenshot({ path: testInfo.outputPath(`video-model-names-${locale}.png`) });
         await page.keyboard.press('Escape');
@@ -36,7 +36,7 @@ for (const locale of ['en', 'zh'] as const) {
         await page.locator('.ai-select-popover:visible .ai-select-item').filter({ hasText: label }).click();
       };
       await openCredentials();
-      await choose('Alibaba Cloud Wan 3.0 Prime');
+      await choose('Wan 3.0 Prime');
       await expect(page.locator('#settings-video-workspace-input')).toBeVisible();
       await page.locator('#settings-video-workspace-input').fill('workspace123');
       await page.locator('#settings-video-key-input').fill('synthetic-wan-credential');

@@ -25,8 +25,8 @@ afterEach(async () => {
 });
 
 for (const api of ['openai-completions', 'openai-responses'] as const) {
-  for (const invalidTarget of ['existing-target', null]) {
-    it(`preserves rejected create input and error before one durable correction (${api}/${invalidTarget === null ? 'null' : 'destination'})`, async () => {
+  for (const [kind, invalidTarget] of [['destination', 'existing-target'], ['empty', ''], ['null', null]] as const) {
+    it(`preserves rejected create input and error before one durable correction (${api}/${kind})`, async () => {
       const chats = await import('../../../src/main/features/chats');
       const projects = await import('../../../src/main/features/projects');
       const tasks = await import('../../../src/main/features/project_tasks');
@@ -53,9 +53,17 @@ for (const api of ['openai-completions', 'openai-responses'] as const) {
         expect(round).toBeLessThanOrEqual(3);
         if (round === 2) {
           expect(await projects.listProjects(uid)).toEqual([]);
-          expect(JSON.stringify(body)).toContain('target_project');
-          if (invalidTarget === null) expect(JSON.stringify(body)).toMatch(/expected string/i);
-          else expect(JSON.stringify(body)).toContain('only valid for move_conversation');
+          expect(await tasks.listTasks(uid, '')).toEqual([]);
+          expect((await chats.getConversationMetadata(uid, conv.conversation_id))?.project_id).toBeFalsy();
+          expect(filing.hasPendingConversationFiling(uid, conv.conversation_id)).toBe(false);
+          const text = api === 'openai-completions'
+            ? body.messages.find((entry: any) => entry.role === 'tool' && entry.tool_call_id === 'call_1')?.content
+            : body.input.find((entry: any) => entry.type === 'function_call_output' && entry.call_id === 'call_1')?.output;
+          expect(JSON.parse(text)).toMatchObject({
+            ok: false, code: 'E_PROJECT_SETUP_TARGET_ON_CREATE', action: 'create', field: 'target_project',
+            error: expect.stringMatching(/omit target_project.*move_conversation/i),
+          });
+          expect(text).not.toContain('existing-target');
         }
         if (round === 3) {
           expect(await projects.listProjects(uid)).toHaveLength(1);
@@ -106,7 +114,15 @@ for (const api of ['openai-completions', 'openai-responses'] as const) {
       // that optional destination fields are not forced into nullable inputs.
       expect(declared.strict).not.toBe(true);
       expect(declared.parameters.required).toEqual(['action']);
-      expect(declared.parameters.properties.target_project.type).toBe('string');
+      expect(declared.parameters.properties.action.description).toMatch(/create:.*file this conversation.*turn ends/i);
+      expect(declared.parameters.properties.target_project).toMatchObject({
+        type: 'string',
+        description: expect.stringMatching(/required for move_conversation.*add_agents.*omit to use the current project.*omit for all other actions/i),
+      });
+      expect(declared.parameters.properties.agents).toMatchObject({
+        type: 'array', minItems: 1, maxItems: 20,
+        description: expect.stringMatching(/add_agents only.*existing Agent IDs or exact names/i),
+      });
     });
   }
 }

@@ -75,6 +75,7 @@ describe('cross_session_memory tool › project tier exposure', () => {
   it('keeps every global mutation available to Commander', async () => {
     const h = stubHandler();
     const tool = createCrossSessionMemoryTool(h, { globalTiersReadOnly: false });
+    expect(tool.description).not.toContain('<handback');
     for (const target of ['user', 'shared']) {
       for (const input of [
         { action: 'add', content: 'new' },
@@ -86,6 +87,19 @@ describe('cross_session_memory tool › project tier exposure', () => {
       { op: 'add', tier: 'user' }, { op: 'replace', tier: 'user' }, { op: 'remove', tier: 'user' },
       { op: 'add', tier: 'shared' }, { op: 'replace', tier: 'shared' }, { op: 'remove', tier: 'shared' },
     ]);
+  });
+
+  it.each([false, true])('shows the exact handback on supported read-only surfaces (project=%s)', (includeProjectTier) => {
+    const h = stubHandler();
+    const options = { includeProjectTier, globalTiersReadOnly: true };
+    const tool = createCrossSessionMemoryTool(h, { ...options, supportsCapabilityHandback: true });
+    const defaultTool = createCrossSessionMemoryTool(h, options);
+
+    expect(tool.description).toContain('Hand the original user/shared memory write request back to Commander with <handback reason="capability_boundary" />.');
+    expect(tool.description).toContain('Use intended scope');
+    expect(tool.description).not.toContain('hand back those changes');
+    expect(estimateTextTokens(tool.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    expect(tool.inputSchema).toEqual(defaultTool.inputSchema);
   });
 
   it('non-project sessions expose three stores and keep routing in the target parameter', () => {

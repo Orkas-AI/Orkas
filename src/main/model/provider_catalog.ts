@@ -15,9 +15,22 @@
  *
  * ## Selection policy
  *
- * The shipped catalog generally favors the two newest useful version
- * generations, but this is a curation guideline rather than a runtime cap.
- * Keep older models when capability or product coverage justifies them.
+ * Prefer retaining useful stable choices across the three newest version
+ * generations. Maintain the curated catalog explicitly and preserve saved
+ * selections.
+ * When refreshing a vendor's built-in picker, order stable models by version
+ * descending, using the vendor's stable release date for same-generation
+ * named tiers. Keep older choices when they cover a distinct capability or
+ * price tier. Keep previews, experiments, and dated snapshots out of new
+ * picks when a stable model covers the same use. Hide superseded choices with
+ * hiddenFromPicker while retaining saved ids. Before removing or migrating
+ * a saved model id, verify the provider's deprecation or shutdown and obtain
+ * approval for a compatible same-route replacement.
+ * Offer the same curated stable model choices for a vendor across built-in
+ * API-key, OAuth, and relay routes wherever each route supports the model.
+ * Keep route-specific IDs, protocols, and limits, and allow differences
+ * where upstream availability differs. Preserve existing defaults and saved
+ * choices when adding model options.
  * Runtime SDK discovery never makes an unlisted provider/model selectable.
  *
  * Runtime override:
@@ -136,8 +149,8 @@ export const CATALOG: readonly CatalogEntry[] = [
 
 // ── Curated model lists ─────────────────────────────────────────────────
 //
-// The sole source of truth for what shows up in the model dropdown.
-// Order in the array = order shown to the user — put the flagship first.
+// The bundled source of truth for the public model dropdown.
+// Keep curated display order within each vendor and route.
 // Ids must match pi-ai's `listPiModels(provider)` exactly.
 //
 // Providers without an entry here expose no selectable chat models.
@@ -935,7 +948,7 @@ interface Scored {
  */
 export function pickLatestGenerations(
   list: RawModel[],
-  generations: number = 2,
+  generations: number = 3,
 ): { id: string; name: string }[] {
   if (!Array.isArray(list) || list.length === 0) return [];
 

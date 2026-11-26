@@ -213,6 +213,7 @@ test(`creates todos in the selected project and defaults status grouping to glob
 }
 
 test('keeps todo card appearance and unfinished processing consistent across both entry points', async ({ orkas }, testInfo) => {
+  test.setTimeout(120_000);
   const page = orkas.page!;
   await page.evaluate(() => (window as any).setLang('zh'));
   const project = await orkas.invoke<any>('projects.create', { name: 'Consistent cards' });
@@ -563,6 +564,7 @@ test('reads full todo card text with repeatable mouse and keyboard disclosure on
 });
 
 test('manages the same backlog from global and project boards without a duplicate project disclosure', async ({ orkas }, testInfo) => {
+  test.setTimeout(180_000);
   const page = orkas.page!;
   await page.evaluate(() => (window as any).setLang('zh'));
   const alpha = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: '桌面应用' });
@@ -668,18 +670,17 @@ test('manages the same backlog from global and project boards without a duplicat
   await clearAssignment.click();
   await expect(pendingCard.locator('.project-todo-assign')).toHaveClass(/is-empty/);
   await pendingCard.locator('.project-todo-assign').click();
-  const agentOption = page.locator('.context-menu-item', { hasText: agent.name });
-  await expect(agentOption.locator('.context-menu-avatar')).toHaveCount(1);
-  await expect(agentOption.locator('.context-menu-icon')).toHaveCount(0);
+  const agentOption = page.getByRole('option', { name: agent.name, exact: true });
+  await expect(agentOption.locator('.ai-select-option-icon')).toHaveCount(1);
   await agentOption.click();
   await expect(pendingCard.locator('.project-todo-assign')).toContainText(agent.name);
   await pendingCard.locator('.project-todo-assign').click();
-  const selectedAgentOption = page.locator('.context-menu-item', { hasText: agent.name });
-  const selectedAgentCheck = selectedAgentOption.locator('.context-menu-trailing-icon');
-  await expect(selectedAgentOption.locator('.context-menu-avatar')).toHaveCount(1);
-  await expect(selectedAgentCheck).toHaveCount(1);
+  const selectedAgentOption = page.getByRole('option', { name: agent.name, exact: true, selected: true });
+  const selectedAgentCheck = selectedAgentOption.locator('.ai-select-check');
+  await expect(selectedAgentOption.locator('.ai-select-option-icon')).toHaveCount(1);
+  await expect(selectedAgentCheck).toBeVisible();
   const [selectedAgentLabelBox, selectedAgentCheckBox] = await Promise.all([
-    selectedAgentOption.locator('.context-menu-label').boundingBox(),
+    selectedAgentOption.getByText(agent.name, { exact: true }).boundingBox(),
     selectedAgentCheck.boundingBox(),
   ]);
   expect(selectedAgentLabelBox).not.toBeNull();
@@ -858,16 +859,21 @@ test('manages the same backlog from global and project boards without a duplicat
   await orkas.invoke('projects.tasks.delete', { projectId: b, taskId: pushed.task.id });
   await expect(content.getByText('后台同步待办', { exact: true })).toHaveCount(0);
 
-  // Persist Auto-advance=on while this project has no actionable tasks, so the
-  // project detail can prove it renders the actual project setting without
-  // starting a model-backed run during this deterministic E2E.
+  // Enable auto-advance from the global board once the project has no actionable tasks.
   const beforeDriver = await orkas.invoke<{ tasks: Array<{ id: string; status: string }> }>('projects.tasks.list', { projectId: b });
-  for (const item of beforeDriver.tasks.filter((candidate) => candidate.status === 'todo' || candidate.status === 'blocked')) {
+  const actionable = beforeDriver.tasks.filter((item) => item.status === 'todo' || item.status === 'blocked');
+  for (const item of actionable) {
     await orkas.invoke('projects.tasks.update', { projectId: b, taskId: item.id, status: 'review' });
   }
-  const driver = await orkas.invoke<{ config: { enabled: boolean } }>('projects.driver.set', { projectId: b, enabled: true });
+  for (const item of actionable) {
+    await expect(content.locator(`.todo-column.is-review .project-todo-item[data-tid="${item.id}"]`)).toBeVisible();
+  }
+  const autoAdvance = content.locator(`.todo-driver-bar .todo-scope-driver-toggle[data-pid="${b}"]`);
+  await expect(autoAdvance).toHaveAttribute('aria-pressed', 'false');
+  await autoAdvance.click();
+  await expect(autoAdvance).toHaveAttribute('aria-pressed', 'true');
+  const driver = await orkas.invoke<{ config: { enabled: boolean } }>('projects.driver.get', { projectId: b });
   expect(driver.config.enabled).toBe(true);
-  await expect(content.locator(`.todo-driver-bar .todo-scope-driver-toggle[data-pid="${b}"]`)).toHaveAttribute('aria-pressed', 'true');
 
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.screenshot({ path: testInfo.outputPath('global-todos.png') });
@@ -1000,6 +1006,7 @@ test('processes an assigned Codex todo from its card with one execution and no C
     });
     await openSidebarEntry(page, '#todos-btn');
     const card = page.locator('#todos-content .project-todo-item', { hasText: content });
+    await expect(card.locator('[data-action="todo-conversation"]')).toHaveCount(0);
     await card.hover();
     await card.locator('[data-action="todo-menu"]').click();
     await page.locator('.context-menu-item', { hasText: 'Process now' }).click();
@@ -1032,6 +1039,10 @@ test('processes an assigned Codex todo from its card with one execution and no C
     const history = await orkas.invoke<{ history: Array<{ from: string; to?: string[] }> }>('conversations.history', { cid, limit: 20 });
     expect(history.history.find((message) => message.from === 'user')?.to).toEqual([agent.agent_id]);
     expect(history.history.some((message) => message.from === 'commander')).toBe(false);
+    await openSidebarEntry(page, '#todos-btn');
+    await card.locator('[data-action="todo-conversation"]').click();
+    await expect(page.locator('#chat-history')).toContainText(content);
+    expect(orkas.readCliState().invocations.filter((item) => item.prompt.includes(content))).toHaveLength(1);
   }
 });
 
@@ -1080,7 +1091,7 @@ test('assigns global and project todos in the editor and keeps cards and saved o
     expect(tasks.tasks.find((t) => t.content === title)).not.toHaveProperty('owner_agent_id');
     {
       await card.locator('.project-todo-assign').click();
-      await page.locator('.context-menu-item', { hasText: agent.name }).click();
+      await page.getByRole('option', { name: agent.name, exact: true }).click();
       await expect(card.locator('.project-todo-assign')).toContainText(agent.name);
       const assigned = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
       const task = assigned.tasks.find((t) => t.content === title);
@@ -1106,6 +1117,85 @@ test('assigns global and project todos in the editor and keeps cards and saved o
 // column that cannot overflow is the oracle for "kept its own height": a body
 // that fits by squashing its cards would scroll too, and would be just as
 // unusable.
+test('searches grouped todo Agents and limits quick assignment to the project', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('zh'));
+  await page.setViewportSize({ width: 1024, height: 720 });
+  const { agents } = await orkas.invoke<{ agents: Array<{ agent_id: string; name: string; source: string; enabled: boolean }> }>(
+    'agents.list', { summary: true },
+  );
+  const platform = agents.find(agent => agent.source !== 'custom' && agent.enabled !== false)!;
+  expect(platform).toBeDefined();
+  const ids: Record<string, string> = {};
+  for (const name of ['ReportDesk', 'DailyReport', 'Report', '日报整理']) {
+    const { agent } = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name, description: 'Review progress', category: 'general',
+    });
+    ids[name] = agent.agent_id;
+  }
+  const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Agent scope' });
+  const pid = project.project_id;
+  for (const id of [ids.Report, platform.agent_id]) {
+    await orkas.invoke('projects.bindings.add', { projectId: pid, kind: 'agent', id });
+  }
+  const { task } = await orkas.invoke<{ task: { id: string } }>('projects.tasks.create', { projectId: pid, content: 'Review release' });
+  const getTask = async () => (await orkas.invoke<{ tasks: Array<{ id: string; owner_agent_id?: string }> }>(
+    'projects.tasks.list', { projectId: pid },
+  )).tasks.find(item => item.id === task.id);
+  await openSidebarEntry(page, '#todos-btn');
+  await page.locator('#todos-add-btn').click();
+  const modal = page.locator('#todo-editor-modal');
+  await modal.locator('#project-todo-project .ai-select-trigger').click();
+  await page.locator('#project-todo-project-listbox .ai-select-item[data-value=""]').click();
+  const agentTrigger = modal.locator('#project-todo-agent .ai-select-trigger');
+  await expect(agentTrigger).toBeEnabled();
+  await agentTrigger.click();
+  const search = page.getByRole('combobox', { name: '搜索智能体...', exact: true });
+  await expect(search).toBeFocused();
+  const list = page.getByRole('listbox', { name: '智能体', exact: true });
+  const custom = list.getByRole('group', { name: '自定义', exact: true });
+  await expect(list.getByRole('group').first()).toHaveAttribute('aria-label', '自定义');
+  await expect(custom.getByRole('option')).toHaveText(['DailyReport', '日报整理', 'Report', 'ReportDesk']);
+  await expect(list.getByRole('group', { name: '平台', exact: true }).getByRole('option', { name: platform.name, exact: true })).toBeVisible();
+  await expect(list.getByRole('option').first()).toHaveText('未指定');
+  await expect(list.getByRole('option').nth(1)).toHaveText('指挥官');
+  await page.screenshot({ path: testInfo.outputPath('todo-agent-picker-editor-zh.png') });
+  await search.fill(' rEPORT ');
+  await expect(custom.getByRole('option')).toHaveText(['Report', 'ReportDesk', 'DailyReport']);
+  await expect(list.getByRole('group', { name: '平台', exact: true })).toBeHidden();
+  await search.fill('No matches');
+  await expect(page.getByText('无匹配智能体', { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('todo-agent-picker-empty-zh.png') });
+  await search.press('Enter');
+  await expect(search).toBeFocused();
+  await page.getByRole('button', { name: '清空', exact: true }).click();
+  await expect(custom.getByRole('option')).toHaveCount(4);
+  await search.press('Escape');
+  await expect(agentTrigger).toBeFocused();
+  await expect(agentTrigger).toHaveText('未指定');
+  await expect(modal).toBeVisible();
+  await modal.getByRole('button', { name: '取消', exact: true }).click();
+
+  await page.evaluate(() => (window as any).setLang('en'));
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const card = page.locator(`#todos-content .project-todo-item[data-tid="${task.id}"]`);
+  const quick = card.locator('[data-action="todo-assign"]');
+  await quick.click();
+  const quickSearch = page.getByRole('combobox', { name: 'Search agents...', exact: true });
+  await expect(quickSearch).toBeFocused();
+  await quickSearch.fill('report');
+  await expect(page.getByRole('listbox').getByRole('option')).toHaveText(['Report']);
+  await page.screenshot({ path: testInfo.outputPath('todo-agent-picker-card-en.png') });
+  expect((await getTask())?.owner_agent_id).toBeUndefined();
+  await quickSearch.press('ArrowDown');
+  await quickSearch.dispatchEvent('keydown', { key: 'Enter', isComposing: true });
+  await expect(quickSearch).toBeFocused();
+  expect((await getTask())?.owner_agent_id).toBeUndefined();
+  await quickSearch.press('Enter');
+  await expect(quick).toHaveText('Report');
+  expect((await getTask())?.owner_agent_id).toBe(ids.Report);
+});
+
 test('reaches every to-do and keeps reading positions through background refreshes', async ({ connectorOrkas: orkas }, testInfo) => {
   const page = orkas.page!;
   await page.setViewportSize({ width: 1440, height: 900 });

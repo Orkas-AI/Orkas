@@ -46,9 +46,10 @@ import { FileSnapshotCache, mapFileSnapshots } from '../util/file-snapshot';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { taskContent } from '../util/project-task-content';
+import { isTaskNoteWithinLimit } from '../../core-agent/src/shared/task-note-limit';
 import { clampStr, isCommanderTaskOwner, isDueDate, orderTaskAttachments, normaliseTask as _normaliseTask, sanitiseTaskAttachmentName as _sanitiseAttachmentName,
   matchesTaskDeleteExpectation, type TaskDeleteExpectation,
-  TASK_STATUSES as STATUSES } from './project_task_record';
+  TASK_NOTE_KINDS, TASK_STATUSES as STATUSES } from './project_task_record';
 import { ALLOWED_EXTENSIONS } from './chat_attachments';
 import * as projects from './projects';
 import * as agents from './agents';
@@ -57,6 +58,7 @@ import { getActiveUserId } from './users';
 const log = createLogger('project-tasks');
 
 export type TaskStatus = 'todo' | 'progress' | 'review' | 'done';
+export type TaskNoteKind = 'result' | 'blocker';
 // Review is unfinished work awaiting confirmation, so it counts as open.
 const OPEN_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['todo', 'progress', 'review']);
 
@@ -83,12 +85,26 @@ export interface ProjectTask {
   done_at?: string;
   /** Local calendar day (`YYYY-MM-DD`) the user wants this done by. */
   due_at?: string;
+  /** When the current status began. Set at creation and moved only by a status
+   *  change; older records have none. */
+  status_changed_at?: string;
+  /** `user` when the user set the current status in the app; absent when a
+   *  model or the host did. The user has already seen their own changes. */
+  status_changed_by?: 'user';
+  /** The conversation whose tool call created this to-do or last changed its
+   *  status or note. Someone in that conversation has already seen it. */
+  last_change_cid?: string;
+  /** The latest result, or what the user must provide while it is stuck. */
+  note?: string;
+  note_kind?: TaskNoteKind;
 }
 
 export type TaskError =
   | 'project_not_found'
   | 'task_not_found'
   | 'due_invalid'
+  | 'note_too_long'
+  | 'note_invalid'
   | 'content_empty'
   | 'content_too_long'
   | 'content_invalid'
@@ -242,10 +258,7 @@ async function _resolveOwner(
     if (!agent || getActiveUserId() !== uid) return 'owner_not_bound';
     return { owner_agent: agent.name, owner_agent_id: agent.agent_id };
   }
-  if (id) {
-    const bindings = await projects.getBindings(uid, pid);
-    if (!bindings.agents.includes(id)) return 'owner_not_bound';
-  }
+  if (id && !await projects.isAgentAvailableInProject(uid, pid, id)) return 'owner_not_bound';
   const out: { owner_agent?: string; owner_agent_id?: string } = {};
   if (name) out.owner_agent = name;
   if (id) out.owner_agent_id = id;
@@ -443,6 +456,8 @@ export interface ProjectTaskView {
   updated_at: string;
   done_at?: string;
   due_at?: string;
+  note?: string;
+  note_kind?: TaskNoteKind;
 }
 export function taskView(t: ProjectTask): ProjectTaskView {
   return {
@@ -458,6 +473,7 @@ export function taskView(t: ProjectTask): ProjectTaskView {
     created_at: t.created_at,
     updated_at: t.updated_at,
     ...(t.done_at ? { done_at: t.done_at } : {}),
+    ...(t.note ? { note: t.note, note_kind: t.note_kind || 'result' } : {}),
   };
 }
 
@@ -471,12 +487,19 @@ export interface CreateTaskInput extends TaskContentInput {
   origin_cid?: string;
   /** 'user' or an agent display name. */
   created_by?: string;
+  /** Host-only: the conversation of the tool call creating it. */
+  change_cid?: string;
   /** Caller-supplied id so the editor can upload attachments to a draft task dir
    *  BEFORE the task JSON exists (the renderer pre-allocates it); create then
    *  adopts whatever landed in that dir. Must be a fresh `t_<12hex>`. */
   id?: string;
   /** Renderer selection order; directory membership remains authoritative. */
   attachment_order?: string[];
+}
+
+/** The app's own editor creates as the user; tools pass their own `created_by`. */
+function _createdByUser(input: CreateTaskInput): boolean {
+  return (clampStr(input.created_by, 200) || 'user') === 'user';
 }
 
 export async function createTask(
@@ -530,6 +553,9 @@ export async function createTask(
         created_by: clampStr(input.created_by, 200) || 'user',
         created_at: now,
         updated_at: now,
+        status_changed_at: now,
+        ...(_createdByUser(input) ? { status_changed_by: 'user' as const } : {}),
+        ...(typeof input.change_cid === 'string' && input.change_cid ? { last_change_cid: input.change_cid } : {}),
         ...owner,
         ...(dependsOn.length ? { depends_on: dependsOn } : {}),
         ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
@@ -550,6 +576,15 @@ export interface UpdateTaskPatch extends TaskContentInput {
   owner_agent_id?: string;
   /** `YYYY-MM-DD`; null or empty clears the due date. */
   due_at?: string | null;
+  /** Replaces the result note; null or empty clears it and its kind. Shared
+   *  projects do not keep notes yet, so their saves ignore both. */
+  note?: string | null;
+  /** Defaults to `result`; only valid together with a nonempty note. */
+  note_kind?: TaskNoteKind;
+  /** Host-only: the app's own editor sets `user`; models and the host omit it. */
+  status_actor?: 'user';
+  /** Host-only: the conversation of the tool call making this change. */
+  change_cid?: string;
   /** Execution conversation, replaced only by a successful host dispatch.
    *  Never exposed as a model or renderer input field. Ordinary edits omit it. */
   origin_cid?: string;
@@ -607,6 +642,21 @@ export async function updateTask(
       else if (!isDueDate(patch.due_at)) return { ok: false, error: 'due_invalid' };
       else next.due_at = patch.due_at;
     }
+    if (patch.note !== undefined || patch.note_kind !== undefined) {
+      if (patch.note !== undefined && patch.note !== null && typeof patch.note !== 'string') return { ok: false, error: 'note_invalid' };
+      const note = typeof patch.note === 'string' ? patch.note.trim() : '';
+      if (!note) {
+        // An empty note clears both fields; a kind alone describes nothing.
+        if (patch.note === undefined) return { ok: false, error: 'note_invalid' };
+        delete next.note; delete next.note_kind;
+      } else {
+        if (!isTaskNoteWithinLimit(note)) return { ok: false, error: 'note_too_long' };
+        const kind = patch.note_kind ?? 'result';
+        if (!TASK_NOTE_KINDS.includes(kind)) return { ok: false, error: 'note_invalid' };
+        next.note = note;
+        next.note_kind = kind;
+      }
+    }
     if (patch.attachment_order !== undefined) {
       const names = orderTaskAttachments(_scanAttachmentsDir(uid, pid, tid), patch.attachment_order);
       if (names.length) next.attachments = names; else delete next.attachments;
@@ -618,6 +668,15 @@ export async function updateTask(
       if (patch.status === 'done') next.done_at = nowIso();
       else delete next.done_at;
     }
+    if (next.status !== cur.status) {
+      next.status_changed_at = nowIso();
+      if (patch.status_actor === 'user') next.status_changed_by = 'user';
+      else delete next.status_changed_by;
+    }
+    if (next.status !== cur.status || next.note !== cur.note || next.note_kind !== cur.note_kind) {
+      if (typeof patch.change_cid === 'string' && patch.change_cid) next.last_change_cid = patch.change_cid;
+      else delete next.last_change_cid;
+    }
     next.updated_at = nowIso();
     options.beforeWrite?.();
     await _writeTask(uid, pid, next);
@@ -626,12 +685,8 @@ export async function updateTask(
   });
 }
 
-/** Record the conversation a to-do belongs to without rolling anything back if
- *  the backlink fails. Dispatch entry points call this after an admitted run;
- *  the `todo_tasks` create handler calls it once for a to-do saved from a
- *  conversation (in a project, only that conversation's first open one) and
- *  `project_setup` for its first initial to-do, so opening or running it
- *  returns there. Status edits do not. */
+/** Record the execution conversation after admission. A failed backlink
+ *  cannot roll back an accepted run. Ordinary saves and edits never call this. */
 export async function recordTaskExecution(uid: string, pid: string, tid: string, cid: string): Promise<void> {
   try {
     if (!TASK_ID_RE.test(tid) || !cid.trim()) {
@@ -647,9 +702,9 @@ export async function recordTaskExecution(uid: string, pid: string, tid: string,
 
 /** Shortcut: mark done. */
 export async function completeTask(
-  uid: string, pid: string, tid: string,
+  uid: string, pid: string, tid: string, actor?: 'user',
 ): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
-  return updateTask(uid, pid, tid, { status: 'done' });
+  return updateTask(uid, pid, tid, { status: 'done', ...(actor ? { status_actor: actor } : {}) });
 }
 
 /** Human review decision on a task that is awaiting review. `approved` → done,
@@ -662,7 +717,7 @@ export async function decideReview(
 ): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError | 'not_in_review' }> {
   if (!(await _scopeExists(uid, pid))) return { ok: false, error: 'project_not_found' };
   const result = await updateTask(uid, pid, tid,
-    { status: decision === 'approved' ? 'done' : 'progress' },
+    { status: decision === 'approved' ? 'done' : 'progress', status_actor: 'user' },
     { expectedStatus: 'review' });
   return result.ok === false && result.error === 'status_conflict'
     ? { ok: false, error: 'not_in_review' }

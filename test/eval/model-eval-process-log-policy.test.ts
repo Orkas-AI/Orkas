@@ -326,6 +326,29 @@ describe("Model Eval process-log policy", () => {
       interrupted.ingest('stderr', "[agent-runner] Tool returned error {\n*** You are running in headless mode.\n  tool: 'unrelated',\n");
       expect(interrupted.finish()).toMatchObject({ passed: false, levelCounts: { error: 1 } });
     });
+    it('accepts the current WebKit startSessionAdmission record only inside its owned native stderr stream', () => {
+      const text = '[WebKitWin:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 8543142656536241089\r\n'
+        + '[WebKitWin:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 8543142656536241089 returning true\r\n';
+      const owned = createModelEvalLogCollector('native-webkit', { producer: 'webkit-native-browser' });
+      owned.ingest('stderr', text.slice(0, 43)); owned.ingest('stderr', text.slice(43));
+      expect(owned.finish()).toMatchObject({ passed: true, coveragePassed: true,
+        capturedLineCount: 2, analyzedLineCount: 2, levelCounts: { info: 2, error: 0 } });
+      for (const producer of [undefined, 'chromium-headless-browser']) {
+        const unowned = createModelEvalLogCollector('unowned-current-webkit', { producer }); unowned.ingest('stderr', text);
+        expect(unowned.finish()).toMatchObject({ passed: false, levelCounts: { error: 2 } });
+      }
+      for (const malformed of [
+        '[WebKitWin:Media:ERROR] MediaSessionManagerInterface::startSessionAdmission(0) 17',
+        '[WebKitWin:Other:-] MediaSessionManagerInterface::startSessionAdmission(0) 17',
+        '[WebKitWin:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 123456789012345678901',
+        '[WebKitWin:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 17 returning true: native failure',
+        '[WebKitWin:Media:-] MediaSessionManagerInterface::startSessionAdmissionOther(0) 17',
+      ]) {
+        const invalid = createModelEvalLogCollector('invalid-current-webkit', { producer: 'webkit-native-browser' });
+        invalid.ingest('stderr', malformed + '\n');
+        expect(invalid.finish()).toMatchObject({ passed: false, levelCounts: { error: 1 } });
+      }
+    });
     it('accepts owned WebKit media records and bounded session dumps across chunks', () => {
       const logs = createModelEvalLogCollector('native-webkit', { producer: 'webkit-native-browser' });
       logs.ingest('stderr', '[WebKitWin:Media:-] MediaSessionManagerInterface::sessionWillBeginPlayback(0) 18446744073709551615\r\n'

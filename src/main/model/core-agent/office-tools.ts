@@ -16,8 +16,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 import type { AgentTool, ToolContext, ToolResult, ToolResultImage } from '#core-agent';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { gateOutsideRead } from './outside-read-gate';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
@@ -183,6 +185,9 @@ export interface OfficeToolsOpts {
   userId?: string;
   /** Current conversation id — adds its attachment dir to the writable scope. */
   cid?: string;
+  /** Who is asking, for the approval prompt a read outside the workspace may need. */
+  agentId?: string;
+  agentName?: string;
   /** Project scope for workspace resolution. */
   projectId?: string;
   /** Extra writable/readable roots (skill-edit / agent-edit dirs). */
@@ -267,18 +272,51 @@ function guardPath(opts: OfficeToolsOpts, abs: string, action: string): string |
   return null;
 }
 
+/** A file read elsewhere on the computer follows the user's access setting, as the file
+ *  tools do; outputs keep to the workspace (guardPath 'writable'). */
+async function guardRead(opts: OfficeToolsOpts, abs: string, operation: string, ctx?: ToolContext): Promise<string | null> {
+  const gate = await gateOutsideRead({
+    userId: opts.userId ?? '',
+    ...(opts.cid ? { cid: opts.cid } : {}),
+    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    ...(opts.agentName ? { agentName: opts.agentName } : {}),
+    roots: allowedRootsFor(opts),
+    abs,
+    operation,
+    ...(ctx ? { ctx } : {}),
+  });
+  return gate.ok === false ? `${gate.code}: ${gate.message}` : null;
+}
+
 /** Resolve an embedded image `src` against the conversation's readable scope:
  *  returns the absolute path, or an error message. An image must live in the
  *  workspace / attachment scope (same sandbox as reads) and exist on disk —
  *  OfficeCLI embeds it by copying the bytes at create time. */
-function resolveImagePath(opts: OfficeToolsOpts, ctx: ToolContext, rawSrc: unknown): { abs: string } | { error: string } {
+async function resolveImagePath(opts: OfficeToolsOpts, ctx: ToolContext, rawSrc: unknown, operation: string): Promise<{ abs: string } | { error: string }> {
   const raw = typeof rawSrc === 'string' ? rawSrc.trim() : '';
   if (!raw) return { error: 'an image requires a `src` path' };
   const abs = path.resolve(ctx.workingDir ?? '.', raw);
-  const scopeErr = guardPath(opts, abs, 'readable');
+  const scopeErr = await guardRead(opts, abs, operation, ctx);
   if (scopeErr) return { error: scopeErr.replace(/^E_[A-Z_]+:\s*/, '') };
   if (!fs.existsSync(abs)) return { error: `image not found: ${abs}` };
   return { abs };
+}
+
+async function pptxImageFormatMismatch(file: string): Promise<string | undefined> {
+  const extension = path.extname(file).toLowerCase();
+  const expected = extension === '.png' ? 'PNG' : ['.jpeg', '.jpg'].includes(extension) ? 'JPEG' : undefined;
+  if (!expected) return;
+  try {
+    const handle = await fs.promises.open(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    try {
+      if (!(await handle.stat()).isFile()) return;
+      const head = Buffer.alloc(8);
+      const { bytesRead } = await handle.read(head, 0, head.length, 0);
+      const actual = bytesRead === 8 && head.equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+        ? 'PNG' : bytesRead >= 3 && head[0] === 255 && head[1] === 216 && head[2] === 255 ? 'JPEG' : undefined;
+      if (actual && actual !== expected) return `Image ${file} contains ${actual} bytes but uses the ${extension} extension. Use a file with the matching extension.`;
+    } finally { await handle.close(); }
+  } catch { /* Let OfficeCLI report files whose format cannot be confirmed. */ }
 }
 
 const LOCAL_FILE_PROP = /^(?:src|source|file|filename|filepath|path|template|templatepath|image(?:src|path|file)|media(?:src|path|file)|ole(?:src|path|file)|embeddedobject(?:src|path|file))$/i;
@@ -297,16 +335,16 @@ function uriScheme(value: string): string {
  * web links, but active/local schemes are rejected. Walk nested values too so
  * a future richer operation schema cannot accidentally bypass this boundary.
  */
-function normalizeEditProps(
+async function normalizeEditProps(
   opts: OfficeToolsOpts,
   ctx: ToolContext,
   raw: unknown,
   key = '',
-): { value: unknown } | { error: string } {
+): Promise<{ value: unknown } | { error: string }> {
   if (Array.isArray(raw)) {
     const out: unknown[] = [];
     for (const item of raw) {
-      const normalized = normalizeEditProps(opts, ctx, item, key);
+      const normalized = await normalizeEditProps(opts, ctx, item, key);
       if ('error' in normalized) return normalized;
       out.push(normalized.value);
     }
@@ -315,7 +353,7 @@ function normalizeEditProps(
   if (raw && typeof raw === 'object') {
     const out: Record<string, unknown> = {};
     for (const [childKey, childValue] of Object.entries(raw as Record<string, unknown>)) {
-      const normalized = normalizeEditProps(opts, ctx, childValue, childKey.replace(/[^A-Za-z]/g, ''));
+      const normalized = await normalizeEditProps(opts, ctx, childValue, childKey.replace(/[^A-Za-z]/g, ''));
       if ('error' in normalized) return normalized;
       out[childKey] = normalized.value;
     }
@@ -330,7 +368,7 @@ function normalizeEditProps(
       return { error: `file-bearing property \`${key}\` does not accept URI references` };
     }
     const abs = path.resolve(ctx.workingDir ?? '.', value);
-    const scopeErr = guardPath(opts, abs, 'readable');
+    const scopeErr = await guardRead(opts, abs, 'edit_office', ctx);
     if (scopeErr) return { error: scopeErr.replace(/^E_[A-Z_]+:\s*/, '') };
     let stat: fs.Stats;
     try { stat = fs.statSync(abs); }
@@ -344,11 +382,11 @@ function normalizeEditProps(
   return { value: raw };
 }
 
-function normalizeEditOperations(
+async function normalizeEditOperations(
   opts: OfficeToolsOpts,
   ctx: ToolContext,
   raw: unknown,
-): { operations: EditOp[] } | { error: string } {
+): Promise<{ operations: EditOp[] } | { error: string }> {
   if (!Array.isArray(raw)) return { error: '`operations` must be an array' };
   const operations: EditOp[] = [];
   const fieldsByAction: Readonly<Record<string, ReadonlySet<string>>> = {
@@ -372,7 +410,7 @@ function normalizeEditOperations(
         error: `edit_office ${action} at operations[${index}] does not accept: ${unexpected.join(', ')}`,
       };
     }
-    const normalizedProps = normalizeEditProps(opts, ctx, operation.props);
+    const normalizedProps = await normalizeEditProps(opts, ctx, operation.props);
     if ('error' in normalizedProps) return normalizedProps;
     operations.push({
       ...operation,
@@ -718,6 +756,43 @@ function prepareOutput(
   return { abs };
 }
 
+function checkDocxContent(input: Record<string, unknown>): ToolResult | undefined {
+  for (const section of ['paragraphs', 'tables', 'images'] as const) {
+    const items = input[section];
+    if (items === undefined) continue;
+    if (!Array.isArray(items)) {
+      return parameterError(`${section} must be an array.`, [section], 'invalid_type');
+    }
+    for (const [index, item] of items.entries()) {
+      const field = `${section}[${index}]`;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return parameterError('Expected an object.', [field], 'invalid_type');
+      }
+      if (section === 'paragraphs' && typeof item.text !== 'string') {
+        return parameterError('Provide paragraph text as a string. An empty string creates a blank paragraph.', [`${field}.text`]);
+      }
+      if (section === 'images' && (typeof item.src !== 'string' || !item.src.trim())) {
+        return parameterError('Provide a non-empty local image path.', [`${field}.src`]);
+      }
+      if (section === 'tables') {
+        if (!Array.isArray(item.rows)) {
+          return parameterError('Provide table rows as an array of arrays.', [`${field}.rows`], 'invalid_type');
+        }
+        for (const [rowIndex, row] of item.rows.entries()) {
+          const rowField = `${field}.rows[${rowIndex}]`;
+          if (!Array.isArray(row)) {
+            return parameterError('Provide this table row as an array of cells.', [rowField], 'invalid_type');
+          }
+          const badCell = row.findIndex(cell => cell != null && typeof cell !== 'string' && typeof cell !== 'number');
+          if (badCell >= 0) {
+            return parameterError('Provide text, a number, or a blank cell.', [`${rowField}[${badCell}]`], 'invalid_type');
+          }
+        }
+      }
+    }
+  }
+}
+
 function createDocxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_docx',
@@ -769,7 +844,7 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
         },
         images: {
           type: 'array',
-          description: 'Images appended after tables; src must be in the workspace or attachments.',
+          description: 'Images appended after tables; a src outside the workspace follows the user\'s access setting and may ask the user first.',
           items: {
             type: 'object',
             properties: {
@@ -789,6 +864,8 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
     async execute(input, ctx) {
       const prep = prepareOutput(opts, ctx, input, '.docx');
       if ('error' in prep) return prep.error;
+      const contentError = checkDocxContent(input);
+      if (contentError) return contentError;
       const locale = typeof input.locale === 'string' && input.locale ? input.locale : undefined;
       if (locale) {
         const localeErr = officeArgError(locale, 'locale');
@@ -801,8 +878,7 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
       const images: DocxImageSpec[] = [];
       if (Array.isArray(input.images)) {
         for (const img of input.images as DocxImageSpec[]) {
-          if (!img || typeof img !== 'object') continue;
-          const r = resolveImagePath(opts, ctx, img.src);
+          const r = await resolveImagePath(opts, ctx, img.src, 'create_docx');
           if ('error' in r) return errResult('E_OFFICE_IMAGE', r.error);
           images.push({ ...img, src: r.abs });
         }
@@ -1172,7 +1248,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
               },
               images: {
                 type: 'array',
-                description: 'src: workspace/attachment path. Crop edges: percent; crop: all, vertical,horizontal, or left,top,right,bottom.',
+                description: 'src: image path; one outside the workspace follows the user\'s access setting and may ask the user first. Crop edges: percent; crop: all, vertical,horizontal, or left,top,right,bottom.',
                 items: {
                   type: 'object',
                   properties: {
@@ -1261,14 +1337,20 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
       if ('error' in prep) return prep.error;
       const rawSlides = Array.isArray(input.slides) ? (input.slides as PptxSlideSpec[]) : [];
       const slides: PptxSlideSpec[] = [];
+      const checkedImages = new Set<string>();
       for (const s of rawSlides) {
         if (!s || typeof s !== 'object') { slides.push(s); continue; }
         if (!Array.isArray(s.images)) { slides.push(s); continue; }
         const images: PptxImageSpec[] = [];
         for (const img of s.images as PptxImageSpec[]) {
           if (!img || typeof img !== 'object') continue;
-          const r = resolveImagePath(opts, ctx, img.src);
+          const r = await resolveImagePath(opts, ctx, img.src, 'create_pptx');
           if ('error' in r) return errResult('E_OFFICE_IMAGE', r.error);
+          if (!checkedImages.has(r.abs)) {
+            checkedImages.add(r.abs);
+            const mismatch = await pptxImageFormatMismatch(r.abs);
+            if (mismatch) return errResult('E_OFFICE_IMAGE', mismatch);
+          }
           images.push({ ...img, src: r.abs });
         }
         slides.push({ ...s, images });
@@ -1327,7 +1409,7 @@ function createOfficeRenderTool(opts: OfficeToolsOpts): AgentTool {
       if (!['.docx', '.xlsx', '.pptx'].includes(ext)) {
         return errResult('E_BAD_INPUT', 'office_render supports .docx/.xlsx/.pptx only');
       }
-      const scopeErr = guardPath(opts, abs, 'readable');
+      const scopeErr = await guardRead(opts, abs, 'office_render', ctx);
       if (scopeErr) return { content: scopeErr, isError: true };
       if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
 
@@ -1418,7 +1500,7 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
       if (!['.docx', '.xlsx', '.pptx'].includes(path.extname(abs).toLowerCase())) {
         return errResult('E_BAD_INPUT', 'office_check supports .docx/.xlsx/.pptx only');
       }
-      const scopeErr = guardPath(opts, abs, 'readable');
+      const scopeErr = await guardRead(opts, abs, 'office_check', ctx);
       if (scopeErr) return { content: scopeErr, isError: true };
       if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
 
@@ -1591,7 +1673,7 @@ function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
       if (!['.docx', '.xlsx', '.pptx'].includes(path.extname(abs).toLowerCase())) {
         return errResult('E_BAD_INPUT', 'office_review supports .docx/.xlsx/.pptx only');
       }
-      const scopeErr = guardPath(opts, abs, 'readable');
+      const scopeErr = await guardRead(opts, abs, 'office_review', ctx);
       if (scopeErr) return { content: scopeErr, isError: true };
       if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
       const rawPages = Array.isArray(input.pages) && input.pages.length ? input.pages : ['1'];
@@ -1745,7 +1827,7 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
       if (!['.docx', '.xlsx', '.pptx'].includes(path.extname(abs).toLowerCase())) {
         return errResult('E_BAD_INPUT', 'office_read supports .docx/.xlsx/.pptx only');
       }
-      const scopeErr = guardPath(opts, abs, 'readable');
+      const scopeErr = await guardRead(opts, abs, 'office_read', ctx);
       if (scopeErr) return { content: scopeErr, isError: true };
       if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
 
@@ -1878,11 +1960,11 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
       if (!['.docx', '.xlsx', '.pptx'].includes(sourceExt)) {
         return errResult('E_BAD_INPUT', 'edit_office supports .docx/.xlsx/.pptx only');
       }
-      const sourceScopeErr = guardPath(opts, sourceAbs, 'readable');
+      const sourceScopeErr = await guardRead(opts, sourceAbs, 'edit_office', ctx);
       if (sourceScopeErr) return { content: sourceScopeErr, isError: true };
       if (!fs.existsSync(sourceAbs)) return errResult('E_NOT_FOUND', `${sourceAbs}: file not found`);
 
-      const normalized = normalizeEditOperations(opts, ctx, input.operations);
+      const normalized = await normalizeEditOperations(opts, ctx, input.operations);
       if ('error' in normalized) return errResult('E_BAD_INPUT', normalized.error);
       let normalizedOperations = normalized.operations;
       if (sourceExt === '.pptx') {
@@ -1909,9 +1991,15 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
 
       const sourceWasProduced = !!opts.hasProducedPath?.(sourceAbs);
       const rawOutputPath = typeof input.output_path === 'string' ? input.output_path.trim() : '';
+      // A source elsewhere on the computer is not edited beside itself: its working copy goes
+      // to the workspace, where outputs belong.
+      const writableRoots = allowedRootsFor(opts);
+      const copyBeside = isPathAllowed(sourceAbs, writableRoots)
+        ? sourceAbs
+        : path.join(ctx.workingDir && isPathAllowed(ctx.workingDir, writableRoots) ? ctx.workingDir : writableRoots[0] ?? path.dirname(sourceAbs), path.basename(sourceAbs));
       let requestedOutput = rawOutputPath
         ? path.resolve(ctx.workingDir ?? '.', rawOutputPath)
-        : (sourceWasProduced ? sourceAbs : editedCopyPath(sourceAbs));
+        : (sourceWasProduced ? sourceAbs : editedCopyPath(copyBeside));
       if (path.extname(requestedOutput).toLowerCase() !== sourceExt) {
         return errResult('E_BAD_INPUT', '`output_path` must use the same Office extension as `path`');
       }

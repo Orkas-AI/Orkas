@@ -54,7 +54,6 @@ function loadUnreadRenderer(
   persisted = new Map<string, string>(),
   options: {
     focused?: boolean;
-    loadConversations?: (context: any) => void | Promise<void>;
     invoke?: (channel: string, payload: unknown) => Promise<unknown>;
   } = {},
 ) {
@@ -82,6 +81,7 @@ function loadUnreadRenderer(
     console,
     setTimeout,
     clearTimeout,
+    queueMicrotask,
     currentUserId: 'u1',
     currentView: 'new-chat',
     currentCid: null,
@@ -134,9 +134,6 @@ function loadUnreadRenderer(
     return item;
   };
   context.__setFocused = (value: boolean) => { focused = value; };
-  if (options.loadConversations) {
-    context.loadConversations = () => options.loadConversations!(context);
-  }
   vm.createContext(context);
   vm.runInContext(unreadSource, context);
   return context;
@@ -393,19 +390,22 @@ describe('unread task reply indicators', () => {
     expect(context.__dots['projects-unread-dot'].hidden).toBe(false);
   });
 
-  it('resolves an initially unknown task into the correct parent without losing unread state', async () => {
-    const context = loadUnreadRenderer();
-    context.loadConversations = vi.fn(async () => {
-      context.conversations.push({ conversation_id: 'late-task', project_id: 'p1' });
-    });
+  it('lights a collapsed project for an unknown task without reloading the conversation list', async () => {
+    const invoke = vi.fn(async () => ({
+      ok: true,
+      conversations: [{ conversation_id: 'late-task', project_id: 'p1' }],
+    }));
+    const context = loadUnreadRenderer(new Map(), { invoke });
+    context.loadConversations = vi.fn();
 
     context._markConversationUnread('late-task', { finishedAt: 100 });
     expect(context._isConversationUnread('late-task')).toBe(true);
     expect(context.__projectDots.get('p1').hidden).toBe(true);
 
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(context.loadConversations).toHaveBeenCalledOnce();
-    expect(context.loadConversations).toHaveBeenCalledWith({ full: true });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('conversations.getMany', { cids: ['late-task'] });
+    expect(context.loadConversations).not.toHaveBeenCalled();
+    expect(context.conversations).toEqual([]);
     expect(context._isConversationUnread('late-task')).toBe(true);
     expect(context.__projectDots.get('p1').hidden).toBe(false);
     expect(context.__dots['projects-unread-dot'].hidden).toBe(false);
@@ -625,10 +625,9 @@ describe('unread task reply indicators', () => {
 
   it('assigns an early terminal to its project after conversation scope loads', async () => {
     const context = loadUnreadRenderer(new Map(), {
-      loadConversations: async (runtime) => {
-        runtime.conversations.push({ conversation_id: 'late-task', project_id: 'p1' });
-      },
+      invoke: async () => ({ ok: true, conversations: [{ conversation_id: 'late-task', project_id: 'p1' }] }),
     });
+    context.currentUserId = '';
 
     expect(context._handleTaskTerminalUnread({
       type: 'terminal',
@@ -636,6 +635,9 @@ describe('unread task reply indicators', () => {
       status: 'completed',
       finished_at_ms: 100,
     })).toBe(true);
+    expect(context._isConversationUnread('late-task')).toBe(false);
+    context.currentUserId = 'u1';
+    context._restoreUnreadTaskState();
     expect(context._isConversationUnread('late-task')).toBe(true);
     expect(context.__projectDot.hidden).toBe(true);
 
@@ -643,6 +645,25 @@ describe('unread task reply indicators', () => {
       expect(context._taskUnreadProjectCount('p1')).toBe(1);
       expect(context.__projectDot.hidden).toBe(false);
     });
+  });
+
+  it('resolves the current account while discarding a pending lookup from a previous account', async () => {
+    let resolvePrevious!: (result: unknown) => void;
+    const previous = new Promise(resolve => { resolvePrevious = resolve; });
+    const invoke = vi.fn()
+      .mockReturnValueOnce(previous)
+      .mockResolvedValueOnce({ conversations: [{ conversation_id: 'same-id', project_id: 'p2' }] });
+    const context = loadUnreadRenderer(new Map(), { invoke });
+    context._markConversationUnread('same-id', { finishedAt: 100 });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+
+    context.currentUserId = 'u2';
+    context._markConversationUnread('same-id', { finishedAt: 110 });
+    resolvePrevious({ conversations: [{ conversation_id: 'same-id', project_id: 'p1' }] });
+
+    await vi.waitFor(() => expect(context.__projectDots.get('p2').hidden).toBe(false));
+    expect(context.__projectDots.get('p1').hidden).toBe(true);
+    expect(context.window.TaskUnread.list()[0]).toMatchObject({ cid: 'same-id', projectId: 'p2', finishedAt: 110 });
   });
 
   it('lists unread runs newest first with the outcome of their latest terminal for the home', () => {

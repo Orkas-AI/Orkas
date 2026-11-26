@@ -473,9 +473,11 @@ describe('client_config', () => {
 
   it('ships the synchronized public model catalog with compatibility metadata', () => {
     expect(DEFAULT_PROVIDER_MODELS['openai-codex']).toEqual([
-      { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128000, maxInputImages: 20 },
+      { id: 'gpt-6.2-astra', name: 'GPT-6.2 Astra', maxTokens: 128000, maxInputImages: 20 },
+      { id: 'gpt-6.2-sol', name: 'GPT-6.2 Sol', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', maxTokens: 64000, maxInputImages: 20 },
+      { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128000, maxInputImages: 20 },
       { id: 'gpt-6-sol', name: 'GPT-6 Sol', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-6-luna', name: 'GPT-6 Luna', maxTokens: 64000, maxInputImages: 20 },
       { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },

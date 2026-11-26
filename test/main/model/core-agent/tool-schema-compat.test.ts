@@ -92,7 +92,11 @@ describe('Chat Completions root-schema compatibility through the real SDK', () =
       ]));
       const saving = payload.tools.find((tool: any) => tool.function.name === 'save_app').function.parameters;
       expect(saving.properties.action.description).toBe('Both actions require exactly one source: artifact_id or path. Inspect returns the bound saved destination and its revision without saving.');
-      expect(saving.properties.artifact_id.description).toBe('Application artifact ID in the current conversation.');
+      expect(saving.properties.artifact_id.description).toBe('Exact recorded application artifact ID in this conversation. If you only know its title, retrieve the ID with chat_history first.');
+      const artifactIdFormat = new RegExp(saving.properties.artifact_id.pattern);
+      expect(artifactIdFormat.test('app_id-1')).toBe(true);
+      expect(artifactIdFormat.test('Budget Tracker')).toBe(false);
+      expect(artifactIdFormat.test('')).toBe(false);
       const invalid = payload.tools.some((tool: any) => {
         const schema = tool.function.parameters;
         return schema.type !== 'object' || containsUnion(schema)

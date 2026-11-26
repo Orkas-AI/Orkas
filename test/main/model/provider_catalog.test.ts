@@ -165,8 +165,9 @@ describe('provider_catalog › CURATED_MODELS', () => {
         type: 'object', properties: { path: { type: 'string' } }, required: ['path'],
       } }], onRequestFailure() {},
     })).rejects.toThrow('captured-before-transport');
-    expect(payload).toMatchObject({ model: 'gpt-6.1-terra', stream: true,
-      reasoning: { effort: reasoning === 'off' ? 'none' : reasoning } });
+    expect(payload).toMatchObject({ model: 'gpt-6.1-terra', stream: true });
+    expect(payload.reasoning).toMatchObject({ effort: reasoning === 'off' ? 'none' : reasoning });
+    expect(payload.input.some((item: { type?: string }) => item.type === 'configuration_update')).toBe(false);
     expect(JSON.stringify(payload.input)).toContain('input_image');
     expect(JSON.stringify(payload.input)).toContain('data:image/png;base64,AQID');
     expect(JSON.stringify(payload.input)).toContain('read_file');
@@ -393,7 +394,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
   // out, so an SDK ceiling near the window leaves a long conversation almost no
   // input: minimax-m3's 512K of 524K capped input at 10,076 tokens, below the
   // overhead of an ordinary first request. Reservations come from the table's own
-  // rows: 131072 for wide windows (MiMo, Kimi K3, M3.1 Flash, direct GLM-5.2),
+  // rows: 131072 for wide windows (Kimi K3, M3.1 Flash, direct GLM-5.2),
   // 32768 for 256K ones (Doubao Turbo, direct Kimi K2.7 Code).
   describe('output reservation against the context window', () => {
     // Known rows above the limit but well short of the window, left to a separate
@@ -423,9 +424,10 @@ describe('provider_catalog › CURATED_MODELS', () => {
   });
 
   it.each([
+    ['google/gemini-4-neon', 65536],
+    ['google/gemini-4-hydrogen', 65536],
+    ['google/gemini-4-carbon', 65536],
     ['google/gemini-4-argon', 65536],
-    ['xiaomi/mimo-v2.5', 65536],
-    ['xiaomi/mimo-v2.5-pro', 131072],
     ['minimax/minimax-m3', 131072],
     ['z-ai/glm-5.2', 131072],
     ['x-ai/grok-4.5', 131072],
@@ -520,13 +522,10 @@ describe('provider_catalog › CURATED_MODELS', () => {
   });
 
   it('natively resolves GPT-6 tiers and every retained GPT-5.6 tier', () => {
-    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
-    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual([
-      ...expected,
-    ]);
-    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual([
-      ...expected,
-    ]);
+    const expected = ['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6.1-terra',
+      'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
+    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
 
     for (const provider of ['openai', 'openai-codex'] as const) {
       for (const modelId of expected) {
@@ -560,6 +559,28 @@ describe('provider_catalog › CURATED_MODELS', () => {
         id, api: 'openai-codex-responses', contextWindow: 272_000, maxTokens: 128_000,
       });
     }
+  });
+
+  it.each([
+    ['openai', 'gpt-6.2-astra', 'openai-responses', 'https://api.openai.com/v1', 272_000, 128_000],
+    ['openai', 'gpt-6.2-sol', 'openai-responses', 'https://api.openai.com/v1', 272_000, 64_000],
+    ['openai-codex', 'gpt-6.2-astra', 'openai-codex-responses', 'https://chatgpt.com/backend-api', 272_000, 128_000],
+    ['openai-codex', 'gpt-6.2-sol', 'openai-codex-responses', 'https://chatgpt.com/backend-api', 500_000, 64_000],
+    ['openrouter', 'openai/gpt-6.2-astra', 'openai-completions', 'https://openrouter.ai/api/v1', 1_050_000, 128_000],
+    ['openrouter', 'openai/gpt-6.2-sol', 'openai-completions', 'https://openrouter.ai/api/v1', 1_050_000, 128_000],
+  ] as const)('resolves %s / %s on its own endpoint with its own window and output reservation', (provider, id, api, baseUrl, window, reservation) => {
+    const catalog = { getPiModel: getBuiltinModel as any };
+    expect(isSelectableModel(provider, id)).toBe(true);
+    const resolved = resolveConfiguredPiModel(catalog, provider, id);
+    expect(resolved).toMatchObject({
+      isConfiguredFallback: false,
+      model: { id, provider, api, baseUrl, contextWindow: window, maxTokens: reservation, input: ['text', 'image'] },
+    });
+  });
+
+  it('retains the Kimi Coding 256K input budget when the SDK supplies a higher output limit', () => {
+    const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, 'kimi-coding', 'k3-256k');
+    expect(resolved?.model).toMatchObject({ contextWindow: 262_144, maxTokens: 131_072 });
   });
 
   it('inherits each GPT provider window from pi-ai while retaining output reservations', () => {
@@ -598,7 +619,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
   it('resolves every OpenRouter shortcut or its declared compatibility template', () => {
     expect(CURATED_MODELS.openrouter.length).toBeGreaterThan(0);
-    for (const model of CURATED_MODELS.openrouter || []) {
+    for (const model of CURATED_MODELS.openrouter.filter(entry => !entry.hiddenFromPicker)) {
       const nativeId = model.template || model.id;
       expect(getBuiltinModel('openrouter', nativeId), model.id).toBeDefined();
     }
@@ -629,15 +650,18 @@ describe('provider_catalog › CURATED_MODELS', () => {
       .map((m) => m.id)
       .filter((id) => id.startsWith('openai/gpt-'));
     const nativeIds = [
-      'openai/gpt-6-astra',
+      'openai/gpt-6.2-astra',
+      'openai/gpt-6.2-sol',
       'openai/gpt-6.1-sol',
+      'openai/gpt-6.1-terra',
+      'openai/gpt-6-astra',
       'openai/gpt-6-sol',
       'openai/gpt-6-luna',
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
     ];
-    expect(ids).toEqual([...nativeIds.slice(0, 2), 'openai/gpt-6.1-terra', ...nativeIds.slice(2)]);
+    expect(ids).toEqual(nativeIds);
 
     for (const modelId of nativeIds) {
       expect(getBuiltinModel('openrouter', modelId)).toBeDefined();
@@ -1873,7 +1897,7 @@ describe('provider_catalog › isVisibleProvider / sortProviderIds', () => {
 });
 
 describe('provider_catalog › pickLatestGenerations (fallback)', () => {
-  it('keeps the last N version bands newest-first', () => {
+  it('defaults to the three newest version bands and respects an explicit limit', () => {
     const raw = [
       { id: 'foo-1.0', name: 'Foo 1.0' },
       { id: 'foo-2.0', name: 'Foo 2.0' },
@@ -1881,6 +1905,12 @@ describe('provider_catalog › pickLatestGenerations (fallback)', () => {
       { id: 'foo-2.1-mini', name: 'Foo 2.1 Mini' },
       { id: 'foo-3.0', name: 'Foo 3.0' },
     ];
+    expect(pickLatestGenerations(raw).map((m) => m.id)).toEqual([
+      'foo-3.0',
+      'foo-2.1',
+      'foo-2.1-mini',
+      'foo-2.0',
+    ]);
     const picked = pickLatestGenerations(raw, 2);
     expect(picked.map((m) => m.id)).toEqual([
       'foo-3.0',

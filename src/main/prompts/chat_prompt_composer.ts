@@ -196,8 +196,14 @@ export function buildPlanInteractionHint(interactive: boolean): string {
   ].join('\n');
 }
 
-/** Build the final response-language precedence without loading user state. */
-export function buildLanguageDirectiveText(languageName: string): string {
+/** Build the final response-language precedence without loading user state.
+ *  `descriptionFields: false` drops the Agent/Skill description-field rules for
+ *  execution Agents, which never author those fields. */
+export function buildLanguageDirectiveText(
+  languageName: string,
+  options: { descriptionFields?: boolean } = {},
+): string {
+  const descriptionFields = options.descriptionFields !== false;
   return [
     '## User language',
     '',
@@ -207,11 +213,14 @@ export function buildLanguageDirectiveText(languageName: string): string {
     '',
     'Quoted text, code, file contents, proper nouns, earlier assistant messages, and internal delegation or continuation instructions do not switch the response language.',
     '',
-    'Write all human-readable prose in the chosen language, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields. Agent and Skill descriptions instead follow the description-language rules in their owning creator Skill.',
+    'Write all human-readable prose in the chosen language, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields.'
+      + (descriptionFields ? ' Agent and Skill descriptions instead follow the description-language rules in their owning creator Skill.' : ''),
     '',
     'Keep protocol tokens unchanged: XML tag names, JSON keys, tool/skill ids or names, file paths, code, and `select` / `multiselect` `value` strings.',
     '',
-    '`description_zh` is always Chinese and `description_en` is always English; examples show shape only, not output language.',
+    descriptionFields
+      ? '`description_zh` is always Chinese and `description_en` is always English; examples show shape only, not output language.'
+      : 'Examples show shape only, not output language.',
   ].join('\n');
 }
 

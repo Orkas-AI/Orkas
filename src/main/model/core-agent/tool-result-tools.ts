@@ -282,7 +282,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
     filters: {
       type: 'array',
       maxItems: 8,
-      description: 'Up to eight structured predicates combined with AND.',
+      description: 'Structured predicates combined with AND.',
       items: {
         type: 'object',
         additionalProperties: false,
@@ -298,7 +298,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
       type: 'array',
       maxItems: 3,
       items: { type: 'string' },
-      description: 'Up to three dotted fields used to group a structured aggregate.',
+      description: 'Dotted fields that group a structured aggregate.',
     },
     order: { type: 'string', enum: ['asc', 'desc'], description: 'Structured aggregate sort order; default desc.' },
     limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum structured result groups; default 20.' },
@@ -321,14 +321,14 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
       },
       match: {
         type: 'string',
-        description: 'Required exact case-insensitive text. Use only for unstructured-text count.',
+        description: 'Unstructured-text count only: exact case-insensitive text.',
       },
       count_unit: {
         type: 'string',
         enum: ['matching_lines', 'occurrences'],
-        description: 'Required count unit. Use only for unstructured-text count.',
+        description: 'Unstructured-text count only.',
       },
-      cursor: { type: 'integer', minimum: 0, description: 'Required for read: exact non-negative character cursor. Do not prefetch sequential chunks.' },
+      cursor: { type: 'integer', minimum: 0, description: 'Required for read: exact character cursor. Do not prefetch sequential chunks.' },
       max_tokens: {
         type: 'integer',
         minimum: 256,
@@ -337,17 +337,17 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
       },
     },
     required: ['ref'],
-    description: 'Use only fields for the selected action. materialize takes ref only. Unused read/query fields are listed by request in ignored_fields; other incompatible fields are errors.',
+    description: 'Use only fields for the selected action. materialize takes ref only.',
   };
   const actionProperty = {
     type: 'string',
     enum: ['search', 'query', 'read', 'materialize'],
-    description: 'search: narrow text lookup; query: deterministic aggregates; read: exact source excerpts; materialize: session-scoped UTF-8 copies for full-data calculations that query cannot express. Use one operation per call.',
+    description: 'search: narrow text lookup; query: deterministic aggregates; read: exact source excerpts; materialize: session-scoped UTF-8 copies for full-data calculations that query cannot express.',
   };
   return {
     name: 'tool_result',
     description:
-      'Inspect oversized tool results retained in the current agent session using the literal opaque tool.hash ref from a prior <persisted-output ref="..."> marker, not read_files. Make at most one tool_result call per model step and batch up to eight currently needed same-action requests. Use only the selected action; never use a tool-call ID such as call_....',
+      'Inspect oversized tool results retained in the current agent session using the literal opaque tool.hash ref from a prior <persisted-output ref="..."> marker, not read_files; never use a tool-call ID such as call_.... Make at most one tool_result call per model step, batching the currently needed same-action requests.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -357,7 +357,7 @@ function createToolResultTool(opts: ToolResultToolsOpts): AgentTool {
           type: 'array',
           minItems: 1,
           maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
-          description: 'One to eight same-action requests. The whole batch shares 10000 tokens and remaining model-step capacity; earlier items use space first.',
+          description: 'The whole batch shares 10000 tokens and remaining model-step capacity; earlier items use space first.',
           items: requestSchema,
         },
       },

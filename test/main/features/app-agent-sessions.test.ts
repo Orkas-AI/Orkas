@@ -2,21 +2,51 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { createHash } from 'node:crypto';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
+import type { TaskDependencies } from '../../../src/main/features/web_apps/tasks';
 
 let root: string, previous: string | undefined;
-const runs = vi.hoisted(() => ({ calls: [] as any[], hold: false, unresolved: false, pending: [] as Array<{stateAbsPath:string;transactionId:string}>, question: false, form: false, formFile: false, failure:false, fixture: undefined as undefined | {name:string;bytes:string;text:string}, release: undefined as undefined | (() => void) }));
+const runs = vi.hoisted(() => ({ calls: [] as any[], frames: 0, artifactDelivery: '', oversizedIntermediate: false, textOnly: false, hold: false, unresolved: false, pending: [] as Array<{stateAbsPath:string;transactionId:string}>, question: false, form: false, formFile: false, failure:false, fixture: undefined as undefined | {name:string;bytes:string;text:string}, release: undefined as undefined | (() => void) }));
 vi.mock('../../../src/main/model/client', () => ({
   async *streamChatWithModel(opts: any) {
     runs.calls.push({ cid: opts.cid, message: opts.message, workingDir: opts.workingDir, systemPrompt: opts.systemPrompt });
     if (runs.hold) await new Promise<void>(resolve => { runs.release = resolve; });
     if(runs.failure){yield{type:'error',text:'The selected service is unavailable. Choose another service and try again.',failureKind:'config',failureCode:'fixture_terminal_failure'};yield{type:'done'};return;}
     await fs.mkdir(opts.workingDir, { recursive: true });
-    const file = path.join(opts.workingDir, runs.fixture?.name || 'final.mp4');
-    await fs.writeFile(file, runs.fixture ? Buffer.from(runs.fixture.bytes,'base64') : 'video-' + runs.calls.length);
-    await opts.onFileWritten?.(file);
+    if (runs.artifactDelivery) {
+      const dir = path.join(path.dirname(opts.workingDir), 'artifacts', 'bundle');
+      await fs.mkdir(dir, { recursive: true });
+      for (let first = 0; first < 1001; first += 32) {
+        await Promise.all(Array.from({ length: Math.min(32, 1001 - first) }, (_, i) =>
+          fs.writeFile(path.join(dir, `render-${first + i}.txt`), 'working file')));
+      }
+      // Mark the last real directory entry as delivered, independently of filesystem order.
+      runs.artifactDelivery = (await fs.readdir(dir, { withFileTypes: true })).at(-1)!.name;
+      const final = path.join(dir, runs.artifactDelivery);
+      await fs.writeFile(final, 'published artifact');
+      await opts.onFileWritten?.(final);
+      const unrelated = path.join(path.dirname(opts.workingDir), 'private-fixture.txt');
+      await fs.writeFile(unrelated, 'private fixture');
+      await opts.onFileWritten?.(unrelated);
+    } else if (!runs.textOnly) {
+      const file = path.join(opts.workingDir, runs.fixture?.name || 'final.mp4');
+      await fs.writeFile(file, runs.fixture ? Buffer.from(runs.fixture.bytes, 'base64') : 'video-' + runs.calls.length);
+      await opts.onFileWritten?.(file);
+    }
+    if (runs.oversizedIntermediate) {
+      const { MAX_TEXT_FILE_BYTES } = await import('../../../src/main/util/file-size-limits');
+      const draft = path.join(opts.workingDir, 'preview-intermediate.mov');
+      await fs.writeFile(draft, '');
+      await fs.truncate(draft, MAX_TEXT_FILE_BYTES + 1);
+    }
+    // Working files a run leaves without delivering them, such as checked frames.
+    for (let n = 0; n < runs.frames; n++) {
+      await fs.mkdir(path.join(opts.workingDir, 'frames'), { recursive: true });
+      await fs.writeFile(path.join(opts.workingDir, 'frames', `frame-${String(n).padStart(3, '0')}.png`), 'frame-' + n);
+    }
     if (runs.unresolved) runs.pending.push(await startPendingGeneration(opts.userId, opts.cid, 'pending-one'));
-    yield { type: 'final', text: runs.form ? 'Choose a caption.\n<agent-input-form>\n'+JSON.stringify({ fields: [{ id: 'answer', label: 'Caption', type: runs.formFile ? 'file' : 'textarea', required: true }] })+'\n</agent-input-form>' : runs.question ? 'Which caption should I use?\n<plan-interaction status="open" />' : runs.fixture?.text ?? 'Saved video ' + runs.calls.length };
+    yield { type: 'final', text: runs.form ? 'Choose a caption.\n<agent-input-form>\n'+JSON.stringify({ fields: [{ id: 'answer', label: 'Caption', type: runs.formFile ? 'file' : 'textarea', required: true }] })+'\n</agent-input-form>' : runs.question ? 'Which caption should I use?\n<plan-interaction status="open" />' : runs.textOnly ? 'I still need the source footage.' : runs.fixture?.text ?? 'Saved video ' + runs.calls.length };
     yield { type: 'done' };
   },
   async chatWithModel() { throw new Error('Unexpected model request'); },
@@ -27,12 +57,12 @@ beforeEach(async () => {
   previous = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = root;
   vi.resetModules();
-  runs.calls = []; runs.hold = false; runs.unresolved = false; runs.pending = []; runs.question = false; runs.form = false; runs.formFile = false; runs.failure=false; runs.fixture=undefined; runs.release = undefined;
+  runs.calls = []; runs.frames = 0; runs.artifactDelivery = ''; runs.oversizedIntermediate = false; runs.textOnly = false; runs.hold = false; runs.unresolved = false; runs.pending = []; runs.question = false; runs.form = false; runs.formFile = false; runs.failure=false; runs.fixture=undefined; runs.release = undefined;
   (await import('../../../src/main/features/users')).activateUser(uid);
 });
 afterEach(async () => {
   runs.release?.();
-  (await import('../../../src/main/features/web_apps/task-host')).stopAppTaskMaintenance();
+  await (await import('../../../src/main/features/web_apps/task-host')).stopAppTaskMaintenance();
   for (const call of runs.calls) await (await import('../../../src/main/features/group_chat/bus')).dropConv(uid, call.cid);
   (await import('../../../src/main/model/core-agent/bash-permissions'))._resetForTest();
   (await import('../../../src/main/model/core-agent/bash-permissions'))._setBroadcastForTest(null);
@@ -141,6 +171,123 @@ it('denies a one-shot permission through its real owner and never accepts a synt
   expect(result.interactions).toBeUndefined(); expect(runs.calls).toHaveLength(1);
 });
 
+it('returns the reply and the delivered video of a run that leaves more than 100 files', async () => {
+  // On 2026-11-17 a VideoStudio run with frames and test renders failed every
+  // tasks.get with E_LIMIT, so the user never saw its reply.
+  const host = await import('../../../src/main/features/web_apps/task-host'), signal = new AbortController().signal;
+  runs.frames = 130;
+  await host.appTaskCall(uid, key, 'tasks.start', { requestId: 'many-files', title: 'Video', prompt: 'Make video', agentId: 'commander', files: [] }, signal);
+  const settled = await finish(host, 'many-files');
+  expect(settled).toMatchObject({ status: 'completed', text: 'Saved video 1' });
+  expect(settled.files).toHaveLength(100);
+  expect(settled.files[0]).toMatchObject({ name: 'final.mp4', published: true });
+  await host.maintainAppTasks();
+  const saved = await host.appTaskCall(uid, key, 'tasks.get', { requestId: 'many-files' }, signal);
+  expect(saved).toMatchObject({ status: 'completed', saved: true, text: 'Saved video 1' });
+  expect(saved.files.map((file: any) => file.id)).toEqual(settled.files.map((file: any) => file.id));
+  const video = await host.appTaskCall(uid, key, 'tasks.output', { requestId: 'many-files', outputId: saved.files.find((file: any) => file.name === 'final.mp4').id }, signal);
+  expect(Buffer.from(video.base64, 'base64').toString()).toBe('video-1');
+  expect(runs.calls).toHaveLength(1);
+});
+
+it('returns and archives a declared file past one thousand artifact entries', async () => {
+  const host = await import('../../../src/main/features/web_apps/task-host');
+  const signal = new AbortController().signal, requestId = 'artifact-delivery';
+  runs.artifactDelivery = 'pending';
+  const { deps } = host.taskService as unknown as { deps: TaskDependencies };
+  const startWatch = deps.watch!;
+  // Keep the live checks before the explicit status call settles this fixture.
+  const watch = vi.spyOn(deps, 'watch').mockImplementationOnce(async (...args) => {
+    await startWatch(...args);
+    host.stopAppTaskMaintenance();
+  });
+  try {
+    await host.appTaskCall(uid, key, 'tasks.start', { requestId, title: 'Archive', prompt: 'Deliver the final file', agentId: 'commander', files: [] }, signal);
+  } finally {
+    watch.mockRestore();
+  }
+  const inspected = await finish(host, requestId);
+  expect(inspected.files).toHaveLength(100);
+  const final = inspected.files[0];
+  expect(final).toMatchObject({ name: runs.artifactDelivery, published: true });
+  const call = (method: string, args: object = {}) => host.appTaskCall(uid, key, method, { requestId, ...args }, signal);
+  expect(await call('tasks.output', { outputId: final.id })).toMatchObject({ base64: Buffer.from('published artifact').toString('base64') });
+  const unrelated = path.join(path.dirname(runs.calls[0].workingDir), 'private-fixture.txt');
+  const { listProducedPaths } = await import('../../../src/main/features/chats');
+  expect(await listProducedPaths(uid, runs.calls[0].cid)).toContain(unrelated);
+  expect(inspected.files.some((file: any) => file.name === 'private-fixture.txt')).toBe(false);
+  await expect(call('tasks.output', { outputId: createHash('sha256').update(unrelated).digest('hex') })).rejects.toMatchObject({ code: 'E_FILE' });
+  const saved = await call('tasks.get');
+  expect(saved).toMatchObject({ status: 'completed', saved: true, text: inspected.text });
+  expect(saved.files.map((file: any) => file.id)).toEqual(inspected.files.map((file: any) => file.id));
+  const downloaded = await call('tasks.output', { outputId: final.id });
+  expect(Buffer.from(downloaded.base64, 'base64').toString()).toBe('published artifact');
+  expect(runs.calls).toHaveLength(1);
+}, 60_000);
+
+it.each(['removed', 'replaced'])('keeps the reply and other files if a declared file is %s before archive', async change => {
+  const host = await import('../../../src/main/features/web_apps/task-host');
+  const signal = new AbortController().signal, requestId = 'lost-delivery';
+  const { deps } = host.taskService as unknown as { deps: TaskDependencies };
+  const archive = deps.archive!;
+  runs.frames = 1;
+  const mutation = vi.spyOn(deps, 'archive').mockImplementationOnce(async (...args) => {
+    expect(args[2].files).toContainEqual(expect.objectContaining({ name: 'final.mp4', published: true }));
+    const file = path.join(runs.calls[0].workingDir, 'final.mp4');
+    if (change === 'removed') await fs.unlink(file);
+    else await fs.writeFile(file, 'new bytes for a different version', 'utf8');
+    return archive(...args);
+  });
+  await host.appTaskCall(uid, key, 'tasks.start', { requestId, title: 'Clip', prompt: 'Deliver the final clip', agentId: 'commander', files: [] }, signal);
+  const inspected = await finish(host, requestId);
+  const saved = await host.appTaskCall(uid, key, 'tasks.get', { requestId }, signal);
+  expect(mutation).toHaveBeenCalledTimes(1);
+  expect(saved).toMatchObject({ status: 'failed', saved: true, text: 'Saved video 1', error: { code: 'E_OUTPUT_SAVE_FAILED' } });
+  expect(saved.files).toHaveLength(1);
+  expect(saved.files[0]).toMatchObject({ name: 'frame-000.png', published: false });
+  await expect(host.appTaskCall(uid, key, 'tasks.output', { requestId, outputId: inspected.files.find((file: any) => file.name === 'final.mp4').id }, signal)).rejects.toMatchObject({ code: 'E_FILE' });
+  expect(runs.calls).toHaveLength(1);
+});
+
+it.each([false, true])('archives a delivered file beside a non-downloadable working render (retain=%s)', async keepSession => {
+  const host = await import('../../../src/main/features/web_apps/task-host');
+  const signal = new AbortController().signal;
+  const requestId = 'working-render';
+  runs.oversizedIntermediate = true;
+  await host.appTaskCall(uid, key, 'tasks.start', {
+    requestId, title: 'Media review', prompt: 'Save the final review clip', agentId: 'commander', files: [], keepSession,
+  }, signal);
+  const settled = await finish(host, requestId);
+  await host.maintainAppTasks();
+  const saved = await host.appTaskCall(uid, key, 'tasks.get', { requestId }, signal);
+  expect(saved).toMatchObject({ status: 'completed', saved: true, text: 'Saved video 1' });
+  expect(settled.files.map((file: any) => file.id)).toEqual(saved.files.map((file: any) => file.id));
+  expect(saved.files).toHaveLength(1);
+  expect(saved.files[0]).toMatchObject({ name: 'final.mp4', published: true });
+  const clip = await host.appTaskCall(uid, key, 'tasks.output', { requestId, outputId: saved.files[0].id }, signal);
+  expect(Buffer.from(clip.base64, 'base64').toString()).toBe('video-1');
+  expect(runs.calls).toHaveLength(1);
+});
+
+it('saves a text-only reply when a working render exceeds the app download limit', async () => {
+  runs.textOnly = true;
+  runs.oversizedIntermediate = true;
+  const host = await import('../../../src/main/features/web_apps/task-host');
+  const signal = new AbortController().signal;
+  const requestId = 'text-only-working-render';
+  await host.appTaskCall(uid, key, 'tasks.start', {
+    requestId, title: 'Check the source', prompt: 'Can this material be used?', agentId: 'commander', files: [],
+  }, signal);
+  const settled = await finish(host, requestId);
+  expect(settled).toMatchObject({ status: 'completed', text: 'I still need the source footage.' });
+  await host.maintainAppTasks();
+  const saved = await host.appTaskCall(uid, key, 'tasks.get', { requestId }, signal);
+  expect(saved).toMatchObject({ status: 'completed', saved: true, text: settled.text, files: [] });
+  const context = (await import('../../../src/main/paths')).appConversationRoot(uid, runs.calls[0].cid)!;
+  await expect(fs.stat(context)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(runs.calls).toHaveLength(1);
+});
+
 it('records an unavailable delivery check separately from missing media and keeps its saved files', async () => {
   const host = await import('../../../src/main/features/web_apps/task-host'), signal = new AbortController().signal;
   await host.appTaskCall(uid, key, 'tasks.start', { requestId: 'output-check', title: 'Video', prompt: 'Make video', agentId: 'commander', files: [], deliverable: 'video' }, signal);
@@ -242,6 +389,23 @@ it('keeps generated sources when app result saving fails, then retries only stor
   await fs.unlink(destination); await host.maintainAppTasks();
   expect((await host.appTaskCall(uid, key, 'tasks.get', { requestId: 'save-retry' }, signal)).status).toBe('completed');
   expect(runs.calls).toHaveLength(1);
+});
+
+// Review 2026-11-16 S9-7: each poll of a running app task reads its conversation state once, not twice.
+it('inspects a running one-shot task once per status poll', async () => {
+  runs.hold = true;
+  const host = await import('../../../src/main/features/web_apps/task-host'), signal = new AbortController().signal;
+  await host.appTaskCall(uid, key, 'tasks.start', { requestId: 'one-look', title: 'Video', prompt: 'Make video', agentId: 'commander', files: [] }, signal);
+  await vi.waitFor(() => expect(runs.release).toBeTypeOf('function'));
+  await host.stopAppTaskMaintenance();
+  const chat = await import('../../../src/main/features/group_chat');
+  const runtime = vi.spyOn(chat, 'runtimeStatus');
+  try {
+    expect(await host.appTaskCall(uid, key, 'tasks.get', { requestId: 'one-look' }, signal)).toMatchObject({ status: 'running', saved: false });
+    expect(runtime).toHaveBeenCalledOnce();
+  } finally { runtime.mockRestore(); }
+  runs.release!();
+  expect(await finish(host, 'one-look')).toMatchObject({ status: 'completed' });
 });
 
 it('answers the existing permission gate only through the owning app task and never auto-approves missing decisions', async () => {

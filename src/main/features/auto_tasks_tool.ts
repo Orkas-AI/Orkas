@@ -9,6 +9,9 @@ import { logErrorSummary } from '../util/log-redact';
 
 const log = createLogger('auto-tasks-tool');
 
+const READ_ONLY = { ok: false, error: 'project_read_only',
+  message: "Another project's automations are read-only here; changing them requires a conversation in that project." };
+
 const contract = require('../../../bin/auto-tasks-contract.cjs');
 const EDIT_FIELDS = ['title', 'content', 'schedule', 'enabled', 'end_condition', 'recipient', 'skill', 'connector', 'attachments', 'project_id'];
 
@@ -76,9 +79,30 @@ export function createAutoTasksTool(opts: {
           return { content: JSON.stringify({ ok: true, task: taskView(task) }) };
         }
         const updates = Object.fromEntries(EDIT_FIELDS.filter((key) => data[key] !== undefined).map((key) => [key, data[key]]));
+        // Commander outside a project (no bound scope) reads every project's
+        // automations but changes only global ones and a project it created
+        // for this conversation this turn (plan §6, second phase R3).
+        const current = action === 'create' || opts.projectId !== undefined
+          ? null : await autoTasks.getTask(opts.userId, taskId);
+        if (opts.projectId === undefined) {
+          const { pendingCreatedProjectId } = await import('./conversation_filing');
+          const createdHere = opts.cid ? pendingCreatedProjectId(opts.userId, opts.cid) : undefined;
+          const writable = (project: string | null | undefined) => !project || project === createdHere;
+          // A target project that does not exist keeps storage's own not-found answer.
+          const target = updates.project_id as string | null | undefined;
+          const targetReadOnly = !writable(target) && await projectExists(opts.userId, target!);
+          if (!writable(current?.project_id) || targetReadOnly) {
+            return { content: JSON.stringify(READ_ONLY), isError: true };
+          }
+        }
         const result = await autoTasks.applyAutoTaskMutation(opts.userId, {
           action, taskId, updates,
-        }, { sourceAttachmentCid: opts.cid, projectId: opts.projectId, ...(opts.cid ? { conversationId: opts.cid } : {}) });
+        }, {
+          sourceAttachmentCid: opts.cid, projectId: opts.projectId,
+          ...(opts.projectId === undefined && action !== 'create'
+            ? { expectedSourceProjectId: current?.project_id ?? null } : {}),
+          ...(opts.cid ? { conversationId: opts.cid } : {}),
+        });
         if (!result.ok && result.error && !/^[a-z][a-z0-9_]*$/.test(result.error)) return fail('automation operation failed');
         if (result.ok && result.taskId && result.kind !== 'deleted') {
           try { opts.onSaved?.(result.taskId, result.task?.title || result.title || ''); } catch { /* navigation is an offer, never a failure */ }

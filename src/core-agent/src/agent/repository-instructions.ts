@@ -110,7 +110,9 @@ export function repositoryInstructionsText(
     "[Repository context — host-discovered facts]",
     `Working directory: ${context.workingDir}`,
     `Repository root: ${context.repositoryRoot}`,
-    "Only root-to-working-directory AGENTS.md files are preloaded below; subdirectories are not scanned. Do not reread these files solely to reload unchanged instructions.",
+    !context.files.length && !context.discoveryTruncated
+      ? "The host checked from the repository root through the working directory and found no applicable AGENTS.md instructions."
+      : "Only root-to-working-directory AGENTS.md files are preloaded below; subdirectories are not scanned. Do not reread these files solely to reload unchanged instructions.",
     "Before modifying files in a deeper or other authorized directory, check the target's ancestor directories for applicable AGENTS.md files not loaded here and read them with existing file tools. Reuse rules already read in this turn unless they change.",
     "AGENTS.md files are ordered shallow-to-deep. Each file applies only to files inside its directory subtree; a deeper applicable file takes precedence.",
   ];

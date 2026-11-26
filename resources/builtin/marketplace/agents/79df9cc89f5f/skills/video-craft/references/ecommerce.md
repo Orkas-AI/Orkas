@@ -52,8 +52,8 @@ Distinguish what the available material can show:
 Choose by the control you need: cinematic product action can be a generated clip;
 exact editable offer words belong in the page. Reuse the actual product references.
 For work that follows a reference, use [reference-recreation.md](reference-recreation.md).
-Keep words in the timeline, off the footage, so a later price or caption change
-reuses the finished footage.
+When building a page, keep editable words in the timeline so later price or
+caption changes reuse the footage.
 
 ## Common formats
 
@@ -112,9 +112,10 @@ citations or extra approval stage.
 Review the actual sequence against the original request, not only the authored
 timeline. Can a new viewer identify the product, understand the intended buying
 point, and follow how the shots support it? Check the opening and its payoff,
-meaningful changes within scenes and the joins between them. Use `video.sheet`
-at the relevant times; after rendering, inspect the final-file frames returned
-by `video.ship`. A few sampled frames cannot establish smooth motion between
+meaningful changes within scenes and the joins between them. Request specific
+times with `video.sheet` when the preview misses a relevant moment. After
+rendering, inspect the final-file frames returned by `video.ship`. A few sampled
+frames cannot establish smooth motion between
 them. Technical success or changing pixels does not establish a useful story.
 Name the specific scene/time and corrective change for a warranted finding;
 do not invent a minimum shot count, product-area ratio or mandatory transition.

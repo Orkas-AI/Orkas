@@ -36,6 +36,20 @@ function deferred<T>() {
 }
 
 describe('conversation polling cancellation', () => {
+  it('does not settle a send whose receipt check is still running from a historical reply', async () => {
+    const pending = { confirmingSend: true };
+    const context = vm.createContext({
+      pendingConvs: new Map([['c1', pending]]),
+      currentCid: 'c2',
+      setGroupConversationBusy: vi.fn(),
+      _updateConvSidebarBadge: vi.fn(),
+    });
+    vm.runInContext(extractFunction('_onPolledResponse'), context);
+    await context._onPolledResponse('c1', { id: 'old-reply', from: 'agent', text: 'Earlier reply' });
+    expect(context.pendingConvs.get('c1')).toBe(pending);
+    expect(context.setGroupConversationBusy).not.toHaveBeenCalled();
+  });
+
   it('clears a valid zero-valued timer handle instead of leaving polling active', () => {
     const clearInterval = vi.fn();
     const context: any = {

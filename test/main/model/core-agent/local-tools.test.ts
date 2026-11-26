@@ -30,6 +30,36 @@ it.each(['apply_patch', 'edit_file'])('advertises the accepted read/write baseli
 let tmpDir: string;
 let prevWs: string | undefined;
 
+it('waits for a host-bound command without losing output tracking or conversation isolation', async () => {
+  await allFilesAuto();
+  const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+  const { _resetProcessSessionsForTest } = await import('../../../../src/core-agent/src/tools/process-session');
+  const onShellFileObserved = vi.fn();
+  const tools = createLocalTools({ userId: UID, cid: CID, onShellFileObserved });
+  const bash = tools.find(t => t.name === 'bash')!;
+  const session = tools.find(t => t.name === 'process_session')!;
+  const foreign = createLocalTools({ userId: UID, cid: 'other-conversation' }).find(t => t.name === 'process_session')!;
+  const quote = (s: string) => "'" + s.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''") + "'";
+  const script = "console.log('ready');process.stdin.once('data',()=>{require('fs').writeFileSync('waited.txt','complete');process.exit(0)})";
+  const command = `${process.platform === 'win32' ? '& ' : ''}${quote(TEST_NODE)} -e ${quote(script)}`;
+  const ctx = { workingDir: tmpDir, state: { commandSessionEnabled: true, processSessionOwner: 'forged' } };
+  try {
+    const initial = JSON.parse((await bash.execute({ command, yield_time_ms: 0 }, ctx)).content);
+    const input = { action: 'read', session_id: initial.session_id, wait_for: 'exit', yield_time_ms: 600000 };
+    expect((await foreign.execute(input, ctx)).isError).toBe(true);
+    expect(foreign.inspectReadContinuation!(input, ctx)).toBeUndefined();
+    expect(session.inspectReadContinuation!(input, ctx)?.waiting).toBe(true);
+    const pending = session.execute(input, ctx);
+    await session.execute({ action: 'write', session_id: initial.session_id, chars: 'finish\n' }, ctx);
+    const result = await pending;
+    expect(JSON.parse(result.content)).toMatchObject({ status: 'exited', exit_code: 0 });
+    expect(result.observations?.fileChanges).toEqual([expect.objectContaining({ sourcePath: path.join(tmpDir, 'waited.txt') })]);
+    expect(fs.readFileSync(path.join(tmpDir, 'waited.txt'), 'utf8')).toBe('complete');
+    expect(onShellFileObserved).toHaveBeenCalledTimes(1);
+    expect((await session.execute(input, ctx)).observations).toBeUndefined();
+  } finally { await _resetProcessSessionsForTest(); }
+});
+
 it('routes browser runtime installation through the ordinary bash permission path', async () => {
   await allFilesAuto();
   const core = await import('../../../../src/core-agent/src/tools/builtin');
@@ -188,15 +218,92 @@ it('keeps Redis service shutdown behind one-time host approval without executing
   }
 });
 
+it.each([
+  ['Get-Process fixture-runtime | ForEach-Object { if ($true) { Stop-Process -Id $_.Id -Force } }', true],
+  ['Get-Process fixture-runtime | ForEach-Object { while ($true) { Stop-Process -Id $_.Id -Force; break } }', true],
+  ['Get-Process fixture-runtime | ForEach-Object { for ($i=0; $i -lt 1; $i++) { Stop-Process -Id $_.Id -Force } }', true],
+  ['if (Stop-Process -Name fixture-runtime -Force) { Write-Output done }', true],
+  ['Get-Process fixture-runtime | ForEach-Object { if ($true) { Stop-Process -Id $_.Id -WhatIf } }', false],
+  ['Get-Process fixture-runtime | ForEach-Object { while ($true) { Stop-Process -Id 10444 -Force; break } }', false],
+  ['Get-Process fixture-runtime | ForEach-Object { Write-Output "if ($true) { Stop-Process -Id $_.Id -Force }" }', false],
+  ['Write-Output { if ($true) { Stop-Process -Name fixture-runtime -Force } }', false],
+  ['Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id $_.Id -Force }', true],
+  ['Get-Process fixture-runtime | % { Stop-Process -Id $_.Id -Force }', true],
+  ['Stop-Process -Id (Get-Process fixture-runtime).Id -Force', true],
+  ['Get-Process fixture-runtime | Stop-Process -Force', true],
+  ['Stop-Process -Id 10444 -Force', false],
+  ['Get-Process fixture-runtime | ForEach-Object { try { Stop-Process -Id $_.Id -Force } catch {} }', true],
+  ['Get-Process fixture-runtime | ForEach-Object -Process { spps -Id $PSItem.Id -Force }', true],
+  ['Stop-Process -Id (Get-Process -Name fixture-runtime).Id -Force', true],
+  ['Stop-Process -Name fixture-runtime -ErrorVariable 10444 -Force', true],
+  ['Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id $_.Id -WhatIf }', false],
+  ['Get-Process -Id 10444 | ForEach-Object { Stop-Process -Id $_.Id -Force }', false],
+  ['Get-Process fixture-runtime | ForEach-Object { Write-Output "Stop-Process -Id $_.Id -Force" }', false],
+] as const)('keeps the broad-selection approval boundary through host admission: %s', async (command, broad) => {
+  await allFilesAuto();
+  const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+  const core = await import('../../../../src/core-agent/src/tools/builtin');
+  const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+  // Never execute a process-control command, including on a failing baseline.
+  const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'fixture execution receipt' });
+  const requests: any[] = [];
+  bp._setBroadcastForTest((_channel, info: any) => {
+    requests.push(info);
+    bp.respond(info.request_id, 'deny');
+  });
+  try {
+    const bash = createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' }).find(tool => tool.name === 'bash')!;
+    const result = await bash.execute({ command }, { workingDir: tmpDir, state: {} } as any);
+    if (broad) {
+      expect.soft(requests).toHaveLength(1);
+      expect.soft(requests[0]?.irreversible ?? []).toContain('untargeted_process_kill');
+      expect.soft(result.isError).toBe(true);
+      expect.soft(result.content).toContain('E_BASH_RISK_DENIED');
+      expect.soft(execute).not.toHaveBeenCalled();
+    } else {
+      expect(requests).toHaveLength(0);
+      expect(result.isError).toBeFalsy();
+      expect(execute).toHaveBeenCalledExactlyOnceWith({ command }, expect.anything());
+    }
+  } finally {
+    execute.mockRestore();
+    bp._setBroadcastForTest(null);
+    bp._resetForTest();
+  }
+});
+
 describe('local-tools › Windows PowerShell compatibility preflight', () => {
-  it('advertises the actual host shell before command parameters on Windows only', async () => {
+  it.each([
+    { platform: 'darwin', override: undefined, interpreter: '/bin/sh', syntax: 'POSIX shell syntax', outputDir: '$ORKAS_OUTPUT_DIR' },
+    { platform: 'linux', override: 'cmd.exe', interpreter: '/bin/sh', syntax: 'POSIX shell syntax', outputDir: '$ORKAS_OUTPUT_DIR' },
+    { platform: 'win32', override: undefined, interpreter: 'Windows PowerShell 5.1', syntax: 'use PowerShell syntax', outputDir: '$env:ORKAS_OUTPUT_DIR' },
+    { platform: 'win32', override: 'C:\\Program Files\\PowerShell\\7\\PWSH.EXE', interpreter: 'PowerShell (`pwsh`)', syntax: 'use PowerShell syntax', outputDir: '$env:ORKAS_OUTPUT_DIR' },
+    { platform: 'win32', override: 'cmd.exe', interpreter: 'cmd.exe', syntax: 'Use cmd syntax', outputDir: '%ORKAS_OUTPUT_DIR%' },
+    { platform: 'win32', override: 'C:\\Program Files\\Git\\bin\\bash.exe', interpreter: 'Bash', syntax: 'Use Bash syntax', outputDir: '$ORKAS_OUTPUT_DIR' },
+    { platform: 'win32', override: 'C:\\Private\\custom-shell.exe', interpreter: 'configured Windows shell', syntax: "Use the configured shell's syntax", outputDir: 'ORKAS_OUTPUT_DIR' },
+  ] as const)('advertises $interpreter for $platform with shell override $override', async ({ platform, override, interpreter, syntax, outputDir }) => {
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
-    const windows = createLocalTools({ hostPlatform: 'win32' }).find(tool => tool.name === 'bash')!;
-    const posix = createLocalTools({ hostPlatform: 'darwin' }).find(tool => tool.name === 'bash')!;
-    expect(windows.description).toContain('`bash` tool runs Windows PowerShell 5.1');
-    expect((windows.inputSchema.properties as any).command.description).toContain('use PowerShell syntax');
-    expect(posix.description).not.toContain('PowerShell');
-    expect((posix.inputSchema.properties as any).command.description).not.toContain('PowerShell');
+    const { toToolDefinition } = await import('../../../../src/core-agent/src/tools/base');
+    vi.stubEnv('ORKAS_WINDOWS_SHELL', override);
+    try {
+      const tools = createLocalTools({ hostPlatform: platform });
+      const tool = toToolDefinition(tools.find(candidate => candidate.name === 'bash')!);
+      const command = (tool.inputSchema.properties as Record<string, { type: string; description: string }>).command;
+      expect(tool.description).toContain(interpreter);
+      expect(command).toMatchObject({ type: 'string', description: expect.stringContaining(syntax) });
+      expect(command.description).toContain(`\`${outputDir}\``);
+      expect(tool.inputSchema.required).toEqual(['command']);
+      expect(tools.filter(candidate => candidate.name === 'bash')).toHaveLength(1);
+      if (interpreter === '/bin/sh') expect(command.description).toContain('<(...)');
+      if (!interpreter.includes('PowerShell')) {
+        expect(tool.description).not.toContain('PowerShell');
+        expect(command.description).not.toContain('PowerShell');
+      }
+      if (override?.includes('\\')) {
+        expect(tool.description).not.toContain(override);
+        expect(command.description).not.toContain(override);
+      }
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it.each([
@@ -295,6 +402,14 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
   ])('admits native literal regions without treating their contents as code: %s', async command => {
     const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
     expect(windowsPowerShellCompatibilityError(command, 'win32')).toBeNull();
+  });
+
+  it('treats the native Export-Csv command name the same in either casing', async () => {
+    const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
+    const args = ' -InputObject $record -Path report.csv -NoTypeInformation';
+    expect(windowsPowerShellCompatibilityError('Export-Csv' + args, 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('export EXAMPLE=value', 'win32')).toContain('source/export');
+    expect(windowsPowerShellCompatibilityError('export-csv' + args, 'win32')).toBeNull();
   });
 
   it.each([
@@ -739,7 +854,7 @@ describe('ordinary-operation host admission', () => {
     } finally { bp._setBroadcastForTest(null); bp._resetForTest(); }
   });
 
-  it('retains ownership across a shell-produced tree and ordinary preview, without trusting an executable', async () => {
+  it('keeps a shell-discovered preview available but requires approval to remove its tree', async () => {
     await allFilesApproval();
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const core = await import('../../../../src/core-agent/src/tools/builtin');
@@ -759,10 +874,16 @@ describe('ordinary-operation host admission', () => {
       execute.mockResolvedValue({ content: 'completed' });
       expect((await bash.execute({ command: 'open build/report.pdf' }, ctx)).isError).toBeFalsy();
       expect((await bash.execute({ command: process.platform === 'win32'
-        ? 'Remove-Item -LiteralPath build -Recurse -Force' : 'rm -rf build' }, ctx)).isError).toBeFalsy();
-      expect(requests).toHaveLength(0);
-      expect((await bash.execute({ command: 'open -a Terminal build/report.pdf' }, ctx)).isError).toBe(true);
+        ? 'Remove-Item -LiteralPath build -Recurse -Force' : 'rm -rf build' }, ctx)).isError).toBe(true);
       expect(requests).toHaveLength(1);
+      expect(fs.readFileSync(path.join(tmpDir, 'build', 'report.pdf'), 'utf8')).toBe('%PDF-1.4 fixture');
+      expect((await bash.execute({ command: 'open -a Terminal build/report.pdf' }, ctx)).isError).toBe(true);
+      expect(requests).toHaveLength(2);
+      fs.writeFileSync(path.join(tmpDir, 'build', 'report.pdf'), '%PDF-1.4 replacement contents');
+      execute.mockClear();
+      expect((await bash.execute({ command: 'open build/report.pdf' }, ctx)).isError).toBe(true);
+      expect(requests).toHaveLength(3);
+      expect(execute).not.toHaveBeenCalled();
     } finally { execute.mockRestore(); bp._setBroadcastForTest(null); bp._resetForTest(); }
   });
 });
@@ -802,13 +923,70 @@ describe('local-tools › interactive CLI action contract', () => {
 });
 
 describe('local-tools › persistent process sessions', () => {
+  it('does not infer shell ownership from another concurrent writer\'s snapshot delta', async () => {
+    await allFilesAuto();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const core = await import('../../../../src/core-agent/src/tools/builtin');
+    const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
+    const workspace = path.join(tmpDir, 'shared-shell-output');
+    fs.mkdirSync(path.join(workspace, '.cache'), { recursive: true });
+    const written = [vi.fn(), vi.fn()];
+    const observed = [vi.fn(), vi.fn()];
+    const bash = written.map((onFileWritten, id) => createLocalTools({
+      userId: UID, cid: CID, agentId: `writer-${id}`, extraRoots: [workspace], onFileWritten, onShellFileObserved: observed[id],
+    }).find(tool => tool.name === 'bash')!);
+    const original = core.bashTool.execute.bind(core.bashTool);
+    let entered = 0;
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    // Both host snapshots precede either process. The actual children then
+    // wait for both real files, making overlap independent of process speed.
+    const execute = vi.spyOn(core.bashTool, 'execute').mockImplementation(async (input, ctx) => {
+      if (++entered === 2) release();
+      await ready;
+      return original(input, ctx);
+    });
+    const requests: any[] = [];
+    bp._setBroadcastForTest((_channel, info: any) => { requests.push(info); bp.respond(info.request_id, 'deny'); });
+    const quote = (s: string) => "'" + s.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''") + "'";
+    try {
+      const results = await Promise.all(bash.map((tool, id) => {
+        const script = `const fs=require('fs');fs.mkdirSync('writer-${id}');fs.writeFileSync('writer-${id}/draft.txt','draft-${id}');
+          fs.writeFileSync('.cache/${id}.ready','');const deadline=Date.now()+3000;const timer=setInterval(()=>{
+            if(fs.existsSync('.cache/${1 - id}.ready'))clearInterval(timer);
+            else if(Date.now()>deadline){clearInterval(timer);process.exitCode=1;}},20);`;
+        return tool.execute({ command: `${process.platform === 'win32' ? '& ' : ''}${quote(TEST_NODE)} -e ${quote(script)}`, timeoutMs: 5000 }, {
+          workingDir: workspace, state: {},
+        } as any);
+      }));
+      results.forEach(result => expect(result.isError, result.content).toBeFalsy());
+      for (const id of [0, 1]) {
+        expect(fs.readFileSync(path.join(workspace, `writer-${id}/draft.txt`), 'utf8')).toBe(`draft-${id}`);
+        expect.soft(written[id]).not.toHaveBeenCalled();
+        expect.soft(observed[id]).toHaveBeenCalledWith(path.join(workspace, `writer-${id}/draft.txt`), expect.any(String));
+        expect.soft(results[id].observations?.fileChanges).toEqual(expect.arrayContaining([
+          expect.objectContaining({ sourcePath: path.join(workspace, `writer-${id}/draft.txt`), afterExists: true }),
+        ]));
+      }
+      expect(requests).toHaveLength(0);
+      execute.mockReset().mockResolvedValue({ content: 'intercepted cleanup; no files removed' });
+      // A's observation of B's new tree must not waive review of deleting it.
+      const command = process.platform === 'win32' ? 'Remove-Item writer-1 -Recurse -Force' : 'rm -rf writer-1';
+      const cleanup = await bash[0].execute({ command }, { workingDir: workspace, state: {} } as any);
+      expect.soft(requests).toHaveLength(1);
+      expect.soft(cleanup.isError).toBe(true);
+      expect.soft(execute).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(workspace, 'writer-1/draft.txt'), 'utf8')).toBe('draft-1');
+    } finally { execute.mockRestore(); bp._setBroadcastForTest(null); bp._resetForTest(); }
+  });
+
   it.each([false, true])('isolates concurrent output manifests and environments (programmatic=%s)', async (programmatic) => {
     await allFilesAuto();
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const { markProgrammaticToolCallState } = await import('../../../../src/core-agent/src/tools/run-program');
     const { _resetProcessSessionsForTest } = await import('../../../../src/core-agent/src/tools/process-session');
     const written = [vi.fn(), vi.fn()];
-    const bash = written.map(onFileWritten => createLocalTools({ userId: UID, cid: CID, onFileWritten }).find(t => t.name === 'bash')!);
+    const bash = written.map(onShellFileObserved => createLocalTools({ userId: UID, cid: CID, onShellFileObserved }).find(t => t.name === 'bash')!);
     const workspace = path.join(tmpDir, 'parallel-output');
     fs.mkdirSync(path.join(workspace, '.cache'), { recursive: true });
     const state = { commandSessionEnabled: true, sandboxEnv: { KEEP_ME: 'original' } };
@@ -952,8 +1130,8 @@ describe('local-tools › persistent process sessions', () => {
     const { markProgrammaticToolCallState } = await import('../../../../src/core-agent/src/tools/run-program');
     const workspace = path.join(tmpDir, 'managed-command');
     fs.mkdirSync(workspace, { recursive: true });
-    const onFileWritten = vi.fn();
-    const tools = createLocalTools({ userId: UID, cid: CID, onFileWritten });
+    const onShellFileObserved = vi.fn();
+    const tools = createLocalTools({ userId: UID, cid: CID, onShellFileObserved });
     const bash = tools.find((tool) => tool.name === 'bash')!;
     const session = tools.find((tool) => tool.name === 'process_session')!;
     const quote = (value: string) => "'" + value.replace(/'/g, process.platform === 'win32' ? "''" : "'\\''") + "'";
@@ -970,7 +1148,7 @@ describe('local-tools › persistent process sessions', () => {
       const readiness = { timeout: 5_000 };
       if (ending === 'stop') {
         await expect.poll(() => fs.existsSync(path.join(workspace, 'generated.txt')), readiness).toBe(true);
-      } else await expect.poll(() => onFileWritten.mock.calls.length, readiness).toBe(1);
+      } else await expect.poll(() => onShellFileObserved.mock.calls.length, readiness).toBe(1);
       const foreign = createLocalTools({ userId: UID, cid: 'foreign' }).find((tool) => tool.name === 'process_session')!;
       const readInput = { action: 'read', session_id: initial.session_id };
       const forgedCtx = { ...ctx, state: { ...ctx.state, processSessionOwner: 'forged' } };
@@ -986,7 +1164,7 @@ describe('local-tools › persistent process sessions', () => {
       const repeated = await session.execute({ action: ending === 'stop' ? 'stop' : 'read', session_id: initial.session_id }, ctx);
       if (ending === 'stop') expect(repeated.isError).toBeFalsy();
       expect(repeated.observations).toBeUndefined();
-      expect(onFileWritten).toHaveBeenCalledTimes(1);
+      expect(onShellFileObserved).toHaveBeenCalledTimes(1);
       const programCommand = `${process.platform === 'win32' ? '& ' : ''}${quote(TEST_NODE)} -e ${quote("require('fs').writeFileSync('generated.txt','complete');console.log('done')")}`;
       const program = await bash.execute({ command: programCommand, yield_time_ms: 0 }, {
         ...ctx, state: markProgrammaticToolCallState({ commandSessionEnabled: true }),
@@ -1004,11 +1182,11 @@ describe('local-tools › persistent process sessions', () => {
     fs.mkdirSync(workspace, { recursive: true });
     const selected = ws.setWorkspacePath(UID, workspace);
     if (!selected.ok) throw new Error(selected.error);
-    const onFileWritten = vi.fn();
+    const onShellFileObserved = vi.fn();
     const tools = localTools.createLocalTools({
       userId: UID,
       cid: CID,
-      onFileWritten,
+      onShellFileObserved,
     });
     const processSession = tools.find((tool) => tool.name === 'process_session')!;
     const ctx = { workingDir: workspace, state: { commandSessionEnabled: true } } as any;
@@ -1048,7 +1226,7 @@ describe('local-tools › persistent process sessions', () => {
         coverage: 'exact',
       }),
     ]);
-    expect(onFileWritten).toHaveBeenCalledWith(generated, { preExisting: false });
+    expect(onShellFileObserved).toHaveBeenCalledWith(generated, expect.any(String));
   });
 });
 
@@ -3442,5 +3620,98 @@ describe('local-tools › markdown_to_pdf › locked probe+render wiring', () =>
       vi.doUnmock('../../../../src/main/util/md-to-pdf');
       vi.resetModules();
     }
+  });
+});
+
+describe('local-tools › JSON validity notice on native writes', () => {
+  const notice = /<json-validity path="[^"]+" valid="false">The file as written is not valid JSON: [^<]+<\/json-validity>/;
+
+  it('write_file states a broken .json file, keeps the write a success and leaves valid receipts unchanged', async () => {
+    await allFilesAuto();
+    const { write, wsDir } = await buildWriteTool();
+    const ctx = { workingDir: wsDir, state: {} } as any;
+    const broken = '{"customers":["Aster","Cedar"],"total":1800}}\n';
+    const bad = await write.execute({ path: 'risk.json', content: broken }, ctx);
+    expect(bad.isError).toBeFalsy();
+    expect(fs.readFileSync(path.join(wsDir, 'risk.json'), 'utf8')).toBe(broken);
+    expect(bad.content).toMatch(notice);
+    expect(bad.content).toContain('position 44'); // the 45th character, right after the 44-character object
+
+    // A valid file, a BOM-prefixed one and other extensions carry no notice.
+    for (const [file, content] of [['ok.json', '{"a":1}\n'], ['bom.json', '﻿{"a":1}'], ['rows.jsonl', '{"a":1}\n{"b":'],
+      ['loose.json5', '{a:1,}'], ['notes.txt', '{"a":1}}']]) {
+      const result = await write.execute({ path: file, content }, ctx);
+      expect(result.isError, file).toBeFalsy();
+      expect(result.content, file).not.toContain('json-validity');
+    }
+    // Extension case does not matter; an empty .json is not valid JSON either.
+    expect((await write.execute({ path: 'UPPER.JSON', content: '{' }, ctx)).content).toMatch(notice);
+    expect((await write.execute({ path: 'empty.json', content: '' }, ctx)).content).toMatch(notice);
+    // Over the bound the file is not parsed.
+    const large = `[${'1,'.repeat(1_100_000)}1]]`;
+    expect((await write.execute({ path: 'large.json', content: large }, ctx)).content).not.toContain('json-validity');
+  });
+
+  it('write_file over its own earlier output reports a break, but not a file that already was not strict JSON', async () => {
+    await allFilesAuto();
+    // Files under an extra root count as this run's own, so they are overwritten in place.
+    const ownRoot = path.join(tmpDir, 'ws');
+    const { write, wsDir } = await buildWriteTool({ extraRoots: [ownRoot] });
+    const ctx = { workingDir: wsDir, state: {} } as any;
+    await write.execute({ path: 'own.json', content: '{"a":1}' }, ctx);
+    expect((await write.execute({ path: 'own.json', content: '{"a":1}}' }, ctx)).content).toMatch(notice);
+    await write.execute({ path: 'tsconfig.json', content: '{\n  // comments are JSONC\n  "strict": true\n}\n' }, ctx);
+    const again = await write.execute({ path: 'tsconfig.json', content: '{\n  // still JSONC\n  "strict": false\n}\n' }, ctx);
+    expect(again.isError).toBeFalsy();
+    expect(again.content).not.toContain('json-validity');
+  });
+
+  it('edit_file reports an edit that breaks a valid .json file and stays silent for JSONC or valid results', async () => {
+    await allFilesAuto();
+    const { edit, wsDir } = await buildEditTool();
+    const data = path.join(wsDir, 'risk.json');
+    fs.writeFileSync(data, '{"customers":["Aster"],"total":1200}\n');
+    const broke = await run(edit, { path: data, old_string: '1200}', new_string: '1200}}' });
+    expect(broke.isError).toBeFalsy();
+    expect(broke.content).toContain('edited="1"');
+    expect(broke.content).toMatch(notice);
+
+    fs.writeFileSync(data, '{"customers":["Aster"],"total":1200}\n');
+    const fine = await run(edit, { path: data, old_string: '1200', new_string: '1500' });
+    expect(fine.content).not.toContain('json-validity');
+
+    const jsonc = path.join(wsDir, 'settings.json');
+    fs.writeFileSync(jsonc, '{\n  // editor\n  "tabSize": 2,\n}\n');
+    const unchangedKind = await run(edit, { path: jsonc, old_string: '"tabSize": 2', new_string: '"tabSize": 4' });
+    expect(unchangedKind.isError).toBeFalsy();
+    expect(unchangedKind.content).not.toContain('json-validity');
+  });
+
+  it('apply_patch marks only the .json files it leaves invalid', async () => {
+    await allFilesAuto();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const good = path.join(wsDir, 'summary.json');
+    const bad = path.join(wsDir, 'risk.json');
+    const result = await applyPatch.execute({
+      patch: ['*** Begin Patch', `*** Add File: ${good}`, '+{"customer_count":2}', `*** Add File: ${bad}`, '+{"total":1800}}', '*** End Patch'].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(result.isError).toBeFalsy();
+    const files = JSON.parse(result.content).files;
+    expect(files.find((file: any) => file.path === good).json_invalid).toBeUndefined();
+    expect(files.find((file: any) => file.path === bad).json_invalid).toMatch(/^The file as written is not valid JSON: /);
+  });
+
+  it('append_file builds a file in chunks, so an unfinished .json carries no notice', async () => {
+    await allFilesAuto();
+    const { write, wsDir } = await buildWriteTool();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const append = localTools.createLocalTools({ userId: UID, cid: CID }).find((t) => t.name === 'append_file')!;
+    const ctx = { workingDir: wsDir, state: {} } as any;
+    const first = await write.execute({ path: 'chunks.json', content: '{"rows":[' }, ctx);
+    expect(first.content).toMatch(notice);
+    const revision = /revision="([^"]+)"/.exec(first.content)![1];
+    const next = await append.execute({ path: 'chunks.json', content: '1,2', base_revision: revision }, ctx);
+    expect(next.isError, next.content).toBeFalsy();
+    expect(next.content).not.toContain('json-validity');
   });
 });

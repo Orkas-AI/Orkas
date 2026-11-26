@@ -2523,9 +2523,9 @@ describe('rejected requests', () => {
     expect(out.detail.length).toBeLessThanOrEqual('Provider said: '.length + 241);
   });
 
-  it('says retrying as is will not help from the second rejection in a row', async () => {
+  it('suggests adjusting the request or switching models from the second rejection in a row', async () => {
     setCurrentLang('en');
-    const advice = 'This request has been rejected repeatedly';
+    const advice = 'The model service rejected several requests in a row. Check any error details, then try adjusting the request or choosing another model in Settings.';
     const scope = {};
     const first = (await rejected('400 bad request', 'custom', scope))[0];
     const second = (await rejected('400 bad request', 'custom', scope))[0];

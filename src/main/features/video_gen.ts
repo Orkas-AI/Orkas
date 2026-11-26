@@ -1,6 +1,6 @@
 import { MEDIA_TRANSFER_POLICY } from '../util/media-transfer-policy';
 import { fetchMediaAndRead } from '../util/media-rate-limit';
-import { VIDEO_MODEL_SPECS, LEGACY_VIDEO_MODELS, isSeedance25Model, videoModelSpec, videoFrameSupport, isRetiredVideoModel, WAN_REGIONS } from './video_models';
+import { VEO_DURATIONS, VIDEO_MODEL_SPECS, LEGACY_VIDEO_MODELS, isSeedance25Model, videoModelSpec, videoFrameSupport, isRetiredVideoModel, WAN_REGIONS } from './video_models';
 import { fitVideoParameters, videoParameterModel } from './video_parameter_compatibility';
 import { createVideoCloudCredentials } from './video_cloud_auth';
 /** Video generation through configured user-owned provider keys. */
@@ -24,9 +24,16 @@ import { t } from '../i18n';
 import { composeAbortSignal, fetchAndReadWithTimeout, throwIfAborted } from '../util/abort';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import { logErrorSummary, logPathRef } from '../util/log-redact';
+import { Semaphore } from 'async-mutex';
+import { acquireWithAbort } from '../util/locks';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
 
 const log = createLogger('video-gen');
+// Saved profiles retain their Orkas model IDs. Pin the versions sent to Ark.
+const DOUBAO_UPSTREAM_MODELS = new Map([
+  ['doubao-seedance-2-0-mini', 'doubao-seedance-2-0-mini-260615'],
+  ['doubao-seedance-2-5-flash', 'doubao-seedance-2-5-flash-261115'],
+]);
 const fetchNativeVideoAndRead: typeof fetchMediaAndRead = (input,init,timeout,signal,message,read,codes) => fetchMediaAndRead(input,init,timeout,signal,message,read,codes,'video');
 const DEFAULT_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_TIMEOUT_MS = 60 * 60_000;
@@ -230,7 +237,27 @@ export function classifyVideoGenError(message: string): 'TIMEOUT' | 'PROVIDER_AP
 }
 
 
+// Every caller shares the four source-approved video slots. Request deadlines begin
+// after admission; cancellation while waiting never sends a provider request.
+const videoSlots = new Semaphore(4);
+
 export async function generateVideo(input: GenerateVideoInput): Promise<GenerateVideoResult> {
+  let release: (() => void) | undefined;
+  try {
+    try {
+      const acquire = async () => (await videoSlots.acquire())[1];
+      release = input.signal ? await acquireWithAbort(acquire, input.signal) : await acquire();
+      throwIfAborted(input.signal);
+    } catch (err) {
+      return { ok: false, errorCode: 'BAD_INPUT', message: sanitizeLogTextForUpload((err as Error)?.message || String(err)), dispatched: false };
+    }
+    return await generateVideoObserved(input);
+  } finally {
+    release?.();
+  }
+}
+
+async function generateVideoObserved(input: GenerateVideoInput): Promise<GenerateVideoResult> {
   try {
     throwIfAborted(input.signal);
   } catch (err) {
@@ -849,9 +876,7 @@ export async function callDoubaoVideo(req: AdapterVideoRequest): Promise<Adapter
   }
 
   const createBody = {
-    // Pin only the outgoing Mini ID; keep saved profiles and result identity.
-    // https://docs.volcengine.com/docs/ark/seedance-2-5?lang=en
-    model: req.model === 'doubao-seedance-2-0-mini' ? 'doubao-seedance-2-0-mini-260615' : req.model,
+    model: DOUBAO_UPSTREAM_MODELS.get(req.model) ?? req.model,
     content,
     ratio: req.ratio,
     duration: req.duration,
@@ -1565,7 +1590,7 @@ export function videoGenerationInputError(input: GenerateVideoInput, profile: Vi
   if (profile.provider === 'google') {
     if (input.duration !== undefined) return 'Omni controls video duration through the prompt. Omit duration and describe the timing in the prompt.';
   }
-  if (profile.provider === 'google-cloud' && input.duration !== undefined && ![4, 6, 8].includes(input.duration)) return 'Veo 3.1 supports durations of 4, 6 or 8 seconds.';
+  if (profile.provider === 'google-cloud' && input.duration !== undefined && !VEO_DURATIONS.includes(input.duration)) return 'Veo 3.1 supports durations of 4, 6 or 8 seconds.';
   if (profile.provider === 'google-cloud' && ['1080p', '4k'].includes(input.resolution || '') && input.duration !== undefined && input.duration !== 8) return 'Veo 3.1 at 1080p or 4K requires 8 seconds.';
   if (profile.provider === 'google-cloud') {
     try { createVideoCloudCredentials(profile.apiKey); }

@@ -67,7 +67,7 @@ function _projectDetailFailure(errLike, fallback) {
 
 let _projectLibraryScopeGeneration = 0;
 let _projectDetailPid = '';     // pid currently rendered in the panel
-let _projectDetailMeta = null;  // { project, agentDetails, files, libraryStatus? }
+let _projectDetailMeta = null;  // { project, agentDetails (added), availableAgents (added + built-in), files, libraryStatus? }
 let _projectKbStatusByName = {}; // {[name]: {status, chunks?, error?, kind?}}
 let _projectKbEventsHandle = null;
 let _projectKbEventsPid = '';
@@ -104,7 +104,7 @@ function _setProjectDetailBusy(busy) {
 // ── Public: navigate-into ──────────────────────────────────────────────
 
 /** Called by boot.js setView('project', pid) on entry. */
-async function loadProjectDetail(pid) {
+async function loadProjectDetail(pid, { refreshShared = false, recordVisit = refreshShared } = {}) {
   _closeProjectDriverHint();
   const loadSeq = ++_projectDetailLoadSeq;
   const libraryRevision = _projectLibraryRevision;
@@ -148,6 +148,7 @@ async function loadProjectDetail(pid) {
         name: '',
       },
       agentDetails: [],
+      availableAgents: [],
       files: [],
       libraryStatus: null,
       instructions: null,
@@ -195,7 +196,7 @@ async function loadProjectDetail(pid) {
     bindingsCall.then((res) => {
       if (!isCurrent()) return;
       if (!res?.ok || typeof validateRecipientAgainstProject !== 'function') return;
-      validateRecipientAgainstProject('project', pid, (res.bindings && res.bindings.agents) || []);
+      validateRecipientAgainstProject('project', pid, projectAvailableAgentIds(res));
     }).catch(() => { /* the batch below owns the load failure */ });
     // Paint the Agent rail as soon as its own data is ready. A large file tree
     // or slow secondary card must not delay a newly added binding from showing.
@@ -206,10 +207,17 @@ async function loadProjectDetail(pid) {
         ..._projectDetailMeta,
         project: getRes.project,
         agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
+        availableAgents: _projectAvailableAgents(listRes),
       };
       _renderProjectAgents();
     }).catch(() => { /* the batch below owns the load failure */ });
     void _loadProjectMemory(pid);
+    // The goal (a navigation load also picks the first Context tab) and what
+    // changed since the last visit (a navigation or another project starts a visit).
+    if (typeof loadProjectGoal === 'function') void loadProjectGoal(pid, { chooseTab: recordVisit });
+    const openOnNews = !_projectDetailTabRequested;
+    _projectDetailTabRequested = false;
+    if (typeof loadProjectRecap === 'function') void loadProjectRecap(pid, { newVisit: recordVisit || prevPid !== pid, openOnNews });
     // These cards read persisted project files. Show each answer as soon as it
     // arrives, even if an unrelated card or startup refresh is still pending.
     instructionsCall.then((res) => {
@@ -243,6 +251,7 @@ async function loadProjectDetail(pid) {
     _projectDetailMeta = {
       project: getRes.project,
       agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
+      availableAgents: _projectAvailableAgents(listRes),
       files: fileTree,
       libraryStatus: kbRes?.ok ? kbRes : null,
       instructions: instructionsRevision !== _projectInstructionsRevision
@@ -275,10 +284,8 @@ function _renderProjectDetailEmpty() {
   if (titleEl) titleEl.textContent = '';
   const agents = document.getElementById('project-agents-list');
   const files = document.getElementById('project-files-list');
-  const agentsEmpty = document.getElementById('project-agents-empty');
   if (agents) agents.innerHTML = '';
   if (files) files.innerHTML = '';
-  if (agentsEmpty) agentsEmpty.style.display = '';
   _clearProjectLibraryViewer();
   _setCardCount('project-detail-agents-count', 0);
   _setCardCount('project-detail-files-count', 0);
@@ -288,16 +295,25 @@ function _renderProjectDetailEmpty() {
   if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators('');
 }
 
+/** Agents usable in the project (added + every built-in) from a
+ *  `projects.bindings.list` answer or the page state built from one; the
+ *  added Agents when it has no such field (an older cached state). */
+function _projectAvailableAgents(res) {
+  if (Array.isArray(res?.availableAgents)) return res.availableAgents;
+  return (Array.isArray(res?.agentDetails) ? res.agentDetails : []).filter((agent) => agent && !agent.unavailable);
+}
+
 function _renderProjectAgents() {
-  const agentDetails = _projectDetailMeta?.agentDetails || [];
+  // Built-in Agents work in every project without being added (the panel note
+  // says so), so the rail lists only the Agents the project added. A built-in
+  // an older project added stays saved but is not listed.
+  const agentDetails = (_projectDetailMeta?.agentDetails || []).filter((agent) => !agent?.builtin);
   const hasAgents = agentDetails.length > 0;
   const agentsList = document.getElementById('project-agents-list');
   if (agentsList) {
     agentsList.innerHTML = _renderProjectAgentCards(agentDetails);
     agentsList.style.display = hasAgents ? '' : 'none';
   }
-  const agentsEmpty = document.getElementById('project-agents-empty');
-  if (agentsEmpty) agentsEmpty.style.display = hasAgents ? 'none' : '';
   _setCardCount('project-detail-agents-count', agentDetails.length);
   _bindProjectAgentCards();
 }
@@ -351,6 +367,16 @@ function _renderProjectDetail({ hydrateSecondary = true, refreshMemory = hydrate
 
 /** Tab nav binding: switch panel visibility + remember the active tab. */
 let _projectDetailActiveTab = 'tasks';
+// A visit with news opens on What's new, unless its navigation asked for a tab
+// (the To-dos page's project link). The tab it took over comes back once What's
+// new is gone.
+let _projectDetailTabRequested = false;
+let _projectDetailTabBeforeNews = '';
+function _openProjectDetailNewsTab() {
+  if (_projectDetailActiveTab === 'recap') return;
+  _projectDetailTabBeforeNews = _projectDetailActiveTab;
+  _projectDetailActiveTab = 'recap';
+}
 function _bindProjectDetailTabs() {
   const tabs = Array.from(document.querySelectorAll('.project-detail-tab'));
   if (!tabs.length) return;
@@ -375,8 +401,10 @@ function _bindProjectDetailTabs() {
         if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
         event.preventDefault();
         const step = event.key === 'ArrowRight' ? 1 : -1;
-        const current = tabs.indexOf(tab);
-        const next = tabs[(current + step + tabs.length) % tabs.length];
+        // What's new is present only with news; arrows skip it while hidden.
+        const visible = tabs.filter((item) => !item.hidden);
+        const current = visible.indexOf(tab);
+        const next = visible[(current + step + visible.length) % visible.length] || tab;
         next.click();
         next.focus();
       });
@@ -418,12 +446,34 @@ async function _ensureProjectAutoTabLoaded(pid) {
   }
 }
 
+/** A narrow tab strip scrolls sideways; keep the selected tab fully in it
+ *  without scrolling anything else. */
+function _keepProjectTabInStrip(tab) {
+  const strip = tab?.parentElement;
+  if (!strip || typeof tab.getBoundingClientRect !== 'function' || !(strip.scrollWidth > strip.clientWidth)) return;
+  const tabBox = tab.getBoundingClientRect();
+  const stripBox = strip.getBoundingClientRect();
+  if (tabBox.left < stripBox.left) strip.scrollLeft -= stripBox.left - tabBox.left;
+  else if (tabBox.right > stripBox.right) strip.scrollLeft += tabBox.right - stripBox.right;
+}
+
 function _syncProjectDetailTabState() {
-  if (_projectDetailActiveTab !== 'todo') _closeProjectDriverHint();
   const tabs = document.querySelectorAll('.project-detail-tab');
+  // A tab that is not present (What's new without news) cannot stay selected.
+  const active = Array.from(tabs).find((tab) => (tab.dataset.projectTab || 'tasks') === _projectDetailActiveTab);
+  if (active?.hidden) {
+    _projectDetailActiveTab = _projectDetailTabBeforeNews || 'tasks';
+    _projectDetailTabBeforeNews = '';
+  }
+  if (_projectDetailActiveTab !== 'todo') {
+    _closeProjectDriverHint();
+    if (_todoAssignPicker) _closeTodoAssignPicker(document.getElementById('project-todo-list'));
+  }
   const panels = document.querySelectorAll('.project-detail-tab-panel');
+  let selectedTab = null;
   for (const tab of tabs) {
     const selected = (tab.dataset.projectTab || 'tasks') === _projectDetailActiveTab;
+    if (selected) selectedTab = tab;
     tab.classList.toggle('is-active', selected);
     tab.setAttribute('role', 'tab');
     tab.setAttribute('aria-selected', selected ? 'true' : 'false');
@@ -437,6 +487,9 @@ function _syncProjectDetailTabState() {
   for (const tools of document.querySelectorAll('[data-project-tools]')) {
     tools.hidden = tools.dataset.projectTools !== _projectDetailActiveTab;
   }
+  _keepProjectTabInStrip(selectedTab);
+  // Showing What's new is the user seeing it.
+  if (typeof acknowledgeProjectRecapIfVisible === 'function') acknowledgeProjectRecapIfVisible();
 }
 
 /** The right rail has two compact tab groups. Their cards stay fixed in the
@@ -462,6 +515,7 @@ function _bindProjectSideTabs() {
       tab.dataset.bound = '1';
       tab.addEventListener('click', () => {
         _projectSideActiveTabs[group] = tab.dataset.projectSideTab || '';
+        if (group === 'context' && typeof projectGoalNoteTabChoice === 'function') projectGoalNoteTabChoice();
         _syncProjectSideTabState(group);
       });
       tab.addEventListener('keydown', (event) => {
@@ -469,8 +523,10 @@ function _bindProjectSideTabs() {
         event.preventDefault();
         const step = event.key === 'ArrowRight' ? 1 : -1;
         const current = tabs.indexOf(tab);
-        const next = tabs[(current + step + tabs.length) % tabs.length];
+        const visible = tabs.filter((item) => !item.hidden);
+        const next = visible[(visible.indexOf(tab) + step + visible.length) % visible.length] || tabs[(current + step + tabs.length) % tabs.length];
         _projectSideActiveTabs[group] = next.dataset.projectSideTab || '';
+        if (group === 'context' && typeof projectGoalNoteTabChoice === 'function') projectGoalNoteTabChoice();
         _syncProjectSideTabState(group);
         next.focus();
       });
@@ -1295,7 +1351,7 @@ function _todoBoardStatus(status) {
 }
 
 function _projectTodoContext() {
-  return { pid: _projectDetailPid, tasks: _projectTodos, agents: _projectDetailMeta?.agentDetails || [], project: _projectDetailMeta?.project };
+  return { pid: _projectDetailPid, tasks: _projectTodos, agents: _projectAvailableAgents(_projectDetailMeta), project: _projectDetailMeta?.project };
 }
 
 /** Today as the same local `YYYY-MM-DD` a due date is stored in. */
@@ -1360,6 +1416,13 @@ function _restoreTodoScroll(host, snapshot) {
   }
 }
 
+function _setTodoColumnCollapsed(body, collapsed) {
+  const column = body.parentElement;
+  body.hidden = collapsed;
+  column.classList.toggle('is-collapsed', collapsed);
+  column.querySelector('.todo-collapse').setAttribute('aria-expanded', String(!collapsed));
+}
+
 function _renderTodoBoard(tasks, context, scope) {
   const board = document.createElement('div');
   board.className = 'todo-board';
@@ -1388,10 +1451,9 @@ function _renderTodoBoard(tasks, context, scope) {
     body.className = 'todo-column-body';
     body.hidden = collapsed;
     toggle.addEventListener('click', () => {
-      body.hidden = !body.hidden;
-      _todoCollapsed.set(key, body.hidden);
-      toggle.setAttribute('aria-expanded', String(!body.hidden));
-      column.classList.toggle('is-collapsed', body.hidden);
+      const nextCollapsed = !body.hidden;
+      _setTodoColumnCollapsed(body, nextCollapsed);
+      _todoCollapsed.set(key, nextCollapsed);
     });
     header.appendChild(toggle);
     for (const task of items) {
@@ -1423,6 +1485,7 @@ function _renderProjectTodosList() {
   const listEl = document.getElementById('project-todo-list');
   if (!listEl) return;
   const scroll = _captureTodoScroll(listEl);
+  _closeTodoAssignPicker(listEl);
   listEl.innerHTML = '';
   listEl.style.display = '';
   const context = _projectTodoContext();
@@ -1533,8 +1596,7 @@ function _renderTodoCard(task, context) {
 
   // Assignment chip: (re)assign the task to one of the project's bound agents
   // or clear it. Global tasks use the account registry. Both assigned and
-  // unassigned Agents show an icon and label. Click opens the menu
-  // built in _openTodoAssignMenu; the write goes through projects.tasks.update
+  // unassigned Agents show an icon and label. The picker writes through projects.tasks.update
   // (owner_agent + owner_agent_id), the same fields the agent/LLM path uses.
   {
     const assignee = document.createElement('div');
@@ -1543,6 +1605,8 @@ function _renderTodoCard(task, context) {
     assign.type = 'button';
     assign.className = 'btn btn-sm project-todo-assign';
     assign.dataset.action = 'todo-assign';
+    assign.setAttribute('aria-haspopup', 'listbox');
+    assign.setAttribute('aria-expanded', 'false');
     let clear = null;
     if (task.owner_agent_id || task.owner_agent) {
       const ownerAgent = _findProjectAgent(task.owner_agent_id, task.owner_agent, context.agents);
@@ -1632,6 +1696,7 @@ function _ensureTodoEditorSelects() {
   if (agent && !_todoEditorAgentSelect) {
     _todoEditorAgentSelect = _aiSelectMount(agent, {
       options: [], value: '', ariaLabel: t('project.todo.assign'),
+      search: _TODO_AGENT_SEARCH, showCheck: true,
       onChange: () => { _todoEditorOwnerChanged = true; },
     });
   }
@@ -1651,27 +1716,26 @@ async function _loadTodoEditorAgents(task) {
   _todoEditorAgents = [];
   _todoEditorAgentLoading = true;
   _todoEditorAgentSelect.close();
-  const options = [{ value: '', label: t('todo.unassigned') }];
+  const unassigned = { value: '', label: t('todo.unassigned') };
   // Keep historical owners visible without re-saving them on title-only edits.
   const ownerValue = task?.owner_agent_id || task?.owner_agent || '';
-  if (ownerValue) options.push({ value: ownerValue, label: task.owner_agent || ownerValue, avatar: { seed: ownerValue } });
-  _todoEditorAgentSelect.setOptions(options, { value: ownerValue });
+  const historicalOwner = ownerValue ? {
+    value: ownerValue, label: task.owner_agent || ownerValue, avatar: { seed: ownerValue }, displayOnly: true,
+  } : null;
+  _todoEditorAgentSelect.setOptions(historicalOwner ? [unassigned, historicalOwner] : [unassigned], { value: ownerValue });
   _updateProjectTodoEditor();
   try {
     const res = await window.orkas.invoke(pid ? 'projects.bindings.list' : 'agents.list',
       pid ? { projectId: pid, localOnly: true } : { summary: true });
     if (seq !== _todoEditorAgentLoadSeq || generation !== _todoEditorGeneration || pid !== _todoEditorPid) return;
-    const agents = pid ? res?.agentDetails : res?.agents;
+    // Project owners: the added Agents plus every built-in.
+    const agents = pid ? (Array.isArray(res?.availableAgents) ? res.availableAgents : res?.agentDetails) : res?.agents;
     if (res?.ok === false || !Array.isArray(agents)) throw new Error('load_failed');
     _todoEditorAgents = _todoAssignableAgents(agents.filter((a) => a?.agent_id && (pid || a.enabled !== false)));
     const owner = _findProjectAgent(task?.owner_agent_id, task?.owner_agent, _todoEditorAgents);
     const value = owner?.agent_id || ownerValue;
-    const next = [{ value: '', label: t('todo.unassigned') },
-      ..._todoEditorAgents.map((a) => ({
-        value: a.agent_id, label: a.name || a.agent_id,
-        avatar: { icon: a.icon, color: a.color, seed: a.agent_id },
-      }))];
-    if (value && !next.some((a) => a.value === value)) next.push({ value, label: task.owner_agent || value, avatar: { seed: value } });
+    const next = [{ value: '', label: t('todo.unassigned') }, ..._todoAgentOptions(_todoEditorAgents)];
+    if (historicalOwner && !next.some((option) => option.value === value)) next.push(historicalOwner);
     _todoEditorAgentSelect.setOptions(next, { value });
   } catch {
     if (seq === _todoEditorAgentLoadSeq && generation === _todoEditorGeneration) {
@@ -2089,13 +2153,32 @@ function _todoCommanderAgent() {
 
 // An unavailable binding cannot run; an existing owner keeps its stored name.
 function _todoAssignableAgents(list = []) {
-  return [_todoCommanderAgent(), ...list.filter((a) => a?.agent_id && a.agent_id !== 'commander' && !a.unavailable)
-    .slice().sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)))];
+  return [_todoCommanderAgent(), ...list.filter((a) => a?.agent_id && a.agent_id !== 'commander' && !a.unavailable)];
+}
+
+const _TODO_AGENT_SEARCH = { placeholderKey: 'agent_picker.search_placeholder', emptyKey: 'agents.no_match' };
+const _TODO_AGENT_GROUPS = ['', 'agents.source_custom', 'agents.source_marketplace'];
+
+function _todoAgentOptions(agents) {
+  const groups = _TODO_AGENT_GROUPS.map(() => []);
+  for (const agent of agents) {
+    const platform = agent.source && isMarketplaceCatalogSource(agent.source);
+    const group = agent.agent_id === 'commander' ? 0 : platform ? 2 : 1;
+    const label = agent.name || agent.agent_id;
+    const sortKey = typeof pinyinSortKey === 'function' ? pinyinSortKey(label) : label.toLowerCase();
+    groups[group].push({ sortKey, option: {
+      value: agent.agent_id, label, group: _TODO_AGENT_GROUPS[group],
+      avatar: { icon: agent.icon, color: agent.color, seed: agent.agent_id },
+    } });
+  }
+  return groups.flatMap(group => group
+    .sort((a, b) => a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0)
+    .map(entry => entry.option));
 }
 
 // Commander is always available. Other owners resolve from the scope's agent
 // details; missing owners keep their stored display name on the chip.
-function _findProjectAgent(agentId, name, list = _projectDetailMeta?.agentDetails || []) {
+function _findProjectAgent(agentId, name, list = _projectAvailableAgents(_projectDetailMeta)) {
   if (agentId === 'commander' || (!agentId && (name === 'commander' || name === 'Commander'))) {
     return _todoCommanderAgent();
   }
@@ -2128,9 +2211,6 @@ async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
   }
 }
 
-// Open the assignee menu anchored at the click: the project's bound agents plus
-// an unassign entry (when already assigned). Uses the shared context-menu, which
-// lives at the body level so the list re-render after a mutation can't destroy it.
 let _projectTodoRunning = false;
 
 // Dispatch a task in a new conversation through the project Commander or the
@@ -2216,22 +2296,35 @@ function _openTodoRowMenu(evt, tid, context = _projectTodoContext()) {
   showContextMenu(evt, items);
 }
 
-function _openTodoAssignMenu(evt, tid, context = _projectTodoContext()) {
-  if (!_todoContextHasScope(context) || typeof showContextMenu !== 'function') return;
+let _todoAssignPicker = null;
+
+function _closeTodoAssignPicker(host) {
+  if (_todoAssignPicker && (!host || host.contains(_todoAssignPicker.anchor))) _todoAssignPicker.select.close();
+}
+
+function _openTodoAssignPicker(anchor, tid, context = _projectTodoContext()) {
+  if (!_todoContextHasScope(context) || anchor.disabled || typeof _aiSelectMount !== 'function') return;
   const task = (context.tasks || []).find((x) => x && x.id === tid);
+  if (!task) return;
+  const wasOpen = _todoAssignPicker?.anchor === anchor;
+  _closeTodoAssignPicker();
+  if (wasOpen) return;
   const agents = _todoAssignableAgents(context.agents);
-  const currentId = task?.owner_agent_id || _findProjectAgent('', task?.owner_agent, agents)?.agent_id;
-  const items = [];
-  for (const a of agents) {
-    const isCurrent = currentId === a.agent_id;
-    items.push({
-      label: a.name || a.agent_id,
-      avatar: { icon: a.icon, color: a.color, seed: a.agent_id },
-      trailingIcon: isCurrent ? 'check' : undefined,
-      onClick: () => (isCurrent ? undefined : _assignTodoAgent(tid, a, context)),
-    });
-  }
-  showContextMenu(evt, items);
+  const select = _aiSelectMount(document.createElement('span'), {
+    anchor,
+    options: _todoAgentOptions(agents),
+    value: task.owner_agent_id || _findProjectAgent('', task.owner_agent, agents)?.agent_id,
+    ariaLabel: t('project.todo.assign'),
+    search: _TODO_AGENT_SEARCH,
+    showCheck: true,
+    onClose: () => { _todoAssignPicker = null; },
+    onChange: (value) => {
+      const agent = agents.find(candidate => candidate.agent_id === value);
+      if (agent) return _assignTodoAgent(tid, agent, context);
+    },
+  });
+  _todoAssignPicker = { anchor, select };
+  select.open();
 }
 
 function _bindProjectTodos() {
@@ -2343,11 +2436,13 @@ function _bindTodoListActions(listEl, resolveContext) {
     if (!tid || _projectTodoMutating) return;
     const context = resolveContext(row.dataset.pid);
     if (!_todoContextHasScope(context)) return;
+    const assign = e.target.closest('[data-action="todo-assign"]');
     if (e.target.closest('[data-action="todo-attachments"]')) {
       e.stopPropagation();
       void _openTodoAttachments(e, context.tasks.find((task) => task.id === tid), context);
     } else if (e.target.closest('[data-action="todo-project"]')) {
       _projectDetailActiveTab = 'todo';
+      _projectDetailTabRequested = true;
       setView('project', context.pid);
     } else if (e.target.closest('[data-action="todo-conversation"]')) {
       const task = context.tasks.find((item) => item.id === tid);
@@ -2357,7 +2452,7 @@ function _bindTodoListActions(listEl, resolveContext) {
       }
     } else if (e.target.closest('[data-action="todo-unassign"]')) _assignTodoAgent(tid, null, context);
     else if (e.target.closest('[data-action="todo-menu"]')) _openTodoRowMenu(e, tid, context);
-    else if (e.target.closest('[data-action="todo-assign"]')) _openTodoAssignMenu(e, tid, context);
+    else if (assign) _openTodoAssignPicker(assign, tid, context);
     else if (e.target.closest('[data-action="todo-status"]')) _openTodoStatusMenu(e, tid, context);
     else if (e.target.closest('[data-action="todo-toggle-content"]')
       || !e.target.closest('button, a, input, select, textarea, [role="button"]')) {
@@ -4756,9 +4851,11 @@ async function _openAddPicker() {
       projectId: _projectDetailPid,
     });
     if (!res?.ok) throw new Error(res?.error || 'load_failed');
-    // Group custom agents first; retain the existing name order within each source.
+    // Addable Agents first (custom before platform), then the built-ins that
+    // are already available; retain the existing name order within each group.
     candidates = (res.agents || []).slice().sort((a, b) =>
-      Number(b.source === 'custom') - Number(a.source === 'custom') || _byDisplayName(a, b));
+      Number(!!a.builtin) - Number(!!b.builtin)
+      || Number(b.source === 'custom') - Number(a.source === 'custom') || _byDisplayName(a, b));
   } catch (err) {
     _projectDetailLog.warn('load candidates failed', err);
     return;
@@ -4819,6 +4916,23 @@ async function _openAddPicker() {
       const desc = _pickItemDescription(c, lang);
       const descHtml = desc ? `<div class="project-binding-desc muted">${escapeHtml(desc)}</div>` : '';
       const source = _projectBindingSourceHtml(c.source);
+      if (c.builtin) {
+        // Built-in Agents work in every project without being added.
+        const available = escapeHtml(t('project.bindings.builtin_available_short'));
+        return `
+        <div class="project-binding-picker-item is-disabled" data-kind="agent" data-id="${escapeHtml(id)}" data-source="${escapeHtml(c.source || '')}"
+             aria-disabled="true" title="${escapeHtml(t('project.bindings.builtin_available'))}">
+          <div class="project-binding-main">
+            <div class="project-binding-head">
+              <span class="project-binding-name">${name}</span>
+              ${source}
+            </div>
+            ${descHtml}
+          </div>
+          <span class="project-binding-available">${available}</span>
+        </div>
+      `;
+      }
       return `
         <div class="project-binding-picker-item" data-kind="agent" data-id="${escapeHtml(id)}" data-source="${escapeHtml(c.source || '')}">
           <div class="project-binding-main">
@@ -4829,7 +4943,7 @@ async function _openAddPicker() {
             ${descHtml}
 
           </div>
-          <button type="button" class="btn btn-sm" data-action="pick" aria-label="Add">${_projectUiIconHtml('plus')}</button>
+          <button type="button" class="btn btn-sm" data-action="pick" aria-label="${escapeHtml(t('project.bindings.add_agent'))}">${_projectUiIconHtml('plus')}</button>
         </div>
       `;
     }).join('');
@@ -5151,7 +5265,8 @@ function _initProjectDetailBindings() {
     if (_todoEditorPid !== null && _todoEditorAgentSelect) {
       _todoEditorAgentSelect.setAriaLabel(t('project.todo.assign'));
       _todoEditorAgentSelect.setOptions(_todoEditorAgentSelect.state.options.map((option) =>
-        option.value ? option : { ...option, label: t('todo.unassigned') }));
+        !option.value ? { ...option, label: t('todo.unassigned') }
+          : option.value === 'commander' && !option.displayOnly ? { ...option, label: t('chat.recipient_commander') } : option));
     }
   });
 }

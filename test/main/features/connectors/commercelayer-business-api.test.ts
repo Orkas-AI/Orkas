@@ -11,17 +11,62 @@ const reply=(body:unknown,status=200)=>new Response(status===204?null:JSON.strin
 const resource=(type:string,id:string,attributes:unknown={})=>({type,id,attributes});
 afterEach(()=>{vi.restoreAllMocks();vi.unstubAllGlobals();});
 describe('Commerce Layer pinned merchant contracts',()=>{
- it('compiles the complete selected inventory and preserves official writable fields and required values',()=>{
-  const actions=api.actionsFor(),selected=evidence.inventory.filter((row:any)=>!row.excluded_reason),validator=new AjvJsonSchemaValidator();
-  expect(evidence.inventory).toHaveLength(1271);expect(Object.keys(actions)).toHaveLength(1166);expect(new Set(Object.keys(actions))).toEqual(new Set(selected.map((r:any)=>r.action)));
-  for(const row of selected){const spec=actions[row.action],op=evidence.model.paths[row.path][row.method.toLowerCase()],seen=new Set<string>();expect(()=>validator.getValidator(spec.input_schema),row.action).not.toThrow();
-   function compare(raw:any,converted:any){if(raw.$ref){const id=raw.$ref.slice('#/components/schemas/'.length).replaceAll('/','__');expect(converted.$ref).toBe('#/$defs/'+id);if(seen.has(id))return;seen.add(id);compare(raw.$ref.slice(2).split('/').reduce((v:any,k:string)=>v[k],evidence.model),spec.input_schema.$defs[id]);return;}expect(converted.type).toEqual(raw.type);if(raw.enum)expect(converted.enum).toEqual(raw.enum);if(raw.required)expect(converted.required).toEqual(raw.required);if(raw.properties){expect(Object.keys(converted.properties)).toEqual(Object.keys(raw.properties));for(const k of Object.keys(raw.properties))compare(raw.properties[k],converted.properties[k]);}if(raw.items)compare(raw.items,converted.items);if(raw.oneOf)raw.oneOf.forEach((s:any,i:number)=>compare(s,converted.oneOf[i]));}
-   if(op.requestBody)compare(op.requestBody.content['application/vnd.api+json'].schema,spec.input_schema.properties.body);
+ const selected = evidence.inventory.filter((row: any) => !row.excluded_reason);
+ const validator = new AjvJsonSchemaValidator();
+ const cohorts = Array.from({ length: Math.ceil(selected.length / 200) }, (_, index) => ({
+  group: index + 1,
+  rows: selected.slice(index * 200, (index + 1) * 200),
+ }));
+
+ it('registers the complete selected inventory and preserves merchant risk boundaries', () => {
+  const actions = api.actionsFor();
+  expect(evidence.inventory).toHaveLength(1271);
+  expect(Object.keys(actions)).toHaveLength(1166);
+  expect(new Set(Object.keys(actions))).toEqual(new Set(selected.map((row: any) => row.action)));
+  for (const name of ['POST /stripe_gateways', 'POST /customer_password_resets', 'GET /discount_engines']) {
+   expect(api.isNative(name)).toBe(false);
   }
-  for(const name of ['POST /stripe_gateways','POST /customer_password_resets','GET /discount_engines'])expect(api.isNative(name)).toBe(false);
-  expect(actions['PATCH /orders/{orderId}'].risk).toBe('D');expect(actions['POST /imports'].risk).toBe('D');
-  const original=actions['PATCH /stock_items/{stockItemId}'].input_schema.$defs.stockItemUpdate.properties.data.properties.attributes.properties,changed={...original};delete changed._validate;expect(Object.keys(changed)).not.toEqual(Object.keys(original));
- },20000);
+  expect(actions['PATCH /orders/{orderId}'].risk).toBe('D');
+  expect(actions['POST /imports'].risk).toBe('D');
+  const attributes = actions['PATCH /stock_items/{stockItemId}'].input_schema.$defs.stockItemUpdate.properties.data.properties.attributes.properties;
+  const changed = { ...attributes };
+  delete changed._validate;
+  expect(Object.keys(changed)).not.toEqual(Object.keys(attributes));
+ });
+
+ // Each cohort retains the native schema checks without one oversized test watchdog.
+ it.each(cohorts)('compiles selected input schemas and preserves writable fields (group $group)', ({ rows }) => {
+  const actions = api.actionsFor();
+  for (const row of rows) {
+   const spec = actions[row.action];
+   const op = evidence.model.paths[row.path][row.method.toLowerCase()];
+   const seen = new Set<string>();
+   expect(() => validator.getValidator(spec.input_schema), row.action).not.toThrow();
+
+   function compare(raw: any, converted: any) {
+    if (raw.$ref) {
+     const id = raw.$ref.slice('#/components/schemas/'.length).replaceAll('/', '__');
+     expect(converted.$ref).toBe('#/$defs/' + id);
+     if (seen.has(id)) return;
+     seen.add(id);
+     const component = raw.$ref.slice(2).split('/').reduce((value: any, key: string) => value[key], evidence.model);
+     compare(component, spec.input_schema.$defs[id]);
+     return;
+    }
+    expect(converted.type).toEqual(raw.type);
+    if (raw.enum) expect(converted.enum).toEqual(raw.enum);
+    if (raw.required) expect(converted.required).toEqual(raw.required);
+    if (raw.properties) {
+     const keys = Object.keys(raw.properties);
+     expect(Object.keys(converted.properties)).toEqual(keys);
+     for (const key of keys) compare(raw.properties[key], converted.properties[key]);
+    }
+    if (raw.items) compare(raw.items, converted.items);
+    if (raw.oneOf) raw.oneOf.forEach((item: any, index: number) => compare(item, converted.oneOf[index]));
+   }
+   if (op.requestBody) compare(op.requestBody.content['application/vnd.api+json'].schema, spec.input_schema.properties.body);
+  }
+ }, 20000);
  it('retains fulfillment contacts and sparse associations with correctly encoded explicit queries',async()=>{
   const doc={data:[resource('orders','order-1',{customer_email:'fixture@example.invalid',metadata:{errors:'business value'}})],included:[resource('addresses','address-1',{phone:'123',email:'fixture@example.invalid'})]};
   const fetch=vi.fn(async()=>reply(doc));vi.stubGlobal('fetch',fetch);

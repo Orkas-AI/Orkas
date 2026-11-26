@@ -32,6 +32,8 @@ export interface TaskInspection {
     files: Array<{ id: string; name: string; bytes: number; version?: string; path?: string; published?: boolean }>;
     [key: string]: unknown;
 }
+/** settle()'s inspection of an unfinished task; the same tasks.get reuses it instead of inspecting again. */
+export interface SettledInspection { result: TaskInspection; cancelRequested: boolean; messageId?: string }
 export interface TaskDependencies {
     activeUser(): string;
     hostId?(uid: string): Promise<string>;
@@ -116,26 +118,29 @@ export class AppTaskService {
     }
     /** Host calls this independently of page lifetime. Every irreversible
      * cleanup follows a durable receipt. Retrying only repeats storage IO. */
-    async settle(s: TaskScope, requestId: string): Promise<void> {
+    async settle(s: TaskScope, requestId: string): Promise<SettledInspection | undefined> {
         const file = await this.file(s, requestId);
-        await fileEditLock(file).runExclusive(async () => {
+        return fileEditLock(file).runExclusive(async (): Promise<SettledInspection | undefined> => {
             this.check(s);
             const v = await this.read(file, requestId);
             if (!v?.cid || v.cleaned) { await this.deps.unwatch?.(s, requestId); return; }
             await this.assertHost(s, v.hostId);
             await this.deps.assertOwner?.(s.userId, v.cid, s, !!v.result, v.version === 1);
             if (!v.result) {
-                let result = ['preparing', 'rejected'].includes(v.phase) ? { status: 'failed', text: '', files: [], ...(v.errorCode?{error:{code:v.errorCode}}:{}) } : await this.deps.inspect(s.userId, v.cid, v.messageId, v.baseline, v.cancelRequested || v.interactionRejected);
+                let asked = !!(v.cancelRequested || v.interactionRejected);
+                let result = ['preparing', 'rejected'].includes(v.phase) ? { status: 'failed', text: '', files: [], ...(v.errorCode?{error:{code:v.errorCode}}:{}) } : await this.deps.inspect(s.userId, v.cid, v.messageId, v.baseline, asked);
+                const unfinished = (): SettledInspection => ({ result, cancelRequested: asked, ...(v.messageId ? { messageId: v.messageId } : {}) });
                 if (v.directDelivery && !v.cancelRequested && result.status === 'waiting_input' && this.deps.rejectInteraction) {
                     // Persist the outcome before stopping a wait. A crash can repeat cancellation,
                     // never generation. Legacy receipts keep their original interactive contract.
                     v.interactionRejected = true;
                     await this.save(s, file, v);
                     if (!await this.deps.rejectInteraction(s.userId, v.cid)) return;
+                    asked = true;
                     result = await this.deps.inspect(s.userId, v.cid, v.messageId, v.baseline, true);
                 }
                 if (v.cancelRequested && result.status === 'unknown') result.status = 'stopped';
-                if (!terminal(result.status)) return;
+                if (!terminal(result.status)) return unfinished();
                 if (!this.deps.archive) return;
                 if (v.interactionRejected && !v.cancelRequested) {
                     result.status = 'failed'; result.error = { code: 'E_INTERACTION_REQUIRED' };
@@ -162,7 +167,8 @@ export class AppTaskService {
             await this.deps.unwatch?.(s, requestId);
         });
     }
-    async call(s: TaskScope, method: string, args: any): Promise<any> {
+    /** `settled` is this call's own settle() result; it stands in for a second inspection only while the receipt still matches it. */
+    async call(s: TaskScope, method: string, args: any, settled?: SettledInspection): Promise<any> {
         const file = await this.file(s, args.requestId);
         if (method === 'tasks.start') return fileEditLock(file).runExclusive(async () => {
             this.check(s);
@@ -241,10 +247,31 @@ export class AppTaskService {
             if (method === 'tasks.get') return { requestId: args.requestId, status: 'unknown', text: '', files: [] };
             throw new AppError('E_TASK_UNCERTAIN');
         }
+        if (method === 'tasks.output' && this.deps.output) {
+            const output = this.deps.output.bind(this.deps);
+            const cid = v.cid;
+            const readOutput = async (current: Receipt) => {
+                this.check(s);
+                await this.deps.assertOwner?.(s.userId, cid, s, !!current.result, current.version === 1);
+                if (!current.result) await this.assertHost(s, current.hostId);
+                const result = await output(s.userId, cid, args.outputId, current.result, s);
+                this.check(s);
+                return result;
+            };
+            if (v.result) return readOutput(v);
+            // Settlement saves a receipt before removing the live workspace. Decide which
+            // ownership check and file source apply from the same locked snapshot.
+            return fileEditLock(file).runExclusive(async () => {
+                const current = await this.read(file, args.requestId);
+                if (!current || current.cid !== cid) throw new AppError('E_TASK');
+                return readOutput(current);
+            });
+        }
         await this.deps.assertOwner?.(s.userId, v.cid, s, !!v.result, v.version === 1);
         if (!v.result || ['tasks.respond', 'tasks.release'].includes(method)) await this.assertHost(s, v.hostId);
         if (method === 'tasks.get') {
-            const result = v.result || await this.deps.inspect(s.userId, v.cid, v.messageId, v.baseline, v.cancelRequested);
+            const reuse = settled && settled.cancelRequested === !!v.cancelRequested && settled.messageId === v.messageId;
+            const result = v.result || (reuse ? settled.result : await this.deps.inspect(s.userId, v.cid, v.messageId, v.baseline, v.cancelRequested));
             this.check(s);
             if (v.directDelivery) {
                 const { form: _form, interactions: _interactions, inputId: _inputId, ...visible } = result;
@@ -280,11 +307,6 @@ export class AppTaskService {
                 binding.closed = true; await writeJson(bindingFile, binding);
                 return { released: true };
             });
-        }
-        if (method === 'tasks.output' && this.deps.output) {
-            const result = await this.deps.output(s.userId, v.cid, args.outputId, v.result, s);
-            this.check(s);
-            return result;
         }
         throw new AppError('E_METHOD');
     }

@@ -363,7 +363,7 @@ describe("Providers (pi-ai backed)", () => {
     } finally { release?.(); vi.unstubAllGlobals(); warning.mockRestore(); }
   });
 
-  it.each(['aborted', 'body_failure'] as const)('records %s without guessing a flattened cause or retrying', async mode => {
+  it.each(['aborted', 'body_failure'] as const)('records %s with original transport evidence and no extra SDK request', async mode => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
     const provider = createPiProvider({ provider: 'openai-codex', model: 'gpt-5.6-sol', apiKey: `fixture.${token}.fixture` });
@@ -389,7 +389,7 @@ describe("Providers (pi-ai backed)", () => {
       }
       expect(events.filter(event => event.type === 'message_end')).toHaveLength(0);
       expect(failures).toMatchObject([{ phase: mode === 'aborted' ? 'before_response' : 'after_response',
-        code: 'unknown', aborted: mode === 'aborted', elapsedMs: expect.any(Number),
+        code: mode === 'body_failure' ? 'ECONNRESET' : 'unknown', aborted: mode === 'aborted', elapsedMs: expect.any(Number),
         ...(mode === 'body_failure' ? { httpStatus: 200 } : {}),
       }]);
       expect(fetchStub).toHaveBeenCalledTimes(1);
@@ -1298,13 +1298,17 @@ describe("Providers (pi-ai backed)", () => {
         tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
         reasoning: "low",
       })).rejects.toThrow(/payload captured before network/);
-      expect(capturedPayload).toMatchObject({
-        model: modelId,
-        reasoning: { effort: "low" },
-      });
+      expect(capturedPayload).toMatchObject({ model: modelId });
+      expect(capturedPayload?.reasoning).toMatchObject({ effort: "low" });
+      if (providerId === "openai-codex") {
+        expect(capturedPayload?.input.some((item: { type?: string }) => item.type === "configuration_update"))
+          .toBe(false);
+      }
       expect(capturedPayload?.tools ?? []).toEqual([]);
-      expect(capturedPayload?.input[0]).toMatchObject({ type: 'additional_tools',
-        tools: [expect.objectContaining({ type: 'function', name: 'read_file' })] });
+      expect(capturedPayload?.input).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'additional_tools',
+          tools: [expect.objectContaining({ type: 'function', name: 'read_file' })] }),
+      ]));
       expect(JSON.stringify(capturedPayload?.input)).toContain("input_image");
     });
 
@@ -1333,7 +1337,7 @@ describe("Providers (pi-ai backed)", () => {
       const openrouter = await capture("openrouter", "aion-labs/aion-2.0");
       const zai = await capture("zai", "glm-4.7");
       const qwen = await capture("qwen-token-plan", "qwen3.8-max");
-      const together = await capture("together", "MiniMaxAI/MiniMax-M3");
+      const together = await capture("together", "MiniMaxAI/MiniMax-M3.1-Flash");
 
       expect(openai).not.toHaveProperty("reasoning");
       expect(anthropic).not.toHaveProperty("thinking");
@@ -1344,7 +1348,7 @@ describe("Providers (pi-ai backed)", () => {
       expect(together).not.toHaveProperty("reasoning");
     });
 
-    it.each(["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])(
+    it.each(["claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])(
       "keeps the initial %s tool prefix stable when a tool is loaded later",
       async (modelId) => {
         let payload: any;
@@ -1848,8 +1852,8 @@ describe("Providers (pi-ai backed)", () => {
         })],
       });
 
-      // Compaction may remove the transcript insertion point. The current
-      // active definitions must then move into the prefix, never disappear.
+      // Compaction moves the declaration to the checkpoint before retained
+      // calls that depend on it.
       const session = new Session();
       session.beginUserTurn([{ type: "text", text: "Find release notes" }]);
       session.addAssistantMessage(loadedMessages[2].content);
@@ -1865,14 +1869,18 @@ describe("Providers (pi-ai backed)", () => {
       expect(JSON.stringify(compactedMessages)).not.toContain("addedToolNames");
       const compacted = await capture(compactedMessages);
       if (supportsAdditionalTools) {
-        expect(compacted.tools ?? []).toEqual([]);
-        expect(compacted.input.filter((item: any) => item.type === insertionType)).toHaveLength(1);
-        expect(compacted.input[0]).toMatchObject({ type: insertionType,
-          tools: [expect.objectContaining({ name: 'tool_load' }), expect.objectContaining({ name: 'web_search' })] });
+        expect(compacted.input[0]).toEqual(initial.input[0]);
       } else {
-        expect(compacted.tools.map((tool: any) => tool.name)).toEqual(["tool_load", "web_search"]);
-        expect(compacted.input.some((item: any) => item.type === insertionType)).toBe(false);
+        expect(compacted.tools).toEqual(initial.tools);
       }
+      const checkpointIndex = compacted.input.findIndex((item: any) => JSON.stringify(item).includes("Earlier searches are complete."));
+      const additionIndex = compacted.input.findIndex((item: any) =>
+        item.type === insertionType && item.tools.some((tool: any) => tool.name === "web_search"));
+      const retainedCallIndex = compacted.input.findIndex((item: any) =>
+        item.type === "function_call" && item.name === "web_search");
+      expect(checkpointIndex).toBeGreaterThanOrEqual(0);
+      expect(additionIndex).toBeGreaterThan(checkpointIndex);
+      expect(retainedCallIndex).toBeGreaterThan(additionIndex);
 
       // Providers without native deferred schemas advertise the expanded list
       // up front. Do not claim their load round preserves the same prefix.
@@ -1888,6 +1896,14 @@ describe("Providers (pi-ai backed)", () => {
         .rejects.toThrow(/payload captured before network/);
       expect(capturedPayload?.tools.map((tool: any) => tool.name)).toEqual(["tool_load", "web_search"]);
       expect(capturedPayload?.input.some((item: any) => item.type === "tool_search_output")).toBe(false);
+      const fallback = async (messages: Message[]) => {
+        await expect(compatibility.complete({ model: model.id, messages, tools }))
+          .rejects.toThrow(/payload captured before network/);
+        return structuredClone(capturedPayload);
+      };
+      expect(await fallback(compactedMessages)).toEqual(await fallback(compactedMessages.map((message) => ({
+        role: message.role, content: message.content,
+      }))));
     });
 
     it("preserves structured tool schemas when adapting them to pi-ai", () => {
@@ -2142,11 +2158,38 @@ describe("Providers (pi-ai backed)", () => {
         "```xml\n<think>example</think>\n```",
         "<thinker>visible element</thinker>",
         "\n<thin",
+        "</think> is a closing tag",
+        "</think>\n",
+        "\n</thin",
       ];
 
       for (const text of lookalikes) {
         expect(stripLeadingThinkTextForTest(text)).toBe(text);
       }
+    });
+
+    it("removes an orphaned leading closing line from opted-in provider answers", () => {
+      const text = "</think>\n\nVisible result";
+      const raw = [{ type: "text" as const, text }];
+
+      expect(mapProviderContentForTest(raw, true)).toEqual([
+        { type: "text", text: "Visible result" },
+      ]);
+      expect(mapProviderContentForTest(raw)).toEqual(raw);
+    });
+
+    it("holds a split orphaned closing line until the answer begins", () => {
+      const filter = createLeadingThinkTextFilterForTest();
+
+      expect(filter.push(" \n</th")).toBe("");
+      expect(filter.push("ink>\r")).toBe("");
+      expect(filter.push("\n \n")).toBe("");
+      expect(filter.push("Visible")).toBe("Visible");
+      expect(filter.push(" result")).toBe(" result");
+      expect(filter.finish()).toBe("");
+      expect(filter.takeThinkingActivity()).toEqual({
+        started: false, chars: 0, text: "", ended: false,
+      });
     });
 
     it("omits legacy foreign reasoning when history moves to an OpenAI Responses model", () => {

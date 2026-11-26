@@ -863,24 +863,32 @@ describe('local_agents/backends/_acp process lifecycle', () => {
 });
 
 describe('ACP model selection preserves the fresh-session tool surface', () => {
-  it.each(['supported', 'missing-capability', 'rejected-reload'])('preserves MCP tools or fails before model execution: %s', async mode => {
+  it.each(['supported', 'rejected-model', 'missing-capability', 'rejected-reload', 'unanswered-reload'])('preserves MCP tools or identifies the pre-prompt failure: %s', async mode => {
     const fixture = String.raw`
 const send = value => process.stdout.write(JSON.stringify(value)+'\n');let attached=false,selected=false;const mode=process.argv[1];
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line);
  if(m.method==='initialize')send({id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:mode!=='missing-capability'}}});
  if(m.method==='session/new'){attached=m.params.mcpServers.length===1;send({id:m.id,result:{sessionId:'model-tools'}});}
- if(m.method==='session/set_model'){selected=true;attached=false;send({id:m.id,result:{}});}
- if(m.method==='session/load'){attached=m.params.sessionId==='model-tools'&&m.params.mcpServers[0]?.name==='orkas';send(mode==='rejected-reload'?{id:m.id,error:{code:-32000,message:'Reload unavailable'}}:{id:m.id,result:{}});}
+ if(m.method==='session/set_model'){selected=true;attached=false;send(mode==='rejected-model'?{id:m.id,error:{code:-32602,message:'Model unavailable'}}:{id:m.id,result:{}});}
+ if(m.method==='session/load'&&mode!=='unanswered-reload'){attached=m.params.sessionId==='model-tools'&&m.params.mcpServers[0]?.name==='orkas';send(mode==='rejected-reload'?{id:m.id,error:{code:-32000,message:'Reload unavailable'}}:{id:m.id,result:{}});}
  if(m.method==='session/prompt'){process.stderr.write('PROMPT_SUBMITTED\n');send({id:m.id,...(selected&&attached?{result:{stopReason:'end_turn'}}:{error:{code:-32000,message:'Native model switch lost the MCP surface'}})});}
 });`;
     const events:any[]=[];
-    await makeAcpBackend({logName:'local-agents:test-model-tools',argv:['-e',fixture,mode],clientName:'fixture',refreshMcpAfterModelSelection:true}).run({
+    await makeAcpBackend({logName:'local-agents:test-model-tools',argv:['-e',fixture,mode],clientName:'fixture',cliName:'Hermes',refreshMcpAfterModelSelection:true}).run({
       binPath:TEST_NODE,cwd:process.cwd(),prompt:'Use the configured tools',modelOverride:'selected-model',
       bridge:{mcpConfigPath:'unused',server:{command:TEST_NODE,args:[],env:{}}},signal:new AbortController().signal,
-      timeoutMs:5000,onEvent:event=>events.push(event),
+      timeoutMs:mode==='unanswered-reload'?1200:5000,onEvent:event=>events.push(event),
     });
     expect(events.at(-1)).toMatchObject({type:'done',status:mode==='supported'?'completed':'failed'});
+    if(mode!=='supported'){
+      expect(events.at(-1)).toMatchObject({cliError:mode==='rejected-model'?'parameter_unsupported':'tool_restore_failed',retrySafe:false});
+      expect(events.at(-1).error).toContain('Hermes');
+      expect(events.at(-1).error).not.toContain('Reload unavailable');
+      if (mode === 'rejected-model' || mode === 'rejected-reload') {
+        expect(events.at(-1).nativeError).toBe(mode === 'rejected-model' ? 'Model unavailable' : 'Reload unavailable');
+      }
+    }
     expect(events.filter(event=>event.type==='stderr-line'&&event.line==='PROMPT_SUBMITTED')).toHaveLength(mode==='supported'?1:0);
     expect(events.filter(event=>event.type==='done')).toHaveLength(1);
   });

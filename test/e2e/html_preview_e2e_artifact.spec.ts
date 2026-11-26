@@ -70,28 +70,36 @@ test('a program creates one visible app then previews its returned ID with two l
   await expect(cards).toContainText(title);
 });
 
-test('a program receives real overflow diagnostics without images then explicitly recovers with one mobile screenshot', async ({ modelOrkas: app }, info) => {
+test('a program receives screenshots for both the overflowing page and the corrected page', async ({ modelOrkas: app }, info) => {
   const scale = await app.electronApp!.evaluate(({ screen }) => screen.getPrimaryDisplay().scaleFactor);
-  const broken = app.createWorkspaceFile('program-preview/broken.html', `<!doctype html><style>body{margin:0}main{width:900px}</style><main>Report too wide</main>`);
+  const paintViewportEdge = (width: number, height: number) => `
+    html{scrollbar-width:none}
+    #viewport-edge{position:fixed;inset:auto 0 0;height:12px;background:#d00}
+    @media (min-width: ${width - 1}px) and (max-width: ${width + 1}px)
+      and (min-height: ${height - 1}px) and (max-height: ${height + 1}px) { #viewport-edge{background:#00c000} }`;
+  const broken = app.createWorkspaceFile('program-preview/broken.html', `<!doctype html>
+    <style>body{margin:0}main{width:900px}${paintViewportEdge(390, 844)}</style>
+    <main>Report too wide</main><div id="viewport-edge"></div>`);
   const good = app.createWorkspaceFile('program-preview/good.html', `<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>body{font:18px sans-serif;margin:24px}button:focus-visible{outline:3px solid blue}</style>
-    <h1>Mobile report</h1><button onclick="this.textContent='Checked'">Check</button>`);
+    <style>body{font:18px sans-serif;margin:24px}button:focus-visible{outline:3px solid blue}${paintViewportEdge(321, 481)}</style>
+    <h1>Mobile report</h1><button onclick="this.textContent='Checked'">Check</button><div id="viewport-edge"></div>`);
   let invoked = false;
   app.setModelRequestScript((_request, tools) => {
     if (!tools.has('html_preview')) return { calls: [{ callId: 'load-preview', name: 'tool_load', args: { groups: ['workspace.artifact'] } }] };
     if (invoked) return { text: 'The overflow was detected and the corrected mobile preview passed.' };
     invoked = true;
     return { calls: [{ callId: 'program-file-preview', name: 'run_program', args: { code: `
-      const failed = await tools.html_preview({ path: ${JSON.stringify(broken)}, target: 'mobile', screenshots: true, interactions: false });
-      if (failed.ok) throw Error('Overflow was accepted');
-      const rejected = JSON.parse(failed.content);
-      if (rejected.visual_evidence.attached || rejected.viewports[0].horizontalOverflowPx <= 1) throw Error('Missing overflow diagnostics');
-      text(failed.content);
+      const preview = await tools.html_preview({ path: ${JSON.stringify(broken)}, target: 'mobile', screenshots: true, interactions: false });
+      if (!preview.ok) throw Error(preview.content);
+      const evidence = JSON.parse(preview.content);
+      if (!evidence.visual_evidence.attached || evidence.viewports[0].horizontalOverflowPx <= 1) throw Error('Missing screenshot or overflow evidence');
+      text(preview.content);
       const recovered = await tools.html_preview({ path: ${JSON.stringify(good)}, target: 'mobile', screenshots: true,
-        interactions: false, mobile: { width: 320, height: 480 } });
+        interactions: false, mobile: { width: 321, height: 481 } });
       if (!recovered.ok) throw Error(recovered.content);
-      const evidence = JSON.parse(recovered.content);
-      if (evidence.viewports[0].width !== 320 || evidence.viewports[0].height !== 480 || evidence.interactions.performed) throw Error('Mobile options changed');
+      const corrected = JSON.parse(recovered.content);
+      if (corrected.viewports[0].width !== 321 || corrected.viewports[0].height !== 481
+        || corrected.viewports[0].horizontalOverflowPx > 1 || corrected.interactions.performed) throw Error('Missing corrected viewport evidence');
       text(recovered.content);
     ` } }] };
   });
@@ -101,11 +109,20 @@ test('a program receives real overflow diagnostics without images then explicitl
   const request = app.modelRequests.at(-1)!;
   expect(JSON.stringify(request.input ?? request.messages)).toContain('Program completed after 2 tool calls');
   const images = providerImageUrls(request.input ?? request.messages);
-  expect(images).toHaveLength(1);
-  const pixels = Buffer.from(images[0].split(',')[1], 'base64');
-  const metadata = await sharp(pixels).metadata();
-  expect([metadata.width, metadata.height]).toEqual([320 * scale, 480 * scale]);
-  writeFileSync(info.outputPath('program-mobile-recovery.webp'), pixels);
+  expect(images).toHaveLength(2);
+  for (const [index, url] of images.entries()) {
+    const pixels = Buffer.from(url.split(',')[1], 'base64');
+    writeFileSync(info.outputPath(`program-mobile-preview-${index}.webp`), pixels);
+    const { data, info: image } = await sharp(pixels).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const [width, height] = index === 0 ? [390, 844] : [321, 481];
+    expect(Math.abs(image.width - width * scale)).toBeLessThanOrEqual(1);
+    expect(Math.abs(image.height - height * scale)).toBeLessThanOrEqual(1);
+    // The strip is green only at the requested layout, within one CSS pixel of DPI rounding.
+    const bottomPixel = ((image.height - 4) * image.width + Math.floor(image.width / 2)) * image.channels;
+    const [red, green, blue] = data.subarray(bottomPixel, bottomPixel + 3);
+    // Native color conversion can shift a channel slightly; the red fallback must still fail.
+    expect(Math.max(red, Math.abs(green - 192), blue)).toBeLessThanOrEqual(4);
+  }
 });
 
 test('creates an app and previews its ID with a working host bridge and no workspace copy', async ({ sdkOrkas: orkas }, info) => {

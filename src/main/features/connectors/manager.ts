@@ -1620,7 +1620,14 @@ export function beginOAuthConnect(
   const runtimeEpoch = _runtimeEpoch;
   const reportOutcome = (outcome: OAuthConnectOutcome) => {
     if (runtimeEpoch !== _runtimeEpoch) return;
-    broadcastOAuthConnectOutcome(outcome);
+    const display = entry.catalog_parent_id ? findCatalogEntry(entry.catalog_parent_id) || entry : entry;
+    broadcastOAuthConnectOutcome({
+      ...outcome,
+      ...(outcome.result === 'failure' ? {
+        display_name: display.display_name_en || display.display_name,
+        display_name_zh: display.display_name_zh,
+      } : {}),
+    });
   };
   if (localCliAttemptKey) _localCliConnectAttempts.set(localCliAttemptKey, attemptId);
   void connectViaOAuth(uid, catalogId, {
@@ -1893,9 +1900,11 @@ export function beginCustomOAuthConnect(uid: string, id: string): OAuthConnectSt
         result: 'cancelled', code, duration_ms: Math.max(0, Date.now() - startedAt) });
       return;
     }
+    const cancelled = code === 'user_cancelled' || code === 'superseded';
     broadcastOAuthConnectOutcome({ attempt_id: attemptId, catalog_id: id,
-      result: code === 'user_cancelled' || code === 'superseded' ? 'cancelled' : 'failure',
+      result: cancelled ? 'cancelled' : 'failure',
       duration_ms: Date.now() - startedAt, code,
+      ...(!cancelled ? { display_name: inst.display_name } : {}),
       error: registry.load(uid).connections[id]?.status.kind === 'error'
         ? (registry.load(uid).connections[id]?.status as { message: string }).message
         : 'OAuth authorization failed',

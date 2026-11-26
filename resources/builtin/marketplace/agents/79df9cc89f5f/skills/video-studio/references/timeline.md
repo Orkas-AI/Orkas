@@ -1,6 +1,6 @@
 # Timeline and page
 
-A video is a manifest plus, when it has designed text or motion, a page. Edit both with file tools. `video.check` tells you when something is wrong.
+For timeline renders, edit the manifest with file tools, along with the HTML page when the video has one. Use `video.check` to check the timeline.
 
 ## manifest.json
 
@@ -35,7 +35,7 @@ A video is a manifest plus, when it has designed text or motion, a page. Edit bo
 - `"audio": "keep"` uses the clip's own sound, with optional `volume`. The default is silent.
 - `text` fills the page's `data-slot` elements of that scene. `{ "fact_id": "price" }` reads from `product.json`, so a price changes in one place. Use it for prices and specs.
 - `narration.text` drives captions when `captions.enabled` is true. `narration.asset` is its audio; it must fit inside the scene.
-- `tracks` play across the whole video from 0s: `music` or `sfx`. `duck` lowers it under speech.
+- `tracks` start at 0s: `music`, `sfx`, or `narration`. For one take covering several scenes from the start, add `{ "kind": "narration", "asset": "voice-all", "volume": 1 }`, using the real asset id. `duck` lowers music under speech.
 - Use even numbers for width and height. 9:16 is 1080×1920, 1:1 is 1080×1080, 16:9 is 1920×1080. Total limit 600s.
 
 ## assets.json
@@ -127,6 +127,33 @@ The rules behind it:
 - `<img data-clip="id">` places a clip yourself. A clip you do not place fills the frame behind the content. Never use `<video>` or `<audio>`: they are refused, because they do not render frame-accurately.
 - Keep local files inside the video folder, for example `./assets/logo.png`, and reference them relatively. `product.capture` saves there: into `videos/main` unless you pass `video_dir`, with its paths relative to that folder. Nothing remote: no web fonts, CDNs or remote images.
 - `./assets/vendor/gsap.min.js` is provided; just reference it.
+- `./assets/vendor/screen-demo.js`, loaded after GSAP, shows a step done on a
+  screenshot: a pointer or finger that taps, text typed into a field, the view
+  moving in on a part, a ring or spotlight on it. Put the scene's screenshots in
+  one box with explicit geometry; it frames them as a browser or phone
+  (`ScreenDemo(box, tl, { frame: 'none' })` for no frame). A scene's screenshots
+  are its clips in order, so the next screen cuts in where the tap leads to it.
+
+  ```html
+  <div class="demo" style="position: absolute; left: 120px; top: 420px; width: 840px; height: 1300px">
+    <img data-clip="pick" alt=""><img data-clip="slots" alt="">
+  </div>
+  ```
+
+  ```js
+  window.__timelines.book = gsap.timeline({ paused: true });
+  ScreenDemo('[data-scene-id="book"] .demo', window.__timelines.book)
+    .tap(0.38, 0.42, 0.8)                         // x, y on the screenshot, at 0.8 s
+    .type([0.06, 0.12, 0.88, 0.05], '老街', 1.4)  // the field's [x, y, width, height], typed from 1.4 s
+    .tap(0.5, 0.88, 2.6)                          // just before the clip "slots" starts
+    .zoom([0.04, 0.12, 0.92, 0.3], 3.0)           // move in on the result; zoom(null, t) moves back out
+    .mark([0.04, 0.12, 0.92, 0.1], 3.4);          // ring it; { spot: true } dims the rest, { until: t } ends it
+  ```
+
+  Positions are fractions of the screenshot, or its own pixels. Read them off
+  the screenshot and check them in the `video.check` previews. The view moves in
+  on each tap or typing as it happens and back out when nothing happens for a
+  moment; `zoom` sets it yourself, and `{ follow: false }` keeps it still.
 - Style captions with `.orkas-caption` if the default does not suit.
 
 ## Frame 0

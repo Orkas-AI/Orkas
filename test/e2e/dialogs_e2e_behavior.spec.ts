@@ -438,6 +438,7 @@ test('global requests show their source task across navigation, locales and narr
   const title = '发送每周进展给项目成员 · Review the weekly release progress';
   const created = await app.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title });
   const cid = created.conversation.conversation_id;
+  await page.evaluate(() => (window as any).loadConversations());
   await page.evaluate(() => (window as any).setView('settings'));
   await page.setViewportSize({ width: 760, height: 600 });
   // Deliver the same host push that a pending operation uses. Only UI and
@@ -500,6 +501,14 @@ test('global requests show their source task across navigation, locales and narr
     command: 'echo ready', reasons: ['network_egress'], can_allow_run: true,
   });
   await expect(approval).toBeVisible();
+  const status = page.locator(`#conversation-list .conv-item[data-cid="${cid}"] .conv-item-status-label`);
+  await expect(status).toHaveText('Awaiting confirmation');
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.screenshot({ path: testInfo.outputPath('sidebar-awaiting-approval-en.png') });
+  await page.evaluate(() => (window as any).setLang('zh'));
+  await expect(status).toHaveText('待确认');
+  await page.screenshot({ path: testInfo.outputPath('sidebar-awaiting-approval-zh.png') });
+  await page.setViewportSize({ width: 760, height: 600 });
   const cancel = approval.locator('[data-act="cancel"]');
   await expect(cancel).toBeInViewport();
   expect(await approval.locator('.ui-dialog-context').evaluate(node =>
@@ -507,6 +516,7 @@ test('global requests show their source task across navigation, locales and narr
   await approval.screenshot({ path: testInfo.outputPath('global-permission-context-long.png') });
   await push('bash:permission_cancelled', { request_ids: ['context-long'] });
   await expect(approval).toHaveCount(0);
+  await expect(status).toHaveCount(0);
 });
 
 const permissionDialogTest = test;

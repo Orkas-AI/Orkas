@@ -14,7 +14,7 @@ const test = base.extend({
 
 // Website receipts and actual DOM state are independent of tool success flags.
 test('task browser reaches frames, native files, options, keys and popup POST forms', async ({ modelOrkas: orkas }) => {
-  const uploads: Array<{ bytes: number; files: number }> = [];
+  const uploads: Array<{ bytes: number; files: number; trustedChange: boolean }> = [];
   let postBody = '';
   const server = createServer((request, response) => {
     if (request.url === '/upload') {
@@ -25,7 +25,10 @@ test('task browser reaches frames, native files, options, keys and popup POST fo
         files += (text.match(/filename="[^"]+"/g) || []).length;
         tail = text.slice(-128).replace(/filename="[^"]+"/g, '');
       });
-      request.on('end', () => { uploads.push({ bytes, files }); response.end('uploaded'); });
+      request.on('end', () => {
+        uploads.push({ bytes, files, trustedChange: request.headers['x-trusted-change'] === 'true' });
+        response.end('uploaded');
+      });
       return;
     }
     if (request.url === '/posted') {
@@ -38,7 +41,7 @@ test('task browser reaches frames, native files, options, keys and popup POST fo
     if (request.url === '/child') {
       response.end(`<!doctype html><input aria-label="Child"><button onclick="window.clicks=(window.clicks||0)+1">Child button</button>
         <input type="file" multiple aria-label="Files"><input type="file" webkitdirectory aria-label="Folder">
-        <script>document.querySelectorAll('input[type=file]').forEach(input=>input.addEventListener('change',async()=>{const data=new FormData();for(const file of input.files)data.append('files',file);await fetch('/upload',{method:'POST',body:data})}))</script>`);
+        <script>document.querySelectorAll('input[type=file]').forEach(input=>input.addEventListener('change',async event=>{const data=new FormData();for(const file of input.files)data.append('files',file);await fetch('/upload',{method:'POST',headers:{'X-Trusted-Change':String(event.isTrusted)},body:data})}))</script>`);
       return;
     }
     response.end(`<!doctype html><style>iframe{width:450px;height:260px}#scroll{width:100px;height:60px;overflow:auto}#scroll div{width:500px;height:500px}</style>
@@ -141,7 +144,7 @@ test('task browser reaches frames, native files, options, keys and popup POST fo
     });
     const directoryResult = await act(child, 'Folder', 'upload', { file_paths: [folder] });
     expect(directoryResult, JSON.stringify(directoryResult)).toMatchObject({ ok: true, file_count: 1 });
-    await expect.poll(() => uploads.length).toBe(2); expect(uploads[1].files).toBe(1);
+    await expect.poll(() => uploads.length).toBe(2); expect(uploads[1]).toMatchObject({ files: 1, trustedChange: true });
     main = await observe(); expect(await act(main, 'Popup submit', 'click')).toMatchObject({ ok: true });
     await expect.poll(() => postBody).toBe('draft=exact-post');
     let popup: any;

@@ -108,10 +108,12 @@ import {
   quoteVideoCanvasDraft,
   quoteVideoCanvasRedo,
   resetVideoCanvasJobsForTest,
+  resolveVideoCanvasDelivery,
   scheduleVideoCanvasRender,
   startVideoCanvasDraft,
   startVideoCanvasRedo,
   stopVideoCanvasRender,
+  stopVideoCanvasJobsForQuit,
   updateVideoCanvasVideo,
   videoCanvasDraftOptions,
   videoCanvasJobs,
@@ -119,6 +121,7 @@ import {
   type VideoCanvasJobEvent,
 } from '../../../src/main/features/video_canvas_jobs';
 import { applyVideoCanvasDraftChange, type VideoCanvasDraftChange } from '../../../src/main/features/video_canvas';
+import { fitVideoParameters } from '../../../src/main/features/video_parameter_compatibility';
 import { reserveProductionRequest } from '../../../src/main/features/video_production_budget';
 import { notifyUserSwitch } from '../../../src/main/features/user-switch-hooks';
 import { normaliseSeedreamSize } from '../../../src/main/features/image_size';
@@ -231,6 +234,39 @@ afterEach(async () => {
 });
 
 describe('rendering when the user updates a video', () => {
+  it.each(['confirm', 'edit', 'account_switch'] as const)(
+    'resolves a still-frame review only for its current canvas (%s)', async (decision) => {
+      let delivered = false;
+      mocks.ship.mockImplementationOnce(async options => {
+        const current = await options.reviewHeldStills({ percent: 76, scenes: [{ id: 'one', seconds: 2 }] });
+        if (!current?.() || options.signal.aborted) return { ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' };
+        delivered = true;
+        return { ok: true, version: { id: 'v2' } };
+      });
+      scheduleVideoCanvasRender(CTX, 'main');
+      await until(() => !!lastOf('review'));
+      const review = lastOf('review')?.review;
+      expect(videoCanvasJobs(UID, CID, { busy: false })).toMatchObject([
+        { video_id: 'main', review: { percent: 76, preview_path: path.join(workspace, 'ad/render/main.mp4') } },
+      ]);
+      expect(delivered).toBe(false);
+      expect(resolveVideoCanvasDelivery({ ...CTX, cid: 'another' }, 'main', review?.id, 'deliver', () => false).ok).toBe(false);
+      expect(resolveVideoCanvasDelivery(CTX, 'main', 'older-review', 'deliver', () => false)).toEqual({ ok: false, code: 'changed' });
+      expect(resolveVideoCanvasDelivery(CTX, 'main', review?.id, 'deliver', () => true)).toEqual({ ok: false, code: 'busy' });
+      if (decision === 'account_switch') {
+        account.uid = 'new-account';
+        await notifyUserSwitch(UID, account.uid);
+      } else {
+        expect(resolveVideoCanvasDelivery(CTX, 'main', review?.id, decision === 'confirm' ? 'deliver' : 'edit', () => false)).toEqual({ ok: true });
+      }
+      expect(resolveVideoCanvasDelivery(CTX, 'main', review?.id, 'deliver', () => false).ok).toBe(false);
+      await until(() => videoCanvasJobs(UID, CID, { busy: false }).length === 0);
+      expect(delivered).toBe(decision === 'confirm');
+      expect(lastOf('done')?.version).toBe(decision === 'confirm' ? 'v2' : undefined);
+      expect(mocks.render).toHaveBeenCalledOnce();
+    },
+  );
+
   it('cancels a queued old-account render and admits work for the newly active account', async () => {
     scheduleVideoCanvasRender(CTX, 'main', { delayMs: 10 });
     notifyUserSwitch(UID, 'next-user');
@@ -502,6 +538,57 @@ describe('rendering when the user updates a video', () => {
   });
 });
 
+// Review 2026-11-16 S4-10: a quit stops what the canvas started, as it stops the Agent's turns,
+// so FFmpeg does not run on after the app and partial files are removed.
+describe('quitting the app', () => {
+  it('stops a render and a take in progress, reports neither as failed, and waits for them to let go', async () => {
+    let unwound = false;
+    mocks.render.mockImplementation(({ signal }) => new Promise((resolve) => {
+      signal.addEventListener('abort', () => setTimeout(() => {
+        unwound = true;
+        resolve({ ok: false, op: 'video.render', errorCode: 'E_RENDER_ABORTED', message: 'aborted' });
+      }, 30));
+    }));
+    let takeSignal: AbortSignal | undefined;
+    mocks.videoExecute.mockImplementationOnce((_request, context) => new Promise((resolve) => {
+      takeSignal = context.signal;
+      context.signal.addEventListener('abort', () => resolve({ isError: true, content: 'operation aborted' }));
+    }));
+    scheduleVideoCanvasRender(CTX, 'main', { delayMs: 0 });
+    expect(await startVideoCanvasRedo({ ctx: CTX, asset: 'shot', isBusy: () => false })).toEqual({ ok: true });
+    await until(() => mocks.render.mock.calls.length === 1 && !!takeSignal);
+
+    await stopVideoCanvasJobsForQuit();
+
+    expect((mocks.render.mock.calls[0][0].signal as AbortSignal).aborted).toBe(true);
+    expect(takeSignal!.aborted).toBe(true);
+    expect(unwound).toBe(true);
+    expect(mocks.ship).not.toHaveBeenCalled();
+    expect(events.some((event) => event.status === 'failed' || event.status === 'done')).toBe(false);
+    expect(videoCanvasJobs(UID, CID, { busy: false })).toEqual([]);
+  });
+
+  it('does not hold the quit open for a render that never lets go', async () => {
+    mocks.render.mockImplementation(() => new Promise(() => {}));
+    scheduleVideoCanvasRender(CTX, 'main', { delayMs: 0 });
+    await until(() => mocks.render.mock.calls.length === 1);
+    vi.useFakeTimers();
+    try {
+      let done = false;
+      const quitting = stopVideoCanvasJobsForQuit().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await quitting;
+      expect(done).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('returns at once when nothing is running', async () => {
+    await expect(stopVideoCanvasJobsForQuit()).resolves.toBeUndefined();
+  });
+});
+
 describe('a change while the user waits for an update', () => {
   /** A render that stays busy until it is stopped, then takes `unwindMs` to let go. */
   const busyUntilStopped = (unwindMs = 0) => mocks.render.mockImplementation(({ signal }) => new Promise((resolve) => {
@@ -632,7 +719,7 @@ describe('the services a shot can be made on again', () => {
       choices: [
         { id: 'doubao', name: 'Doubao Seedance 2.0', frames: 'first_last', ...SEEDANCE_OFFER, params: { ratio: '9:16', resolution: '720p', duration: 8, audio: false } },
         { id: 'h3', name: 'MiniMax H3 Lite', frames: 'first_last', ratios: CONCRETE_RATIOS, resolutions: ['480p', '768p'], durations: [4, 5, 6, 8, 10, 12, 15], silent: false, params: { ratio: '9:16', resolution: '768p', duration: 8, audio: true } },
-        { id: 'vidu', name: 'Vidu Q3 Turbo', frames: 'first_last', ratios: ['16:9', '9:16', '1:1', '4:3', '3:4'], resolutions: ['540p', '720p', '1080p'], durations: [3, 4, 5, 6, 8, 10, 12, 15], silent: true, params: { ratio: '9:16', resolution: '720p', duration: 8, audio: false } },
+        { id: 'vidu', name: 'Vidu Q3 Turbo', frames: 'first_last', ratios: ['16:9', '9:16', '1:1', '4:3', '3:4'], resolutions: ['540p', '720p', '1080p'], durations: [1, 2, 3, 4, 5, 6, 8, 10, 12, 15], silent: true, params: { ratio: '9:16', resolution: '720p', duration: 8, audio: false } },
         { id: 'kling', name: 'Kling 4.0', frames: 'first_last', ratios: ['16:9', '9:16', '1:1', '21:9'], resolutions: ['720p', '1080p'], durations: [3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30], silent: false, params: { ratio: '9:16', resolution: '720p', duration: 8, audio: true } },
         { id:'public', name:'orkas-video', frames: 'none', ...SEEDANCE_OFFER, params: { ratio: '9:16', resolution: '720p', duration: 8, audio: false } },
       ],
@@ -708,6 +795,77 @@ describe('the services a shot can be made on again', () => {
     const doubao = odd.choices.find((choice) => choice.id === 'doubao')!;
     expect(doubao.params.duration).toBe(7);
     expect(doubao.durations).toEqual([4, 5, 6, 7, 8, 10, 12, 15]);
+  });
+
+  // Decided 2026-11-18 (review S4-6, option A): the canvas fits a setting the way the Agent's
+  // generation does (fitVideoParameters), so a take asks a service for the same thing from either.
+  it('fits a resolution a service does not make to the lowest it offers not below it, as the Agent does', async () => {
+    mocks.candidates = [
+      { entry: { id: 'fast', provider: 'doubao', model: 'doubao-seedance-2-0-fast-260128', apiKey: 'fixture-key' } },
+      { entry: SERVICES.h3 },
+      { entry: SERVICES.vidu },
+    ];
+    addTake('take');
+
+    const options = await videoCanvasRedoOptions(CTX, 'take', undefined, { resolution: '540p' });
+    if (!options.ok) throw new Error('no options');
+    const byId = Object.fromEntries(options.choices.map((choice) => [choice.id, choice]));
+    // Asked for 540p: Seedance 2.0 Fast (480p, 720p) and H3 Lite (480p, 768p) make the next sharper
+    // one, not a softer 480p; Vidu makes 540p itself. What each lists is unchanged.
+    expect(byId.fast).toMatchObject({ resolutions: ['480p', '720p'], params: { resolution: '720p' } });
+    expect(byId.h3).toMatchObject({ resolutions: ['480p', '768p'], params: { resolution: '768p' } });
+    expect(byId.vidu).toMatchObject({ resolutions: ['540p', '720p', '1080p'], params: { resolution: '540p' } });
+    for (const entry of mocks.candidates.map(({ entry }) => entry)) {
+      expect(byId[entry.id as string].params.resolution)
+        .toBe(fitVideoParameters({ resolution: '540p' }, entry.provider as string, entry.model as string).resolution);
+      expect(byId[entry.id as string]).not.toHaveProperty('unavailable');
+    }
+
+    // The price is asked for what is made.
+    expect(await quoteVideoCanvasRedo(CTX, 'take', 'fast', undefined, { resolution: '540p' })).toMatchObject({ ok: true });
+    expect(mocks.quote.mock.calls[0][0][0]).toMatchObject({ resolution: '720p' });
+  });
+
+  it('rounds a length a service cannot make up as the Agent does, keeping Veo to 4, 6 or 8 seconds', async () => {
+    const runway = { id: 'runway', provider: 'runway', model: 'gen4.5', apiKey: 'fixture-key' };
+    const veo = {
+      id: 'veo',
+      provider: 'google-cloud',
+      model: 'veo-3.1-fast-generate-001',
+      apiKey: JSON.stringify({
+        type: 'service_account',
+        project_id: 'video-project',
+        client_email: 'video@video-project.iam.gserviceaccount.com',
+        private_key: crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }),
+      }),
+    };
+    mocks.candidates = [{ entry: SERVICES.doubao }, { entry: runway }, { entry: veo }];
+    const agentLength = (entry: Record<string, unknown>, duration: number) =>
+      fitVideoParameters({ duration, resolution: '720p' }, entry.provider as string, entry.model as string).duration;
+    const choicesFor = async (asset: string, settings?: Record<string, unknown>) => {
+      const options = await videoCanvasRedoOptions(CTX, asset, undefined, settings);
+      if (!options.ok) throw new Error('no options');
+      return Object.fromEntries(options.choices.map((choice) => [choice.id, choice]));
+    };
+
+    // One second asked for: Runway makes 2 at the least, Seedance 4.
+    addTake('take');
+    const short = await choicesFor('take', { duration: 1 });
+    expect(short.runway.params.duration).toBe(2);
+    expect(short.doubao.params.duration).toBe(4);
+    expect(short.runway.params.duration).toBe(agentLength(runway, 1));
+
+    // A take on record at 8.4 seconds asks for the whole second above, as its call did, not a
+    // shorter 8; Veo takes its next step up, and still lists only 4, 6 and 8.
+    addTake('odd', { request: { duration: 8.4 } });
+    const odd = await choicesFor('odd');
+    expect(odd.doubao).toMatchObject({ params: { duration: 9 }, durations: [4, 5, 6, 8, 9, 10, 12, 15] });
+    expect(odd.doubao.params.duration).toBe(agentLength(SERVICES.doubao, 8.4));
+    addTake('veo', { request: { duration: 4.2 } });
+    const onVeo = (await choicesFor('veo')).veo;
+    expect(onVeo).toMatchObject({ params: { duration: 6 }, durations: [4, 6, 8] });
+    expect(onVeo.params.duration).toBe(agentLength(veo, 4.2));
+    expect(onVeo).not.toHaveProperty('unavailable');
   });
 
   it.each([
@@ -1627,6 +1785,19 @@ describe('making a new shot', () => {
     }),
   });
   const CONCRETE = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'];
+
+  it('does not silently replace a configured model removed after it was selected', async () => {
+    configure('doubao', 'h3');
+    const id = await draft({ prompt: 'pour juice', choice: 'h3' });
+    expect(await videoCanvasDraftOptions(CTX, id)).toMatchObject({ ok: true, current: 'h3' });
+
+    configure('doubao');
+    expect(await videoCanvasDraftOptions(CTX, id)).toMatchObject({ ok: true, current: '', unavailable: { code: 'other' } });
+    expect(await quoteVideoCanvasDraft(CTX, id)).toEqual({ ok: false, code: 'route_unavailable' });
+    expect(await generate(id)).toEqual({ ok: false, code: 'route_unavailable' });
+    expect(mocks.quote).not.toHaveBeenCalled();
+    expect(mocks.videoExecute).not.toHaveBeenCalled();
+  });
 
   it.each([UID, 'next-user', null])('rechecks draft account %s after the real pending-request read', async nextUser => {
     configure('doubao');

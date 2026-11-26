@@ -56,6 +56,88 @@ async function writeAttempt(cid: string, failure: Record<string, unknown>, actor
 }
 
 describe('group_chat failed-turn smart retry', () => {
+  it('preserves an explicit ImageStudio export on a failed reply retry', async () => {
+    const cid = 'native-image-png-retry';
+    const { IMAGE_STUDIO_AGENT_ID } = await import('../../../../src/main/model/core-agent/tool-catalog');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    await state.seedReservedActors(UID, cid);
+    await state.ensureAgentMember(UID, cid, IMAGE_STUDIO_AGENT_ID, 'ImageStudio');
+    const rows = await writeAttempt(cid, { failure_kind: 'operation', failure_code: 'image_studio_native_png_missing' },
+      IMAGE_STUDIO_AGENT_ID, '/export-png Replace the title');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const [source, failed] = rows;
+    fs.writeFileSync(layout.conversationMessageFile(UID, cid),
+      [JSON.stringify({ ...source, image_studio_native_png: true }), JSON.stringify(failed)].join('\n') + '\n');
+
+    const api = await import('../../../../src/main/features/group_chat');
+    expect(await api.resolveFailedTurnRetry({ userId: UID, cid, failedMessageId: failed.id, visibleText: 'Retry' }))
+      .toMatchObject({ ok: true, value: { enqueue: { forceTo: [IMAGE_STUDIO_AGENT_ID], imageStudioNativePng: true } } });
+  });
+
+  it.each(['resume', 'restart'] as const)('restores the task owner scope and dependency result on %s', async mode => {
+    const cid = `scoped-${mode}`;
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    const predecessor = await board.createTask(UID, cid, { assignee: 'researcher', instruction: 'Inspect sales.', createdBy: 'user' });
+    await board.claimTask(UID, cid, predecessor.task_id);
+    await board.finishTask(UID, cid, predecessor.task_id, 'done', { resultMsgId: 'sales-result' });
+    const task = await board.createTask(UID, cid, { assignee: 'commander', instruction: 'Write only the introduction.',
+      createdBy: 'user', sourceMsgId: `${cid}-source`, assignmentContext: 'Researcher owns the chart.', after: [predecessor.task_id] });
+    await board.claimTask(UID, cid, task.task_id);
+    await board.finishTask(UID, cid, task.task_id, 'failed');
+    await writeAttempt(cid, { task_id: task.task_id, source_message_id: `${cid}-source` });
+    const layout = await import('../../../../src/main/util/project-layout');
+    fs.appendFileSync(layout.conversationMessageFile(UID, cid), JSON.stringify({ id: 'sales-result', from: 'researcher', to: ['user'],
+      text: 'Verified revenue is 37.', produced: ['verified-sales.csv'] }) + '\n');
+    if (mode === 'resume') {
+      const sessions = await import('../../../../src/main/model/core-agent/session-store');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      (await sessions.getSession(state.buildGconvSessionId(cid))).beginUserTurn([{ type: 'text', text: task.instruction }]);
+    }
+    const api = await import('../../../../src/main/features/group_chat');
+    const result = await api.resolveFailedTurnRetry({ userId: UID, cid, failedMessageId: `${cid}-failed`, visibleText: 'Retry' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.mode).toBe(mode);
+    expect(result.value.enqueue.model_text).toContain(task.instruction);
+    expect(result.value.enqueue.model_text).not.toContain('Authoritative original request');
+    expect(result.value.enqueue.assignmentContext).toContain('Researcher owns the chart.');
+    expect(result.value.enqueue.predecessorContext).toContain('Verified revenue is 37.');
+    expect(result.value.enqueue.predecessorContext).toContain('verified-sales.csv');
+    expect(result.value.enqueue.retryOfTaskId).toBeUndefined();
+  });
+
+  it('keeps the original delegated assignment when retrying a failed retry', async () => {
+    const cid = 'retry-of-delegated-retry';
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    const parent = await board.createTask(UID, cid, { assignee: 'commander', instruction: 'Prepare report.', createdBy: 'user' });
+    const original = await board.createTask(UID, cid, { assignee: 'commander', instruction: 'Review report.',
+      createdBy: 'commander', parentTaskId: parent.task_id });
+    await board.finishTask(UID, cid, original.task_id, 'failed');
+    const attempt = await board.createTask(UID, cid, { assignee: 'commander', instruction: original.instruction,
+      createdBy: 'user', sourceMsgId: `${cid}-source`, retryOfTaskId: original.task_id });
+    await board.finishTask(UID, cid, attempt.task_id, 'failed');
+    await writeAttempt(cid, { task_id: attempt.task_id, source_message_id: `${cid}-source` });
+    const api = await import('../../../../src/main/features/group_chat');
+    expect(await api.resolveFailedTurnRetry({ userId: UID, cid, failedMessageId: `${cid}-failed`, visibleText: 'Retry' }))
+      .toMatchObject({ ok: true, value: { enqueue: { retryOfTaskId: original.task_id } } });
+  });
+
+  it.each(['foreign-owner', 'foreign-source', 'missing-shared-task'])(
+    'rejects ambiguous or mismatched recovery provenance: %s', async kind => {
+      const cid = `invalid-scope-${kind}`;
+      const board = await import('../../../../src/main/features/group_chat/task_board');
+      const task = await board.createTask(UID, cid, { assignee: kind === 'foreign-owner' ? 'researcher' : 'commander',
+        instruction: 'A separate task.', createdBy: 'user', sourceMsgId: kind === 'foreign-source' ? 'another-source' : `${cid}-source` });
+      const rows = await writeAttempt(cid, { task_id: kind === 'missing-shared-task' ? 'unknown-task' : task.task_id,
+        source_message_id: `${cid}-source` });
+      rows[0].to = ['commander', 'researcher'];
+      const layout = await import('../../../../src/main/util/project-layout');
+      fs.writeFileSync(layout.conversationMessageFile(UID, cid), rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+      const api = await import('../../../../src/main/features/group_chat');
+      expect(await api.resolveFailedTurnRetry({ userId: UID, cid, failedMessageId: `${cid}-failed`, visibleText: 'Retry' }))
+        .toMatchObject({ ok: false });
+    });
+
   it('preserves the original language request on resume rather than selecting the English recovery prose', async () => {
     const cid = 'language-resume-cid';
     const request = 'Inspect the input and reply in Korean.';

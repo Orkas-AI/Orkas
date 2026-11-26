@@ -6,9 +6,11 @@ import * as projectTasks from './project_tasks';
 import { createLogger } from '../logger';
 import { prompts } from '../prompts/loader';
 import { logErrorSummary } from '../util/log-redact';
+import { projectGoalAndRecapEnabled } from '../util/project-feature-flags';
 import { formatConnectorSetupAssistance } from './connector_setup_context';
 import { hasPendingConversationFiling } from './conversation_filing';
 import { readState } from './group_chat/state';
+import * as projectRecap from './project_recap';
 
 const log = createLogger('conversation-assistance');
 /** Ids listed per group; counts stay exact beyond this. */
@@ -23,6 +25,7 @@ const HANDOFF_NOTE_CHARS = 2000;
 const HANDOFF_NOTE_READ_BYTES = 16 * 1024;
 
 type Task = projectTasks.ProjectTask;
+type Automation = import('./auto_tasks').AutoTask;
 
 function isOpen(task: Task): boolean {
   return task.status !== 'done';
@@ -60,10 +63,10 @@ const UNFINISHED_RUN_AFTER_MS = 60 * 60 * 1000;
 /** The enabled automations in scope (every scope outside a project, the
  *  project's own inside one) and, among them, the ones whose last run failed
  *  or never reported an end. Empty when nothing is enabled. */
-async function automationFacts(userId: string, projectId?: string): Promise<string> {
+async function automationFacts(userId: string, projectId?: string, read?: Automation[]): Promise<string> {
   try {
     const autoTasks = await import('./auto_tasks');
-    const enabled = (await autoTasks.listTasks(userId, projectId === undefined ? undefined : { projectId }))
+    const enabled = (read ?? await autoTasks.listTasks(userId, projectId === undefined ? undefined : { projectId }))
       .filter((task) => task.enabled);
     if (!enabled.length) return '';
     const now = Date.now();
@@ -113,13 +116,18 @@ function dueList(tasks: readonly Task[]): string {
 /** Open to-dos linked to this conversation, in the conversation's own to-do
  *  scope. Only their count and ids reach a named Agent; content can run to
  *  thousands of characters, so it stays behind `todo_tasks` get. */
-async function openTodosGuidance(userId: string, cid: string, projectId: string): Promise<string> {
+async function openTodosGuidance(userId: string, cid: string, projectId: string, known?: Task[]): Promise<string> {
+  // `known` is this scope's list when the turn already read it.
   let tasks: Task[];
-  try {
-    tasks = await projectTasks.listTasks(userId, projectId);
-  } catch (err) {
-    log.warn('open to-dos unavailable for turn guidance', { error: logErrorSummary(err) });
-    return '';
+  if (known) {
+    tasks = known;
+  } else {
+    try {
+      tasks = await projectTasks.listTasks(userId, projectId);
+    } catch (err) {
+      log.warn('open to-dos unavailable for turn guidance', { error: logErrorSummary(err) });
+      return '';
+    }
   }
   const open = newestFirst(tasks.filter((task) => task.origin_cid === cid && isOpen(task)));
   if (!open.length) return '';
@@ -160,16 +168,11 @@ async function accountOpenWorkGuidance(userId: string, cid: string): Promise<str
 /** Commander inside a project: this project's backlog and automations only,
  *  so the account view is never repeated there. Empty when the backlog has
  *  nothing open and no automation run needs attention. */
-async function projectOpenWorkGuidance(userId: string, cid: string, projectId: string): Promise<string> {
-  let tasks: Task[];
-  try {
-    tasks = await projectTasks.listTasks(userId, projectId);
-  } catch (err) {
-    log.warn('project backlog unavailable for turn guidance', { error: logErrorSummary(err) });
-    return '';
-  }
+async function projectOpenWorkGuidance(userId: string, cid: string, projectId: string, snapshot: ProjectSnapshot): Promise<string> {
+  if (!snapshot.tasks) return '';
+  const tasks = snapshot.tasks;
   const progress = projectTasks.computeProgress(tasks);
-  const automation = await automationFacts(userId, projectId);
+  const automation = await automationFacts(userId, projectId, snapshot.automations);
   if (!progress.open && !automationFactsNeedAttention(automation)) return '';
   const byId = new Map(tasks.map((task) => [task.id, task]));
   // A missing dependency id cannot hold work back; only an unfinished one does.
@@ -195,6 +198,57 @@ async function projectOpenWorkGuidance(userId: string, cid: string, projectId: s
     automation_facts: automation,
   }).trim();
 }
+
+/** The project's to-dos and automations, read once for a Commander turn and
+ *  shared by the open-work snapshot and the "since last here" digest. */
+interface ProjectSnapshot { tasks?: Task[]; automations?: Automation[] }
+
+async function readProjectSnapshot(userId: string, projectId: string): Promise<ProjectSnapshot> {
+  const snapshot: ProjectSnapshot = {};
+  try {
+    snapshot.tasks = await projectTasks.listTasks(userId, projectId);
+  } catch (err) {
+    log.warn('project backlog unavailable for turn guidance', { error: logErrorSummary(err) });
+  }
+  try {
+    snapshot.automations = await (await import('./auto_tasks')).listTasks(userId, { projectId });
+  } catch (err) {
+    // Unreadable automations add no facts, as before; nothing reads them again.
+    log.warn('automations unavailable for turn guidance', { error: logErrorSummary(err) });
+    snapshot.automations = [];
+  }
+  return snapshot;
+}
+
+/** What changed in the project, outside this conversation, that neither
+ *  Commander nor the project page has shown the user yet (plan appendix A.1).
+ *  One report per run: a later Commander turn of the same run already told
+ *  the user. */
+async function projectSinceLastVisitGuidance(userId: string, cid: string, projectId: string, snapshot: ProjectSnapshot, turnId?: string): Promise<{
+  guidance: string; recap?: ShownRecap;
+}> {
+  if (projectRecap.recapShownInCurrentRun(userId, cid, turnId)) return { guidance: '' };
+  try {
+    if (!snapshot.tasks) return { guidance: '' };
+    const recap = await projectRecap.computeProjectRecap(userId, projectId, {
+      surface: 'commander', excludeCid: cid, tasks: snapshot.tasks, ...(snapshot.automations ? { automations: snapshot.automations } : {}),
+    });
+    if (!recap.total) return { guidance: '' };
+    return {
+      guidance: prompts.load('project_since_last_visit', {
+        since: projectRecap.formatRecapSince(recap),
+        change_lines: projectRecap.formatRecapLines(recap),
+      }).trim(),
+      recap: { projectId, computed_at: recap.computed_at, counts: projectRecap.recapCounts(recap) },
+    };
+  } catch (err) {
+    log.warn('project changes unavailable for turn guidance', { error: logErrorSummary(err) });
+    return { guidance: '' };
+  }
+}
+
+/** The digest a turn showed, for recording it as seen once the turn is delivered. */
+export type ShownRecap = projectRecap.ShownRecap;
 
 /** A fence longer than any run of backticks in the body, so the note's own
  *  fences cannot end the block early. */
@@ -242,9 +296,11 @@ async function readNoteHead(notePath: string): Promise<{
   }
 }
 
-/** Run facts and handoff state beyond this conversation's visible history.
- *  Only the current recorded run's conversation receives them; reopening an
- *  older run's conversation is ordinary chat. */
+/** What an automation run may not see from its conversation's history:
+ *  which run it is, how the run before it ended, and the handoff note the
+ *  task keeps between runs. Only a run in progress in the conversation of
+ *  the run on record gets it; the same conversation between runs, or an
+ *  older run's conversation reopened later, is ordinary chat. */
 async function automationRunGuidance(userId: string, cid: string, taskId: string): Promise<{
   guidance: string; readSeed?: ReadSeed;
 }> {
@@ -296,13 +352,15 @@ async function automationRunGuidance(userId: string, cid: string, taskId: string
 export async function resolveConversationAssistanceForTurn(
   userId: string,
   cid: string,
-  delivery: { agentId?: string; outputDelivery?: 'final' | 'process' } = {},
+  delivery: { agentId?: string; outputDelivery?: 'final' | 'process'; hostTodoRun?: boolean; turnId?: string } = {},
 ): Promise<{
   kind?: chats.ConversationAssistance['kind'];
   guidance: string;
   /** Files whose complete text the guidance carries, stamped as already read
    *  for this run; absent when nothing was shown whole. */
   readSeeds?: ReadSeed[];
+  /** The project's news this turn tells the user; absent when there is none. */
+  recap?: ShownRecap;
 }> {
   const conversation = await chats.getConversationMetadata(userId, cid);
   if (!conversation) return { kind: undefined, guidance: '' };
@@ -316,14 +374,20 @@ export async function resolveConversationAssistanceForTurn(
   const entryGuidance = assistance?.kind === 'app_creation'
     ? prompts.load('app_creation_guidance').trim()
     : formatConnectorSetupAssistance(assistance);
-  let automationTaskId = '';
-  try { automationTaskId = (await import('./auto_tasks')).activeRunTaskId(userId, cid); }
+  // Only the time a run is in progress is that run, in any conversation: runs
+  // continue in the conversation an automation created, so the user's own
+  // follow-up there between runs is ordinary chat (review S3-4). A run in
+  // progress names its own task, even in another automation's conversation.
+  // A conversation an automation created stays its output throughout, so it
+  // still gets no offer to save, schedule or file the work (2026-10-28).
+  let runTaskId = '';
+  try { runTaskId = (await import('./auto_tasks')).activeRunTaskId(userId, cid); }
   catch (err) { log.warn('automation run state unavailable for turn guidance', { error: logErrorSummary(err) }); }
-  automationTaskId ||= conversation.origin_auto_task_id || '';
+  const automationTaskId = runTaskId || conversation.origin_auto_task_id || '';
   // The actor delivering an automation run's result learns which run this
   // is, how the previous one ended and what the task's handoff note holds.
-  const automation = automationTaskId && finalDelivery
-    ? await automationRunGuidance(userId, cid, automationTaskId)
+  const automation = runTaskId && finalDelivery
+    ? await automationRunGuidance(userId, cid, runTaskId)
     : { guidance: '' };
   const automationRun = automation.guidance;
   // A conversation an automation created already recurs and has no one to
@@ -336,32 +400,47 @@ export async function resolveConversationAssistanceForTurn(
   // the Commander holds the project executor, so only it is told to offer one.
   const projectOffer = commander && finalDelivery && !automationTaskId
     && !conversation.project_id && !hasPendingConversationFiling(userId, cid)
-    ? prompts.load('project_offer_guidance').trim()
+    ? prompts.load('project_offer_guidance', {
+      goal_inputs: projectGoalAndRecapEnabled() ? ' and any goal and success criteria they\n  stated or agreed to' : '',
+    }).trim()
     : '';
   // Publish the host scope fact before any global backlog tool selection.
   const todoScope = finalDelivery && !conversation.project_id
-    ? prompts.load('global_todo_scope').trim()
+    ? prompts.load(commander ? 'global_todo_scope_commander' : 'global_todo_scope', {
+      goal_and: projectGoalAndRecapEnabled() ? 'goal and ' : '',
+    }).trim()
     : '';
   // Commander alone sees the open-work snapshot: global-only outside a
-  // project, the project's own backlog inside one. A conversation an
-  // automation created runs one scheduled job and gets no snapshot. The
-  // snapshot carries this conversation's own to-dos, so the plain facts block
-  // remains only where the snapshot is absent.
+  // project, the project's own backlog inside one. An automation's run is
+  // one scheduled job and gets no snapshot. The snapshot carries this
+  // conversation's own to-dos, so the plain facts block remains only where
+  // the snapshot is absent.
+  const projectSnapshot = commander && finalDelivery && !automationTaskId && conversation.project_id
+    ? await readProjectSnapshot(userId, conversation.project_id)
+    : undefined;
   const openWork = commander && finalDelivery && !automationTaskId
     ? (conversation.project_id
-      ? await projectOpenWorkGuidance(userId, cid, conversation.project_id)
+      ? await projectOpenWorkGuidance(userId, cid, conversation.project_id, projectSnapshot || {})
       : await accountOpenWorkGuidance(userId, cid))
     : '';
+  // The project Commander replying to the user learns what changed elsewhere
+  // in the project since the user was last shown it. A to-do run the host
+  // started may have no reader, so it neither reports the news nor counts as
+  // having shown it; an automation run is excluded above.
+  const since = projectSnapshot && !delivery.hostTodoRun
+    ? await projectSinceLastVisitGuidance(userId, cid, conversation.project_id!, projectSnapshot, delivery.turnId)
+    : { guidance: '' };
   const openTodos = finalDelivery && !openWork
-    ? await openTodosGuidance(userId, cid, conversation.project_id || '')
+    ? await openTodosGuidance(userId, cid, conversation.project_id || '', projectSnapshot?.tasks)
     : '';
   return {
     kind: assistance?.kind,
     guidance: [
-      entryGuidance, automationRun, followUp, projectOffer, todoScope, openWork, openTodos,
+      entryGuidance, automationRun, followUp, projectOffer, todoScope, openWork, since.guidance, openTodos,
     ]
       .filter(Boolean)
       .join('\n\n'),
     ...(automation.readSeed ? { readSeeds: [automation.readSeed] } : {}),
+    ...(since.recap ? { recap: since.recap } : {}),
   };
 }

@@ -13,7 +13,7 @@
 
 ## Calling
 
-Pass `production_dir` on every `generate_video` and `generate_image`. Up to 4 can run at once, so request independent shots together.
+Pass `production_dir` on every `generate_video` and `generate_image`. Up to 4 can run at once, so request independent shots together. Once the planned external calls are authorized, group independent stills with distinct output paths and all references ready. Check each still before submitting any image or shot that uses it as a reference.
 
 ```json
 { "prompt": "...", "output_path": "lamp-ad/shots/glow.mp4", "production_dir": "lamp-ad",

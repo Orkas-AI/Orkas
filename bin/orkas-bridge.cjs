@@ -421,7 +421,7 @@ function createServer() {
           return textResult(result.text);
         } catch (err) { return errorResult(err); }
       },
-      ['cid', ...contract.rejectedFields],
+      ['cid', ...contract.rejectedFields, ...contract.legacyReadFields],
     ));
   }
 
@@ -452,6 +452,11 @@ function createServer() {
           source_path: z.string().min(1).optional().describe('For add_attachment, supply task_id and the absolute path of a file in the current workspace or conversation attachments. Copies into the task using its filename; existing names are rejected. Maximum 200 MiB.'),
           owner: z.string().optional().describe('Agent DISPLAY NAME, not an id. Empty clears on update.'),
           due_at: z.string().optional().describe('Local calendar date YYYY-MM-DD the user wants the task done by, when they gave one. Empty clears on update.'),
+          // Mirrors core-agent project-tasks-tool.ts.
+          ...{
+            note: z.string().max(300).optional().describe("Update/complete: one line the user reads when they return, in the user's language: for review or done, what was delivered and where it is; while stuck, what the user must provide. Replaces the previous note; empty clears it."),
+            note_kind: z.enum(['result', 'blocker']).optional().describe('With note: result (default) or blocker.'),
+          },
         } : {}),
         // The owning executor validates effective ids and ignores unused list/create values.
         task_id: z.string().min(1).optional().catch(ctx => ctx.input).describe('Required for get/update/complete/add_attachment/delete. Omit for list/create; ignored if supplied, reported in ignored_fields. Created task ids come from the result. delete also removes attachments.'),

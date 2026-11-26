@@ -21,6 +21,7 @@ import { GOOGLE_ENTRIES } from './catalog-google';
 import { LOCAL_COMMERCE_ENTRIES } from './catalog-local-commerce';
 import { REMOTE_COMMERCE_ENTRIES } from './catalog-remote-commerce';
 import { JAPAN_COMMERCE_ENTRIES } from './catalog-japan-commerce';
+import { OPENSEO_ENTRY } from './catalog-openseo';
 import type { CatalogEntry } from './types';
 
 const GOOGLE_DRIVE_ICON_SVG = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#1e88e5" d="M4.5 20.5h15L24 12.7h-15z"/><path fill="#fbc02d" d="M9 12.7h15L16.5 0h-15z"/><path fill="#43a047" d="M0 20.5h4.5L16.5 0H12z"/></svg>';
@@ -70,6 +71,7 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     category: 'communication',
     description_zh: '读取 Outlook 个人资料、联系人、邮箱设置和任务。',
     description_en: 'Read Outlook profile, contacts, mailbox settings, and tasks.',
+    setup_scope_note: 'Cannot read email messages.',
     description_es: "Consulta el perfil, los contactos, la configuración del buzón y las tareas de Outlook.",
     description_fr: "Consultez le profil Outlook, les contacts, les paramètres de la boîte aux lettres et les tâches.",
     description_ko: "Outlook 프로필, 연락처, 사서함 설정, 작업을 읽습니다.",
@@ -461,6 +463,7 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     usage_metering: { provider: 'composio', credits_milli_per_call: 420 },
   },
   ...GOOGLE_ENTRIES,
+  OPENSEO_ENTRY,
   {
     id: 'bing-webmaster',
     display_name: 'Bing Webmaster Tools',

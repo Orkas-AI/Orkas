@@ -55,7 +55,10 @@ function loadNavigation(initialView: string, initialId = '') {
     return elements.get(id)!;
   };
   const setView = vi.fn();
-  const selectSkillFile = vi.fn(async () => {});
+  const selectSkillFile = vi.fn(async (source: string, id: string, filepath: string) => {
+    context._selectedSkill = { source, id, filepath };
+  });
+  const invoke = vi.fn(async (..._args: unknown[]) => ({ discarded: true }));
   const context: any = {
     Object,
     currentView: initialView,
@@ -65,7 +68,14 @@ function loadNavigation(initialView: string, initialId = '') {
     _skillEditMode: false,
     _skillEditSkillId: null,
     _selectedSkill: null,
-    _importDraftId: null,
+    currentUserId: 'account-a',
+    _skillDraftCleanups: new Map(),
+    _skillDetailOwnerId: null,
+    _skillPackageDraftId: null,
+    _skillDraftEditedId: null,
+    _isSkillPlatformSource: () => false,
+    _flushSkillFieldSave: vi.fn(async () => true),
+    window: { orkas: { invoke } },
     _skillSource: (source: string) => source,
     _skillChatCtrl: null,
     _updateEditButtonLabel: vi.fn(),
@@ -81,6 +91,9 @@ function loadNavigation(initialView: string, initialId = '') {
   };
   vm.createContext(context);
   vm.runInContext([
+    extractFunction(skillsSource, '_onSkillsBack'),
+    extractFunction(skillsSource, '_recycleEmptySkillDetailDraft'),
+    extractFunction(skillsSource, 'toggleSkillEditMode'),
     extractFunction(skillsSource, '_normalizeSkillDetailReturnTarget'),
     extractFunction(skillsSource, '_captureSkillDetailReturnTarget'),
     extractFunction(skillsSource, '_showSkillsGridView'),
@@ -90,7 +103,7 @@ function loadNavigation(initialView: string, initialId = '') {
     extractFunction(skillsSource, '_returnFromSkillsDetailView'),
     extractFunction(skillsSource, '_resetSkillsDetailForNavigation'),
   ].join('\n'), context);
-  return { context, element, selectSkillFile, setView };
+  return { context, element, invoke, selectSkillFile, setView };
 }
 
 describe('skill detail return navigation', () => {
@@ -123,6 +136,69 @@ describe('skill detail return navigation', () => {
     expect(setView).not.toHaveBeenCalled();
     expect(element('panel-skills').classList.contains('resource-detail-overlay')).toBe(false);
     expect(element('skills-grid-view').style.display).toBe('flex');
+  });
+
+  it.each(['back', 'navigation', 'another skill'])('requests cleanup of the exact old detail when leaving by %s', async (route) => {
+    const { context, invoke } = loadNavigation('skills');
+    await context.openSkillDetail('custom', 'old-import');
+    if (route === 'back') context._onSkillsBack();
+    else if (route === 'navigation') context._resetSkillsDetailForNavigation();
+    else await context.openSkillDetail('custom', 'other-skill');
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('skills.discardImportDraft', {
+      id: 'old-import', ownerId: 'account-a',
+    });
+  });
+
+  it('returns to the list on Done when the host recycled the placeholder', async () => {
+    const { context, invoke, element } = loadNavigation('skills');
+    await context.openSkillDetail('custom', 'old-import');
+    context._skillEditMode = true;
+    context._skillEditSkillId = 'old-import';
+    await context.toggleSkillEditMode();
+    expect(context._flushSkillFieldSave).toHaveBeenCalledWith({ validate: true });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('skills.discardImportDraft', {
+      id: 'old-import', ownerId: 'account-a',
+    });
+    await vi.waitFor(() => expect(element('skills-grid-view').style.display).toBe('flex'));
+  });
+
+  it('leaves a locally edited draft alone even while autosave is pending', async () => {
+    const { context, invoke } = loadNavigation('skills');
+    await context.openSkillDetail('custom', 'changed');
+    context._skillDraftEditedId = 'changed';
+    context._onSkillsBack();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('finishes the edit without waiting for recycling and keeps a removed draft from reopening', async () => {
+    const { context, selectSkillFile, invoke } = loadNavigation('skills');
+    let finishCleanup!: () => void;
+    invoke.mockImplementationOnce(() => new Promise(resolve => {
+      finishCleanup = () => resolve({ discarded: true });
+    }));
+    await context.openSkillDetail('custom', 'pending-import');
+    context._skillEditMode = true;
+    context._skillEditSkillId = 'pending-import';
+    await context.toggleSkillEditMode();
+    expect(context._skillEditMode).toBe(false);
+    const renderCount = selectSkillFile.mock.calls.length;
+    const reopen = context.openSkillDetail('custom', 'pending-import');
+    finishCleanup();
+    await reopen;
+    expect(selectSkillFile).toHaveBeenCalledTimes(renderCount);
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains the original draft identity when leaving a package result after switching accounts', async () => {
+    const { context, invoke } = loadNavigation('skills');
+    await context.openSkillDetail('custom', 'package-draft');
+    context._skillPackageDraftId = 'package-draft';
+    context._selectedSkill = null;
+    context.currentUserId = 'account-b';
+    context._onSkillsBack();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('skills.discardImportDraft', {
+      id: 'package-draft', ownerId: 'account-a',
+    });
   });
 
   it('routes cross-page skill entries through the overlay helper and resets on navigation', () => {

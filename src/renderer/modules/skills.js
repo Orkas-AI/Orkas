@@ -985,27 +985,31 @@ async function _flipSkillEnabled(skillId, nextEnabled) {
 
 // ─── View switching: grid ↔ detail ─────────────────────────────────────
 
-// Back from the skill detail/edit view. An unconfirmed URL-import draft (a
-// placeholder that was never authored — set in `_saveSkillFromUrl`, cleared
-// once real content is written or the user clicks Done) prompts before
-// leaving: the user explicitly chooses to discard the half-finished import or
-// keep working. Authored/committed skills and ordinary edits just leave.
-async function _onSkillsBack() {
-  if (_importDraftId) {
-    const discard = await uiConfirm({
-      message: t('skills.import.back_confirm'),
-      okLabel: t('skills.import.back_discard'),
-      cancelLabel: t('skills.import.back_continue'),
-    });
-    if (!discard) return; // "keep editing" — stay in the edit chat
-    const draftId = _importDraftId;
-    _importDraftId = null;
-    try {
-      const r = await window.orkas.invoke('skills.discardImportDraft', { id: draftId });
-      if (r && r.discarded) { _skillsCache = null; await loadSkills(); }
-    } catch (_) { /* best effort — a leftover empty draft is non-fatal */ }
-  }
+function _onSkillsBack() {
   _returnFromSkillsDetailView();
+}
+
+// The host decides whether the selected item is a pristine import draft.
+// Protect local edits immediately, even while the autosave timer is pending.
+function _recycleEmptySkillDetailDraft() {
+  const id = _skillPackageDraftId || (_selectedSkill?.source === 'custom' && _selectedSkill.id);
+  const ownerId = _skillDetailOwnerId;
+  if (!id || !ownerId || _skillDraftEditedId === id) return Promise.resolve(false);
+  const key = `${ownerId}:${id}`;
+  const pending = _skillDraftCleanups.get(key);
+  if (pending) return pending;
+
+  const cleanup = (async () => {
+    try {
+      const result = await window.orkas.invoke('skills.discardImportDraft', { id, ownerId });
+      if (!result?.discarded) return false;
+      _skillsCache = null;
+      try { await loadSkills(); } catch (_) { /* The grid can refresh on its next load. */ }
+      return true;
+    } catch (_) { return false; }
+  })().finally(() => _skillDraftCleanups.delete(key));
+  _skillDraftCleanups.set(key, cleanup);
+  return cleanup;
 }
 
 function _normalizeSkillDetailReturnTarget(target) {
@@ -1052,6 +1056,10 @@ function _showSkillsGridView() {
     if (chatCol) chatCol.style.display = 'none';
     _updateEditButtonLabel();
   }
+  void _recycleEmptySkillDetailDraft();
+  _skillPackageDraftId = null;
+  _skillDraftEditedId = null;
+  _skillDetailOwnerId = null;
   if (grid) grid.style.display = 'flex';
   if (detail) detail.style.display = 'none';
   // Collapse source tree so next detail open starts clean.
@@ -1110,6 +1118,18 @@ function _resetSkillsDetailForNavigation() {
 
 async function _showSkillsDetailView(source, id, opts = {}) {
   source = _skillSource(source);
+  const pendingCleanup = source === 'custom' && _skillDraftCleanups.get(`${currentUserId}:${id}`);
+  if (pendingCleanup && await pendingCleanup) return;
+  if (_skillPackageDraftId || (_selectedSkill
+      && (_selectedSkill.id !== id || _selectedSkill.source !== source))) {
+    if (_skillEditMode) {
+      try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
+    }
+    void _recycleEmptySkillDetailDraft();
+    _skillPackageDraftId = null;
+    _skillDraftEditedId = null;
+  }
+  _skillDetailOwnerId = currentUserId;
   const grid = document.getElementById('skills-grid-view');
   const detail = document.getElementById('skills-detail-view');
   if (grid) grid.style.display = 'none';
@@ -1132,9 +1152,8 @@ async function _showSkillsDetailView(source, id, opts = {}) {
 
 // Switch the detail pane to the "installed as an external package" state.
 // A URL import can resolve to a verbatim package (in the per-user packages
-// tree) rather than an editable skill; main already removed the placeholder
-// skill, so there is no skill content to render. Point the user to package
-// management instead.
+// tree) rather than an editable skill. The draft stays recoverable until
+// the user leaves this detail view.
 function _showSkillAsPackageState(name) {
   _skillEditMode = false;
   _skillEditSkillId = null;
@@ -1163,8 +1182,7 @@ function _showSkillAsPackageState(name) {
   };
   const backBtn = document.getElementById('skills-as-package-back');
   if (backBtn) backBtn.onclick = () => _onSkillsBack();
-  // Placeholder skill is gone and a package may now contribute skills —
-  // refresh the grid in the background so a later "Back" shows fresh state.
+  // A package may contribute skills. Refresh the grid in the background.
   Promise.resolve().then(() => loadSkills()).catch(() => {});
 }
 
@@ -1890,7 +1908,10 @@ function _renderSkillFileEditor(body, content, _ext) {
     }, 600);
   };
 
-  ta.addEventListener('input', scheduleSave);
+  ta.addEventListener('input', () => {
+    if (_selectedSkill?.source === 'custom') _skillDraftEditedId = skillId;
+    scheduleSave();
+  });
 }
 
 // ─── Skill name inline edit (mirrors agents.js's name editor) ───
@@ -1961,6 +1982,7 @@ let _pendingSkillField = null;
 let _skillFieldSaveTimer = null;
 function _scheduleSkillFieldSave(field, value) {
   if (!_canEditSelectedSkillName()) return;
+  if (_selectedSkill.source === 'custom') _skillDraftEditedId = _selectedSkill.id;
   _pendingSkillField = { field, value };
   clearTimeout(_skillFieldSaveTimer);
   _skillFieldSaveTimer = setTimeout(_flushSkillFieldSave, 800);
@@ -2086,11 +2108,11 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
 
 let _skillEditMode = false;
 let _skillEditSkillId = null;
-// Id of an unconfirmed URL-import placeholder skill. While set, leaving the
-// import chat discards the draft if it was never authored (e.g. the source was
-// installed as an external package, or the install failed). Cleared once the
-// import produces real content or finalizes as a package.
-let _importDraftId = null;
+// The package result view no longer has a selected editable Skill.
+const _skillDraftCleanups = new Map();
+let _skillDetailOwnerId = null;
+let _skillPackageDraftId = null;
+let _skillDraftEditedId = null;
 
 function _updateEditButtonLabel() {
   const btn = document.getElementById('skill-edit-btn');
@@ -2114,12 +2136,9 @@ function _skillImportAutoSeedFromResponse(data) {
   const displayText = typeof data?.seedDisplayText === 'string' && data.seedDisplayText.trim()
     ? data.seedDisplayText.trim()
     : t('skills.import_seed_display');
-  return { displayText, modelText, force: true };
-}
-
-function _skillAutoSeedHasModelText(autoSeed) {
-  if (typeof autoSeed === 'string') return !!autoSeed.trim();
-  return !!(autoSeed && typeof autoSeed === 'object' && typeof autoSeed.modelText === 'string' && autoSeed.modelText.trim());
+  return { displayText, modelText, force: true,
+    ...(data?.importMetadataId ? { importMetadataId: data.importMetadataId } : {}),
+  };
 }
 
 // When called with {autoSeed: true} (e.g. right after skill creation), sends
@@ -2129,7 +2148,7 @@ function _skillAutoSeedHasModelText(autoSeed) {
 // mode (user clicks "edit" on an existing skill) no message is sent
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
-  if (!_selectedSkill) return;
+  if (!_selectedSkill || _skillDraftCleanups.has(`${_skillDetailOwnerId}:${_selectedSkill.id}`)) return;
   // Marketplace editing is dev-only; lift the source guard accordingly.
   if (_selectedSkill.source !== 'custom'
       && !(_isSkillPlatformSource(_selectedSkill.source) && false)) return;
@@ -2148,13 +2167,19 @@ async function toggleSkillEditMode(opts = {}) {
     // rename + refreshes caches before we re-render readonly view.
     const committed = await _flushSkillFieldSave({ validate: true });
     if (committed === false) return;
-    // Explicit "Done" is a commit: keep the skill (even an empty import draft
-    // the user chose to finalize) and stop the back-prompt from firing.
-    _importDraftId = null;
+    if (!_selectedSkill || !_skillEditMode || _skillEditSkillId !== _selectedSkill.id) return;
+    const completedSkillId = _selectedSkill.id;
     _skillEditMode = false;
     _skillEditSkillId = null;
     document.getElementById('skills-chat-col').style.display = 'none';
     _updateEditButtonLabel();
+    const completedOwnerId = _skillDetailOwnerId;
+    void _recycleEmptySkillDetailDraft().then((recycled) => {
+      if (!recycled || _selectedSkill?.id !== completedSkillId || _skillEditMode
+          || _skillDetailOwnerId !== completedOwnerId) return;
+      _selectedSkill = null;
+      _returnFromSkillsDetailView();
+    });
     // Swap the body back to read-only view of the current file. Use the
     // _selectedSkill.id snapshot — flush may have rotated it if the
     // directory got renamed.
@@ -2190,7 +2215,11 @@ async function toggleSkillEditMode(opts = {}) {
             ? opts.autoSeed.displayText.trim()
             : t('skills.import_seed_display'))
         : t('skills.help_finish_seed');
-      await _skillChatCtrl.send(displayText, { model_text: seed });
+      const importMetadataId = opts.autoSeed?.importMetadataId;
+      await _skillChatCtrl.send(displayText, {
+        model_text: seed,
+        ...(importMetadataId ? { import_metadata_id: importMetadataId } : {}),
+      });
     }
   }
 }
@@ -2294,13 +2323,9 @@ function _ensureSkillChatController() {
     hooks: {
       buildExtraBody: _buildSkillEditChatExtraBody,
       async onFinal(ev, msgEl, id) {
-        // Authoring wrote real files → this import produced a genuine custom
-        // skill; commit it so backing out no longer prompts/discards.
-        if (ev?.written?.length || ev?.created?.length) _importDraftId = null;
         if (_pendingSkillImportReplacementId) {
           const nextId = _pendingSkillImportReplacementId;
           _pendingSkillImportReplacementId = null;
-          _importDraftId = null;
           _skillEditSkillId = nextId;
           _selectedSkill = { source: 'custom', id: nextId, filepath: 'SKILL.md' };
           _skillsCache = null;
@@ -2315,13 +2340,9 @@ function _ensureSkillChatController() {
       onStreamEvent(ev, msgEl, id) {
         const inner = ev?.event;
         if (!inner) return;
-        // `skill_as_package`: the URL import was installed as an external
-        // package and main deleted the placeholder skill. Switch the detail
-        // pane to the package result state (no skill content to show).
         if (inner.stream === 'skill_as_package') {
-          // Placeholder already deleted by main; clear the draft guard so the
-          // grid-view exit doesn't try to re-discard a gone id.
-          _importDraftId = null;
+          if (_skillEditSkillId !== id || _selectedSkill?.id !== id) return;
+          _skillPackageDraftId = id;
           _showSkillAsPackageState(inner.data?.name || '');
           return;
         }
@@ -2329,8 +2350,7 @@ function _ensureSkillChatController() {
           const nextId = inner.data?.skillId || inner.data?.skills?.[0]?.skill_id || '';
           if (nextId) {
             _pendingSkillImportReplacementId = nextId;
-            _importDraftId = null;
-            _skillsCache = null;
+              _skillsCache = null;
           }
           return;
         }
@@ -2342,10 +2362,9 @@ function _ensureSkillChatController() {
         const { oldId, newId } = inner.data || {};
         if (!oldId || !newId || oldId === newId) return;
         if (id !== oldId && _skillEditSkillId !== oldId) return;
-        // A rename means real content was authored — commit the import draft.
-        _importDraftId = null;
         // Update active selection / id-resolver target
         _skillEditSkillId = newId;
+        if (_skillDraftEditedId === oldId) _skillDraftEditedId = newId;
         if (_selectedSkill && _selectedSkill.id === oldId) {
           _selectedSkill = { ..._selectedSkill, id: newId };
         }
@@ -2652,9 +2671,6 @@ async function _saveSkillFromUrl({ msgEl }) {
     }
     const createdId = _skillCreateIdFromResponse(data);
     const autoSeed = _skillImportAutoSeedFromResponse(data);
-    // URL imports start as empty placeholders. If the user backs out before
-    // the edit chat authors real content, offer to discard that placeholder.
-    _importDraftId = data.skill?.id && _skillAutoSeedHasModelText(autoSeed) ? data.skill.id : null;
     await _afterSkillCreated(createdId, true, autoSeed);
   } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');

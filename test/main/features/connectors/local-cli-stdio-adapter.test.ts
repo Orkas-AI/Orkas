@@ -66,21 +66,33 @@ describe('official local CLI MCP adapter', () => {
     const workDir = path.join(runtimeDir, 'work');
     fs.mkdirSync(workDir);
     const schemaStarted = path.join(runtimeDir, 'schema-started');
+    const releaseSchema = path.join(runtimeDir, 'release-schema');
     const mutation = path.join(runtimeDir, 'mutation');
     const descendantMutation = path.join(runtimeDir, 'descendant-mutation');
     const descendantPid = path.join(runtimeDir, 'descendant-pid');
+    const descendantCode = [
+      "const fs = require('node:fs');",
+      `fs.writeFileSync(${JSON.stringify(descendantPid)}, String(process.pid));`,
+      `fs.writeFileSync(${JSON.stringify(schemaStarted)}, 'started');`,
+      'const poll = setInterval(() => {',
+      `  if (!fs.existsSync(${JSON.stringify(releaseSchema)})) return;`,
+      `  fs.writeFileSync(${JSON.stringify(descendantMutation)}, 'schema fixture completed');`,
+      '  clearInterval(poll);',
+      '  clearTimeout(watchdog);',
+      '}, 25);',
+      'const watchdog = setTimeout(() => { clearInterval(poll); process.exitCode = 1; }, 15000);',
+    ].join('\n');
     const fakeCli = path.join(runtimeDir, 'npx-cli.cjs');
     fs.writeFileSync(fakeCli, [
       "const fs = require('node:fs');",
       "if (process.argv.includes('--schema')) {",
-      `  require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify([
-        `require('node:fs').writeFileSync(${JSON.stringify(descendantPid)}, String(process.pid));`,
-        `require('node:fs').writeFileSync(${JSON.stringify(schemaStarted)}, 'started');`,
-        `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(descendantMutation)}, 'unexpected late effect'), 450);`,
-      ].join('\n'))}], { stdio: 'inherit' });`,
-      `  setTimeout(() => process.stdout.write(JSON.stringify({ effect: 'write' })), 350);`,
+      `  const descendant = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendantCode)}], { stdio: 'inherit' });`,
+      '  descendant.once("exit", (code) => {',
+      "    if (code === 0) process.stdout.write(JSON.stringify({ effect: 'write' }));",
+      '    else process.exitCode = 1;',
+      '  });',
       '} else {',
-      `  fs.writeFileSync(${JSON.stringify(mutation)}, 'unexpected mutation');`,
+      `  fs.writeFileSync(${JSON.stringify(mutation)}, 'official write was executed');`,
       `  process.stdout.write(JSON.stringify({ ok: true }));`,
       '}',
     ].join('\n'));
@@ -112,19 +124,22 @@ describe('official local CLI MCP adapter', () => {
       await vi.waitFor(() => expect(fs.existsSync(schemaStarted)).toBe(true), { timeout: 5_000 });
       if (abandon === 'cancel') controller.abort();
       else if (abandon === 'disconnect') await client.close();
+      else fs.writeFileSync(releaseSchema, 'continue');
       const result = await pending;
       if (abandon === 'continue') {
         expect(result).not.toBeInstanceOf(Error);
         expect(result.isError).not.toBe(true);
       } else {
-        await new Promise((resolve) => setTimeout(resolve, 550));
+        expect(result).toBeInstanceOf(Error);
       }
+      // The fixture's watchdog outlives this assertion, so a child that was
+      // left running cannot satisfy the cancellation check by exiting on its own.
+      await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 6_000 });
       expect(fs.existsSync(mutation)).toBe(abandon === 'continue');
       expect(fs.existsSync(descendantMutation)).toBe(abandon === 'continue');
-      await vi.waitFor(() => expect(() => process.kill(Number(fs.readFileSync(descendantPid, 'utf8')), 0)).toThrow());
     } finally {
       await client.close();
-      fs.rmSync(runtimeDir, { recursive: true, force: true });
+      await fs.promises.rm(runtimeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
       expect(Buffer.concat(diagnostics).toString('utf8')).toBe('');
     }
   });

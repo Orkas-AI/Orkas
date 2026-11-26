@@ -155,6 +155,46 @@ describe('chats › createConversation', () => {
 });
 
 describe('chats › message history tombstones', () => {
+  it('reopens legacy VideoStudio previews in the task workspace alongside coding links', async () => {
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const state = await import('../../../src/main/features/group_chat/state');
+    const directory = await import('../../../src/main/features/local_agents/project-directory');
+    const workspace = await import('../../../src/main/features/user_workspace');
+    const { VIDEO_STUDIO_AGENT_ID } = await import('../../../src/main/model/core-agent/tool-catalog');
+    const { chatMediaLocalPathFromUrl } = await import('../../../src/main/util/chat-media-url');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { title: 'Legacy mixed task' });
+    const taskRoot = path.join(tmpDir, 'task-workspace');
+    const taskDir = path.join(taskRoot, 'promo');
+    const codingDir = path.join(tmpDir, 'coding-project');
+    for (const dir of [taskDir, codingDir]) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'main-v6.mp4'), dir === taskDir ? 'task video' : 'coding video');
+    }
+    expect(workspace.setWorkspacePath(TEST_UID, taskRoot).ok).toBe(true);
+    await state.setWorkspaceDirOnce(TEST_UID, cid, 'promo');
+    directory.writeCodingDirectory(TEST_UID, cid, codingDir, true);
+    const source = '[Original v6](main-v6.mp4) remains available.';
+    const historyFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const history = [VIDEO_STUDIO_AGENT_ID, 'coding-agent'].map((from, index) =>
+      JSON.stringify({ id: `reply-${index}`, ts: '2026-11-26T15:34:26', from, to: ['user'], text: source })
+    ).join('\n') + '\n';
+    fs.writeFileSync(historyFile, history);
+
+    const page = await chats.getMessagesPage(TEST_UID, cid, 10);
+    const videoPath = (text: string) => path.normalize(chatMediaLocalPathFromUrl(/\]\(([^)]+)\)/.exec(text)?.[1] ?? ''));
+    expect(page.history.map(row => videoPath(row.text))).toEqual([
+      path.join(taskDir, 'main-v6.mp4'), path.join(codingDir, 'main-v6.mp4'),
+    ]);
+    const indexed = await chats.getMessagesPageAtMessageId(TEST_UID, cid, 'reply-0');
+    expect(videoPath(indexed!.history[0].text)).toBe(path.join(taskDir, 'main-v6.mp4'));
+
+    fs.unlinkSync(path.join(taskDir, 'main-v6.mp4'));
+    const unavailable = await chats.getMessagesPage(TEST_UID, cid, 10);
+    expect(unavailable.history[0].text).toBe(source);
+    expect(fs.readFileSync(historyFile, 'utf8')).toBe(history);
+  });
+
   it('upgrades legacy assistant media URLs for display without rewriting user text', async () => {
     const chats = await loadChats();
     const mediaUrls = await import('../../../src/main/util/chat-media-url');
@@ -269,7 +309,53 @@ describe('chats › message history tombstones', () => {
     expect(persisted[3].produced).toBeUndefined();
   });
 
-  it('lists produced paths raw with the same resolution the display path applies', async () => {
+  it('shares a single history scan across a burst of callers and reads new output after a rewrite', async () => {
+    const chats = await loadChats();
+    const paths = await import('../../../src/main/paths');
+    const { listConversationOutputs } = await import('../../../src/main/features/conversation_outputs');
+    const { setWorkspaceDirOnce } = await import('../../../src/main/features/group_chat/state');
+    const client = await import('../../../src/main/features/conversation-history-client');
+    const request = vi.spyOn(client, 'historyRequest');
+    const fsPromises = createRequire(import.meta.url)('node:fs/promises');
+    const read = vi.spyOn(fsPromises, 'readFile');
+    syncBuiltinESMExports();
+    try {
+      const conversation = await chats.createConversation(TEST_UID, { title: 'files' });
+      const cid = conversation.conversation_id;
+      const directory = paths.userChatsDir(TEST_UID);
+      const history = path.join(directory, `${cid}.jsonl`);
+      // Legacy metadata can require sidebar participant enrichment. Listing
+      // outputs only needs the title and project, so it must never do that read.
+      const { agent_ids, commander_in_chat, participant_summary_updated_at, ...legacy } = conversation;
+      fs.writeFileSync(path.join(directory, '_index.json'), JSON.stringify([legacy]));
+      fs.writeFileSync(path.join(directory, cid, 'meta.json'), JSON.stringify(legacy));
+      await setWorkspaceDirOnce(TEST_UID, cid, 'files');
+      const output = ['before.txt', 'after.txt'].map(name => path.join(tmpDir, name));
+      for (const file of output) fs.writeFileSync(file, 'output');
+      const write = (file: string) => fs.writeFileSync(history,
+        JSON.stringify({ from: 'commander', produced: [file], process: [{ text: 'x'.repeat(1024 * 1024) }] }) + '\n');
+      write(output[0]);
+
+      const requests = await Promise.all(Array.from({ length: 37 }, async () => (
+        await listConversationOutputs(TEST_UID, cid)
+      ).items.map(item => item.path)));
+      expect(requests).toEqual(Array.from({ length: 37 }, () => [output[0]]));
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(read.mock.calls.some(([file]) => file === history)).toBe(false);
+      expect((await listConversationOutputs(TEST_UID, cid)).items.map(item => item.path)).toEqual([output[0]]);
+      expect(request).toHaveBeenCalledTimes(1);
+
+      write(output[1]);
+      expect(await chats.listProducedPaths(TEST_UID, cid, 500)).toEqual([output[1]]);
+      expect(request).toHaveBeenCalledTimes(2);
+    } finally {
+      request.mockRestore();
+      read.mockRestore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it('lists produced paths with the same resolution the display path applies', async () => {
     // The file panel and file-action authorization only need the produced
     // path strings. The oracle is the display path itself: the raw reader must
     // present exactly the paths getMessages presents — stored lists, the cited

@@ -109,7 +109,7 @@ finished clips. List key images, opening stills and clips together in the one
 
 ## Review
 
-In `video.sheet` frames and the delivered frames, check that a new viewer can
+In the preview and the delivered frames, check that a new viewer can
 tell who is who, where they are, what they want and what changed, that each
 person looks the same in every shot, and that no generated subtitle or music
 doubles the timeline's own. Name the shot and the fix.

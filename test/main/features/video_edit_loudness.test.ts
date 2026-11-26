@@ -1,6 +1,12 @@
+import { spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
-import { parseEbur128Summary } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
+import { editVideo, loudnormMeasuredOptions, normalizeLoudnessAudioFilter, parseEbur128Summary } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
+import { bundledFfmpegPaths } from '../../../src/main/util/bundled-runtime';
 
 // A realistic ffmpeg `ebur128=peak=true` stderr Summary block.
 const NORMAL = `
@@ -109,4 +115,43 @@ describe('parseEbur128Summary', () => {
     const clipping = NORMAL.replace('Peak:       -1.4 dBFS', 'Peak:        0.8 dBFS');
     expect(parseEbur128Summary(clipping)!.truePeakDbfs).toBe(0.8);
   });
+});
+
+// 2026-11-17 benchmark: delivery told the Agent to run normalize_loudness on a -18.4 LUFS ad, and
+// one loudnorm pass left it at -16.6, still outside the delivery's 2 LU, so the advice could not
+// be followed to the end. normalize_loudness now measures first and applies that measurement.
+describe('normalize_loudness reaches the delivery loudness', () => {
+  const { ffmpeg } = bundledFfmpegPaths();
+
+  it('turns a loudnorm measurement into second-pass options, and refuses an incomplete one', () => {
+    const measured = '{"input_i":"-28.25","input_tp":"-6.16","input_lra":"11.00","input_thresh":"-38.57","target_offset":"4.43"}';
+    expect(loudnormMeasuredOptions(`[Parsed_loudnorm_0 @ 0x1]\n${measured}\n`)).toBe('measured_I=-28.25:measured_TP=-6.16:measured_LRA=11:measured_thresh=-38.57:offset=4.43:linear=true');
+    expect(loudnormMeasuredOptions('{"input_i":"-inf","input_tp":"-inf","input_lra":"0.00","input_thresh":"-70.00","target_offset":"0.00"}')).toBeNull();
+    expect(loudnormMeasuredOptions('no json here')).toBeNull();
+    expect(normalizeLoudnessAudioFilter('measured_I=-28.25:linear=true')).toMatch(/^loudnorm=I=-14:TP=-1:LRA=11:measured_I=-28\.25:linear=true,aresample=/);
+    expect(normalizeLoudnessAudioFilter()).toMatch(/^loudnorm=I=-14:TP=-1:LRA=11,aresample=/);
+  });
+
+  it.skipIf(!ffmpeg)('brings a quiet music bed under a short voice within 2 LU of -14 LUFS', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-normalize-'));
+    try {
+      const input = path.join(dir, 'quiet.mp4');
+      const made = spawnSync(ffmpeg!, ['-y', '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'anoisesrc=d=20:c=pink:a=0.03:seed=7',
+        '-f', 'lavfi', '-i', 'sine=f=300:d=2.5,volume=0.35,tremolo=f=5:d=0.8',
+        '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=25:d=20',
+        '-filter_complex', '[1:a]adelay=300|300,apad[v];[0:a][v]amix=inputs=2:duration=first:normalize=0,aformat=channel_layouts=stereo[a]',
+        '-map', '2:v', '-map', '[a]', '-t', '20', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', input], { encoding: 'utf8' });
+      expect(made.status, made.stderr).toBe(0);
+      const output = path.join(dir, 'normalized.mp4');
+      const result: any = await editVideo({ op: 'normalize_loudness', inputAbsPath: input, outputAbsPath: output });
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      // Measured independently of the op, as delivery measures it.
+      const summary = spawnSync(ffmpeg!, ['-hide_banner', '-nostats', '-i', output, '-map', '0:a:0', '-af', 'ebur128=peak=true', '-f', 'null', '-'], { encoding: 'utf8' });
+      const integrated = parseEbur128Summary(summary.stderr)!.integratedLufs!;
+      expect(Math.abs(integrated + 14)).toBeLessThanOrEqual(2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

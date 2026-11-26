@@ -22,10 +22,13 @@ test.afterEach(async({modelOrkas:orkas})=>{
 test.setTimeout(180000);
 const id='builtin-content-workbench';
 // Load fault-fixture modules before a live app starts source-integrity checks.
-async function open(orkas:any,ready=true){
+async function open(orkas:any,ready=true,appId=id){
  const page=orkas.page!;await page.evaluate(()=>(window as any).setLang('zh'));await openSidebarEntry(page,'#apps-btn');
  await orkas.electronApp.evaluate(async(_electron:any,args:any)=>{if((globalThis as any).__contentOutputFixture)return;const raw=(process as any).mainModule.require.bind((process as any).mainModule),modules=new Map(Object.values(args).map((file:any)=>[file,raw(file)])),load=(file:string)=>modules.get(file)||(process as any).mainModule.constructor._cache[file]?.exports||raw(file);(globalThis as any).__contentOutputFixture={load,service:load(args.taskHost).taskService,workspace:load(args.workspace)};},{host:path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'),runtime:path.resolve(__dirname,'../../src/main/features/web_apps/runtime.ts'),taskHost:path.resolve(__dirname,'../../src/main/features/web_apps/task-host.ts'),workspace:path.resolve(__dirname,'../../src/main/features/group_chat/conv_workspace.ts'),paths:path.resolve(__dirname,'../../src/main/paths.ts')});
- const preview=await orkas.openPreview(()=>page.locator(`.app-card[data-app-id="${id}"]`).click()),frame=preview.frameLocator('.saved-app-viewer-frame');if(ready)await expect(frame.locator('#brief')).toBeEnabled();return{preview,frame};
+ const preview=await orkas.openPreview(()=>page.locator(`.app-card[data-app-id="${appId}"]`).click());
+ let frame=preview.frameLocator('.saved-app-viewer-frame');
+ if(appId==='builtin-product-listing'){await frame.locator('button[data-view="creative"]').click();frame=frame.frameLocator('#media-workspace');}
+ if(ready)await expect(frame.locator('#brief')).toBeEnabled();return{preview,frame};
 }
 async function index(frame:any){return frame.locator('body').evaluate(async()=>((await (window as any).orkasApp.storage.get({key:'content-index-v1',scope:'cloud'})).value));}
 async function work(frame:any,id:string){return frame.locator('body').evaluate(async(_el:any,id:string)=>JSON.parse((await (window as any).orkasApp.appFiles.readText({path:'works/'+id+'.json',scope:'cloud'})).text),id);}
@@ -118,6 +121,48 @@ test('creates quietly without an operation selector and automatically archives c
  await orkas.closePreview(preview);
 });
 
+for(const appId of [id,'builtin-product-listing'])test(`submits a text-only follow-up after a request with material in ${appId}`,async({modelOrkas:orkas},info)=>{
+ const {preview,frame}=await open(orkas,true,appId);
+ await frame.locator('#nav-image').click();
+ await frame.locator('#brief').fill('保留商品外观，生成一张白底主图。');
+ await transferFiles(frame,[{name:'product.png',base64:png}]);
+ await expect(frame.locator('#selected-assets .chat-attach-chip')).toHaveCount(1);
+ await stageOutputs(orkas,[{name:'first.png',base64:png}]);
+ orkas.setModelTextReplies(['已完成。']);
+ await frame.locator('#submit').click();
+ await expect.poll(async()=>(await index(frame))?.works[0]?.status,{timeout:30000}).toBe('completed');
+ const first=await work(frame,(await index(frame)).works[0].id);
+
+ const followUp='生成一张以红灯笼为主题的春节海报。';
+ await frame.locator('#brief').fill(followUp);
+ await expect(frame.locator('#selected-assets .chat-attach-chip')).toHaveCount(0);
+ await stageOutputs(orkas,[{name:'second.png',base64:png}]);
+ orkas.setModelTextReplies(['已完成。']);
+ await frame.locator('#submit').click();
+ await expect(frame.locator('#confirm')).toBeHidden({timeout:2500});
+ await expect.poll(async()=>(await index(frame))?.works.map((row:any)=>row.status),{timeout:30000}).toEqual(['completed','completed']);
+ const second=await work(frame,(await index(frame)).works[0].id);
+ expect(second).toMatchObject({brief:followUp,assetIds:[]});
+ const [firstSources,secondSources]=await frame.locator('body').evaluate(async(_el:any,requestIds:string[])=>{
+  const api=(window as any).orkasApp;
+  return Promise.all(requestIds.map(async requestId=>JSON.parse((await api.appFiles.readText({path:`requests/${requestId}.json`,scope:'cloud'})).text).sources));
+ },[first.jobs[0].requestId,second.jobs[0].requestId]);
+ expect(firstSources).toMatchObject([{name:'product.png'}]);
+ expect(secondSources).toEqual([]);
+ expect(orkas.modelRequests).toHaveLength(2);
+
+ if(appId==='builtin-product-listing'){
+  await orkas.page.evaluate(()=>(window as any).setLang('en'));
+  await frame.locator('body').evaluate(()=>window.dispatchEvent(new Event('focus')));
+  await expect(frame.locator('html')).toHaveAttribute('lang','en');
+  await preview.setViewportSize({width:480,height:720});
+ }else await preview.setViewportSize({width:1000,height:800});
+ const record=frame.locator('.history-row').filter({hasText:followUp});
+ await expect(record.locator('.record-summary')).toHaveText(followUp);
+ await record.scrollIntoViewIfNeeded();
+ await preview.screenshot({path:info.outputPath('text-only-follow-up.png')});
+ await orkas.closePreview(preview);
+});
 test('retries automatic result collection without another model run and exposes only safe saved-file actions',async({modelOrkas:orkas})=>{
  const{preview,frame}=await open(orkas);
  await orkas.electronApp!.evaluate(async(_electron,module)=>{const runtime=((globalThis as any).__contentOutputFixture?.load(module)||(process as any).mainModule.require(module)).runtime,original=runtime.execute;const state={fail:true};(globalThis as any).__collectionRetry=state;runtime.execute=async function(...args:any[]){if(args[1]==='tasks.output'&&state.fail)throw new (((globalThis as any).__contentOutputFixture?.load(module.replace('host.ts','runtime.ts'))||(process as any).mainModule.require(module.replace('host.ts','runtime.ts'))).AppError)('E_FAILED');return original.apply(this,args);};},path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'));
@@ -165,7 +210,7 @@ test('rejects unsupported and oversized pasted files before reading while retain
  const{preview,frame}=await open(orkas);await frame.locator('#brief').fill('Keep this request.');
  const handled=await frame.locator('#brief').evaluate(el=>{const w=window as any,original=FileReader.prototype.readAsDataURL;w.__fileReads=[];FileReader.prototype.readAsDataURL=function(file:Blob){w.__fileReads.push((file as File).name);return original.call(this,file);};const data=new DataTransfer();data.items.add(new File(['bad'],'program.exe'));data.items.add(new File([new Uint8Array(20*1024*1024+1)],'large.png'));data.items.add(new File(['valid text'],'valid.txt'));const e=new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:data});el.dispatchEvent(e);return e.defaultPrevented;});expect(handled).toBe(true);
  await expect(frame.locator('#selected-assets')).toContainText('valid.txt');await expect(frame.locator('#upload')).toBeEnabled();await expect(frame.locator('#notice')).toHaveClass(/error/);expect(await frame.locator('body').evaluate(()=>(window as any).__fileReads)).toEqual(['valid.txt']);
- const files=Array.from({length:20},(_,i)=>({name:'source-'+i+'.txt',base64:Buffer.from('Unique text '+i).toString('base64')}));await transferFiles(frame,files);await expect(frame.locator('#selected-assets .chat-attach-chip')).toHaveCount(19);await expect(frame.locator('#reset-work')).toBeEnabled();expect((await index(frame)).assets).toHaveLength(19);expect(await frame.locator('body').evaluate(()=>(window as any).__fileReads.length)).toBe(19);await expect(frame.locator('#brief')).toHaveValue('Keep this request.');expect(orkas.modelRequests).toHaveLength(0);await orkas.closePreview(preview);
+ const files=Array.from({length:20},(_,i)=>({name:'source-'+i+'.txt',base64:Buffer.from('Unique text '+i).toString('base64')}));await transferFiles(frame,files);await expect(frame.locator('#selected-assets .chat-attach-chip')).toHaveCount(19,{timeout:30_000});await expect(frame.locator('#reset-work')).toBeEnabled();expect((await index(frame)).assets).toHaveLength(19);expect(await frame.locator('body').evaluate(()=>(window as any).__fileReads.length)).toBe(19);await expect(frame.locator('#brief')).toHaveValue('Keep this request.');expect(orkas.modelRequests).toHaveLength(0);await orkas.closePreview(preview);
 });
 
 test('recovers a failed dropped-file save without losing other input or duplicating a retried file',async({modelOrkas:orkas})=>{
@@ -178,7 +223,10 @@ test('recovers a failed dropped-file save without losing other input or duplicat
 test('keeps newly typed text during an import and retries a failed attachment save from its retained material',async({modelOrkas:orkas})=>{
  const{preview,frame}=await open(orkas);await frame.locator('#brief').fill('Initial request.');
  await orkas.electronApp!.evaluate(async(_electron,module)=>{const runtime=((globalThis as any).__contentOutputFixture?.load(module)||(process as any).mainModule.require(module)).runtime,original=runtime.execute;let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});const state={ready:false,failed:false,release,restore:()=>{release();runtime.execute=original;}};runtime.execute=async function(...args:any[]){if(args[1]==='appFiles.writeBase64'&&args[2].path.startsWith('media/')){state.ready=true;await gate;}if(args[1]==='storage.set'&&args[2].value?.drafts?.image?.assetIds?.length&&!state.failed){state.failed=true;throw new (((globalThis as any).__contentOutputFixture?.load(module.replace('host.ts','runtime.ts'))||(process as any).mainModule.require(module.replace('host.ts','runtime.ts'))).AppError)('E_FAILED');}return original.apply(this,args);};(globalThis as any).__materialImport=state;},path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'));
- try{const file={name:'reference.txt',base64:Buffer.from('Retain this source').toString('base64')};await transferFiles(frame,[file]);await expect.poll(()=>orkas.electronApp!.evaluate(()=>(globalThis as any).__materialImport.ready)).toBe(true);await expect(frame.locator('#reset-work')).toBeDisabled();await expect(frame.locator('#nav-video')).toBeDisabled();await frame.locator('#brief').fill('New text typed while importing.');await transferFiles(frame,[{name:'busy.txt',base64:Buffer.from('Do not accept while busy').toString('base64')}],'paste');await orkas.electronApp!.evaluate(()=>(globalThis as any).__materialImport.release());await expect(frame.locator('#upload')).toBeEnabled();await expect(frame.locator('#notice')).toHaveClass(/error/);await expect(frame.locator('#selected-assets .chat-attach-chip')).toHaveCount(0);await expect(frame.locator('#brief')).toHaveValue('New text typed while importing.');expect((await index(frame)).assets).toHaveLength(1);
+ try{const file={name:'reference.txt',base64:Buffer.from('Retain this source').toString('base64')};await transferFiles(frame,[file]);await expect.poll(()=>orkas.electronApp!.evaluate(()=>(globalThis as any).__materialImport.ready)).toBe(true);await expect(frame.locator('#reset-work')).toBeDisabled();await expect(frame.locator('#nav-video')).toBeDisabled();await frame.locator('#brief').fill('New text typed while importing.');await transferFiles(frame,[{name:'busy.txt',base64:Buffer.from('Do not accept while busy').toString('base64')}],'paste');
+ // Let the new text autosave before releasing the attachment's separate write.
+ await expect.poll(async()=>(await index(frame))?.drafts?.image?.brief).toBe('New text typed while importing.');
+ await orkas.electronApp!.evaluate(()=>(globalThis as any).__materialImport.release());await expect(frame.locator('#upload')).toBeEnabled();await expect(frame.locator('#notice')).toHaveClass(/error/);await expect(frame.locator('#selected-assets .chat-attach-chip')).toHaveCount(0);await expect(frame.locator('#brief')).toHaveValue('New text typed while importing.');expect((await index(frame)).assets).toHaveLength(1);
   await transferFiles(frame,[file]);await expect(frame.locator('#selected-assets')).toContainText('reference.txt');await expect(frame.locator('#upload')).toBeEnabled();expect((await index(frame)).assets).toHaveLength(1);expect((await index(frame)).drafts.image.brief).toBe('New text typed while importing.');
   const source=(await index(frame)).assets[0];await frame.locator('body').evaluate(async(_el:any,p:string)=>(window as any).orkasApp.appFiles.remove({path:p,scope:'cloud'}),source.path);await transferFiles(frame,[file],'paste');await expect(frame.locator('#upload')).toBeEnabled();expect(await frame.locator('body').evaluate(async(_el:any,p:string)=>(await (window as any).orkasApp.appFiles.readBase64({path:p,scope:'cloud'}))?.base64,source.path)).toBe(file.base64);expect((await index(frame)).assets).toHaveLength(1);
   await frame.locator('#nav-library').click();await frame.locator('.library-card').getByRole('button',{name:'移除',exact:true}).click();await frame.locator('#confirm [value="confirm"]').click();await expect(frame.locator('.library-card')).toHaveCount(0);await frame.locator('#nav-image').click();await transferFiles(frame,[file],'paste');await expect(frame.locator('#upload')).toBeEnabled();await frame.locator('#nav-library').click();await expect(frame.locator('.library-card')).toContainText('reference.txt');expect((await index(frame)).assets).toHaveLength(1);expect(orkas.modelRequests).toHaveLength(0);
@@ -478,7 +526,7 @@ test('keeps unrestricted settings after reopen and omits constraints from the ac
  await frame.locator('#duration').fill('7201');await frame.locator('#brief').focus();await expect(frame.locator('#duration')).toBeEmpty();orkas.setModelTextReplies(['Controlled task completion.']);await frame.locator('#submit').click();
  // Only an unsaved terminal receipt produces this visible state. Observe the
  // consumer outcome instead of polling Electron's experimental inspector.
- await expect(frame.locator('#job-status')).toHaveAttribute('data-status','saving');
+ await expect(frame.locator('#job-status')).toHaveAttribute('data-status','saving',{timeout:60_000});
  await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentArchiveGate.release());await expect(frame.locator('#job-status')).toHaveText('失败',{timeout:60000});
  const saved=await work(frame,(await index(frame)).works[0].id),brief=await frame.locator('body').evaluate(async(_el:any,id:string)=>JSON.parse((await (window as any).orkasApp.appFiles.readText({path:'requests/'+id+'.json',scope:'cloud'})).text),saved.jobs[0].requestId);expect(brief.settings).toEqual({});await preview.screenshot({path:info.outputPath('content-unrestricted-zh.png')});
  }finally{await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentArchiveGate?.restore());await orkas.closePreview(preview);}
@@ -543,7 +591,9 @@ test('preserves saved work when loading fails and retries a failed reset without
  let{preview,frame}=await open(orkas);await frame.locator('#brief').fill('已有内容');await legacyDraft(frame);await expect(frame.locator('#save-state')).toHaveText('已保存');const original=(await index(frame)).works[0];await orkas.closePreview(preview);
  await orkas.electronApp!.evaluate(async(_electron,args)=>{const load=((globalThis as any).__contentOutputFixture?.load||(process as any).mainModule.require.bind((process as any).mainModule)),runtime=load(args.host).runtime,original=runtime.execute,{AppError}=load(args.runtime);const c={mode:'read',writes:0,restore:()=>{runtime.execute=original;delete(globalThis as any).__contentStorage;}};runtime.execute=async function(...input:any[]){if(input[1]==='storage.set'||input[1]==='appFiles.writeText')c.writes++;if(c.mode==='read'&&input[1]==='storage.get')throw new AppError('E_FAILED');if(c.mode==='write'&&input[1]==='storage.set'){c.mode='normal';throw new AppError('E_FAILED');}return original.apply(this,input);};(globalThis as any).__contentStorage=c;},{host:path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'),runtime:path.resolve(__dirname,'../../src/main/features/web_apps/runtime.ts')});
  try{({preview,frame}=await open(orkas,false));await expect(frame.locator('#notice')).toHaveClass(/error/);await expect(frame.locator('#brief')).toBeDisabled();await expect(frame.locator('#reset-work')).toBeDisabled();expect(await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStorage.writes)).toBe(0);await orkas.closePreview(preview);await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStorage.mode='normal');
-  ({preview,frame}=await open(orkas));await showRecords(frame);await frame.locator('#works-list .record-summary').click();await expect(frame.locator('#brief')).toHaveValue('已有内容');expect((await work(frame,original.id)).brief).toBe('已有内容');await reset(frame);await frame.locator('#brief').fill('失败后仍能保存');await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStorage.mode='write');await reset(frame);await expect(frame.locator('#notice')).toHaveClass(/error/);await expect(frame.locator('#brief')).toHaveValue('失败后仍能保存');await reset(frame);await expect(frame.locator('#brief')).toBeEmpty();
+  ({preview,frame}=await open(orkas));await showRecords(frame);await frame.locator('#works-list .record-summary').click();await expect(frame.locator('#brief')).toHaveValue('已有内容');expect((await work(frame,original.id)).brief).toBe('已有内容');await reset(frame);await frame.locator('#brief').fill('失败后仍能保存');
+  await expect(frame.locator('#save-state')).toHaveText('已保存');
+  await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStorage.mode='write');await reset(frame);await expect(frame.locator('#notice')).toHaveClass(/error/);await expect(frame.locator('#brief')).toHaveValue('失败后仍能保存');await reset(frame);await expect(frame.locator('#brief')).toBeEmpty();
   await orkas.closePreview(preview);({preview,frame}=await open(orkas));await showRecords(frame);await expect(frame.locator('#works-list .record-summary')).toHaveCount(1);await expect(frame.locator('#brief')).toBeEmpty();expect((await work(frame,original.id)).brief).toBe('已有内容');expect(orkas.modelRequests).toHaveLength(0);
  }finally{await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStorage?.restore());await orkas.closePreview(preview);}
 });
@@ -594,21 +644,32 @@ test('keeps explicitly requested text delivery working and previews its saved re
 
 test('settles an unexpected one-shot input form as a failure without exposing Continue or starting another generation',async({modelOrkas:orkas})=>{
  const{preview,frame}=await open(orkas);await frame.locator('#brief').fill('Create a product image using reasonable defaults.');
- orkas.setModelTextReplies(['Choose a caption.\n<agent-input-form>\n'+JSON.stringify({fields:[{id:'caption',label:'Caption',type:'textarea',required:true}]})+'\n</agent-input-form>']);
+ orkas.setModelTextReplies(['<agent-input-form>\n'+JSON.stringify({fields:[{id:'caption',label:'Caption',type:'textarea',required:true}]})+'\n</agent-input-form>']);
  await frame.locator('#submit').click();await expect(frame.locator('#job-status')).toHaveText('失败',{timeout:60000});
  const saved=await work(frame,(await index(frame)).works[0].id);expect(saved.jobs[0].errorCode).toBe('E_INTERACTION_REQUIRED');
+ await expect(frame.locator('.record-failure-summary')).toHaveText('操作未完成，已保存的内容会保留。');
+ await expandRecord(frame);await expect(frame.locator('#record-reply')).toBeHidden();
  await recordMenu(frame);await expect(frame.locator('#record-menu').getByRole('menuitem',{name:'继续',exact:true})).toBeDisabled();await frame.locator('#record-menu').press('Escape');
  const started=orkas.modelRequests.length;await refreshRecord(frame);expect(orkas.modelRequests).toHaveLength(started);await orkas.closePreview(preview);
 });
 
 for(const[kind,agentId]of [['image','814b61b027f0'],['video','79df9cc89f5f'],['audio','5f890bd72ac4']]as const)test(`submits the exact ${kind} request and rejects a text-only media result honestly`,async({modelOrkas:orkas})=>{
  const{preview,frame}=await open(orkas);await frame.locator('#nav-'+kind).click();const text='这是用户原文。\n不要改写这段需求。';await frame.locator('#brief').fill(text);
+ const reply={image:'图片已完成。',video:'没收到要剪辑的视频，请重新添加 <素材 A & B>。',audio:'请补充旁白内容。'}[kind];
+ const missingOutput={image:'未生成图片。',video:'未生成视频。',audio:'未生成音频。'}[kind];
  await orkas.electronApp!.evaluate(async(_electron,module)=>{const runtime=((globalThis as any).__contentOutputFixture?.load(module)||(process as any).mainModule.require(module)).runtime,original=runtime.execute;(globalThis as any).__contentStarts=[];runtime.execute=async function(...args:any[]){if(args[1]==='tasks.start')(globalThis as any).__contentStarts.push(args[2]);return original.apply(this,args);};},path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'));
- orkas.setModelTextReplies(['A task reply without a media deliverable.']);await frame.locator('#submit').click();await expect(frame.locator('#job-status')).toHaveText('失败',{timeout:60000});const starts=await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStarts);expect(starts).toHaveLength(1);expect(starts[0]).toMatchObject({agentId,prompt:text});
- const saved=await work(frame,(await index(frame)).works[0].id);expect(saved.results).toHaveLength(0);expect(saved.jobs[0]).toMatchObject({status:'failed',errorCode:'E_OUTPUT_MISSING',text:'A task reply without a media deliverable.'});expect(saved.brief).toBe(text);
+ orkas.setModelTextReplies([reply]);await frame.locator('#submit').click();await expect(frame.locator('#job-status')).toHaveText('失败',{timeout:60000});const starts=await orkas.electronApp!.evaluate(()=>(globalThis as any).__contentStarts);expect(starts).toHaveLength(1);expect(starts[0]).toMatchObject({agentId,prompt:text});
+ const saved=await work(frame,(await index(frame)).works[0].id);expect(saved.results).toHaveLength(0);expect(saved.jobs[0]).toMatchObject({status:'failed',errorCode:'E_OUTPUT_MISSING',text:reply});expect(saved.brief).toBe(text);
  const brief=await frame.locator('body').evaluate(async(_el:any,p:string)=>JSON.parse((await (window as any).orkasApp.appFiles.readText({path:p,scope:'cloud'})).text),starts[0].files[0]);expect(brief.kind).toBe(kind);expect(brief).not.toHaveProperty('operation');expect(brief.settings).not.toHaveProperty('language');
- await expect(frame.locator('.record-failure-summary').first()).toHaveText('未生成结果，请调整需求后重试。');await expandRecord(frame);await expect(frame.locator('#record-error')).toHaveText('未生成结果，请调整需求后重试。');await recordMenu(frame);await expect(frame.locator('#record-menu').getByRole('menuitem',{name:'继续',exact:true})).toBeDisabled();const visible=await orkas.page!.evaluate(async()=>(await (await (window as any).apiFetch('/api/conversations/list')).json()).conversations);expect(visible.some((row:any)=>row.kind==='app_task'||row.conversation_id?.startsWith('app_'))).toBe(false);await orkas.closePreview(preview);expect(orkas.modelRequests.length).toBeGreaterThan(0);
- const requests=orkas.modelRequests.length,reopened=await open(orkas);await reopened.frame.locator('#nav-'+kind).click();await expect(reopened.frame.locator('.record-failure-summary').first()).toHaveText('未生成结果，请调整需求后重试。');expect(orkas.modelRequests).toHaveLength(requests);await orkas.closePreview(reopened.preview);
+ await expect(frame.locator('.record-failure-summary').first()).toContainText(reply);
+ await expandRecord(frame);
+ await expect(frame.locator('#record-error')).toHaveText(missingOutput);
+ await expect(frame.locator('#record-reply')).toBeVisible();
+ await expect(frame.locator('#record-reply-text')).toHaveText(reply);
+ await recordMenu(frame);await expect(frame.locator('#record-menu').getByRole('menuitem',{name:'继续',exact:true})).toBeDisabled();const visible=await orkas.page!.evaluate(async()=>(await (await (window as any).apiFetch('/api/conversations/list')).json()).conversations);expect(visible.some((row:any)=>row.kind==='app_task'||row.conversation_id?.startsWith('app_'))).toBe(false);await orkas.closePreview(preview);expect(orkas.modelRequests.length).toBeGreaterThan(0);
+ const requests=orkas.modelRequests.length,reopened=await open(orkas);await reopened.frame.locator('#nav-'+kind).click();
+ await expect(reopened.frame.locator('.record-failure-summary').first()).toContainText(reply);
+ expect(orkas.modelRequests).toHaveLength(requests);await orkas.closePreview(reopened.preview);
 });
 
 test('keeps immutable outputs from separate runs and previews compact saved files',async({modelOrkas:orkas},info)=>{

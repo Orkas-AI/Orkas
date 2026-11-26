@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { StringDecoder } from "node:string_decoder";
-import { decodeProcessOutput, type SandboxExecutor, type SandboxResult } from "../sandbox/executor.js";
+import { createProcessOutputDecoder, type SandboxExecutor, type SandboxResult } from "../sandbox/executor.js";
 import { discardStreamedToolOutput } from "../sandbox/output-capture.js";
 import type { ToolContext, ToolResult, ToolReadContinuation } from "./base.js";
 import { isProgrammaticToolCallContext } from "./run-program.js";
@@ -32,11 +31,28 @@ export function managedCommandsEnabled(ctx: ToolContext): boolean {
   return ctx.state.commandSessionEnabled === true && !isProgrammaticToolCallContext(ctx);
 }
 
-export function commandSessionWait(value: unknown): number | null {
+export function commandSessionWait(value: unknown, waitFor: unknown = "output"): number | null {
+  if (waitFor !== "output" && waitFor !== "exit") return null;
   if (value === undefined) return 10_000;
   if (typeof value !== "number" || !Number.isInteger(value)) return null;
   // Out-of-range integers use the omitted-value default, not a clamped wait.
-  return value >= 0 && value <= 30_000 ? value : 10_000;
+  return value >= 0 && value <= (waitFor === "exit" ? 600_000 : 30_000) ? value : 10_000;
+}
+
+/** Keep a bounded explicit wait visible through the existing progress channel.
+ * The heartbeat declares only this wait's budget, never a renewed process deadline. */
+export async function withCommandWaitProgress(ctx: ToolContext, ms: number, waitForExit: () => Promise<void>): Promise<void> {
+  if (!ctx.emitProgress || !ms || ctx.signal?.aborted) return waitForExit();
+  const startedAt = Date.now();
+  const progress = () => ctx.emitProgress?.({
+    phase: "running", message: "Waiting for command completion",
+    data: { elapsedMs: Math.max(0, Date.now() - startedAt), timeoutMs: ms, heartbeat: true },
+  });
+  progress();
+  const heartbeat = setInterval(progress, 60_000);
+  heartbeat.unref();
+  try { await waitForExit(); }
+  finally { clearInterval(heartbeat); }
 }
 
 export function runningCommandSessions(owner: string): number {
@@ -127,7 +143,8 @@ export function inspectCommandRead(input: Record<string, unknown>, ctx: ToolCont
   const end = Math.min(session.end, cursor + maxChars);
   return {
     version: JSON.stringify([session.id, cursor, end, !!session.result]),
-    waiting: !ctx.signal?.aborted && !session.result && cursor === session.end && (commandSessionWait(input.yield_time_ms) ?? 0) > 0,
+    waiting: !ctx.signal?.aborted && !session.result && (input.wait_for === "exit" || cursor === session.end)
+      && (commandSessionWait(input.yield_time_ms, input.wait_for) ?? 0) > 0,
   };
 }
 
@@ -173,7 +190,7 @@ export async function startCommandSession(
     stopRequested: false, stoppedByRequest: false,
   };
   sessions.set(session.id, session);
-  const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
+  const decoders = { stdout: createProcessOutputDecoder(), stderr: createProcessOutputDecoder() };
   const terminal = ctx.state.commandSessionTerminal as ((result: ToolResult) => Promise<ToolResult>) | undefined;
   const callSignal = ctx.signal;
   const runSignal = ctx.state.commandSessionSignal instanceof AbortSignal ? ctx.state.commandSessionSignal : undefined;
@@ -182,8 +199,7 @@ export async function startCommandSession(
       session.control = control;
       if (session.stopRequested) control.stop();
     },
-    onOutput: (bytes, stream, env) => append(session, process.platform === "win32"
-      ? decodeProcessOutput(bytes, process.platform, env) : decoders[stream].write(bytes)),
+    onOutput: (bytes, stream, env) => append(session, decoders[stream].write(bytes, env)),
   }).then(async (raw) => {
     // Pin attribution at execution completion, before asynchronous formatting
     // or host file delivery. An overlapping original cancellation wins.
@@ -229,11 +245,14 @@ export async function continueCommandSession(input: Record<string, unknown>, ctx
   if (session.owner !== owner(ctx)) return { content: "E_PROCESS_SESSION_NOT_FOUND: process session not found", isError: true };
   const action = input.action;
   if (action === "read") {
-    const ms = commandSessionWait(input.yield_time_ms);
-    if (ms === null) return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
+    const ms = commandSessionWait(input.yield_time_ms, input.wait_for);
+    if (ms === null) return { content: "E_BAD_INPUT: yield_time_ms must be an integer; wait_for must be output or exit", isError: true };
     const cursor = typeof input.cursor === "number" && Number.isFinite(input.cursor)
       ? Math.max(session.start, Math.min(session.end, input.cursor)) : session.start;
-    await wait(session, ms, () => !!session.result || session.end > cursor, ctx.signal);
+    const untilExit = input.wait_for === "exit";
+    const pending = () => wait(session, ms, () => !!session.result || (!untilExit && session.end > cursor), ctx.signal);
+    if (untilExit && !session.result) await withCommandWaitProgress(ctx, ms, pending);
+    else await pending();
   } else if (action === "write") {
     if (session.result || !session.control) return { content: "E_PROCESS_NOT_RUNNING: process session is not running", isError: true };
     if (typeof input.chars !== "string" || input.chars.length > 64_000) {

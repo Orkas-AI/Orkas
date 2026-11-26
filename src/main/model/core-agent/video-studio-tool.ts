@@ -6,6 +6,7 @@ import { parameterError } from '../../../../bin/tool-parameter-errors.cjs';
 
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
@@ -18,6 +19,9 @@ import {
   transcribeSpeech,
   type VideoStudioOp,
 } from '../../features/video_studio';
+import { probeDeliveredVideo } from '../../features/video_studio_delivery';
+import { PHRASE_FRAMES_NOTE, phraseFrameSamples, type PhraseLine } from '../../features/video_phrases';
+import { writeTimedFrameSheet } from '../../features/video_timeline_ship';
 import {
   captureProductSource,
   normalizeProductCaptureClips,
@@ -37,6 +41,8 @@ import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { createLogger } from '../../logger';
 import { logErrorSummary, logPathRef } from '../../util/log-redact';
 import { userLocalRoot } from '../../paths';
+import { narrationPaceNote } from '../../util/narration-timing';
+import { gateOutsideRead } from './outside-read-gate';
 
 const log = createLogger('video-studio-tool');
 
@@ -274,6 +280,44 @@ Promise<{ path: string; dir: string; host: string; silent: boolean } | PageRefus
   return { refusal: { errorCode: 'E_REFERENCE_PAGE_NOT_SAVED', message: `The video playing on ${failed.host} could not be saved: ${reason}. Ask the user to save it and attach it.` } };
 }
 
+/** A sheet of a transcribed video's picture under its phrases, or null for a recording with no
+ *  picture or frames that could not be made: the transcript never waits on it. */
+async function phraseFramesVisual(
+  inputAbsPath: string,
+  lines: readonly PhraseLine[],
+  signal: AbortSignal | undefined,
+): Promise<{ image: { data: string; mediaType: 'image/png' | 'image/webp' }; summary: { frames: number; phrases: number; note: string } } | null> {
+  let dir: string | null = null;
+  try {
+    const spec = await probeDeliveredVideo(inputAbsPath, signal);
+    if (!spec?.width || !spec.height || !spec.durationSec || !(spec.durationSec > 0)) return null;
+    const samples = phraseFrameSamples(lines, spec.durationSec);
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-phrase-frames-'));
+    const sheet = await writeTimedFrameSheet({
+      videoPathAbs: inputAbsPath, outputDirAbs: dir, width: spec.width, height: spec.height, samples, ...(signal ? { signal } : {}),
+    });
+    const image = sheet ? await prepareVideoStudioModelVisual(sheet) : null;
+    if (!image) return null;
+    const spread = samples.length < lines.length ? ` ${samples.length} of the ${lines.length} phrases are shown, spread evenly.` : '';
+    return { image, summary: { frames: samples.length, phrases: lines.length, note: `${PHRASE_FRAMES_NOTE}${spread}` } };
+  } catch (err) {
+    log.warn('phrase frames unavailable', { error: logErrorSummary(err) });
+    return null;
+  } finally {
+    if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** Who is asking, for the approval prompt a read outside the workspace may need. */
+function gateIdentity(opts: VideoStudioToolOpts): { userId: string; cid?: string; agentId?: string; agentName?: string } {
+  return {
+    userId: opts.userId,
+    ...(opts.cid ? { cid: opts.cid } : {}),
+    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    ...(opts.agentName ? { agentName: opts.agentName } : {}),
+  };
+}
+
 /** The timeline tool owns the model-visible definition, and says where files go. */
 export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
   return {
@@ -294,6 +338,14 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId, opts.cid)]));
         const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || REFERENCE_FALLBACK_DIR), roots);
         let inputAbsPath = raw ? resolvePath(ctx, opts, raw, roots) : '';
+        // A local video elsewhere on the computer is read by the user's access setting; only
+        // that file joins what the inspection may read.
+        let outsideSource: string[] = [];
+        if (raw) {
+          const gate = await gateOutsideRead({ ...gateIdentity(opts), roots: [...roots, ...readOnlyRoots], abs: inputAbsPath, operation: 'reference.inspect', ctx });
+          if (gate.ok === false) return refuse(gate.code, gate.message);
+          if (!isPathAllowed(inputAbsPath, [...roots, ...readOnlyRoots])) outsideSource = [inputAbsPath];
+        }
         let page: { dir: string; host: string; silent: boolean } | null = null;
         try {
           if (rawUrl) {
@@ -303,7 +355,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             inputAbsPath = saved.path;
           }
           const result = await inspectVideoReference({ inputAbsPath, compositionDirAbs,
-            readRoots: [...roots, ...readOnlyRoots], writeRoots, sampleTimes: input.sample_times, signal: ctx.signal });
+            readRoots: [...roots, ...readOnlyRoots, ...outsideSource], writeRoots, sampleTimes: input.sample_times, signal: ctx.signal });
           if (!result.ok) return { content: resultContent(result), isError: true };
           const visual = await prepareVideoStudioModelVisual(String(result.contact_sheet));
           if (!visual) return { content: resultContent({ ok: false, op, errorCode: 'E_REFERENCE_IMAGE', message: 'Reference frames could not be attached for inspection.' }), isError: true };
@@ -360,6 +412,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           }),
         }));
         const eligibleTotal = listings.reduce((sum, item) => sum + item.listing.eligible, 0);
+        // The line length a scene holds, given before a line is written rather than after
+        // generate_speech refuses it.
+        const pace = wantedLanguage && routes.length ? narrationPaceNote(wantedLanguage) : null;
         return {
           content: resultContent({
             ok: routes.length > 0,
@@ -372,6 +427,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               next_action: availability.nextAction,
             } : {}),
             ...(wantedLanguage ? { requested_language: wantedLanguage } : {}),
+            ...(pace ? { pace } : {}),
             ...(wantedLanguage && routes.length && eligibleTotal === 0 ? {
               message: `No configured voice is verified for ${wantedLanguage}. Narrate in a language a listed route covers, or call again with all_voices true to see every voice this account has.`,
             } : {}),
@@ -426,9 +482,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       const inputRaw = String(input.input_path || '').trim();
       if (!inputRaw) return parameterError('input_path is required for speech.transcribe', ['input_path'], 'required');
       const inputAbsPath = resolvePath(ctx, opts, inputRaw, roots);
-      if (!isPathAllowed(inputAbsPath, roots)) {
-        return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside scope: ${inputAbsPath}`, isError: true } as ToolResult;
-      }
+      const gate = await gateOutsideRead({ ...gateIdentity(opts), roots, abs: inputAbsPath, operation: 'speech.transcribe', ctx });
+      if (gate.ok === false) return { content: `${gate.code}: ${gate.message}`, isError: true } as ToolResult;
       const fileErr = await ensureInputFile(inputAbsPath);
       if (fileErr) return { content: fileErr, isError: true } as ToolResult;
 
@@ -445,13 +500,29 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         ...(typeof input.model === 'string' && input.model.trim() ? { model: input.model.trim() } : {}),
         ...(typeof input.language === 'string' && input.language.trim() ? { language: input.language.trim() } : {}),
         timestamps: input.timestamps === 'segment' ? 'segment' : 'word',
-        allowModelDownload: input.allow_model_download === true,
+        phraseLines: true,
         ...(ctx.signal ? { signal: ctx.signal } : {}),
         onProgress: (event) => ctx.emitProgress?.(event),
       });
       if (result.ok) await notifyWritten(opts, [result.transcript_path]);
       else if (result.text_path) await notifyWritten(opts, [result.text_path]);
-      return { content: resultContent(result), isError: result.ok === false } as ToolResult;
+      // The lines are the phrase view's own; the model reads them there.
+      const { phrase_lines: lines, ...shown } = result;
+      const frames = result.ok && Array.isArray(lines) && lines.length
+        ? await phraseFramesVisual(inputAbsPath, lines as PhraseLine[], ctx.signal)
+        : null;
+      if (frames) {
+        // Ahead of the phrases and the long summary: a large result is stored and shown by its
+        // start, and the picture is attached either way, so what it is must come first
+        // (2026-11-19: a 26 s episode's transcript was 35 KB and the note at its end went unseen).
+        const { ok, op: resultOp, ...rest } = shown;
+        return {
+          content: resultContent({ ok, op: resultOp, phrase_frames: frames.summary, visual_evidence: { attached: true, role: 'phrase_frames' }, ...rest }),
+          images: [frames.image],
+          imageRetention: 'active_turn',
+        } as ToolResult;
+      }
+      return { content: resultContent(shown), isError: result.ok === false } as ToolResult;
     },
   };
 }

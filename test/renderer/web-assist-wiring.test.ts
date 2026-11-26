@@ -562,6 +562,7 @@ describe('Web Assist renderer wiring', () => {
       selectedTab: () => ({ tab_id: 'same-tab', suspended: true }),
       currentState: { active_tab_id: 'same-tab' }, activationInFlight: '',
       panelOpen: false, panelTab: 'browser', activeView: 'conversation',
+      windowPresented: true,
       panelResizing: false, modalIsOpen: () => false,
       window: { orkas: { invoke } }, renderState() {}, syncVisibility() {}, log: { warn() {} },
     });
@@ -581,6 +582,25 @@ describe('Web Assist renderer wiring', () => {
     context.ensureMainActiveTab(true);
     context.ensureMainActiveTab();
     context.ensureMainActiveTab();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('webAssist.activateTab', { tabId: 'same-tab' });
+    await Promise.resolve();
+  });
+
+  it('keeps a released selection inactive until the native window returns', async () => {
+    const start = webAssistSource.indexOf('  function ensureMainActiveTab(retry = false) {');
+    const end = webAssistSource.indexOf('  function modalIsOpen()', start);
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const context = vm.createContext({
+      selectedTab: () => ({ tab_id: 'same-tab', suspended: true }),
+      currentState: { active_tab_id: 'same-tab' }, activationInFlight: '',
+      panelOpen: true, panelTab: 'browser', activeView: 'conversation',
+      windowPresented: false,
+      window: { orkas: { invoke } }, renderState() {}, syncVisibility() {}, log: { warn() {} },
+    });
+    vm.runInContext(webAssistSource.slice(start, end), context);
+    context.ensureMainActiveTab();
+    expect(invoke).not.toHaveBeenCalled();
+    context.setWindowPresentation({ active: true });
     expect(invoke).toHaveBeenCalledExactlyOnceWith('webAssist.activateTab', { tabId: 'same-tab' });
     await Promise.resolve();
   });

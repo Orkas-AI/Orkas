@@ -10,7 +10,8 @@ export function buildSaveAppTool(resolveScope: () => AppSaveScope | Promise<AppS
       properties: {
         action: { type: 'string', enum: ['inspect', 'save'], default: 'save',
           description: 'Both actions require exactly one source: artifact_id or path. Inspect returns the bound saved destination and its revision without saving.' },
-        artifact_id: { type: 'string', description: 'Application artifact ID in the current conversation.' },
+        artifact_id: { type: 'string', pattern: '^[A-Za-z0-9_-]+$',
+          description: 'Exact recorded application artifact ID in this conversation. If you only know its title, retrieve the ID with chat_history first.' },
         path: { type: 'string', description: 'Application folder or HTML entry, absolute or relative to this task workspace. Use a dedicated app folder.' },
         mode: { type: 'string', enum: ['auto', 'new', 'update'], default: 'auto',
           description: 'Auto creates if unbound and otherwise updates. New explicitly saves an independent copy. Update requires an available bound destination.' },

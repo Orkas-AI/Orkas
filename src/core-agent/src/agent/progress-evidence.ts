@@ -1,5 +1,5 @@
 import type { FileChangeObservation, FileReadObservation, ToolReadContinuation, ToolResult } from "../tools/base.js";
-import { mergeToolRoundProgress, type ToolRoundProgress } from "./loop-guards.js";
+import { mergeToolRoundProgress, RUN_NO_PROGRESS_NUDGE_ROUNDS, type ToolRoundProgress } from "./loop-guards.js";
 
 type Outcome = { result: ToolResult; err?: unknown; aborted?: boolean; stalled?: boolean };
 type Range = [number, number];
@@ -31,10 +31,32 @@ function changeProgress(change: FileChangeObservation): ToolRoundProgress {
 export class ProgressEvidence {
   private reads = new Map<string, Range[]>();
   private continuations = new Set<string>();
+  private browser?: { target: string; fingerprint: string; repeats: number };
+  private browserObservedThisRound = false;
+  private browserAdvised = false;
 
   reset(): void {
     this.reads.clear();
     this.continuations.clear();
+    this.browser = undefined;
+    this.browserObservedThisRound = false;
+  }
+
+  get browserAdvisorySent(): boolean { return this.browserAdvised; }
+
+  takeBrowserAdvisory(otherProgress: ToolRoundProgress, endingTools: boolean): number | undefined {
+    if (otherProgress === "productive" || otherProgress === "discovery" || endingTools) {
+      this.browser = undefined;
+      this.browserObservedThisRound = false;
+      return;
+    }
+    if (!this.browserObservedThisRound || !this.browser) return;
+    this.browserObservedThisRound = false;
+    this.browser.repeats += 1;
+    const repeats = this.browser.repeats - 1;
+    if (this.browserAdvised || repeats < RUN_NO_PROGRESS_NUDGE_ROUNDS) return;
+    this.browserAdvised = true;
+    return repeats;
   }
 
   observe(name: string, outcome: Outcome, continuation?: ToolReadContinuation, beforeRead?: ToolReadContinuation): ToolRoundProgress {
@@ -43,6 +65,20 @@ export class ProgressEvidence {
     if (!failed && (name === "manage_execution_plan" || name === "tool_load")) return "neutral";
     let progress: ToolRoundProgress = "neutral";
     const observations = result.observations;
+    if (name === "inner_browser") {
+      const snapshot = observations?.browserObservation;
+      if (failed || result.persistedOutput || snapshot === "reset") {
+        this.browser = undefined;
+        this.browserObservedThisRound = false;
+      }
+      else if (snapshot) {
+        const previous = this.browser;
+        if (previous?.target !== snapshot.target || previous.fingerprint !== snapshot.fingerprint) {
+          this.browser = { ...snapshot, repeats: 0 };
+        }
+        this.browserObservedThisRound = true;
+      }
+    }
     if (observations?.stateMutation) {
       const state = observations.stateMutation;
       progress = state.scope && state.version && typeof state.changed === "boolean"

@@ -6,6 +6,14 @@ const m=require('../../resources/builtin/apps/builtin-content-workbench/model.js
 const asset=(id='source',name='reference.png',bytes=16)=>m.asset({id,name,path:'media/'+id+'.'+name.split('.').pop(),bytes,createdAt:'2026-11-11T00:00:00.000Z'});
 const work=(kind='image')=>({...m.draft(kind,'en'),id:'work-one',title:'Launch',brief:'Keep this exact authored request.\nIncluding its second line.',revision:1,jobs:[],results:[]});
 describe('content creation, delivery and recovery',()=>{
+ it('names why a picked file cannot be added, by format or size',()=>{
+  expect(m.importProblem('clip.mp4',5_445_289)).toBe('');
+  expect(m.importProblem('clip.avi',1)).toBe('FORMAT');
+  expect(m.importProblem('clip.mp4',200*1024*1024+1)).toBe('SIZE');
+  expect(m.importProblem('photo.png',20*1024*1024+1)).toBe('SIZE');
+  expect(m.importProblem('photo.png',20*1024*1024)).toBe('');
+  expect(()=>m.asset({id:'big',name:'clip.mp4',path:'media/big.mp4',bytes:200*1024*1024+1,createdAt:'2026-11-17'})).toThrow('FILE');
+ });
  it('sends advisory shape and format with reference duration across media and text outputs',()=>{
   for(const kind of ['image','video','audio']){
    const w=m.draft(kind,'en');w.brief='Synthetic creation';

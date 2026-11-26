@@ -2418,6 +2418,8 @@ function formatTime(iso) {
 //   - set options via _aiSelectMount(el, { options, value, placeholder,
 //                                          onChange })
 //   - reads current value via el.dataset.value (string)
+//   - search adds name filtering and optional locale-key option groups
+//   - an existing anchor can open the popover through the returned API
 // Keyboard: Enter/Space toggles the popover, arrow keys to nav, Esc to close.
 
 const AI_SELECT_BASE_POPOVER_Z_INDEX = 14000;
@@ -2478,7 +2480,7 @@ function _aiSelectPopoverZIndexFor(el) {
 function _aiSelectMount(el, config) {
   if (!el) return null;
   const state = {
-    options: [],        // [{value, label, hint?, iconName?, avatar?, disabled?}]
+    options: [],        // [{value, label, hint?, iconName?, avatar?, disabled?, group?, displayOnly?}]
     value: '',
     allowMultiple: false,
     multiple: false,
@@ -2510,22 +2512,49 @@ function _aiSelectMount(el, config) {
   const controlId = el.id || `ai-select-${++_aiSelectIdSeq}`;
   const triggerId = `${controlId}-trigger`;
   const listboxId = `${controlId}-listbox`;
+  const externalTrigger = state.anchor;
+  const searchConfig = state.search;
   const accessibleName = () => String(
     state.ariaLabel
     || el.getAttribute?.('aria-label')
     || state.placeholder,
   );
-  el.innerHTML = `
-    <button type="button" class="ai-select-trigger" id="${escapeHtml(triggerId)}" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="${escapeHtml(listboxId)}" aria-label="${escapeHtml(accessibleName())}">
-      <span class="ai-select-label"></span>
+  const selectedLabelId = `${triggerId}-value`;
+  const triggerHtml = externalTrigger ? '' : `
+    <button type="button" class="ai-select-trigger" id="${escapeHtml(triggerId)}"
+      ${searchConfig ? `aria-describedby="${escapeHtml(selectedLabelId)}"` : 'role="combobox"'}
+      aria-haspopup="listbox" aria-expanded="false"
+      aria-controls="${escapeHtml(listboxId)}" aria-label="${escapeHtml(accessibleName())}">
+      <span class="ai-select-label"${searchConfig ? ` id="${escapeHtml(selectedLabelId)}"` : ''}></span>
       ${caretIcon}
-    </button>
-    <div class="ai-select-popover" id="${escapeHtml(listboxId)}" role="listbox" aria-labelledby="${escapeHtml(triggerId)}" hidden></div>
-  `;
+    </button>`;
+  const popoverHtml = searchConfig ? `
+    <div class="ai-select-popover is-searchable" hidden>
+      <div class="ai-select-search">
+        ${typeof uiIconHtml === 'function' ? uiIconHtml('search', 'ai-select-search-icon') : ''}
+        <input class="ai-select-search-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="${escapeHtml(listboxId)}" autocomplete="off">
+        <button class="ai-select-search-clear" type="button" tabindex="-1" hidden>${typeof uiIconHtml === 'function' ? uiIconHtml('x', 'ai-select-search-icon') : '&#215;'}</button>
+      </div>
+      <div class="ai-select-results" id="${escapeHtml(listboxId)}" role="listbox"></div>
+      <div class="ai-select-empty ai-select-no-match" role="status" hidden></div>
+    </div>` : `<div class="ai-select-popover" id="${escapeHtml(listboxId)}"
+      role="listbox" aria-labelledby="${escapeHtml(triggerId)}" hidden></div>`;
+  el.innerHTML = triggerHtml + popoverHtml;
 
-  const trigger = el.querySelector('.ai-select-trigger');
+  const trigger = externalTrigger || el.querySelector('.ai-select-trigger');
   const labelEl = el.querySelector('.ai-select-label');
   const popover = el.querySelector('.ai-select-popover');
+  const input = searchConfig ? popover.querySelector('input') : null;
+  const clearSearch = searchConfig ? popover.querySelector('.ai-select-search-clear') : null;
+  const noMatch = searchConfig ? popover.querySelector('.ai-select-no-match') : null;
+  const listbox = searchConfig ? popover.querySelector('.ai-select-results') : popover;
+  if (externalTrigger && !searchConfig) {
+    listbox.removeAttribute('aria-labelledby');
+    listbox.setAttribute('aria-label', accessibleName());
+  }
+  const focusOwner = input || trigger;
+  let visibleOptions = state.options;
+  let optionNodes = [];
 
   const renderOptionLabel = (target, opt) => {
     target.innerHTML = '';
@@ -2549,6 +2578,14 @@ function _aiSelectMount(el, config) {
   };
 
   const renderTrigger = () => {
+    el.dataset.value = state.value || '';
+    if (input) {
+      listbox.setAttribute('aria-label', accessibleName());
+      input.placeholder = t(searchConfig.placeholderKey);
+      input.setAttribute('aria-label', input.placeholder);
+      clearSearch.setAttribute('aria-label', t('common.clear'));
+    }
+    if (externalTrigger) return;
     trigger.setAttribute('aria-label', accessibleName());
     const selected = state.multiple ? state.options.filter(o => state.values.includes(o.value)) : [];
     const opt = state.multiple
@@ -2561,7 +2598,6 @@ function _aiSelectMount(el, config) {
       renderOptionLabel(labelEl, null);
       labelEl.classList.add('placeholder');
     }
-    el.dataset.value = state.value || '';
     if (state.allowMultiple) {
       el.dataset.values = JSON.stringify(state.values);
       trigger.title = opt ? opt.label : '';
@@ -2569,10 +2605,22 @@ function _aiSelectMount(el, config) {
     }
   };
 
+  const setActiveIndex = (idx, scroll = false) => {
+    optionNodes[state.activeIdx]?.classList.remove('hover');
+    state.activeIdx = idx;
+    const item = optionNodes[idx];
+    if (item) {
+      item.classList.add('hover');
+      focusOwner.setAttribute('aria-activedescendant', item.id);
+      if (scroll) item.scrollIntoView({ block: 'nearest' });
+    } else focusOwner.removeAttribute('aria-activedescendant');
+  };
+
   const renderPopover = () => {
-    const scrollTop = popover.scrollTop;
-    popover.innerHTML = '';
-    popover.setAttribute('aria-multiselectable', String(state.multiple));
+    const scrollTop = listbox.scrollTop;
+    listbox.replaceChildren();
+    listbox.setAttribute('aria-multiselectable', String(state.multiple));
+    optionNodes = [];
     if (state.allowMultiple) {
       const header = document.createElement('label');
       header.className = 'ai-select-multiple-row';
@@ -2588,16 +2636,19 @@ function _aiSelectMount(el, config) {
         popover.querySelector('.ai-select-multiple-toggle')?.focus();
       });
       header.appendChild(toggle);
-      popover.appendChild(header);
+      listbox.appendChild(header);
     }
-    if (state.options.length === 0) {
+    if (noMatch) {
+      noMatch.hidden = visibleOptions.length > 0;
+      noMatch.textContent = visibleOptions.length ? '' : t(searchConfig.emptyKey);
+    } else if (visibleOptions.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'ai-select-empty';
       empty.textContent = t('ai_select.empty');
-      popover.appendChild(empty);
-      return;
+      listbox.appendChild(empty);
     }
-    state.options.forEach((opt, idx) => {
+    const groups = new Map();
+    visibleOptions.forEach((opt, idx) => {
       const item = document.createElement('div');
       item.className = 'ai-select-item' + (typeof opt.action === 'function' ? ' is-action' : '');
       item.id = `${listboxId}-option-${idx}`;
@@ -2608,12 +2659,11 @@ function _aiSelectMount(el, config) {
       item.setAttribute('aria-disabled', disabled(opt) ? 'true' : 'false');
       if (selected) item.classList.add('active');
       if (disabled(opt)) item.classList.add('disabled');
-      if (idx === state.activeIdx) item.classList.add('hover');
       const main = document.createElement('div');
       main.className = 'ai-select-item-label';
       renderOptionLabel(main, opt);
       item.appendChild(main);
-      if (state.multiple && selected) {
+      if ((state.multiple || state.showCheck) && selected) {
         const check = document.createElement('span');
         check.className = 'ai-select-check';
         check.setAttribute('aria-hidden', 'true');
@@ -2633,26 +2683,55 @@ function _aiSelectMount(el, config) {
       });
       item.addEventListener('mouseenter', () => {
         if (disabled(opt)) return;
-        state.activeIdx = idx;
-        popover.querySelectorAll('.ai-select-item').forEach((n, i) => n.classList.toggle('hover', i === idx));
+        setActiveIndex(idx);
       });
-      popover.appendChild(item);
+      let parent = listbox;
+      if (input && opt.group) {
+        if (!groups.has(opt.group)) {
+          const group = document.createElement('div');
+          const heading = document.createElement('div');
+          const label = t(opt.group);
+          group.setAttribute('role', 'group');
+          group.setAttribute('aria-label', label);
+          heading.className = 'ai-select-group-label';
+          heading.setAttribute('aria-hidden', 'true');
+          heading.textContent = label;
+          group.appendChild(heading);
+          listbox.appendChild(group);
+          groups.set(opt.group, group);
+        }
+        parent = groups.get(opt.group);
+      }
+      parent.appendChild(item);
+      optionNodes.push(item);
     });
-    if (state.allowMultiple) popover.scrollTop = scrollTop;
-    const active = state.activeIdx >= 0
-      ? popover.querySelectorAll('.ai-select-item')[state.activeIdx]
-      : null;
-    if (active) trigger.setAttribute('aria-activedescendant', active.id);
-    else trigger.removeAttribute('aria-activedescendant');
+    if (state.allowMultiple || input) listbox.scrollTop = scrollTop;
+    setActiveIndex(state.activeIdx);
   };
 
-  // Portal the popover to <body> while open so an ancestor with
-  // `overflow: auto / hidden` (modals, settings panes) can't clip it.
-  // We set `position: fixed` + viewport coords from the trigger's
-  // bounding rect; on scroll/resize we re-measure. This replaces the
-  // earlier "popover lives inside .ai-select" layout — the markup
-  // still renders the popover inside .ai-select for first paint, but
-  // open/close moves it back and forth.
+  const refreshVisibleOptions = () => {
+    if (!input) {
+      visibleOptions = state.options;
+      return;
+    }
+    const query = input.value.trim().toLowerCase();
+    const groups = new Map();
+    for (const option of state.options) {
+      if (option.displayOnly) continue;
+      const name = option.label.toLowerCase();
+      const match = name.indexOf(query);
+      if (match < 0) continue;
+      const group = option.group || '';
+      if (!groups.has(group)) groups.set(group, [[], [], []]);
+      const rank = !query || name === query ? 0 : match === 0 ? 1 : 2;
+      groups.get(group)[rank].push(option);
+    }
+    visibleOptions = [...groups.values()].flat(2);
+    clearSearch.hidden = !input.value;
+  };
+
+  // Use viewport positioning to escape scrolling containers. Search in a
+  // modal stays under the dialog node so its focus trap and AT include it.
   let portalParent = null;
   let portalNextSibling = null;
   const reposition = () => {
@@ -2667,18 +2746,19 @@ function _aiSelectMount(el, config) {
     popover.style.top = '0px';
     const rect = trigger.getBoundingClientRect();
     popover.dataset.uiOverlay = '';
-    popover.style.position = 'fixed';
-    // Release the in-slot opposite edge so RTL keeps the measured left anchor.
-    popover.style.right = 'auto';
-    popover.style.left = rect.left + 'px';
-    popover.style.width = rect.width + 'px';
+    const minWidth = input ? 220 : state.minWidth;
+    const width = minWidth ? Math.min(Math.max(rect.width, minWidth), window.innerWidth - 16) : rect.width;
+    const start = minWidth && window.getComputedStyle(trigger).direction === 'rtl' ? rect.right - width : rect.left;
+    const left = minWidth ? Math.max(8, Math.min(start, window.innerWidth - width - 8)) : start;
+    popover.style.left = left + 'px';
+    popover.style.width = width + 'px';
     popover.style.maxHeight = '';
     const popH = popover.offsetHeight || 260;
     // A reserved RTL scrollbar gutter can offset the fixed containing block
     // from viewport coordinates. Correct from the rendered menu, retaining
     // the shared trigger measurement and any app-owned CSS positioning.
-    const horizontalOffset = rect.left - popover.getBoundingClientRect().left;
-    if (horizontalOffset) popover.style.left = (rect.left + horizontalOffset) + 'px';
+    const horizontalOffset = left - popover.getBoundingClientRect().left;
+    if (horizontalOffset) popover.style.left = (left + horizontalOffset) + 'px';
     const placement = _dropdownVerticalPlacement(rect, popH, window.innerHeight, {
       edge: 8,
       gap: 4,
@@ -2686,35 +2766,46 @@ function _aiSelectMount(el, config) {
     popover.style.top = placement.top + 'px';
     popover.style.maxHeight = Math.min(260, placement.availableHeight) + 'px';
     popover.dataset.placement = placement.openAbove ? 'top' : 'bottom';
-    popover.style.zIndex = String(_aiSelectPopoverZIndexFor(el));
+    popover.style.zIndex = String(_aiSelectPopoverZIndexFor(trigger));
   };
   const open = () => {
-    if (state.open) return;
+    if (state.open || trigger.disabled) return;
     state.open = true;
     el.classList.add('open');
     trigger.setAttribute('aria-expanded', 'true');
+    if (externalTrigger) trigger.setAttribute('aria-controls', listboxId);
     popover.hidden = false;
     portalParent = popover.parentNode;
     portalNextSibling = popover.nextSibling;
-    document.body.appendChild(popover);
-    const selectedIdx = state.options.findIndex(o => (state.multiple ? state.values.includes(o.value) : o.value === state.value) && !disabled(o));
+    const portal = (input && el.closest('[role="dialog"]')) || document.body;
+    portal.appendChild(popover);
+    if (input) {
+      input.value = '';
+      listbox.scrollTop = 0;
+    }
+    refreshVisibleOptions();
+    const selectedIdx = visibleOptions.findIndex(o => (state.multiple ? state.values.includes(o.value) : o.value === state.value) && !disabled(o));
     state.activeIdx = selectedIdx >= 0
       ? selectedIdx
-      : state.options.findIndex(option => !disabled(option));
+      : visibleOptions.findIndex(option => !disabled(option));
     renderPopover();
     reposition();
-    setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0);
+    setTimeout(() => {
+      if (state.open) document.addEventListener('mousedown', onDocDown, true);
+    }, 0);
     document.addEventListener('keydown', onKey, true);
     window.addEventListener('scroll', reposition, true);
     window.addEventListener('resize', reposition, true);
+    if (input || externalTrigger) focusOwner.focus({ preventScroll: true });
   };
 
-  const close = () => {
+  const close = (restoreFocus = false) => {
     if (!state.open) return;
     state.open = false;
     el.classList.remove('open');
     trigger.setAttribute('aria-expanded', 'false');
-    trigger.removeAttribute('aria-activedescendant');
+    if (externalTrigger) trigger.removeAttribute('aria-controls');
+    focusOwner.removeAttribute('aria-activedescendant');
     popover.hidden = true;
     popover.style.position = '';
     popover.style.left = '';
@@ -2741,14 +2832,16 @@ function _aiSelectMount(el, config) {
     document.removeEventListener('keydown', onKey, true);
     window.removeEventListener('scroll', reposition, true);
     window.removeEventListener('resize', reposition, true);
+    if (restoreFocus) trigger.focus({ preventScroll: true });
+    state.onClose?.();
   };
 
   const onDocDown = (e) => {
-    if (!el.contains(e.target) && !popover.contains(e.target)) close();
+    if (!el.contains(e.target) && !trigger.contains(e.target) && !popover.contains(e.target)) close();
   };
   const nextEnabledIndex = (start, step) => {
-    for (let idx = start; idx >= 0 && idx < state.options.length; idx += step) {
-      if (!disabled(state.options[idx])) return idx;
+    for (let idx = start; idx >= 0 && idx < visibleOptions.length; idx += step) {
+      if (!disabled(visibleOptions[idx])) return idx;
     }
     return state.activeIdx;
   };
@@ -2758,55 +2851,82 @@ function _aiSelectMount(el, config) {
     // adjacent input would otherwise commit its Enter into "pick the
     // active option" of this select.
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Escape') { close(); if (state.allowMultiple) trigger.focus(); e.preventDefault(); }
+    if (input && !popover.contains(e.target) && e.target !== trigger) return;
+    if (externalTrigger && !input && e.target !== trigger) return;
+    if (e.key === 'Escape') {
+      close(Boolean(input || state.allowMultiple));
+      e.preventDefault();
+      if (input) e.stopPropagation();
+    }
+    else if (input && e.key === 'Tab') { close(true); }
+    else if (externalTrigger && e.key === 'Tab') { close(); }
     else if (state.allowMultiple && e.key === 'Tab') { close(); if (e.target !== trigger) trigger.focus(); }
     else if (e.target.classList?.contains('ai-select-multiple-toggle')) return;
     else if (e.key === 'ArrowDown') {
-      state.activeIdx = nextEnabledIndex(state.activeIdx + 1, 1);
-      renderPopover();
+      setActiveIndex(nextEnabledIndex(state.activeIdx + 1, 1), Boolean(input || externalTrigger));
       e.preventDefault();
     } else if (e.key === 'ArrowUp') {
-      state.activeIdx = nextEnabledIndex(
-        state.activeIdx < 0 ? state.options.length - 1 : state.activeIdx - 1,
+      setActiveIndex(nextEnabledIndex(
+        state.activeIdx < 0 ? visibleOptions.length - 1 : state.activeIdx - 1,
         -1,
-      );
-      renderPopover();
+      ), Boolean(input || externalTrigger));
       e.preventDefault();
     } else if (e.key === 'Enter' || (state.multiple && e.key === ' ')) {
-      if (
-        state.activeIdx >= 0
-        && state.activeIdx < state.options.length
-        && !disabled(state.options[state.activeIdx])
-      ) {
-        _aiSelectPick(api, state.options[state.activeIdx].value);
+      const option = visibleOptions[state.activeIdx];
+      if (option && !disabled(option)) {
+        _aiSelectPick(api, option.value);
         e.preventDefault();
-      }
+      } else if (input) e.preventDefault();
     }
   };
 
-  trigger.addEventListener('click', () => state.open ? close() : open());
+  if (!externalTrigger) trigger.addEventListener('click', () => state.open ? close() : open());
+  if (input) {
+    const filter = () => {
+      refreshVisibleOptions();
+      state.activeIdx = -1;
+      listbox.scrollTop = 0;
+      renderPopover();
+      reposition();
+    };
+    input.addEventListener('input', e => { if (!e.isComposing) filter(); });
+    input.addEventListener('compositionend', filter);
+    clearSearch.addEventListener('click', () => {
+      input.value = '';
+      input.focus({ preventScroll: true });
+      filter();
+    });
+  }
 
   const api = {
     el,
     state,
     setOptions(options, { value, placeholder } = {}) {
+      const activeValue = visibleOptions[state.activeIdx]?.value;
       state.options = _aiSelectNormalizeOptions(options);
+      refreshVisibleOptions();
       if (typeof value === 'string') state.value = value;
       if (typeof placeholder === 'string') state.placeholder = placeholder;
       // Normalize value if not in options
       if (state.value && !state.options.some(
         option => option.value === state.value && !option.disabled && typeof option.action !== 'function',
       )) state.value = '';
-      if (
-        state.activeIdx >= state.options.length
-        || state.options[state.activeIdx]?.disabled
-      ) {
-        state.activeIdx = state.options.findIndex(option => !disabled(option));
+      if (input) {
+        state.activeIdx = visibleOptions.findIndex(option => option.value === activeValue && !disabled(option));
+      } else if (state.open && activeValue !== undefined) {
+        state.activeIdx = visibleOptions.findIndex(option => option.value === activeValue && !disabled(option));
+        if (state.activeIdx < 0) state.activeIdx = visibleOptions.findIndex(option => option.value === state.value && !disabled(option));
+        if (state.activeIdx < 0) state.activeIdx = visibleOptions.findIndex(option => !disabled(option));
+      } else if (state.activeIdx >= state.options.length || state.options[state.activeIdx]?.disabled) {
+        state.activeIdx = visibleOptions.findIndex(option => !disabled(option));
       }
       if (state.multiple) state.values = normalizeValues(state.values);
       else state.values = state.value ? [state.value] : [];
       renderTrigger();
-      if (state.open) renderPopover();
+      if (state.open) {
+        renderPopover();
+        if (input || externalTrigger) reposition();
+      }
     },
     setValue(value) {
       state.value = typeof value === 'string' && state.options.some(
@@ -2847,6 +2967,7 @@ function _aiSelectMount(el, config) {
     },
     getValue() { return state.value; },
     onChange(fn) { state.onChange = typeof fn === 'function' ? fn : () => {}; },
+    open,
     close,
   };
 
@@ -2862,7 +2983,7 @@ function _aiSelectPick(api, value) {
   const prev = api.state.value;
   api.state.value = value || '';
   api.el.dataset.value = api.state.value;
-  api.close();
+  api.close(Boolean(api.state.search));
   if (prev !== api.state.value) {
     try { api.state.onChange(api.state.value); } catch (_) {}
   }

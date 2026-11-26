@@ -255,6 +255,36 @@ describe('library_transfer filesystem lifecycle', () => {
     expect(fs.readFileSync(projectPath('archive/plan.md'), 'utf8')).toBe('# durable transfer\n');
   });
 
+  it.each(['global', 'project'] as const)('moves a %s file at the 200 MiB limit and keeps its bytes at the destination', async (scope) => {
+    const name = 'large-notes.md';
+    const original = scope === 'global' ? globalPath(name) : projectPath(name);
+    const target = scope === 'global' ? projectPath(name) : globalPath(name);
+    const bytes = 200 * 1024 * 1024;
+    seed(original, 'start');
+    fs.truncateSync(original, bytes);
+    const writer = fs.openSync(original, 'r+');
+    try { fs.writeSync(writer, 'end', bytes - 3, 'utf8'); }
+    finally { fs.closeSync(writer); }
+    const transfer = await import('../../../src/main/features/library_transfer');
+
+    const result = await transfer.transferLibraryEntries('u1', {
+      mode: 'move', paths: [name],
+      source: scope === 'global' ? { scope } : { scope, projectId: 'p1' },
+      destination: scope === 'global' ? { scope: 'project', projectId: 'p1' } : { scope: 'global' },
+    });
+
+    expect(result).toMatchObject({ ok: true, succeeded: 1, failed: 0, results: [{ ok: true, bytes }] });
+    expect(fs.existsSync(original)).toBe(false);
+    expect(fs.statSync(target).size).toBe(bytes);
+    const reader = fs.openSync(target, 'r');
+    try {
+      const edges = Buffer.alloc(8);
+      fs.readSync(reader, edges, 0, 5, 0);
+      fs.readSync(reader, edges, 5, 3, bytes - 3);
+      expect(edges.toString()).toBe('startend');
+    } finally { fs.closeSync(reader); }
+  }, 20000);
+
   it('preserves both source and existing destination when a move conflicts', async () => {
     seed(globalPath('plan.md'), 'source version');
     seed(projectPath('plan.md'), 'existing destination');
@@ -327,6 +357,23 @@ it.each([
   expect(kb.enqueue).not.toHaveBeenCalled(); expect(projects.enqueue).not.toHaveBeenCalled();
 });
 
+
+it('keeps the source of a failed cross-Library move and reports its encoding', async () => {
+  const source = globalPath('mixed.md');
+  const bytes = Buffer.from([0x61, 0x0a, 0xa3]);
+  seed(source, 'temporary fixture');
+  fs.writeFileSync(source, bytes);
+  const { transferLibraryEntries } = await import('../../../src/main/features/library_transfer');
+  const result = await transferLibraryEntries('u1', {
+    mode: 'move', paths: ['mixed.md'],
+    source: { scope: 'global' }, destination: { scope: 'project', projectId: 'p1' },
+  });
+  expect(result).toMatchObject({ ok: true, succeeded: 0, failed: 1, results: [{
+    ok: false, error: 'invalid_source_encoding', message: expect.stringContaining('UTF-8'),
+  }] });
+  expect(fs.readFileSync(source)).toEqual(bytes);
+  expect(fs.existsSync(projectPath('mixed.md'))).toBe(false);
+});
 
 it('continues a same-Library move batch after a recoverable parent-directory failure', async () => {
   seed(globalPath('blocked.md'), 'Preserved failed source');

@@ -29,6 +29,7 @@
   let resizeObserver = null;
   let layoutFrame = 0;
   let nativeVisible = false;
+  let windowPresented = true;
   let nativeTabId = '';
   let layoutRevision = 0;
   let overlaySubscription = null;
@@ -739,6 +740,7 @@
   }
 
   function ensureMainActiveTab(retry = false) {
+    if (!windowPresented) return;
     const tab = selectedTab();
     if (tab?.suspended && tab.error_code && !retry) return;
     if (!tab || (currentState?.active_tab_id === tab.tab_id && !tab.suspended) || activationInFlight === tab.tab_id) return;
@@ -752,6 +754,12 @@
       activationInFlight = '';
       syncVisibility();
     });
+  }
+
+  function setWindowPresentation(payload) {
+    if (typeof payload?.active !== 'boolean' || windowPresented === payload.active) return;
+    windowPresented = payload.active;
+    if (windowPresented) ensureMainActiveTab();
   }
 
   function dialogIsOpen() {
@@ -1092,6 +1100,7 @@
   }
 
   window.orkas.onPushEvent('web-assist:activity', refreshActivity);
+  window.orkas.onPushEvent('conversations:window-visibility', setWindowPresentation);
   window.orkas.onPushEvent('web-assist:state', (state) => {
     if (state?.assistant_action || state?.tabs?.some(tab => tab?.assistant_action)) {
       showFromMain(state);

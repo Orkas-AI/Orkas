@@ -473,6 +473,61 @@ test('preserves existing product facts and references while creation and library
  await creator.locator('#assign-product-media').click();await expect(creator.locator('#product-media-feedback')).toContainText('未保存');expect((await commerceProduct(frame,product.name)).assets).toHaveLength(1);await creator.locator('#assign-product-media').click();await expect(creator.locator('#product-media-feedback')).toHaveText('已保存');await creator.locator('#assign-product-media').click();const retained=await commerceProduct(frame,product.name);expect(retained.assets).toHaveLength(2);expect(retained.assets[0]).toMatchObject(product.assets[0]);expect(retained.copy).toEqual(product.copy);expect(retained.attempts).toHaveLength(0);await preview.screenshot({path:info.outputPath('commerce-legacy-context-library.png')});expect(orkas.modelRequests).toHaveLength(1);await orkas.closePreview(preview);
 });
 
+test('keeps the Commerce draft after invalid or unreadable references',async({modelOrkas:orkas})=>{
+ let {card,preview,frame,creator}=await openCommerceCreator(orkas);
+ const references=[
+  {id:'missing-ref',name:'missing-reference.png',path:'media/missing-reference.png',kind:'image'},
+  {id:'legacy-ref',name:'legacy-reference.avi',path:'media/legacy-reference.png',kind:'video'},
+  {id:'unreadable-ref',name:'unreadable-reference.png',path:'media/unreadable-reference.png',kind:'image'},
+ ];
+ const product={
+  id:'reference-product',name:'测试参考商品',revision:1,
+  copy:{title:'测试款',description:'',bullets:[]},
+  assets:references,versions:[],jobs:[],attempts:[]
+ };
+ await frame.locator('body').evaluate(async(_element,product)=>{
+  const api=(window as any).orkasApp;
+  await api.appFiles.writeBase64({path:'media/legacy-reference.png',base64:'YQ==',scope:'cloud'});
+  await api.appFiles.writeText({path:'products/'+product.id+'.json',text:JSON.stringify(product),scope:'cloud'});
+  await api.storage.set({key:'listing-index-v1',value:[{id:product.id,name:product.name,sku:'',listings:[]}],scope:'cloud'});
+ },product);
+ await orkas.closePreview(preview);
+ await orkas.electronApp!.evaluate((_electron,modules)=>{
+  const require=(process as any).mainModule.require.bind((process as any).mainModule);
+  const {runtime}=require(modules.host),{AppError}=require(modules.runtime);
+  const execute=runtime.execute;
+  runtime.execute=function(...args:any[]){
+   if(args[1]==='appFiles.readBase64'&&args[2].path==='media/unreadable-reference.png'){
+    runtime.execute=execute;
+    throw new AppError('E_FILE');
+   }
+   return execute.apply(this,args);
+  };
+ },{
+  host:path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'),
+  runtime:path.resolve(__dirname,'../../src/main/features/web_apps/runtime.ts'),
+ });
+ preview=await orkas.openPreview(()=>card.click());
+ frame=preview.frameLocator('.saved-app-viewer-frame');
+ await frame.locator('button[data-view="creative"]').click();
+ creator=frame.frameLocator('#media-workspace');
+ await creator.locator('#nav-image').click();
+ await creator.locator('#product-association button').click();
+ await creator.getByRole('option',{name:product.name,exact:true}).click();
+ const brief=creator.locator('#brief');
+ await brief.fill('保留需求文字');
+ for(const reference of references){
+  await creator.locator('#add-material').click();
+  await creator.locator('#product-references').click();
+  await frame.locator('#picker-options button').filter({hasText:reference.name}).click();
+  await expect(creator.locator('#notice')).toHaveClass(/error/);
+ }
+ await expect(brief).toHaveValue('保留需求文字');
+ await expect(creator.locator('#selected-assets .chat-attach-chip')).toHaveCount(0);
+ expect(orkas.modelRequests).toHaveLength(0);
+ await orkas.closePreview(preview);
+});
+
 test('keeps core copy input after a failed request save and retries once without hidden dispatch',async({modelOrkas:orkas})=>{
  const{preview,frame,creator}=await openCommerceCreator(orkas);const brief='写一段适合通勤人群的旅行杯商品介绍。';await creator.locator('#brief').fill(brief);
  await orkas.electronApp!.evaluate((_electron,module)=>{const runtime=(process as any).mainModule.require(module).runtime,original=runtime.execute;runtime.execute=async function(...args:any[]){if(args[1]==='appFiles.writeText'&&args[2].path.startsWith('requests/')){runtime.execute=original;throw new ((process as any).mainModule.require(module.replace('host.ts','runtime.ts')).AppError)('E_DATA');}return original.apply(this,args);};},path.resolve(__dirname,'../../src/main/features/web_apps/host.ts'));

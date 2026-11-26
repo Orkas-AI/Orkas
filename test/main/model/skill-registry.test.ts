@@ -294,6 +294,17 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     });
   });
 
+  it('gives the model a document-relative link base and a Skill-root read address', async () => {
+    writeSkill(customDir(), 'project-guide', 'Project Guide', 'Guide for editing projects');
+    const { getSystemPromptBlock } = await loadRegistry();
+
+    const text = await getSystemPromptBlock({ runtimeBindings: new Map() });
+
+    expect(text).toMatch(/relative links within a Skill.*linking document's directory/i);
+    expect(text).toMatch(/read_files.*@skill\/<read-ref>\/<path-from-skill-root>/);
+    expect(text).toContain('read ref: @skill/project-guide');
+  });
+
   it('renders only allowlisted skills when allowlist is provided', async () => {
     writeSkill(builtinDir(), 'translate', 'Translate', 'T');
     writeSkill(builtinDir(), 'summarize', 'Summarize', 'S');

@@ -169,6 +169,8 @@ export interface TextReadResult {
 export interface ImageReadResult {
   base64: string;
   mediaType: 'image/jpeg';
+  sourceWidth: number;
+  sourceHeight: number;
   width: number;
   height: number;
   /** Original file size on disk (not the compressed preview size). */
@@ -961,6 +963,8 @@ export async function readImageAsJpeg(
   return {
     base64: out.buf.toString('base64'),
     mediaType: 'image/jpeg',
+    sourceWidth: out.sourceWidth,
+    sourceHeight: out.sourceHeight,
     width: out.width,
     height: out.height,
     bytes: buf.length,

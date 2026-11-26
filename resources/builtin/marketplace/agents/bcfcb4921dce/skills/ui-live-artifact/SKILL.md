@@ -40,7 +40,7 @@ For `live_ready_html`, create or describe these files when a file deliverable is
 - `index.html`: rendered preview that works now in the Orkas embedded artifact surface.
 - `template.html`: optional source template when the user wants future refresh wiring.
 - `data.json`: compact normalized preview data only.
-- `artifact.json`: optional metadata for title, description, refresh mode, view type, and safe source descriptors.
+- `artifact.json`: the required manifest owned by `ui-artifact-workspace`; add title, description, refresh mode, view type, and safe source descriptors.
 - `provenance.json`: optional safe summary of source, transform, timestamp, confidence, and omitted sensitive fields.
 
 If no file workspace is available, embed the same contract in the HTML artifact and final handoff.

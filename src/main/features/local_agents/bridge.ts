@@ -70,10 +70,7 @@ import { buildConversationBrowserTool } from '../group_chat/browser_tool';
 import { browserTaskRunId } from '../web_assist_lifecycle';
 import { getActiveUserId } from '../users';
 import { applyConnectorArgDefaults } from '../../model/core-agent/connector-meta-tools';
-import {
-  listAgentEntries,
-  removeAgentEntry,
-} from '../memory';
+import { listAgentEntries } from '../memory';
 import * as connectors from '../connectors';
 import { createConnectorToolDiscovery, validateDiscoveryParams } from '../connectors/tool-discovery';
 import { requestActionConfirm, connectorAccountKey } from '../connectors/action_confirm';
@@ -648,7 +645,7 @@ function _buildMethods(
             { signal: call.signal },
           );
         case 'remove':
-          return removeAgentEntry(opts.uid, opts.agentId, String(params.old_text || ''));
+          return removeMemoryEntry(opts.uid, { agent: opts.agentId }, String(params.old_text || ''));
         case 'list':
           return listAgentEntries(opts.uid, opts.agentId);
       }

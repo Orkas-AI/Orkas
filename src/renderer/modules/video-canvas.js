@@ -194,6 +194,7 @@
   function videoState(card, job) {
     if (job && job.status === 'failed') return 'failed';
     if (job && job.status === 'running') return 'updating';
+    if (job && job.status === 'review' && job.review) return 'review';
     if (card.id && !(card.versions || []).length) return 'not_rendered';
     return 'ready';
   }
@@ -465,6 +466,7 @@
 
   let _cid = '';
   let _lifetime = 0;
+  let _modelOptionsRevision = 0;
   const _fieldTargets = new WeakMap();
   const _target = () => ({ cid: _cid, dir: _dir, lifetime: _lifetime });
   const _acceptsTarget = (target) => !!target && target.cid === _cid && target.dir === _dir && target.lifetime === _lifetime;
@@ -534,8 +536,7 @@
   const _draftOptionsShown = new Map();
   const _draftLoading = new Set();
   const _draftPromptSaves = new Map();
-  // The panel's menus by name: its model, the way a shot is made, a new shot's shape and length.
-  const _panelSelects = new Map();
+  let _shotModelSelect = null;
   const DRAFT_PROMPT_SAVE_MS = 800;
 
   const _el = (id) => document.getElementById(id);
@@ -735,11 +736,23 @@
       ${meta ? `<div class="video-canvas-meta">${escapeHtml(meta)}</div>` : ''}`;
   }
 
+  /** A stock file names its source and author under its name, opening its page in the browser
+   *  when it has one (2026-11-16). */
+  function _creditHtml(credit) {
+    if (!credit) return '';
+    const text = [credit.source, credit.author, credit.license].filter(Boolean).join(' · ');
+    return credit.url
+      ? `<a class="video-canvas-meta video-canvas-credit" href="${escapeHtml(credit.url)}" title="${escapeHtml(credit.url)}">${escapeHtml(text)}</a>`
+      : `<div class="video-canvas-meta video-canvas-credit">${escapeHtml(text)}</div>`;
+  }
+
   function _renderAssetCard(el, card) {
     const lang = getLang();
+    const credit = card.credit || null;
     _patch(el, 'menu', `${card.key}|${lang}`, _menuButtonHtml(card.key));
     _patch(el, 'link', `${card.key}|${lang}|${_readOnly()}`, _linkHandleHtml(card.key));
-    _patch(el, 'head', `${card.label}|${card.kind}|${lang}`, _cardHeadHtml(card.kind === 'video' ? 'film' : 'image', t('video_canvas.kind.asset'), card.label));
+    _patch(el, 'head', `${card.label}|${card.kind}|${lang}|${JSON.stringify(credit)}`,
+      _cardHeadHtml(card.kind === 'video' ? 'film' : 'image', t('video_canvas.kind.asset'), card.label) + _creditHtml(credit));
     _patch(el, 'media', `${card.media_path}`, `<div class="video-canvas-media" data-open-media="${escapeHtml(card.media_path)}">${_mediaHtml(card.media_path, card.kind, card.label)}</div>`);
   }
 
@@ -837,10 +850,26 @@
         ${percent === null ? '' : `<span class="video-canvas-progress"><i style="width:${percent}%"></i></span>`}
       </div>`;
     }
+    if (state === 'review') {
+      const labels = job.review.scenes.flatMap(({ id, seconds }) => {
+        const index = card.scenes.findIndex((scene) => scene.id === id);
+        return index < 0 ? [] : [t('video_canvas.scene_label', { n: index + 1, seconds: VM.formatSeconds(seconds) })];
+      });
+      const scenes = new Intl.ListFormat(getLang()).format(labels);
+      const message = t('video_canvas.held_stills.message', { percent: job.review.percent });
+      const video = escapeHtml(card.id);
+      const disabled = _readOnly() ? 'disabled' : '';
+      return `<div class="video-canvas-status-row is-review" role="status">
+        <span class="video-canvas-status-text">${escapeHtml(message)}${scenes ? `<br>${escapeHtml(scenes)}` : ''}</span>
+        <button type="button" class="btn btn-sm" data-action="review-preview" data-video="${video}">${escapeHtml(t('video_canvas.held_stills.preview'))}</button>
+        <button type="button" class="btn btn-sm" data-action="review-edit" data-video="${video}" ${disabled}>${escapeHtml(t('video_canvas.held_stills.edit'))}</button>
+        <button type="button" class="btn btn-primary btn-sm" data-action="review-deliver" data-video="${video}" ${disabled}>${escapeHtml(t('video_canvas.held_stills.deliver'))}</button>
+      </div>`;
+    }
     // Update video, always beside the versions, tries again.
     if (state === 'failed') {
       return `<div class="video-canvas-status-row is-failed" role="alert">
-        <span class="video-canvas-status-text">${escapeHtml(t('video_canvas.status.failed'))}</span>
+        <span class="video-canvas-status-text">${escapeHtml(t(job.code === 'E_VIDEO_SHIP_REVIEW_EXPIRED' ? 'video_canvas.held_stills.expired' : 'video_canvas.status.failed'))}</span>
         <button type="button" class="btn btn-sm" data-action="fix-with-agent" data-video="${escapeHtml(card.id)}">${escapeHtml(t('video_canvas.fix_with_agent'))}</button>
       </div>`;
     }
@@ -957,8 +986,9 @@
     if (!card.id) return;
     // Locked apart from drawing the row, so an open version menu stays open.
     const updateButton = el.querySelector(':scope > [data-part="versions"] [data-action="render"]');
-    if (updateButton) updateButton.disabled = _readOnly() || VM.videoState(card, job) === 'updating';
-    const statusSignature = JSON.stringify([VM.videoState(card, job), job && job.phase, job && job.progress, _readOnly(), lang]);
+    const state = VM.videoState(card, job);
+    if (updateButton) updateButton.disabled = _readOnly() || state === 'updating' || state === 'review';
+    const statusSignature = JSON.stringify([state, job?.phase, job?.progress, job?.code, job?.review?.id, _readOnly(), lang]);
     _patch(el, 'status', statusSignature, _statusHtml(card, job));
     const barSignature = JSON.stringify([
       card.scenes.map((scene) => [scene.id, scene.duration_sec, scene.frame_path, scene.media_path, _shotJob(scene.source)?.status]),
@@ -1113,11 +1143,11 @@
   }
 
   function _takeOptionsKey(take, dir = _dir) {
-    return `${dir}|${take.asset_id}|${_inputsSignature(_takeInputsOf(take, dir))}|${_inputsSignature(_takeSettingsOf(take, dir))}`;
+    return `${_modelOptionsRevision}|${dir}|${take.asset_id}|${_inputsSignature(_takeInputsOf(take, dir))}|${_inputsSignature(_takeSettingsOf(take, dir))}`;
   }
 
   function _quoteKey(dir, assetId, choice, inputs, settings) {
-    return `${dir}|${assetId}|${choice || ''}|${_inputsSignature(inputs)}|${_inputsSignature(settings)}`;
+    return `${_modelOptionsRevision}|${dir}|${assetId}|${choice || ''}|${_inputsSignature(inputs)}|${_inputsSignature(settings)}`;
   }
 
   /** The service picked for a take: the user's choice while it is offered, or where it was made. */
@@ -1161,12 +1191,17 @@
     return ratio === 'adaptive' && framed ? t('video_canvas.new_shot.ratio_adaptive') : ratio;
   }
 
+  function _durationText(seconds) {
+    if (seconds === -1) return t('agents.output_format_auto');
+    return seconds > 0 ? t('video_canvas.seconds', { seconds: VM.formatSeconds(seconds) }) : '';
+  }
+
   function _paramsText(params, framed) {
     if (!params) return '';
     return [
       params.ratio ? _ratioText(params.ratio, framed) : '',
       params.resolution || '',
-      typeof params.duration === 'number' && params.duration > 0 ? t('video_canvas.seconds', { seconds: VM.formatSeconds(params.duration) }) : '',
+      _durationText(params.duration),
       typeof params.audio === 'boolean' ? t(params.audio ? 'video_canvas.take.sound' : 'video_canvas.take.silent') : '',
       params.size || '',
     ].filter(Boolean).join(' · ');
@@ -1215,55 +1250,38 @@
     panel.style.top = `${Math.round(view.y + (cardEl.offsetTop + cardEl.offsetHeight) * view.zoom + 12)}px`;
   }
 
-  function _closePanelSelect(name) {
-    const api = _panelSelects.get(name);
-    if (!api) return;
-    _panelSelects.delete(name);
-    try { api.close(); } catch (_) { /* a removed select has nothing to close */ }
+  function _removeShotModelSelect() {
+    _shotModelSelect?.close();
+    _shotModelSelect = null;
   }
 
-  function _closePanelSelects() {
-    for (const name of [..._panelSelects.keys()]) _closePanelSelect(name);
-  }
-
-  /** A menu in the panel, under its name. Its list lives on <body> while open, so one being
-   *  replaced is closed first. */
-  function _mountPanelSelect(name, host, config, locked) {
-    _closePanelSelect(name);
-    if (!host) return;
-    _panelSelects.set(name, _aiSelectMount(host, config));
-    _lockPanelSelect(name, locked);
-  }
-
-  /** Read-only, a menu shows its value and opens nothing. Set apart from drawing it, so an Agent
-   *  starting and stopping leaves an open menu open. */
-  function _lockPanelSelect(name, locked) {
-    const api = _panelSelects.get(name);
-    const trigger = api && api.el && api.el.querySelector('.ai-select-trigger');
-    if (trigger) trigger.disabled = !!locked;
-  }
-
-  /** The services to pick from. The one picked stays pickable when it cannot make the shot, so the
-   *  menu still names it while the panel says why. */
   function _modelOptions(choices, choiceId) {
     return choices.map((choice) => ({
       value: choice.id,
       label: _choiceLabel(choice),
+      hint: _unavailableText(choice.unavailable),
       disabled: !!choice.unavailable && choice.id !== choiceId,
-      ...(choice.unavailable ? { hint: _unavailableText(choice.unavailable) } : {}),
     }));
   }
 
-  function _mountTakeSelect(node, take, options, choiceId) {
-    _mountPanelSelect('model', node.querySelector('[data-take-model]'), {
-      options: _modelOptions(options.choices, choiceId),
-      value: choiceId,
-      ariaLabel: t('video_canvas.take.model'),
-      onChange: (value) => {
-        _takeChoice.set(_takeKey(take), value);
-        _renderTakePanel();
-      },
-    });
+  function _renderShotModelSelect(bar, choices, choiceId, locked, onChange) {
+    const host = bar?.querySelector('[data-take-model]');
+    if (!host) {
+      _removeShotModelSelect();
+      return;
+    }
+    const options = _modelOptions(choices, choiceId);
+    const label = t('video_canvas.take.model');
+    const signature = JSON.stringify([options, choiceId, label]);
+    if (_shotModelSelect?.el !== host) {
+      _removeShotModelSelect();
+      _shotModelSelect = _aiSelectMount(host, { options, value: choiceId, ariaLabel: label, minWidth: 240, onChange });
+    } else if (host.dataset.modelOptions !== signature) {
+      _shotModelSelect.setOptions(options, { value: choiceId });
+    }
+    host.dataset.modelOptions = signature;
+    const trigger = host.querySelector('.ai-select-trigger');
+    trigger.disabled = !!locked;
   }
 
   /** What "+" adds: a reference, or the next frame. */
@@ -1322,7 +1340,7 @@
     const draft = _isOpen() ? _selectedDraft() : null;
     const card = _isOpen() && !draft ? _selectedShot() : null;
     if (!card && !draft) {
-      _closePanelSelects();
+      _removeShotModelSelect();
       panel.hidden = true;
       panel.innerHTML = '';
       _renderSettings();
@@ -1331,7 +1349,7 @@
     // A new shot's panel and a take's have parts of the same names.
     const kind = draft ? 'draft' : 'shot';
     if (panel.dataset.kind !== kind) {
-      _closePanelSelects();
+      _removeShotModelSelect();
       panel.innerHTML = '';
       panel.dataset.kind = kind;
     }
@@ -1396,10 +1414,8 @@
     // plan 27.21); a still lists what it was made at.
     const summary = take.redoable && take.kind === 'video' && choice ? _settingsSummary(choice.params, offersMethod ? method : '') : '';
     const params = summary ? '' : _paramsText(choice ? choice.params : take.params, method === 'frames');
-    const choosing = take.kind === 'video' && loaded && loaded.choices.length > 0;
-    const modelHtml = choosing
-      ? '<div class="video-canvas-take-model" data-take-model></div>'
-      : take.model ? `<span class="video-canvas-take-model-name" title="${escapeHtml(take.model)}">${escapeHtml(take.model)}</span>` : '';
+    const choosing = take.kind === 'video' && loaded?.choices.length;
+    const modelHtml = choosing ? '<div class="video-canvas-take-model" data-take-model></div>' : '';
     const reason = (choice && choice.unavailable) || (loaded && loaded.unavailable) || null;
     // The words Generate would send, as the field shows them.
     const promptField = panel.querySelector(':scope > [data-part="prompt"] textarea');
@@ -1418,12 +1434,12 @@
     // redraws the button beside it and leaves an open menu open. So does the settings button, which
     // the settings popover hangs from.
     const shown = !!(modelHtml || params || summary || generate);
-    _patch(panel, 'bar', JSON.stringify([take.asset_id, choosing && loaded.choices, choiceId, take.model, shown, lang, _dir]), shown
-      ? _barHtml(modelHtml)
-      : '', (node) => { if (choosing) _mountTakeSelect(node, take, loaded, choiceId); else _closePanelSelect('model'); });
-    if (!shown) _closePanelSelect('model');
-    else _lockPanelSelect('model', !editable);
+    _patch(panel, 'bar', JSON.stringify([take.asset_id, modelHtml, shown, lang, _dir]), shown ? _barHtml(modelHtml) : '');
     const bar = panel.querySelector(':scope > [data-part="bar"] > .video-canvas-take-bar');
+    _renderShotModelSelect(bar, loaded?.choices || [], choiceId, !editable, (value) => {
+      _takeChoice.set(key, value);
+      _renderTakePanel();
+    });
     if (bar) {
       _patch(bar.querySelector(':scope > .video-canvas-take-summary'), 'settings', JSON.stringify([summary, !editable, lang]), summary ? _settingsButtonHtml(summary, !editable) : '');
       _patch(bar.querySelector(':scope > .video-canvas-take-row'), 'action', JSON.stringify([take.asset_id, params, quote, blocked, running, asking, lang, _dir]), params || generate
@@ -1451,7 +1467,7 @@
       : '');
 
     if (take.redoable && (!current || _takeOptionsStale.has(optionsKey)) && !readOnly) _loadTakeOptions(take);
-    else if (take.redoable && current && !quote && !readOnly && !running && !reason) _quoteFor(take.asset_id, choiceId, _target(), false, inputsAsked, settingsAsked);
+    else if (take.redoable && current && !quote && !readOnly && !running) _quoteFor(take.asset_id, choiceId, _target(), false, inputsAsked, settingsAsked);
   }
 
   /** A panel's bar: how a video will be made, on a row of its own, in full; then the model, with
@@ -1595,7 +1611,7 @@
     if (choice.durations.length) {
       groups.push(_settingsGroupHtml('duration', t('video_canvas.new_shot.duration'), choice.durations.map((seconds) => ({
         value: seconds,
-        label: escapeHtml(t('video_canvas.seconds', { seconds: VM.formatSeconds(seconds) })),
+        label: escapeHtml(_durationText(seconds)),
       })), params.duration));
     }
     groups.push(_settingsGroupHtml('audio', t('video_canvas.take.audio'), [
@@ -1771,6 +1787,7 @@
 
   async function _loadTakeOptions(take, target = _target()) {
     const inputs = _takeInputsOf(take, target.dir);
+    const revision = _modelOptionsRevision;
     const key = _takeOptionsKey(take, target.dir);
     if (_takeLoading.has(key)) return;
     _takeLoading.add(key);
@@ -1783,7 +1800,7 @@
         ...(inputs ? { inputs } : {}),
         ...(settings ? { settings } : {}),
       }).catch(() => null);
-      if (!_acceptsTarget(target)) return;
+      if (!_acceptsTarget(target) || revision !== _modelOptionsRevision) return;
       // A failed lookup offers no choice: the take is made where it was, as from the Agent.
       if (options && options.ok) {
         _takeOptions.set(key, options);
@@ -1801,7 +1818,7 @@
   // are saved as they are made, so the new shot survives closing the canvas.
 
   function _draftOptionsKey(draft, dir = _dir) {
-    return `${dir}|${draft.id}|${JSON.stringify([draft.kind, draft.method, draft.inputs.map((input) => input.asset_id), draft.choice || '', draft.ratio || '', draft.duration || 0, draft.resolution || '', draft.audio ?? null])}`;
+    return `${_modelOptionsRevision}|${dir}|${draft.id}|${JSON.stringify([draft.kind, draft.method, draft.inputs.map((input) => input.asset_id), draft.choice || '', draft.ratio || '', draft.duration || 0, draft.resolution || '', draft.audio ?? null])}`;
   }
 
   /** The service a new shot is made on: the user's pick while it is offered, else the default. */
@@ -1823,6 +1840,7 @@
     const loaded = options && options.ok !== false ? options : null;
     const video = draft.kind === 'video';
     const choices = loaded && loaded.kind === 'video' ? loaded.choices : [];
+    const choosing = choices.length;
     const choiceId = _draftChoiceOf(draft);
     const choice = choices.find((item) => item.id === choiceId) || null;
     const quote = current ? _quotes.get(`${optionsKey}|${choiceId}`) : null;
@@ -1852,11 +1870,10 @@
           data-original="${escapeHtml(draft.prompt)}">${escapeHtml(draft.prompt)}</textarea>
       </label>`);
 
-    _patch(panel, 'bar', JSON.stringify([draft.id, choices, choiceId, lang, _dir]),
-      _barHtml(choices.length ? '<div class="video-canvas-take-model" data-take-model></div>' : ''), (node) => _mountDraftModel(node, draft, choices, choiceId));
-    if (!choices.length) _closePanelSelect('model');
-    _lockPanelSelect('model', locked);
+    _patch(panel, 'bar', JSON.stringify([draft.id, choosing, lang, _dir]),
+      _barHtml(choosing ? '<div class="video-canvas-take-model" data-take-model></div>' : ''));
     const bar = panel.querySelector(':scope > [data-part="bar"] > .video-canvas-take-bar');
+    _renderShotModelSelect(bar, choices, choiceId, locked, (value) => _saveDraft(draft, { choice: value }));
     const reason = (choice && choice.unavailable) || (loaded && loaded.unavailable) || null;
     const blocked = readOnly || running || pending || !!asking || !!reason || (video && !current);
     // How it is made, its shape, resolution, length and sound, summed up on a button that opens
@@ -1884,26 +1901,17 @@
       : '');
 
     if ((!current || _draftOptionsStale.has(optionsKey)) && !readOnly) _loadDraftOptions(draft);
-    else if (current && !quote && !readOnly && !running && !reason) _quoteDraftFor(draft, choiceId);
-  }
-
-  function _mountDraftModel(node, draft, choices, choiceId) {
-    if (!choices.length) return;
-    _mountPanelSelect('model', node.querySelector('[data-take-model]'), {
-      options: _modelOptions(choices, choiceId),
-      value: choiceId,
-      ariaLabel: t('video_canvas.take.model'),
-      onChange: (value) => _saveDraft(draft, { choice: value }),
-    });
+    else if (current && !quote && !readOnly && !running) _quoteDraftFor(draft, choiceId);
   }
 
   async function _loadDraftOptions(draft, target = _target()) {
+    const revision = _modelOptionsRevision;
     const key = _draftOptionsKey(draft, target.dir);
     if (_draftLoading.has(key)) return;
     _draftLoading.add(key);
     try {
       const options = await global.orkas.invoke('videoCanvas.draftOptions', { cid: target.cid, dir: target.dir, id: draft.id }).catch(() => null);
-      if (!_acceptsTarget(target)) return;
+      if (!_acceptsTarget(target) || revision !== _modelOptionsRevision) return;
       // Without an answer there is no choice to show; making it asks again.
       _draftOptions.set(key, options && options.ok ? options : { ok: false });
       if (options && options.ok) _draftOptionsShown.set(`${target.dir}|${draft.id}`, options);
@@ -2052,9 +2060,7 @@
     for (const api of [..._versionSelects.values(), ..._voiceSelects.values()]) {
       try { api.close(); } catch (_) { /* a removed select has nothing to close */ }
     }
-    for (const api of _panelSelects.values()) {
-      try { api.close(); } catch (_) { /* a removed select has nothing to close */ }
-    }
+    _shotModelSelect?.close();
   }
 
   function _renderHeader() {
@@ -2156,6 +2162,18 @@
   }
 
   // ── Talking to main ──────────────────────────────────────────────────
+
+  function refreshModelOptions() {
+    _modelOptionsRevision += 1;
+    _takeOptions.clear();
+    _takeOptionsStale.clear();
+    _takeOptionsShown.clear();
+    _draftOptions.clear();
+    _draftOptionsStale.clear();
+    _draftOptionsShown.clear();
+    _quotes.clear();
+    if (_isOpen()) _renderTakePanel();
+  }
 
   async function refresh() {
     const requestedCid = _cid;
@@ -2284,6 +2302,19 @@
     if (VM.acceptsResponse(_cid, cid)) await refresh();
   }
 
+  async function _resolveDelivery(video, decision) {
+    const target = _target();
+    const card = _cardOf(`video:${video}`);
+    const review = card && _videoJob(card)?.review;
+    if (!review || _readOnly()) return;
+    const result = await global.orkas.invoke('videoCanvas.resolveDelivery', {
+      cid: target.cid, dir: target.dir, video, reviewId: review.id, decision,
+    }).catch(() => null);
+    if (!_acceptsTarget(target)) return;
+    if (!result?.ok) uiToast(_refusalMessage(result), { variant: 'warning' });
+    await refresh();
+  }
+
   async function _saveLayout() {
     const production = _production();
     if (!production) return;
@@ -2295,6 +2326,7 @@
   const _quoting = new Set();
   async function _quoteFor(assetId, choice, target = _target(), fresh = false, inputs = undefined, settings = undefined) {
     if (!_acceptsTarget(target)) return null;
+    const revision = _modelOptionsRevision;
     const { cid, dir } = target;
     const key = _quoteKey(dir, assetId, choice, inputs, settings);
     if (!fresh && _quoting.has(key)) return null;
@@ -2308,7 +2340,7 @@
         ...(inputs ? { inputs } : {}),
         ...(settings ? { settings } : {}),
       }).catch(() => null);
-      if (!_acceptsTarget(target)) return null;
+      if (!_acceptsTarget(target) || revision !== _modelOptionsRevision) return null;
       _quotes.set(key, quote || { ok: false, code: 'quote_failed' });
       _renderTakePanel();
       return quote;
@@ -2496,12 +2528,13 @@
 
   async function _quoteDraftFor(draft, choiceId, target = _target(), fresh = false) {
     if (!_acceptsTarget(target)) return null;
+    const revision = _modelOptionsRevision;
     const key = `${_draftOptionsKey(draft, target.dir)}|${choiceId || ''}`;
     if (!fresh && _quoting.has(key)) return null;
     _quoting.add(key);
     try {
       const quote = await global.orkas.invoke('videoCanvas.quoteDraft', { cid: target.cid, dir: target.dir, id: draft.id }).catch(() => null);
-      if (!_acceptsTarget(target)) return null;
+      if (!_acceptsTarget(target) || revision !== _modelOptionsRevision) return null;
       _quotes.set(key, quote || { ok: false, code: 'quote_failed' });
       _renderTakePanel();
       return quote;
@@ -2679,13 +2712,14 @@
       return scoped([{
         label: t('common.delete'),
         danger: true,
-        disabled: readOnly || !!(job && job.status === 'running'),
+        disabled: readOnly || job?.status === 'running' || job?.status === 'review',
         onClick: () => _removeDraft(card, target),
       }]);
     }
     if (card.versions) {
       const items = [];
-      if (card.id) {
+      // A video made with ffmpeg alone has no timeline but can still be made again (2026-11-16).
+      if (card.id || card.versions.length) {
         items.push({ label: t('video_canvas.another_version'), onClick: () => _askAnotherVersion(card) });
       }
       items.push({ label: t('video_canvas.say_to_agent'), onClick: () => _sayAboutCard(card) });
@@ -2792,6 +2826,12 @@
       _render();
     },
     render: (target) => _updateVideo(target.dataset.video),
+    'review-preview': (target) => {
+      const card = _cardOf(`video:${target.dataset.video}`);
+      if (card) _openMedia(_videoJob(card)?.review?.preview_path);
+    },
+    'review-edit': (target) => _resolveDelivery(target.dataset.video, 'edit'),
+    'review-deliver': (target) => _resolveDelivery(target.dataset.video, 'deliver'),
     'fix-with-agent': (target) => {
       const card = _cardOf(`video:${target.dataset.video}`);
       if (!card) return;
@@ -3203,8 +3243,9 @@
 
   function _onPointerDown(event) {
     if (event.button !== 0) return;
-    _closeFloating();
     const { target } = event;
+    if (_shotModelSelect?.el.contains(target)) return;
+    _closeFloating();
     if (target.closest('.video-canvas-zoom, .video-canvas-empty')) return;
     const chip = target.closest('.video-canvas-chip[data-scene]');
     if (chip) {
@@ -3361,9 +3402,10 @@
     event.preventDefault();
     _closeFloating();
     const target = _target();
-    // Another version of each video, as its card's menu asks it (decided 2026-11-11). It only
-    // fills the composer, so it stays while an Agent works.
-    const videos = (_production().videos || []).filter((video) => video.id);
+    // Another version of each video, as its card's menu asks it (decided 2026-11-11), a video
+    // made with ffmpeg alone included (2026-11-16). It only fills the composer, so it stays
+    // while an Agent works.
+    const videos = (_production().videos || []).filter((video) => video.id || (video.versions || []).length);
     showContextMenu(event, [{
       label: t('video_canvas.upload_footage'),
       icon: 'folder-open',
@@ -3378,7 +3420,7 @@
       label: videos.length === 1 ? t('video_canvas.another_version_video') : t('video_canvas.another_version_of', { name: video.label }),
       icon: 'film',
       onClick: () => (_acceptsTarget(target) ? _askAnotherVersion(video) : undefined),
-    }))]);
+    }))], { scrollAnchor: _viewport() });
   }
 
   function _onPaste(event) {
@@ -3406,6 +3448,7 @@
     if (event.status === 'stopped') {
       // A change made this update pointless. It has no outcome, and the next one starts afresh.
       if (event.cid !== _cid) return;
+      _readSeq++;
       _jobs.delete(key);
       if (_isOpen()) _render();
       return;
@@ -3433,6 +3476,7 @@
       refresh();
       return;
     }
+    if (event.status === 'review' || _jobs.get(key)?.status === 'review') _readSeq++;
     _jobs.set(key, { ...event });
     if (event.status === 'failed' && !_isOpen()) uiToast(t('video_canvas.status.failed'), { variant: 'warning', timeoutMs: 8000 });
     if (_isOpen()) _render();
@@ -3471,6 +3515,7 @@
   function close() {
     _openRequest += 1;
     _closeSettings();
+    _shotModelSelect?.close();
     _setOpen(false);
   }
 
@@ -3574,5 +3619,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _bind);
   else _bind();
 
-  global.VideoCanvas = { probe, open, close, refresh, notifyTurnEnd, notifyBusy };
+  global.VideoCanvas = { probe, open, close, refresh, refreshModelOptions, notifyTurnEnd, notifyBusy };
 }(typeof window !== 'undefined' ? window : globalThis));

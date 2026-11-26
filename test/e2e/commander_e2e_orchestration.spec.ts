@@ -424,6 +424,69 @@ test.describe('Commander orchestration', () => {
     expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeRelaunch);
   });
 
+  test('retries a failed Commander synthesis after restart without rerunning the completed Agent', async ({
+    modelOrkas,
+  }) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    let page = modelOrkas.page;
+    const narration = 'I will delegate the draft and then review it.';
+    const agentFinalText = 'The draft has three sections and a total of 42.';
+    const synthesis = 'I reviewed the three-section draft and confirmed the total of 42.';
+    modelOrkas.setCommanderSegmentScenario({
+      narration,
+      agentId: CONTENT_WRITER_ID,
+      task: 'Draft the three-section launch note.',
+      agentFinalText,
+      synthesis,
+    }, { synthesisUnavailable: true });
+
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Ask ContentWriter for a launch note, then review its draft.');
+    await page.locator('#new-chat-send-btn').click();
+
+    const failedReply = () => page.locator(
+      '#chat-history .chat-message.assistant[data-from-actor="commander"][data-failed="1"]',
+    );
+    const draftReply = () => page.locator(
+      `#chat-history .chat-message.assistant[data-from-actor="${CONTENT_WRITER_ID}"]`,
+      { hasText: agentFinalText },
+    );
+    await expect(draftReply()).toBeVisible({ timeout: 20_000 });
+    await expect(failedReply()).toHaveAttribute('data-msg-id', /\S+/, { timeout: 30_000 });
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const parentFailures = modelOrkas.apiResponses.filter(({ path, status }) => (
+      ['/api/v1/responses', '/api/v1/chat/completions'].includes(path) && status === 500
+    ));
+    expect(parentFailures.length).toBeGreaterThan(0);
+    for (const failure of parentFailures) {
+      modelOrkas.expectApiFailure(failure.method, failure.path, failure.status);
+    }
+    const requestsBeforeRetry = modelOrkas.modelRequests.length;
+    const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+    expect(conversationId).toBeTruthy();
+
+    page = await modelOrkas.relaunch();
+    await page.locator(`#conversation-list .conv-item[data-cid="${conversationId}"]`).click();
+    await expect(draftReply()).toHaveCount(1);
+    await expect(failedReply()).toContainText(/temporarily unavailable|try again/i);
+    await expect(page.locator('#chat-history .chat-message.assistant[data-from-actor="commander"]', {
+      hasText: narration,
+    })).toHaveCount(1);
+    expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeRetry);
+
+    modelOrkas.restoreCommanderSynthesis();
+    await failedReply().hover();
+    await failedReply().locator('.bubble-retry-btn').click();
+    const recoveredReply = page.locator('#chat-history .chat-message.assistant[data-from-actor="commander"]', {
+      hasText: synthesis,
+    });
+    await expect(recoveredReply).toHaveAttribute('data-msg-id', /\S+/, { timeout: 20_000 });
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    await expect(draftReply()).toHaveCount(1);
+    expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeRetry + 1);
+    expect(JSON.stringify(modelOrkas.modelRequests.at(-1))).toContain(agentFinalText);
+  });
+
   test('shows two dispatched agent results before Commander synthesis and restores them once', async ({
     modelOrkas,
   }) => {

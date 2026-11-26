@@ -12,6 +12,8 @@ export interface ProviderRequestFailure {
   source: ProviderFailureSource;
   lastEvent: string;
   requestSequence?: number;
+  /** Host-local admission round for a capacity skip, before any adapter call. */
+  requestRound?: number;
   contextWindow?: number;
   outputLimit?: number;
   budgetObserved?: boolean;

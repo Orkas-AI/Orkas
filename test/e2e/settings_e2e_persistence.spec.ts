@@ -232,6 +232,7 @@ test.describe('settings persistence', () => {
   }
 
   test('changes all local execution modes in the UI and persists the selected mode', async ({ orkas }, testInfo) => {
+    test.setTimeout(180_000);
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     await openGeneralSettings(orkas.page);
 

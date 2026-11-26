@@ -383,6 +383,9 @@ function _initComposerInput(el) {
       if (event.key !== 'Enter') return false;
       // Own Enter once; outer legacy form handlers cannot send twice.
       event.stopImmediatePropagation();
+      if (el.id === 'chat-input' && window.TaskBoard?.sendNowShortcut(currentCid, event)) {
+        event.preventDefault(); return true;
+      }
       if (el.id === 'auto-task-input' || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) {
         event.preventDefault(); PM.splitBlock(view.state, view.dispatch); return true;
       }

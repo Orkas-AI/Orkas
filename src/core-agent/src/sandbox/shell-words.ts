@@ -1,5 +1,5 @@
 /** Pure best-effort shell lexing shared by command admission and host risk analysis. */
-export type Tok = { type: 'word'; value: string } | { type: 'op'; value: string };
+export type Tok = { type: 'word'; value: string; literal?: boolean } | { type: 'op'; value: string };
 
 const TWO_CHAR_OPS = new Set(['&&', '||', '>>', '|&', '2>']);
 const ONE_CHAR_OPS = new Set(['|', '&', ';', '>', '<', '(', ')', '\n']);
@@ -10,6 +10,13 @@ const ONE_CHAR_OPS = new Set(['|', '&', ';', '>', '<', '(', ')', '\n']);
  *  remain literal inside word tokens, which is what the matchers want. */
 export function tokenize(input: string): Tok[] {
   return scanWords(input, false)!;
+}
+
+/** Opt-in structure for PowerShell admission. Default shell lexing and literal
+ * POSIX admission retain their existing byte interpretation. Quoted blocks are
+ * words; only executable, unquoted braces become grouping operators. */
+export function tokenizePowerShellStructure(input: string): Tok[] {
+  return scanWords(input, false, true)!;
 }
 
 /** Recognize only literal POSIX command lists. Unknown syntax falls back to
@@ -50,16 +57,18 @@ function literalFileHeredoc(tokens: WordToken[]): { delimiter: string; stripTabs
   return file ? heredoc : null;
 }
 
-function scanWords(input: string, literal: boolean): Tok[] | null {
+function scanWords(input: string, literal: boolean, powershellStructure = false): Tok[] | null {
   const toks: WordToken[] = [];
   let cur = '';
   let hasCur = false;
   let quoted = false;
+  let singleQuoted = false;
   let lineStart = 0;
   const flush = () => {
     if (hasCur) {
-      toks.push({ type: 'word', value: cur, ...(literal ? { quoted } : {}) });
-      cur = ''; hasCur = false; quoted = false;
+      toks.push({ type: 'word', value: cur, ...(literal ? { quoted } : {}),
+        ...(powershellStructure && singleQuoted ? { literal: true } : {}) });
+      cur = ''; hasCur = false; quoted = false; singleQuoted = false;
     }
   };
 
@@ -67,6 +76,19 @@ function scanWords(input: string, literal: boolean): Tok[] | null {
   const n = input.length;
   while (i < n) {
     const c = input[i];
+
+    if (powershellStructure && input.slice(i, i + 2) === '<#') {
+      const end = input.indexOf('#>', i + 2);
+      flush(); i = end < 0 ? n : end + 2; continue;
+    }
+    if (powershellStructure && c === '#' && !hasCur) {
+      const end = input.indexOf('\n', i);
+      i = end < 0 ? n : end; continue;
+    }
+    if (powershellStructure && c === '`' && i + 1 < n) {
+      if (input[i + 1] !== '\n') { cur += input[i + 1]; hasCur = true; }
+      i += 2; continue;
+    }
 
     if (literal && c === '#' && !hasCur) {
       const end = input.indexOf('\n', i);
@@ -77,6 +99,7 @@ function scanWords(input: string, literal: boolean): Tok[] | null {
 
     if (c === "'") {
       quoted = true;
+      singleQuoted = true;
       const end = input.indexOf("'", i + 1);
       if (literal && (end === -1 || /[$`{}]/.test(input.slice(i + 1, end)))) return null;
       if (end === -1) { cur += input.slice(i + 1); hasCur = true; i = n; break; }
@@ -86,6 +109,9 @@ function scanWords(input: string, literal: boolean): Tok[] | null {
       quoted = true;
       let j = i + 1; let buf = '';
       while (j < n && input[j] !== '"') {
+        if (powershellStructure && input[j] === '`' && j + 1 < n) {
+          buf += input[j + 1]; j += 2; continue;
+        }
         if (literal && /[$`{}]/.test(input[j])) return null;
         if (input[j] === '\\' && j + 1 < n) {
           const next = input[j + 1];
@@ -135,6 +161,10 @@ function scanWords(input: string, literal: boolean): Tok[] | null {
       continue;
     }
     if (c === ' ' || c === '\t' || c === '\r') { flush(); i++; continue; }
+
+    if (powershellStructure && (c === '{' || c === '}')) {
+      flush(); toks.push({ type: 'op', value: c }); i++; continue;
+    }
 
     if (literal && c === '\n') {
       flush();
@@ -188,4 +218,3 @@ function scanWords(input: string, literal: boolean): Tok[] | null {
   ))) return null;
   return toks;
 }
-

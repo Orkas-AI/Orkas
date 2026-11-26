@@ -7,17 +7,17 @@ description_en: After route lock, produces COMPOSE work or deterministic layout,
 
 # Image Compose
 
-Read this skill after route lock for `COMPOSE`, or later in `HYBRID`, `GENERATE`, or `EDIT` only when deterministic copy, layout, diagram, framing, crop, mask, overlay, SVG/HTML conversion or requested vector PDF delivery is required. Do not preload it during routing. Keep the artifact in one stable directory containing `image-manifest.json`, `index.html`, and local assets.
+Read this skill after route lock for `COMPOSE`, or later in `HYBRID`, `GENERATE`, or `EDIT` only when deterministic copy, layout, diagram, framing, crop, mask, overlay, SVG/HTML conversion or requested vector PDF delivery is required. Do not preload it during routing. Keep the manifest, final source, and local assets in one stable directory.
 
 ## Safe project bootstrap
 
-Create or repair `image-manifest.json` and `index.html` with `write_file` / `edit_file`. Do not assemble either file through `bash`, PowerShell, shell redirection, or an inline script: quoting damage can leave a partially written project and shell safety checks can block recovery.
+Create `image-manifest.json` and, for an HTML final source, its `index.html` entry file with `write_file`. Repair them with `apply_patch`. Do not assemble either file through `bash`, PowerShell, shell redirection, or an inline script: quoting damage can leave a partially written project and shell safety checks can block recovery.
 
 For a fixed-page booklet or catalogue, read [multipage-documents.md](references/multipage-documents.md) before creating its document manifest.
 
 This production skill is the earliest point at which a `COMPOSE` manifest may be created. Initialize it from the `Canonical image-manifest v1` block in `image-router`; that block is the single structural source, so do not redefine or reconstruct the manifest shape here. Replace every example value with the current brief and planning output. Keep its nesting and value types exactly: `brief.purpose` and every `art_direction` field are required by native inspection, and any region coordinates belong under `visual_plan.regions[].bounds`.
 
-For `HYBRID`, `GENERATE`, or `EDIT`, keep the locked lowercase route and the approved generation budget (zero for deterministic EDIT), then add the route-specific reference and request fields required by `image-router` / `image-generate`. After the first write, read the manifest back once and repair it with `edit_file` if needed before the native workflow below.
+Keep the locked lowercase route and generation budget. On every route, carry the declared `reference_intent` and reference boundaries into the manifest, set `required:true` for reproduction references, and add any generation request fields required by `image-generate`. Read the first manifest back once and repair missing or conflicting fields with `apply_patch` before native inspection.
 
 Declare one final source: `entry` for an HTML composition, or `raster_source` for a finished raster. Remove the other final-source field when the candidate changes form; keep generated layers as local HTML assets. Set `entry` explicitly for HTML work under EDIT or GENERATE. After a script transform, bind its actual output as `raster_source` and inspect that path.
 
@@ -29,8 +29,8 @@ Declare one final source: `entry` for an HTML composition, or `raster_source` fo
 - Fit every multi-glyph required headline as a complete phrase before snapshot. Automatic wrapping must never leave a line with only one glyph: widen the text box, reduce the type size, or author an intentional balanced `<br>` before capture. Do not approve a source merely because the DOM contains the exact string; line-by-line rendered legibility is the gate.
 - For a non-generation multi-image set, follow [multi-image-sets.md](references/multi-image-sets.md) for the shared production and acceptance contract.
 - Use semantic HTML for text and SVG for geometry, diagrams, strokes, charts, patterns, and masks. Use CSS for layout, texture, lighting, and controlled effects.
-- Preserve every required-copy string exactly in visible DOM text. Keep important text out of raster assets.
-- For COMPOSE copy revisions in a supplied raster, cover only the old text area and typeset the replacement as a complete glyph or text run; guessing extra strokes onto raster digits can leave the old number readable. Match the original typeface, weight, size, color and baseline, and preserve the surrounding pixels. Verify the replacement in the current snapshot at export size against the source: dimensions, a changed-pixel box, and image metadata do not prove that the visible wording or its styling is correct.
+- For authored HTML, preserve each required-copy string exactly in visible DOM text.
+- For copy revisions limited to one area of a supplied raster with the rest held fixed, typeset the replacement as a complete glyph or text run. If an editable source is available, replace only the editable text and retain its typography and text box. With only a flat raster, use the original pixels to locate the old text and sample matching background pixels outside the old glyphs for a uniform background. Preserve the original title area, alignment, visible type size, weight and color. Wrap the replacement naturally within the original title area. Keep the original line count only if the user explicitly requires it. Use similar letterforms that support the replacement copy when the original font is unknown or lacks the required glyphs and the user did not require that font. When loading a font file directly, use the exact font path returned by local font discovery and verify it opens in the renderer before drawing. Pass discovery output directly to the font loader. For example, with fontconfig and Pillow, pass `subprocess.check_output(["fc-match", "-f", "%{file}", pattern], text=True).strip()` to `ImageFont.truetype`, with `pattern` set to the desired installed family and language. Skip missing or unreadable candidates. Render HTML/SVG only as needed for the replacement pixels. Cover only the old text area by using the unchanged source as the base of `masked_composite`, set its output as the final raster (`raster_source`), and call `project.inspect`. Verify the rendered wording and typography against the source at export size. If the wording, typography, and protected area meet the brief, submit the current evidence with `project.submit_design_review` as the next step of the [native workflow](#native-workflow). Revise again only to fix a concrete defect in the current candidate. After its review passes, complete `project.export` before calling `publish_outputs` or linking the final file. Deliver the exported file.
 - Preserve natural English casing: use sentence case or natural title case for titles and sentence case for body, captions, labels, and CTAs. Keep all caps only when that exact casing is explicit in required user copy or an external brand/source, and then only for one short metadata label, acronym, or code. Never apply `text-transform: uppercase` through a broad selector or use multiple all-caps text roles; create hierarchy with family, width, weight, scale, color, or spacing.
 - Use only local relative assets inside the project directory. Do not use scripts, CDNs, remote fonts, remote images, iframes, embedded pages, autoplay media, or a local server.
 - In `HYBRID`, use the generated raster as one deliberate layer and let HTML/SVG own copy, logo placement, framing, and layout.
@@ -49,20 +49,25 @@ Do not add native `image_studio` operations for authoring libraries. Run these p
 
 Use `structured_visual` for deterministic `diagram`, `bar`, `line`, and `donut` SVGs. Read [structured-visuals.md](references/structured-visuals.md) before writing its JSON input. The output is static local SVG with no script, CDN, browser library, or model call. Use it for Mermaid/ECharts-class needs when a structured chart or graph is enough; author custom SVG when the visual idea needs an irregular editorial composition.
 
-For supported local raster processing, prefer `image_asset` through the runner above: it uses the application's existing Sharp dependency. If another Python image library is needed, first verify the selected interpreter and required imports; do not assume Pillow (`PIL`) is installed.
+For local raster processing and SVG-to-PNG conversion, use `image_asset` through the runner above. Create the request JSON with `write_file` under `--project` before invoking the script. Pass its project-relative path to `--request`; paths in the request are relative to the same project. The script uses the application's existing Sharp dependency. If another Python image library is needed, first verify the selected interpreter and required imports; do not assume Pillow (`PIL`) is installed.
 
-Use `image_asset` with a project-local request JSON:
+For an existing SVG with PNG-only delivery, save `asset-request.json` with the current paths and run the `image_asset` command above to preserve canvas dimensions and transparency. If the same SVG also needs a vector PDF, use the [native workflow](#native-workflow) for both outputs:
 
-- `capabilities`: report Sharp, optional `rembg`, and optional host-configured Real-ESRGAN.
+```json
+{"op":"process","input_path":"assets/icon.svg","output_path":"exports/icon.png"}
+```
+
+Supported `image_asset` operations:
+
+- `capabilities`: report Sharp, RAW, batch processing, and masked composition.
 - `process`: Sharp-backed orientation, resize, crop, extend, rotate, blur/sharpen, flatten/trim, format conversion, compositing, `linear` RGB gain/offset, and `modulate` brightness/saturation/hue/lightness.
 - `batch`: apply shared photo settings with explicit per-photo replacements and resume verified completed items.
 - `masked_composite`: replace only a binary mask's white pixels while retaining the source's exact RGBA in black regions, including partial alpha.
-- `remove_background`: use host-managed `rembg` only when capability evidence says available.
-- `upscale`: use host-managed `ORKAS_REALESRGAN_BIN` only when capability evidence says available. This is local enhancement and does not consume the paid image-generation budget.
-
 Before raster cropping, edge trimming, resizing, RAW development, ICC conversion, photo adjustments, batches, or exact masked composition, read [photo-processing.md](references/photo-processing.md) for request fields, runnable examples, limits, and recovery.
 
-Use `layered_document` for a durable layered source, PNG preview and verified PSD export; read [layered-documents.md](references/layered-documents.md). Preserve existing layer structure; a flattened image stays a single layer, and unsupported native editability must be disclosed.
+If RAW development is unavailable, preserve the originals and the requested development settings, including per-photo overrides, and report the RAW work as pending. If suggesting a developed TIFF or JPEG fallback, explain that it loses access to RAW sensor data and editable RAW development, and get the user's agreement before changing the deliverable.
+
+Use `layered_document` for a durable layered source, PNG preview and verified PSD export. Read [layered-documents.md](references/layered-documents.md) at `@skill/image-compose/references/layered-documents.md`. Preserve existing layer structure; a flattened image stays a single layer, and unsupported native editability must be disclosed.
 
 Never install packages, download weights, or start a service. Keep input, request, and output paths inside the project. Prefer a new output path; set `overwrite:true` only for an explicitly replaceable intermediate.
 
@@ -84,7 +89,10 @@ For a raster final source, `project.inspect` supplies the evidence and next oper
 
 `project.export` is the delivery gate. A changed manifest, HTML file, or local resource invalidates the prior review and requires a new snapshot.
 
-The first `project.export` call must use an explicit workspace-relative `output_path` ending in `.png`. After PNG export succeeds, also export any requested PSD from the same verified layered source and any requested PDF from the current HTML/SVG source, then deliver the requested files instead of handing a completed direct request back to Commander.
+- For vector PDF from a standalone SVG, place the unchanged SVG markup inline in a local HTML entry at the SVG's canvas size and retain its background transparency. Snapshot that entry and review the current evidence. Export the requested PNG first when both formats are requested, then export the vector PDF from the same reviewed source with `project.export`, `format:"pdf"`, and an explicit workspace-relative `.pdf` output path. On a PDF-only follow-up, use the retained source and preserve the earlier PNG and SVG as delivered.
+- For native PNG delivery or PSD preparation, export to an explicit workspace-relative `.png` output path. After PNG export succeeds, export any requested PSD from the same verified layered source.
+
+Deliver the requested files instead of handing a completed direct request back to Commander.
 
 Put essential export dimensions/format before the first preview. Show only exported final deliverables unless the user asks for review evidence, and write nothing after the last preview; the host may add its own produced-file footer.
 
@@ -93,6 +101,6 @@ Before repeating a failed operation, check whether its relevant files, parameter
 On a recoverable inspection, snapshot, review, or export result, use
 `project.status.current_candidate` and `recovery_context` to resume from the
 current files. Repair structural or visual findings and continue the native
-chain without asking the user for a technical confirmation. If no automatic
-repair remains, show the current candidate image and findings before asking
-for the smallest real creative or delivery decision.
+chain without asking the user for a technical confirmation.
+
+If no automatic repair remains, show the current candidate image, name the repairs tried and the remaining defects, and give one practical way to continue in an ordinary reply.

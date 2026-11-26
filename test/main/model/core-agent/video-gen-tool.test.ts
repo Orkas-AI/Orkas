@@ -104,6 +104,24 @@ describe('generate_video tool in the open build', () => {
     expect(h.generateVideo).not.toHaveBeenCalled();
   });
 
+  it('describes optional video settings without promising provider defaults or quality-based routing', async () => {
+    const { createVideoGenTool } = await import('../../../../src/main/model/core-agent/video-gen-tool');
+    const tool = createVideoGenTool({ userId: 'u1' });
+    const properties = (tool.inputSchema as any).properties;
+    expect(tool.inputSchema.required).toEqual(['prompt', 'output_path']);
+    expect(properties.model).toBeUndefined();
+    expect(properties.duration.description).toMatch(/whole seconds.*omit.*service default/i);
+    expect(properties.duration.description).toMatch(/-1.*automatic.*support/i);
+    expect(properties.resolution.description).toMatch(/1080p.*omit.*service default/i);
+    expect(properties.ratio.description).toMatch(/first frame or edit source/i);
+    expect(properties.operation.description).toMatch(/edit.*source video first.*URLs precede local paths.*prompt/i);
+    expect(properties.generate_audio.description).toMatch(/audio by default.*false.*silent.*supported/i);
+    expect(properties.quality.description).toMatch(/economy.*balanced.*quality/i);
+    expect(properties.quality.description).not.toMatch(/lowest-cost|prioritizes final-output/i);
+    expect(tool.name).toBe('generate_video');
+  });
+
+
   it('turns exhausted public API credits into a non-retry instruction', async () => {
     h.generateVideo.mockResolvedValueOnce({
       ok: false,
@@ -187,4 +205,55 @@ it('keeps an unresolved canvas shot visible across turns without retaining a rep
   await tool.execute({ ...shotInput(), shot: 'hero' }, { workingDir: root } as any);
   const { hasPendingProductionRequest } = await import('../../../../src/main/features/video_production_budget');
   expect(await hasPendingProductionRequest({ userId: 'test-video-owner', scope: 'c-video', productionDirAbs: path.join(root, 'ad'), shot: 'hero', kind: 'video' })).toBe(true);
+});
+
+// Shared simultaneous-output case from video_generation_spend, without account billing.
+it('gives simultaneous Studio shots one distinct file and ledger row each', async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  h.generateVideo.mockImplementation(async ({outputAbsPath, prompt}) => {
+    await held;
+    fs.mkdirSync(path.dirname(outputAbsPath), {recursive:true}); fs.writeFileSync(outputAbsPath, prompt);
+    return {ok:true,path:outputAbsPath,bytes:prompt.length,provider:'orkas-api',model:'orkas-video',taskId:prompt};
+  });
+  const tool = studioTool();
+  expect(tool.executionMode).toBe('parallel');
+  const inputs = ['first idea','second idea'].map(prompt => ({...shotInput(),prompt}));
+  const runs = inputs.map(input => tool.execute(input, context()));
+  try { await vi.waitFor(() => expect(h.generateVideo).toHaveBeenCalledTimes(2)); }
+  finally { release(); }
+  const results = await Promise.all(runs);
+  expect(results.every(result => !result.isError)).toBe(true);
+  expect(fs.readdirSync(path.join(root,'ad')).filter(name => name.endsWith('.mp4')).sort()).toEqual(['shot-1-2.mp4','shot-1.mp4']);
+  const ledger = JSON.parse(fs.readFileSync(path.join(root,'ad/assets.json'),'utf8')).assets;
+  expect(ledger).toHaveLength(2);
+  for (const [i,input] of inputs.entries()) {
+    const row = ledger.find((row:any) => row.prompt === input.prompt);
+    expect(fs.readFileSync(path.join(root,'ad',row.path),'utf8')).toBe(input.prompt);
+    expect(String(results[i].content)).toContain(path.join(root,'ad',row.path));
+  }
+});
+
+it('shares a pending video output claim with ordinary file writers', async () => {
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  h.generateVideo.mockImplementation(async ({outputAbsPath}) => {
+    await held; fs.mkdirSync(path.dirname(outputAbsPath), {recursive:true}); fs.writeFileSync(outputAbsPath, 'generated video');
+    return {ok:true,path:outputAbsPath,bytes:15,provider:'orkas-api',model:'orkas-video',taskId:'claimed'};
+  });
+  const pending = studioTool().execute(shotInput(), context());
+  try {
+    await vi.waitFor(() => expect(h.generateVideo).toHaveBeenCalledTimes(1));
+    const output = h.generateVideo.mock.calls[0][0].outputAbsPath;
+    fs.mkdirSync(path.dirname(output), {recursive:true});
+    const { uniquifyPathForWrite } = await import('../../../../src/main/util/uniquify-path');
+    const ordinary = await uniquifyPathForWrite(output, () => false, async ({finalPath}) => {
+      fs.writeFileSync(finalPath, 'ordinary file'); return finalPath;
+    });
+    expect(ordinary).not.toBe(output);
+    release();
+    expect((await pending).isError).not.toBe(true);
+    expect(fs.readFileSync(ordinary,'utf8')).toBe('ordinary file');
+    expect(fs.readFileSync(output,'utf8')).toBe('generated video');
+  } finally { release(); await pending; }
 });

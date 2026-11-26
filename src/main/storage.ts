@@ -13,6 +13,7 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { Mutex, type MutexInterface } from 'async-mutex';
+import { INVALID_JSON_RECORD, readJsonObjectFields } from './util/json-object-fields';
 
 // ── Timestamps / IDs ─────────────────────────────────────────────────────
 
@@ -442,6 +443,7 @@ export async function rewriteJsonlLine<T extends object>(
 }
 
 const JSONL_TAIL_CHUNK_BYTES = 64 * 1024;
+const JSONL_PROJECTED_CHUNK_BYTES = 256 * 1024;
 
 function _concatJsonlSegments(segments: Buffer[]): Buffer {
   if (segments.length === 0) return Buffer.alloc(0);
@@ -516,10 +518,33 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
   filePath: string,
   limit = 200,
   before?: number | null,
-  opts?: { strict?: boolean; skipInvalidRecords?: boolean },
+  opts?: {
+    strict?: boolean;
+    skipInvalidRecords?: boolean;
+    project?: { fields: ReadonlySet<string>; record: (value: unknown) => T | undefined };
+  },
 ): Promise<JsonlPageWithOffsets<T>> {
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   const strictRecords = !!opts?.strict && !opts?.skipInvalidRecords;
+  const project = opts?.project;
+  const parseRecord = (line: Buffer): T | undefined => {
+    const record = _parseJsonlRecord<unknown>(line.toString('utf8'), strictRecords);
+    if (!project || record === undefined) return record as T | undefined;
+    if (record === null || typeof record !== 'object') return project.record(record);
+    const fields: Record<string, unknown> = Object.create(null);
+    for (const key of project.fields) {
+      if (Object.hasOwn(record, key)) fields[key] = (record as Record<string, unknown>)[key];
+    }
+    return project.record(fields);
+  };
+  const parseRange = project && (async (handle: fsp.FileHandle, start: number, end: number): Promise<T | undefined> => {
+    const value = await readJsonObjectFields(handle, start, end, project.fields, opts?.strict);
+    if (value === INVALID_JSON_RECORD) {
+      if (strictRecords) throw new Error('JSONL record is invalid');
+      return undefined;
+    }
+    return value === undefined ? undefined : project.record(value);
+  });
   let handle: fs.promises.FileHandle;
   try {
     handle = await fsp.open(filePath, 'r');
@@ -538,13 +563,17 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
     // an ever-growing carry buffer on every 64 KiB read makes a multi-megabyte
     // JSONL row quadratic (and made a 24 MiB tail take seconds to open).
     let suffixSegments: Buffer[] = [];
+    // Field projections locate the line first and stream that byte range
+    // forward. Keep only its end offset while searching for the prior newline.
+    let projectedLineEnd = -1;
+    const projectedBlock = project ? Buffer.allocUnsafe(JSONL_PROJECTED_CHUNK_BYTES) : undefined;
     const newestFirst: JsonlRecordWithOffset<T>[] = [];
     let oldestRecordStart = -1;
 
     while (position > 0 && newestFirst.length < wanted) {
-      const bytes = Math.min(JSONL_TAIL_CHUNK_BYTES, position);
+      const bytes = Math.min(projectedBlock?.length ?? JSONL_TAIL_CHUNK_BYTES, position);
       position -= bytes;
-      const block = Buffer.allocUnsafe(bytes);
+      const block = projectedBlock ?? Buffer.allocUnsafe(bytes);
       const { bytesRead } = await handle.read(block, 0, bytes, position);
       if (opts?.strict && bytesRead !== bytes) throw new Error('JSONL read is incomplete');
       if (bytesRead <= 0) break;
@@ -552,31 +581,37 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
       let end = bytesRead;
       for (let i = block.lastIndexOf(0x0a, bytesRead - 1); i >= 0 && newestFirst.length < wanted;
         i = i > 0 ? block.lastIndexOf(0x0a, i - 1) : -1) {
-        const current = block.subarray(i + 1, end);
-        const line = suffixSegments.length
-          ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
-          : current;
-        const record = _parseJsonlRecord<T>(line.toString('utf8'), strictRecords);
+        const start = position + i + 1;
+        let record: T | undefined;
+        if (parseRange && projectedLineEnd >= 0) {
+          record = await parseRange(handle, start, projectedLineEnd);
+        } else {
+          const current = block.subarray(i + 1, end);
+          const line = suffixSegments.length
+            ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
+            : current;
+          record = parseRecord(line);
+        }
         if (record !== undefined) {
-          const start = position + i + 1;
           newestFirst.push({ record, start });
           oldestRecordStart = start;
         }
         end = i;
         suffixSegments = [];
+        projectedLineEnd = -1;
       }
       if (newestFirst.length < wanted && end > 0) {
         // Reverse traversal discovers later segments first. Keep that order
         // with O(1) pushes, then reverse once when the record is complete.
-        suffixSegments.push(block.subarray(0, end));
+        if (!project) suffixSegments.push(block.subarray(0, end));
+        else if (projectedLineEnd < 0) projectedLineEnd = position + end;
       }
     }
 
-    if (newestFirst.length < wanted && suffixSegments.length) {
-      const record = _parseJsonlRecord<T>(
-        _concatJsonlSegments(suffixSegments.reverse()).toString('utf8'),
-        strictRecords,
-      );
+    if (newestFirst.length < wanted && (suffixSegments.length || projectedLineEnd >= 0)) {
+      const record = parseRange && projectedLineEnd >= 0
+        ? await parseRange(handle, 0, projectedLineEnd)
+        : parseRecord(_concatJsonlSegments(suffixSegments.reverse()));
       if (record !== undefined) {
         newestFirst.push({ record, start: 0 });
         oldestRecordStart = 0;

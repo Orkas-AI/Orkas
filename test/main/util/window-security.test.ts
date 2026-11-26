@@ -330,4 +330,30 @@ describe('local HTML preview policy', () => {
     navigate(ordinaryFrame);
     expect(ordinaryFrame.preventDefault).not.toHaveBeenCalled();
   });
+
+  it('offers only local navigation from HTML preview frames to the native file router', () => {
+    let navigate!: (event: {
+      preventDefault(): void;
+      url: string;
+      isMainFrame: boolean;
+      frame: { url: string };
+    }) => void;
+    const route = vi.fn((_event, target: URL) => target.pathname.endsWith('.md'));
+    installHtmlPreviewNavigationGuard({ on: (_event, handler) => { navigate = handler; } }, route);
+
+    const event = {
+      preventDefault: vi.fn(), isMainFrame: false,
+      frame: { url: 'chat-media://local/fixture/preview.html' },
+      url: 'chat-media://local/fixture/guide.md',
+    };
+    navigate(event);
+    expect(route).toHaveBeenCalledOnce();
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    navigate({ ...event, url: 'https://example.test/guide.md' });
+    navigate({ ...event, url: 'chat-media://cid/fixture/guide.md' });
+    navigate({ ...event, isMainFrame: true });
+    navigate({ ...event, frame: { url: 'https://example.test/preview.html' } });
+    expect(route).toHaveBeenCalledOnce();
+    expect(event.preventDefault).toHaveBeenCalledTimes(2); // Handoff and the unsupported host.
+  });
 });

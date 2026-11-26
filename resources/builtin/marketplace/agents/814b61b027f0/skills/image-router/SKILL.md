@@ -7,9 +7,13 @@ description_en: The first and only ImageStudio skill to read before route lock; 
 
 # Image Router
 
-Read this skill first and alone for every image creation or revision request. Return a locked route before reading any other ImageStudio skill; do not batch this read with craft, canvas, production, or review skills.
+Read this skill first and alone for each applicable turn. Return a locked route before reading any other ImageStudio skill; do not batch this read with craft, canvas, production, or review skills.
 
 For a clear zero-input poster or social graphic, routine canvas and export choices are low-risk defaults: choose them without asking and state the chosen defaults in the delivery. Ask only when a missing choice changes subject, required copy, brand fidelity, reference intent, paid budget, or final format.
+
+For a localized copy revision on a flat image, interpret requests to keep the title size, position and text area as visible geometry. If the area can be isolated, load `image-compose` and proceed using the available reference. Clarify only if a source font or exact source typography settings are explicitly required and cannot be verified, or if the change area cannot be isolated safely.
+
+When asked only for a recovery plan for an existing candidate, give the concrete repair and its full planned sequence through fresh evidence, design review of that evidence, and export only after the review passes. Treat the tool's suggested next operation as the starting step of the plan.
 
 Before routing any request with a supplied image, classify the user's relationship to that image. An explicit user requirement always wins. Only when the user did not specify the relationship may ImageStudio infer a default:
 
@@ -27,14 +31,15 @@ Explicit user constraints take precedence. Specification/comparison graphics, re
 
 ## Route selection
 
+- For a vector PDF follow-up, locate the retained SVG or HTML source, then load `image-compose` for native export. Reuse its existing project and any still-valid review, or choose `COMPOSE` for a standalone source.
 - Choose `COMPOSE` when typography, diagrams, charts, abstract geometry, cards, covers, posters, social graphics, simple illustrations, or brand layouts can be expressed faithfully with HTML/CSS/SVG. This route uses zero image-generation calls.
 - Choose `HYBRID` when one photographic, painterly, character, or textured raster asset is needed but exact copy, layout, logo placement, or labels should remain deterministic in HTML/SVG. The normal budget is one generated raster asset per user turn.
 - Choose `GENERATE` when the desired output is primarily photographic, cinematic, painterly, character-led, or otherwise depends on synthesized pixels. The normal budget per user turn is one call. Allow a second billable call only when the user explicitly requests iterative refinement or authorizes another attempt; a visual finding by itself is not authorization.
-- Choose `EDIT` when the supplied image remains the original canvas and only requested content or regions change. Use zero generation calls for deterministic edits, or the approved budget for semantic model edits. The manifest must use `reference_intent.mode:"edit"`, name a required `edit_source`, list the exact instructions, and preserve every unaffected region.
-- Distinguish `HYBRID` from `EDIT` by the final artifact contract, not merely by the presence of a supplied photo. A poster or layout that keeps a supplied product/subject image as an immutable foreground layer, generates a separate background asset, and places exact copy/logo deterministically is `HYBRID`. Use `EDIT` when the supplied source canvas remains the object being changed; its production may be deterministic or model-based.
-- A `reproduce` request does not force `EDIT`: choose COMPOSE, HYBRID, or GENERATE according to the visual material required to reproduce the declared attributes.
+- Choose `EDIT` for `edit` intent when the supplied image is the canvas being changed. Use zero generation calls for deterministic edits, or the approved budget for semantic model edits. The manifest must use `reference_intent.mode:"edit"`, name a required `edit_source`, list the exact instructions, and preserve every unaffected region.
+- A composition that keeps a supplied product or subject as an immutable foreground layer, generates a separate background asset, and places exact copy or logo deterministically is `HYBRID`.
+- For `reproduce` intent with deterministic local production, choose `COMPOSE` even when reusing the source canvas. Choose `HYBRID` or `GENERATE` when the required visual material calls for synthesis.
 
-Route using call count and capability, not a remembered provider price. Once a generated route and exact request exist, `image-generate` checks the configured BYO/local provider with `image_studio generation.quote`; the router must not hard-code or locally calculate prices. External providers and host workflows are reported as externally billed and not estimated in-app.
+Route using call count and capability, not a remembered provider price. Once a generated route and exact request exist, `image-generate` checks the configured BYO/local provider with `image_studio generation.quote`; the router must not hard-code or locally calculate prices. External image providers are reported as externally billed and not estimated in-app.
 
 ## Lock output
 
@@ -95,20 +100,45 @@ This is the single structural template for `image-manifest.json`. Production ski
 }
 ```
 
+For a supplied reference, add these top-level fields and replace the example values with the locked intent and reference boundaries. Keep `instructions` as an array even for a single instruction.
+
+```json
+{
+  "reference_intent": {
+    "mode": "reproduce",
+    "basis": "user",
+    "instructions": ["Match the poster and replace only its event name"],
+    "minimum_score": 85
+  },
+  "references": [{
+    "id": "source",
+    "path": "assets/source.png",
+    "role": "edit_source",
+    "strength": 1,
+    "required": true,
+    "preserve": ["Composition, typography, palette and spacing"],
+    "may_change": ["Event name text"],
+    "region_ids": []
+  }]
+}
+```
+
 ## Progressive-disclosure handoff
 
 After route lock, for product listing or sales-creative work, also read [image-craft/references/ecommerce.md](@skill/image-craft/references/ecommerce.md).
 
 After route lock, before a non-generation multi-image set's production or acceptance plan, read [multi-image-sets.md](@skill/image-compose/references/multi-image-sets.md). Keep a planning-only task read-only.
 
-Return `route`, `reason`, `generation_budget`, and a phased `next_skills` list:
+Return `route`, `reference_intent` for supplied references, `reason`, `generation_budget`, and a phased `next_skills` list. Carry the declared reference intent and its preservation and change boundaries into the manifest and review.
+
+For an original-size deliverable, use the file's `source_dimensions` to set the canvas. Use `preview_dimensions` for interpreting the scaled preview and map positions back to source pixels before authoring.
 
 - Add `image-craft` only for original creation, restyling, or an underspecified visual direction.
-- Add `image-canvas` only for multiple meaningful regions, explicit reading order, exact layout constraints, or region-bound references.
+- Add `image-canvas` for distinct visual regions, explicit reading order, exact layout constraints, or region-bound references. Count the reading jobs within the intended composition. A main visual and a separate block of facts or supporting copy are distinct regions even on one artboard.
 - Add `image-compose` for `COMPOSE`, or later in another route only for a deterministic photo adjustment, batch processing, overlay, layout, diagram, crop, mask, composite, layered source, PSD delivery, SVG/HTML conversion or requested vector PDF delivery.
 - Add `image-generate` for `GENERATE`, semantic `EDIT`, or the synthesized raster phase of `HYBRID`.
 - Never add `image-design-review` to startup. Load it only when the current artifact handoff requests review and attaches visual evidence.
 
 After route lock, planning and production skills already selected for the task may be read together. `next_skills` orders the work: establish art direction and canvas before authoring, and read all required instructions before creating project files. Defer skills whose need depends on a later result.
 
-For `COMPOSE` and `HYBRID`, use private `image-compose` scripts for evolving authoring/asset capabilities and reserve native `image_studio` for inspect, capture, review, and export. For `GENERATE` and semantic `EDIT`, use `generate_image` by default; choose a host-configured ComfyUI, InvokeAI, AUTOMATIC1111, or IOPaint workflow only after `workflow.capabilities` proves it executable and the project-local request provides a specific model/control advantage. Both paths use the same manifest budget and converge on deterministic `image_studio` inspection and export. Follow the host next operation for the current artifact; route labels do not establish a review exemption.
+For `COMPOSE` and `HYBRID`, use private `image-compose` scripts for evolving authoring/asset capabilities and reserve native `image_studio` for inspect, capture, review, and export. For `GENERATE` and semantic `EDIT`, use `generate_image` within the manifest budget, then inspect and export the result. Follow the host next operation for the current artifact; route labels do not establish a review exemption.

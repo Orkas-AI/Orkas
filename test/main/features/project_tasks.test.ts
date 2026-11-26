@@ -175,6 +175,27 @@ describe('project_tasks › createTask', () => {
     if (nameOnly.ok) expect(nameOnly.task.owner_agent_id).toBeUndefined();
   });
 
+  it('assigns a project to-do to a built-in Agent the project never added, but still rejects an unadded custom Agent', async () => {
+    const { pt, projects, pid } = await setup();
+    const paths = await import('../../../src/main/paths');
+    const builtinDir = path.join(paths.userMarketplaceAgentsDir(TEST_UID), 'c0ffee000002');
+    fs.mkdirSync(builtinDir, { recursive: true });
+    fs.writeFileSync(path.join(builtinDir, 'agent.json'), JSON.stringify({
+      agent_id: 'c0ffee000002', name: 'BuiltinStudio', description: 'd', created_at: 't', updated_at: 't',
+    }));
+    fs.writeFileSync(path.join(builtinDir, '_install.json'), JSON.stringify({ seed_source: 'builtin' }));
+    const agents = await import('../../../src/main/features/agents');
+    const outsider = await agents.createCustomAgent({ name: 'Outsider' });
+    if (!outsider) throw new Error('agent fixture failed');
+    const created = await pt.createTask(TEST_UID, pid, { content: 'Cut the pauses', owner_agent_id: 'c0ffee000002', owner_agent: 'BuiltinStudio' });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(await pt.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ owner_agent_id: 'c0ffee000002' });
+    expect(await pt.updateTask(TEST_UID, pid, created.task.id, { owner_agent_id: outsider.agent_id }))
+      .toEqual({ ok: false, error: 'owner_not_bound' });
+    expect((await projects.getBindings(TEST_UID, pid)).agents).toEqual([BOUND_AGENT]);
+  });
+
   it('keeps a due day as a local calendar date, clears it on request, drops a malformed one on read, and lists dated work first', async () => {
     const { pt, pid } = await setup();
     const dated = await pt.createTask(TEST_UID, pid, { content: 'Send the launch email', due_at: '2026-10-25' });
@@ -1451,4 +1472,87 @@ it('keeps read-only task navigation associated with current local scope through 
   expect((await cold.deleteTask(TEST_UID, pid, tid)).ok).toBe(true);
   expect(await cold.listTaskSearchRows(TEST_UID, pid)).toEqual([]);
   expect((await cold.listTaskSearchRows(TEST_UID, ''))[0]).toMatchObject({ origin_cid: 'global-chat' });
+});
+
+// Commander project continuity (Common/docs/plans/commander-project-continuity.md
+// §3.2(2)): a to-do records when its current status began and keeps one
+// bounded result note. The "since the user was last here" digest reads both to
+// say what finished, where the result is, and what is stuck.
+describe('project_tasks › status time and result note', () => {
+  it('stamps when the current status began, and only a status change moves it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { pt, pid } = await setup();
+      const at = (iso: string) => { vi.setSystemTime(new Date(iso)); return Date.parse(iso); };
+      const began = at('2026-11-16T08:00:00');
+      const created = await pt.createTask(TEST_UID, pid, { content: 'Draft the launch brief' });
+      if (!created.ok) throw new Error(created.error);
+      const id = created.task.id;
+      expect(Date.parse((created.task as any).status_changed_at)).toBe(began);
+      // An edit that leaves the status alone is not a status change.
+      at('2026-11-16T09:00:00');
+      const edited = await pt.updateTask(TEST_UID, pid, id, { content: 'Draft the Lumen launch brief' });
+      expect(edited.ok && Date.parse((edited.task as any).status_changed_at)).toBe(began);
+      const moved = at('2026-11-16T10:00:00');
+      const review = await pt.updateTask(TEST_UID, pid, id, { status: 'review' });
+      expect(review.ok && Date.parse((review.task as any).status_changed_at)).toBe(moved);
+      // Saving the same status again keeps the time the review began.
+      at('2026-11-16T11:00:00');
+      expect((await pt.updateTask(TEST_UID, pid, id, { status: 'review' })).ok).toBe(true);
+      expect(Date.parse(((await pt.getTask(TEST_UID, pid, id)) as any).status_changed_at)).toBe(moved);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps one bounded result note with its kind, replaces it, clears it, and refuses an invalid one without writing', async () => {
+    const { pt, pid } = await setup();
+    const created = await pt.createTask(TEST_UID, pid, { content: 'Compare competitor prices' });
+    if (!created.ok) throw new Error(created.error);
+    const id = created.task.id;
+    const note = (patch: Record<string, unknown>) => pt.updateTask(TEST_UID, pid, id, patch as never);
+    expect((await note({ status: 'review', note: '对比表在资料库 price.xlsx', note_kind: 'result' })).ok).toBe(true);
+    expect(await pt.getTask(TEST_UID, pid, id)).toMatchObject({ note: '对比表在资料库 price.xlsx', note_kind: 'result' });
+    // Only the latest note is kept: it is what the user needs on return.
+    expect((await note({ status: 'progress', note: '需要店铺后台的登录授权', note_kind: 'blocker' })).ok).toBe(true);
+    expect(await pt.getTask(TEST_UID, pid, id)).toMatchObject({ note: '需要店铺后台的登录授权', note_kind: 'blocker' });
+    // A note past 300 characters or an unknown kind is refused, and the stored note stays.
+    const before = fs.readFileSync(taskFile(pid, id), 'utf8');
+    expect((await note({ note: 'x'.repeat(301), note_kind: 'result' })).ok).toBe(false);
+    expect((await note({ note: 'Sent', note_kind: 'excuse' })).ok).toBe(false);
+    expect(fs.readFileSync(taskFile(pid, id), 'utf8')).toBe(before);
+    expect((await note({ note: 'x'.repeat(300), note_kind: 'result' })).ok).toBe(true);
+    // An empty note clears both fields.
+    const cleared = await note({ note: '' });
+    expect(cleared.ok).toBe(true);
+    const stored = await pt.getTask(TEST_UID, pid, id);
+    expect(stored).not.toHaveProperty('note');
+    expect(stored).not.toHaveProperty('note_kind');
+  });
+
+  it('round-trips 300 Unicode characters in a private result note', async () => {
+    const { pt, pid } = await setup();
+    const created = await pt.createTask(TEST_UID, pid, { content: 'Collect results' });
+    if (!created.ok) throw new Error('task creation failed');
+    const id = created.task.id;
+    const note = '核'.repeat(100) + '📌'.repeat(200);
+    expect(await pt.updateTask(TEST_UID, pid, id, { note })).toMatchObject({ ok: true });
+    expect(await pt.getTask(TEST_UID, pid, id)).toMatchObject({ note, note_kind: 'result' });
+    expect(await pt.updateTask(TEST_UID, pid, id, { note: note + 'x' })).toMatchObject({
+      ok: false, error: 'note_too_long',
+    });
+    expect(await pt.getTask(TEST_UID, pid, id)).toMatchObject({ note, note_kind: 'result' });
+  });
+
+  it('reads a to-do saved before status times and notes existed', async () => {
+    const { pt, pid } = await setup();
+    const created = await pt.createTask(TEST_UID, pid, { content: 'Legacy item', status: 'review' });
+    if (!created.ok) throw new Error(created.error);
+    const file = taskFile(pid, created.task.id);
+    const { status_changed_at: _time, note: _note, note_kind: _kind, ...legacy } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify(legacy));
+    const read = await pt.getTask(TEST_UID, pid, created.task.id);
+    expect(read).toMatchObject({ id: created.task.id, content: 'Legacy item', status: 'review' });
+    expect(read).not.toHaveProperty('note');
+  });
 });

@@ -387,7 +387,10 @@ function apiFetch(url, options) {
   // Streaming: go through window.orkas.stream + ReadableStream body.
   if (opts.stream) {
     if (!_hasOrkasStream()) {
-      return Promise.resolve(_mockJsonResponse({ ok: false, error: 'ipc stream bridge unavailable' }));
+      return Promise.resolve({
+        ..._mockJsonResponse({ ok: false, error: 'ipc stream bridge unavailable' }),
+        streamNotDispatched: true,
+      });
     }
     const payload = { ...query, ...body, ...params };
     return Promise.resolve(_streamResponse(channel, payload, options.signal));

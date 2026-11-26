@@ -172,6 +172,26 @@ describe('local_access_policy', () => {
     )).toEqual(['external_mutation']);
   });
 
+  it.skipIf(process.platform !== 'win32')('guards writes into the Windows Startup folder', async () => {
+    const policy = await import('../../../src/main/features/local_access_policy');
+    const programs = path.join(tmpDir, 'Start Menu', 'Programs');
+    const startup = path.join(programs, 'Startup');
+    const target = path.join(startup, 'note.txt');
+    const neighboringFile = path.join(programs, 'Startup Archive', 'note.txt');
+
+    expect(policy.sensitivePathReasons(startup, 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(target, 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(target.split(path.sep).join('/'), 'write')).toEqual(['sensitive_path']);
+    expect(policy.sensitivePathReasons(target, 'read')).toEqual([]);
+    expect(policy.sensitivePathReasons(neighboringFile, 'write')).toEqual([]);
+  });
+
+  it.skipIf(process.platform === 'win32')('leaves Windows Startup look-alike paths alone on POSIX', async () => {
+    const policy = await import('../../../src/main/features/local_access_policy');
+    const target = path.join(tmpDir, 'Start Menu', 'Programs', 'Startup', 'note.txt');
+    expect(policy.sensitivePathReasons(target, 'write')).toEqual([]);
+  });
+
   it('uses structural defaults without disabling custom server rules', async () => {
     const { clientConfig } = await import('../../../src/main/features/client_config');
     const policy = await import('../../../src/main/features/local_access_policy');

@@ -1,7 +1,7 @@
 /**
- * Turns one timeline video into an mp4: footage is extracted to stills, each scene
- * is captured frame by frame into a cached segment, the segments are joined without
- * re-encoding, and the sound is mixed over the result.
+ * Turns one timeline video into an mp4: eligible cuts are encoded directly,
+ * and composed scenes are captured frame by frame. Both produce cached
+ * segments that are joined without re-encoding before sound is mixed in.
  *
  * Footage reaches the page as stills because a seeked <video> is not frame-accurate:
  * in the measured comparison the old adapter showed the wrong source frame on 100 of
@@ -10,6 +10,7 @@
  * nothing and editing one scene's words re-renders that scene alone.
  */
 import * as crypto from 'node:crypto';
+import type { Stats } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,11 +31,14 @@ import {
   buildMediaQa,
   buildInspectScript,
   buildVideoTrackRemuxArgs,
+  capturePresentedCompositionFrame,
   COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
   COMPOSITION_SCRIPT_TIMEOUT_MS,
   loadCompositionMeta,
+  mp4VideoEncoderArgs,
   normalizeAudioInPlace,
   normalizeCapturedFrame,
+  PHONE_TEXT_MIN_PX,
   probeMedia,
   pruneSegmentCache,
   qualityFps,
@@ -46,6 +50,7 @@ import {
   settleCompositionPaint,
   shouldNormalizeLoudness,
   startRawFrameEncoder,
+  usesSoftwareCompositionPresentation,
   VIDEO_TRACK_REMUX_TIMEOUT_MS,
   videoStudioErrorCode,
   videoStudioReferencedVisualAssetSignature,
@@ -65,7 +70,9 @@ import {
   compileVideoPage,
   deriveVideoTimeline,
   dominantFlatShare,
+  looksLikeScreen,
   pagePictureIssues,
+  silentSceneIssues,
   pagePictureRefs,
   sheetLayoutFor,
   summarizeCheckWarnings,
@@ -93,7 +100,17 @@ const SOURCE = 'orkas-video-timeline';
 const SEGMENT_META_VERSION = 1;
 const WORK_DIR_PREFIX = '.segment-assembly-';
 const STALE_WORK_DIR_MS = 24 * 60 * 60 * 1000;
+/** Each production's scene cache is capped at 2 GB on its own, so the caches of past productions,
+ *  and those the 2.0.0 flow left under keys nothing reads now, would otherwise add up. One unused
+ *  this long is removed when another production renders (review 2026-11-16 S4-7). */
+const IDLE_SEGMENT_CACHE_MS = 30 * 24 * 60 * 60 * 1000;
+const IDLE_SEGMENT_CACHE_REMOVALS_MAX = 16;
+const SEGMENT_CACHE_KEY_RE = /^[0-9a-f]{32}$/;
+const EXPIRED_CACHE_PREFIX = '.expired-';
+const activeSegmentCaches = new Map<string, number>();
+const retiringSegmentCaches = new Map<string, Promise<boolean>>();
 const FRAME_EXTRACT_TIMEOUT_MS = 10 * 60 * 1000;
+const CUT_PROBE_TIMEOUT_MS = 30_000;
 /** A source's last frames can fall a frame or two short of its nominal length. */
 const CLIP_FRAME_SHORTFALL_TOLERANCE = 2;
 const MAX_REPORTED_PAGE_ERRORS = 8;
@@ -121,6 +138,26 @@ const PRODUCT_COVER_MIN_SHARE = 0.25;
  *  among the warnings, since a product filling the frame can leave no room beside it. */
 const WORDS_ON_PRODUCT_ASKS = 3;
 const WORDS_ON_PRODUCT_NAMED = 3;
+/** Empty or still scenes and small text are advisory, like every visual review finding:
+ *  the first check and two more say so where the next decision is made, then they stay
+ *  among the warnings only. */
+const VISUAL_HINT_ASKS = 3;
+/** Asked once more after the first answer: a promotion can rightly keep a screen still. */
+const SCREEN_STEP_ASKS = 2;
+/** A screen on for less than this is a glimpse, not a step to show. */
+const SCREEN_STEP_MIN_SEC = 1.5;
+const SCREEN_DEMO_CLIPS_SCRIPT = `Array.from(document.querySelectorAll('[data-orkas-screen] img[data-clip]'), (img) => img.getAttribute('data-clip'))`;
+
+/** The small-text hint names the size this canvas needs, as the page check measured it. */
+export function smallTextMessage(scenes: readonly string[], warnings: ReadonlyArray<{ code: string; evidence?: Record<string, unknown> }>): string {
+  const minimum = warnings
+    .map((issue) => (issue.code === 'FONT_TOO_SMALL' ? Number(issue.evidence?.minimum_px) : NaN))
+    .find((value) => Number.isFinite(value) && value > 0);
+  const size = minimum ? `under ${minimum}px, about ${PHONE_TEXT_MIN_PX}px when the video fills a phone screen` : 'small';
+  return `Text in ${scenes.join(', ')} is ${size}, so it may be too small to read on a phone.`
+    + ' Enlarge what viewers must read (the main line, labels, captions and the end card\'s call to action) or say less;'
+    + ' small print they need not read can stay. If you did not set that size, a CSS error may have dropped the page\'s styles.';
+}
 
 type ScreenRect = { left: number; top: number; right: number; bottom: number };
 
@@ -270,6 +307,9 @@ export type VideoRenderOptions = VideoProjectPaths & {
   allowFpsFallback?: boolean;
   signal?: AbortSignal;
   onProgress?: VideoProgress;
+  /** The Agent's render: a narrated video that would go silent is fixed first. The canvas
+   *  re-renders a user's own edit without it. */
+  requireSound?: boolean;
 };
 
 type AssetFacts = {
@@ -279,6 +319,7 @@ type AssetFacts = {
   width?: number;
   height?: number;
   sha256?: string;
+  stamp?: string;
 };
 
 export type LoadedVideoProject = {
@@ -368,15 +409,13 @@ export async function loadVideoProject(paths: VideoProjectPaths): Promise<Loaded
   };
 }
 
-/** Hashes of this form count only the facts a timeline quotes. Older ones counted the whole of
- *  product.json, and are still read that way. */
+/** Renders hash the scenes' file as written and only the facts a timeline quotes. */
 const QUOTED_FACTS_HASH = 'facts:';
 /** Deliveries hash what the scenes say, not how their file is laid out: the canvas writes it its
- *  own way, and a change undone there is the video that went out (decided 2026-11-11). Renders
- *  still hash the file's text, and older deliveries are read that way. */
+ *  own way, and a change undone there is the video that went out (decided 2026-11-11). */
 const PARSED_SCENES_HASH = 'parsed:';
 
-type TimelineHashForm = 'whole' | 'facts' | 'parsed';
+type TimelineHashForm = 'facts' | 'parsed';
 
 /** The scenes as the render reads them, in the order the canvas writes them. What does not read
  *  counts as written. */
@@ -427,16 +466,16 @@ export function videoTimelineSourceHash(source: { manifest: string; page: string
   const { manifest, page, product } = source;
   const scenes = form === 'parsed' ? parsedScenes(manifest) : manifest;
   const hash = crypto.createHash('sha256').update(scenes).update('\0').update(page).update('\0');
-  if (form === 'whole') return hash.update(product).update('\0').digest('hex');
   const prefix = form === 'parsed' ? PARSED_SCENES_HASH : QUOTED_FACTS_HASH;
   return `${prefix}${hash.update(quotedFacts(manifest, product)).update('\0').digest('hex')}`;
 }
 
-/** Whether a recorded hash still describes the timeline, in the form it was recorded in. */
+/** Whether a recorded hash still describes the timeline, in the form it was recorded in. One in
+ *  no form a release wrote counts as changed. */
 async function timelineUnchanged(recorded: unknown, paths: { productionDirAbs: string; videoDirAbs: string }): Promise<boolean> {
   if (typeof recorded !== 'string') return false;
-  const form = recorded.startsWith(PARSED_SCENES_HASH) ? 'parsed' : recorded.startsWith(QUOTED_FACTS_HASH) ? 'facts' : 'whole';
-  return recorded === await timelineSourceHash(paths, form);
+  const form = recorded.startsWith(PARSED_SCENES_HASH) ? 'parsed' : recorded.startsWith(QUOTED_FACTS_HASH) ? 'facts' : null;
+  return !!form && recorded === await timelineSourceHash(paths, form);
 }
 
 /** Whether this file is the video's last render and the timeline has changed since. Bytes
@@ -448,14 +487,27 @@ export async function renderedBeforeLastChange(input: { productionDirAbs: string
   return !await timelineUnchanged(record.source_sha256, input);
 }
 
+/** Verify only the file this timeline's renderer recorded. Standalone edits
+ * and historical version files have their own delivery path. */
+export async function verifyRenderedAudioSources(input: {
+  productionDirAbs: string; videoDirAbs: string; fileAbs: string; allowedRoots: readonly string[]; signal?: AbortSignal;
+}): Promise<string | false | undefined> {
+  const record = await readLastRender(input.videoDirAbs);
+  if (typeof record?.output !== 'string' || path.resolve(input.productionDirAbs, record.output) !== path.resolve(input.fileAbs)) return undefined;
+  return matchingAudioDigest(input, record.audio_sources_sha256, input.signal);
+}
+
 type ProductFact = { id: string; text: string };
 
 type LastRender = {
   /** The file the last render wrote, and the timeline it showed. */
   output?: string;
   source_sha256?: string;
+  audio_sources_sha256?: string;
   /** The timeline the latest delivered version shows. */
   delivered_source_sha256?: string;
+  /** Null marks a delivery without a timeline render to verify. */
+  delivered_audio_sources_sha256?: string | null;
   /** Associates optional turn-end notices with this exact delivered version. Older records omit it. */
   delivered_version_id?: string;
   /** The product facts the latest delivered version was made from. The Agent applies a change to
@@ -576,9 +628,15 @@ export async function renderedVisualReview(videoDirAbs: string | undefined, sha2
 
 /** Whether the timeline is ahead of what was last delivered: changed since, or rendered and
  *  never delivered. With nothing on record, as for an upgraded video, nothing has changed. */
-export async function timelineAheadOfDelivery(paths: { productionDirAbs: string; videoDirAbs: string }): Promise<boolean> {
+export async function timelineAheadOfDelivery(
+  paths: { productionDirAbs: string; videoDirAbs: string }, allowedRoots: readonly string[] = [paths.productionDirAbs],
+): Promise<boolean> {
   const record = await readLastRender(paths.videoDirAbs);
-  return !!(record?.output || record?.delivered_source_sha256) && !await timelineUnchanged(record!.delivered_source_sha256, paths);
+  if (!record?.output && !record?.delivered_source_sha256) return false;
+  if (!await timelineUnchanged(record.delivered_source_sha256, paths)) return true;
+  const deliveredAudio = record.delivered_audio_sources_sha256;
+  if (deliveredAudio === null || deliveredAudio === NO_AUDIO_SOURCES_SHA256 || (deliveredAudio === undefined && !record.output)) return false;
+  return await matchingAudioDigest({ ...paths, allowedRoots }, deliveredAudio) === false;
 }
 
 /** The product's facts as they read now. A file that cannot be read has none. */
@@ -603,26 +661,25 @@ function factsOf(value: unknown): ProductFact[] {
 }
 
 /** Remembers what a timeline and the product were before their first change, when nothing
- *  recorded them, as with an upgraded video: its delivered file shows this. A delivery recorded
- *  in an older form is noted again while the timeline is still that delivery, so undoing the
- *  change ahead comes back to it. */
+ *  recorded them, as with an upgraded video: its delivered file shows this. */
 export async function noteTimelineBeforeChange(paths: { productionDirAbs: string; videoDirAbs: string }): Promise<void> {
   const record = await readLastRender(paths.videoDirAbs);
-  const recorded = record?.delivered_source_sha256;
-  const delivered = !!(record?.output || recorded);
-  const olderForm = typeof recorded === 'string' && !recorded.startsWith(PARSED_SCENES_HASH) && await timelineUnchanged(recorded, paths);
+  const delivered = !!(record?.output || record?.delivered_source_sha256);
   const factsNoted = Array.isArray(record?.delivered_facts);
-  if (delivered && factsNoted && !olderForm) return;
+  if (delivered && factsNoted) return;
   await updateLastRender(paths, {
-    ...(delivered && !olderForm ? {} : { delivered_source_sha256: await timelineSourceHash(paths, 'parsed') }),
+    ...(delivered ? {} : { delivered_source_sha256: await timelineSourceHash(paths, 'parsed') }),
     ...(factsNoted ? {} : { delivered_facts: await productFactsNow(paths.productionDirAbs) }),
   });
 }
 
 /** The timeline and the product as they are now have reached the user. */
-export async function markTimelineDelivered(paths: { productionDirAbs: string; videoDirAbs: string }, versionId?: string): Promise<void> {
+export async function markTimelineDelivered(
+  paths: { productionDirAbs: string; videoDirAbs: string }, versionId?: string, audioSourcesSha256?: string,
+): Promise<void> {
   await updateLastRender(paths, {
     delivered_source_sha256: await timelineSourceHash(paths, 'parsed'),
+    delivered_audio_sources_sha256: audioSourcesSha256 ?? null,
     delivered_version_id: versionId,
     delivered_facts: await productFactsNow(paths.productionDirAbs),
   });
@@ -651,6 +708,53 @@ function usedAssetIds(manifest: VideoManifestV3): Set<string> {
   return ids;
 }
 
+function audioSourceIds(manifest: VideoManifestV3): string[] {
+  const tracks = timelineAudioTracks({ manifest, timeline: deriveVideoTimeline(manifest), resolve: id => id });
+  return [...new Set(tracks.map(track => track.absPath))].sort();
+}
+
+function audioSourcesDigest(sources: Array<readonly [string, string]>): string {
+  return crypto.createHash('sha256').update(JSON.stringify(sources)).digest('hex');
+}
+
+const NO_AUDIO_SOURCES_SHA256 = audioSourcesDigest([]);
+
+function assetStamp(stat: Stats): string {
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+}
+
+/** Check the referenced bytes in the current ledger. A legacy audio render
+ * must render once to establish its baseline; legacy silent renders still ship. */
+async function matchingAudioDigest(paths: VideoProjectPaths, recorded: string | undefined, signal?: AbortSignal): Promise<string | false> {
+  const project = await loadVideoProject(paths).catch(() => null);
+  if (!project?.manifest) return false;
+  const ids = audioSourceIds(project.manifest);
+  if (!ids.length) return recorded === undefined || recorded === NO_AUDIO_SOURCES_SHA256 ? NO_AUDIO_SOURCES_SHA256 : false;
+  if (!recorded || recorded === NO_AUDIO_SOURCES_SHA256) return false;
+
+  const byId = new Map<string, VideoAssetRecord>(project.assets.map(asset => [asset.id, asset]));
+  const byPath = new Map<string, string>();
+  const sources: Array<readonly [string, string]> = [];
+  for (const id of ids) {
+    if (signal?.aborted) return false;
+    const asset = byId.get(id);
+    if (!asset) return false;
+    const abs = path.resolve(paths.productionDirAbs, asset.path);
+    if (!isPathAllowed(abs, paths.allowedRoots)) return false;
+    let sha256 = byPath.get(abs);
+    if (!sha256) {
+      const before = await fs.stat(abs).catch(() => null);
+      if (!before?.isFile()) return false;
+      sha256 = await sha256OfFileStream(abs, signal).catch(() => undefined);
+      const after = await fs.stat(abs).catch(() => null);
+      if (!sha256 || !after?.isFile() || assetStamp(before) !== assetStamp(after)) return false;
+      byPath.set(abs, sha256);
+    }
+    sources.push([id, sha256]);
+  }
+  return audioSourcesDigest(sources) === recorded ? recorded : false;
+}
+
 /** Read each used file's real facts. Never trusts the ledger's own numbers. */
 async function measureUsedAssets(input: {
   project: LoadedVideoProject;
@@ -665,6 +769,7 @@ async function measureUsedAssets(input: {
   if (!project.manifest) return { facts, issues };
   const byId = new Map(project.assets.map((asset) => [asset.id, asset]));
   for (const id of usedAssetIds(project.manifest)) {
+    input.signal?.throwIfAborted();
     const record = byId.get(id);
     if (!record) continue; // validateVideoTimeline names it.
     const absPath = path.resolve(paths.productionDirAbs, record.path);
@@ -679,6 +784,7 @@ async function measureUsedAssets(input: {
     }
     const entry: AssetFacts = { record, absPath };
     const probe = await probeMedia(input.ffprobe, absPath, input.signal);
+    input.signal?.throwIfAborted();
     if (record.kind !== 'image') {
       if (!probe || (record.kind === 'video' ? !probe.video : !probe.audio)) {
         issues.push(fileIssue('TIMELINE_ASSET_UNREADABLE', `assets.json#${id}`, `Asset "${id}" could not be read as ${record.kind}.`));
@@ -688,7 +794,10 @@ async function measureUsedAssets(input: {
     }
     entry.width = probe?.video?.width;
     entry.height = probe?.video?.height;
-    if (input.withHash) entry.sha256 = await sha256OfFileStream(absPath);
+    if (input.withHash) {
+      entry.sha256 = await sha256OfFileStream(absPath, input.signal);
+      entry.stamp = assetStamp(stat);
+    }
     facts.set(id, entry);
   }
   return { facts, issues };
@@ -785,6 +894,142 @@ function sceneCues(manifest: VideoManifestV3, scene: DerivedScene, fps: number, 
   }));
 }
 
+type CutStream = {
+  codec_name?: string;
+  width?: number;
+  height?: number;
+  pix_fmt?: string;
+  field_order?: string;
+  sample_aspect_ratio?: string;
+  color_range?: string;
+  color_space?: string;
+  color_transfer?: string;
+  color_primaries?: string;
+  time_base?: string;
+  start_pts?: number;
+  duration_ts?: number;
+  nb_frames?: string;
+  avg_frame_rate?: string;
+  r_frame_rate?: string;
+  side_data_list?: unknown[];
+  tags?: { rotate?: string };
+};
+
+async function probeCutStream(ffprobe: string, file: string, signal?: AbortSignal): Promise<{
+  stream?: CutStream;
+  format?: { format_name?: string; start_time?: string };
+}> {
+  const run = await runVideoProcessForTest(ffprobe, [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries',
+    'format=format_name,start_time:stream=codec_name,width,height,pix_fmt,field_order,sample_aspect_ratio,color_range,color_space,color_transfer,color_primaries,time_base,start_pts,duration_ts,nb_frames,avg_frame_rate,r_frame_rate:stream_side_data_list:stream_tags=rotate',
+    '-of', 'json', file,
+  ], { timeoutMs: CUT_PROBE_TIMEOUT_MS, maxOutputBytes: 64 * 1024, signal });
+  signal?.throwIfAborted();
+  if (run.code !== 0 || run.timedOut || run.stderr) return {};
+  try {
+    const parsed = JSON.parse(run.stdout) as {
+      streams?: CutStream[];
+      format?: { format_name?: string; start_time?: string };
+    };
+    return { stream: parsed.streams?.[0], format: parsed.format };
+  } catch {
+    return {};
+  }
+}
+
+function countCutStreamFrames(stream: CutStream, fps: number): number | undefined {
+  const ticksPerSecond = Number(/^1\/(\d+)$/.exec(stream.time_base ?? '')?.[1]);
+  const ticksPerFrame = ticksPerSecond / fps;
+  const frames = Number(stream.nb_frames);
+  if (stream.start_pts === 0 && stream.avg_frame_rate === `${fps}/1` && stream.r_frame_rate === `${fps}/1`
+    && Number.isSafeInteger(ticksPerFrame) && ticksPerFrame > 0
+    && Number.isSafeInteger(frames) && frames > 0 && stream.duration_ts === frames * ticksPerFrame) return frames;
+  return undefined;
+}
+
+type DirectCut = { source: string; startFrame: number; scaling?: 'bilinear' | 'bicubic' };
+
+/** Admit only a full-canvas cut of progressive, square-pixel SDR MP4.
+ * Exact aspect matches can be resized without cropping. The encoder checks every selected PTS. */
+async function directCutForScene(input: {
+  prepared: PreparedTimeline;
+  scene: DerivedScene;
+  fps: number;
+  ffprobe: string;
+  sources: Map<string, number | undefined>;
+  signal?: AbortSignal;
+}): Promise<DirectCut | undefined> {
+  const { prepared, scene, fps, sources, signal } = input;
+  const { manifest, html } = prepared.project;
+  if (html !== null || manifest.captions?.enabled || manifest.absolute_page || scene.clips.length !== 1) return;
+  const clip = scene.clips[0];
+  if (clip.overlay || clip.startFrame !== 0 || clip.frameCount !== scene.frameCount) return;
+  const fact = prepared.facts.get(clip.assetId);
+  const { width, height } = manifest.canvas;
+  const startFrame = Math.round(clip.inSec * fps);
+  if (Math.abs(clip.inSec * fps - startFrame) > 1e-7 || !fact || fact.record.kind !== 'video'
+    || !fact.width || !fact.height || fact.width * height !== fact.height * width || width % 2 || height % 2) return;
+  if (!sources.has(fact.absPath)) {
+    const { stream, format } = await probeCutStream(input.ffprobe, fact.absPath, signal);
+    const eligible = format?.format_name?.split(',').includes('mp4') && Number(format.start_time) === 0
+      && stream?.codec_name === 'h264' && stream.pix_fmt === 'yuv420p'
+      && (stream.field_order === undefined || stream.field_order === 'progressive')
+      && stream.sample_aspect_ratio === '1:1' && stream.color_range === 'tv' && stream.color_space === 'bt709'
+      && stream.color_transfer === 'bt709' && stream.color_primaries === 'bt709'
+      && !stream.side_data_list?.length && stream.tags?.rotate === undefined;
+    sources.set(fact.absPath, eligible && stream ? countCutStreamFrames(stream, fps) : undefined);
+  }
+  const frameCount = sources.get(fact.absPath);
+  if (frameCount === undefined || startFrame + clip.frameCount > frameCount) return;
+  if (fact.width === width) return { source: fact.absPath, startFrame };
+  // Match the page path's browser enlargement and FFmpeg reduction kernels.
+  return { source: fact.absPath, startFrame, scaling: fact.width < width ? 'bilinear' : 'bicubic' };
+}
+
+async function encodeDirectCut(input: {
+  cut: DirectCut;
+  frameCount: number;
+  width: number;
+  height: number;
+  fps: number;
+  ffmpeg: string;
+  ffprobe: string;
+  output: string;
+  quality?: RenderQuality;
+  signal?: AbortSignal;
+}): Promise<boolean> {
+  const { cut, ffmpeg, ffprobe, fps, frameCount, width, height, output, signal } = input;
+  // Limit the input window before select. Missing frames, timestamp gaps, or
+  // cadence changes cannot be hidden by filling from later frames.
+  const filter = [
+    `trim=end_frame=${frameCount}`,
+    `select='eq(interlace_type,PROGRESSIVE)*lt(abs(t-n/${fps}),0.000001)'`,
+    // Rescale the verified timestamps without setpts, which clears the
+    // declared output frame rate in FFmpeg 7.
+    `settb=1/${fps}`,
+    ...(cut.scaling ? [`scale=${width}:${height}:flags=${cut.scaling}`] : []),
+    // The JPEG/page capture path preserves the source sample matrix and the
+    // raw BGRA encoder writes untagged, square-pixel video. Match its
+    // interpretation so that mixed segments carry compatible H.264 metadata.
+    'setparams=range=unknown:color_primaries=unknown:color_trc=unknown:colorspace=unknown',
+    'setsar=0',
+  ].join(',');
+  const run = await runVideoProcessForTest(ffmpeg, [
+    '-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-xerror',
+    '-ss', (cut.startFrame / fps).toFixed(6), '-noautorotate', '-i', cut.source,
+    '-map', '0:v:0', '-an', '-map_metadata', '-1', '-map_chapters', '-1',
+    '-vf', filter, '-fps_mode', 'passthrough', '-enc_time_base', `1:${fps}`,
+    '-frames:v', String(frameCount),
+    ...mp4VideoEncoderArgs(input.quality), output,
+  ], { timeoutMs: FRAME_EXTRACT_TIMEOUT_MS, signal });
+  signal?.throwIfAborted();
+  if (run.code !== 0 || run.timedOut || run.stderr) return false;
+  const { stream } = await probeCutStream(ffprobe, output, signal);
+  return !!stream && stream.codec_name === 'h264' && stream.width === width && stream.height === height
+    && countCutStreamFrames(stream, fps) === frameCount;
+}
+
 async function extractClipFrames(input: {
   ffmpeg: string;
   clip: DerivedClip;
@@ -862,7 +1107,7 @@ type TimelineFrame = {
   caption: string;
 };
 
-async function showTimelineFrame(input: TimelineFrame): Promise<void> {
+async function applyTimelineFrame(input: TimelineFrame): Promise<void> {
   const call = `window.__ORKAS_VIDEO__.renderFrame(${JSON.stringify(input.sceneId)}, ${JSON.stringify(input.tSec)}, ${JSON.stringify(input.clips)}, ${JSON.stringify(input.caption)})`;
   await withVideoStudioTimeout(
     input.win.webContents.executeJavaScript(call, true),
@@ -871,7 +1116,6 @@ async function showTimelineFrame(input: TimelineFrame): Promise<void> {
     `scene "${input.sceneId}" timed out at ${input.tSec.toFixed(2)}s.`,
     () => { try { input.win.destroy(); } catch { /* best effort */ } },
   );
-  await settleCompositionPaint(input.win);
 }
 
 function captureWindow(win: ElectronBrowserWindow, width: number, height: number, timeoutMessage: string): Promise<NativeImage> {
@@ -896,7 +1140,8 @@ async function showAndCaptureJump(input: TimelineFrame & { width: number; height
   const capture = () => captureWindow(input.win, input.width, input.height, input.timeoutMessage);
   await settleCompositionPaint(input.win);
   const before = (await capture()).toBitmap();
-  await showTimelineFrame(input);
+  await applyTimelineFrame(input);
+  await settleCompositionPaint(input.win);
   let shot = await capture();
   for (let count = 1; count < JUMP_FRAME_MAX_CAPTURES; count += 1) {
     const previous = shot.toBitmap();
@@ -906,6 +1151,22 @@ async function showAndCaptureJump(input: TimelineFrame & { width: number; height
     if (current.equals(previous) && !current.equals(before)) break;
   }
   return shot;
+}
+
+async function captureTimelineFrame(input: TimelineFrame & {
+  width: number;
+  height: number;
+  timeoutMessage: string;
+  jump: boolean;
+  signal?: AbortSignal;
+}): Promise<NativeImage> {
+  if (usesSoftwareCompositionPresentation(input.win)) {
+    return capturePresentedCompositionFrame({ ...input, render: () => applyTimelineFrame(input) });
+  }
+  if (input.jump) return showAndCaptureJump(input);
+  await applyTimelineFrame(input);
+  await settleCompositionPaint(input.win);
+  return captureWindow(input.win, input.width, input.height, input.timeoutMessage);
 }
 
 function sceneFrameClips(scene: DerivedScene, frames: Map<string, ClipFrames>, frame: number): Record<string, string> {
@@ -942,6 +1203,13 @@ type SceneJob = {
   cues: CaptionFrameCue[];
   cached: boolean;
 };
+
+async function publishSceneSegment(job: SceneJob, fps: number, stagingDirAbs: string): Promise<void> {
+  const meta: SegmentMeta = { version: SEGMENT_META_VERSION, scene_id: job.scene.id, frame_count: job.scene.frameCount, fps };
+  await fs.writeFile(path.join(stagingDirAbs, 'meta.json'), JSON.stringify(meta), 'utf8');
+  await fs.rm(job.entryDirAbs, { recursive: true, force: true });
+  await fs.rename(stagingDirAbs, job.entryDirAbs);
+}
 
 class PageContractError extends Error {
   constructor(readonly errorCode: string, message: string) {
@@ -1018,13 +1286,8 @@ async function renderSceneIntoCache(input: {
         caption: cueAt(job.cues, frame),
       };
       const timeoutMessage = `scene "${scene.id}" timed out capturing frame ${frame + 1}.`;
-      let captured: NativeImage;
-      if (frame === 0) {
-        captured = await showAndCaptureJump({ ...shown, width: input.width, height: input.height, timeoutMessage });
-      } else {
-        await showTimelineFrame(shown);
-        captured = await captureWindow(win, input.width, input.height, timeoutMessage);
-      }
+      const captured = await captureTimelineFrame({ ...shown, width: input.width, height: input.height,
+        timeoutMessage, jump: frame === 0, ...(p.signal ? { signal: p.signal } : {}) });
       const normalized = normalizeCapturedFrame(captured, input.width, input.height);
       await withVideoStudioTimeout(
         encoder.writeFrame(normalized.image.toBitmap()),
@@ -1052,10 +1315,7 @@ async function renderSceneIntoCache(input: {
   }
   const probe = await probeMedia(input.ffprobe, path.join(stagingDirAbs, 'segment.mp4'), p.signal);
   if (!probe?.video) throw new Error('segment media could not be probed.');
-  const meta: SegmentMeta = { version: SEGMENT_META_VERSION, scene_id: scene.id, frame_count: scene.frameCount, fps };
-  await fs.writeFile(path.join(stagingDirAbs, 'meta.json'), JSON.stringify(meta), 'utf8');
-  await fs.rm(job.entryDirAbs, { recursive: true, force: true });
-  await fs.rename(stagingDirAbs, job.entryDirAbs);
+  await publishSceneSegment(job, fps, stagingDirAbs);
 }
 
 /** A crash leaves its work directory behind, and these hold extracted frames.
@@ -1071,6 +1331,57 @@ async function sweepStaleWorkDirs(cacheDirAbs: string): Promise<void> {
         log.warn('stale render workspace cleanup failed', { error: logErrorSummary(err) });
       });
     }
+  }
+}
+
+async function withActiveSegmentCache<T>(cacheDirAbs: string, work: () => Promise<T>): Promise<T> {
+  const key = path.resolve(cacheDirAbs);
+  // A caller entering during a rename starts in the new empty directory.
+  const retirement = retiringSegmentCaches.get(key);
+  if (retirement) await retirement;
+  activeSegmentCaches.set(key, (activeSegmentCaches.get(key) ?? 0) + 1);
+  try {
+    return await work();
+  } finally {
+    const remaining = activeSegmentCaches.get(key)! - 1;
+    if (remaining) activeSegmentCaches.set(key, remaining);
+    else activeSegmentCaches.delete(key);
+  }
+}
+
+/** Every render, check and frame sheet makes and removes a work directory in its production's
+ *  cache, so that directory's own modification time is when the production last used it. Called
+ *  while holding the render slot. Cache hits, checks and frame sheets can also be active outside
+ *  that slot. A removed cache costs a full render next time. */
+async function sweepIdleSegmentCaches(cacheDirAbs: string): Promise<void> {
+  const parentAbs = path.dirname(cacheDirAbs);
+  const current = path.basename(cacheDirAbs);
+  const entries = await fs.readdir(parentAbs, { withFileTypes: true }).catch(() => []);
+  let removed = 0;
+  for (const entry of entries) {
+    if (removed >= IDLE_SEGMENT_CACHE_REMOVALS_MAX) break;
+    if (!entry.isDirectory() || entry.name === current) continue;
+    let doomedAbs = path.join(parentAbs, entry.name);
+    // A name of this form is left only by a removal that was interrupted.
+    if (!entry.name.startsWith(EXPIRED_CACHE_PREFIX)) {
+      if (!SEGMENT_CACHE_KEY_RE.test(entry.name)) continue;
+      const key = path.resolve(doomedAbs);
+      if (activeSegmentCaches.has(key)) continue;
+      const stat = await fs.stat(doomedAbs).catch(() => null);
+      if (!stat || Date.now() - stat.mtimeMs <= IDLE_SEGMENT_CACHE_MS
+          || activeSegmentCaches.has(key) || retiringSegmentCaches.has(key)) continue;
+      // Renamed first, so a production that uses its cache from now on starts an empty one.
+      const renamedAbs = path.join(parentAbs, `${EXPIRED_CACHE_PREFIX}${crypto.randomUUID()}`);
+      const retirement = fs.rename(doomedAbs, renamedAbs).then(() => true, () => false)
+        .finally(() => retiringSegmentCaches.delete(key));
+      retiringSegmentCaches.set(key, retirement);
+      if (!await retirement) continue;
+      doomedAbs = renamedAbs;
+    }
+    removed += 1;
+    await fs.rm(doomedAbs, { recursive: true, force: true }).catch((err) => {
+      log.warn('idle segment cache removal failed', { error: logErrorSummary(err) });
+    });
   }
 }
 
@@ -1135,7 +1446,19 @@ async function audioTracksFor(
   return result;
 }
 
-export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoStudioResult> {
+export function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoStudioResult> {
+  return withActiveSegmentCache(p.segmentCacheDirAbs, async () => {
+    try {
+      p.signal?.throwIfAborted();
+      return await renderTimeline(p);
+    } catch (error) {
+      if (!p.signal?.aborted) throw error;
+      return { ok: false, op: 'video.render', errorCode: 'E_RENDER_ABORTED', message: 'render aborted.' };
+    }
+  });
+}
+
+async function renderTimeline(p: VideoRenderOptions): Promise<VideoStudioResult> {
   const op = 'video.render' as const;
   const { ffmpeg, ffprobe } = bundledFfmpegPaths();
   if (!ffmpeg) return { ok: false, op, errorCode: 'E_FFMPEG_MISSING', message: 'Bundled ffmpeg not found.' };
@@ -1149,7 +1472,9 @@ export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoS
     ...(p.fps ? { fps: p.fps } : {}),
     ...(p.signal ? { signal: p.signal } : {}),
   });
-  if (!prepared || hasErrors(issues)) return blockedResult(op, issues);
+  // A narrated video that would go silent is fixed before the Agent renders it, as check reports it.
+  const blocking = prepared && p.requireSound ? [...issues, ...silentSceneIssues(prepared.project.manifest)] : issues;
+  if (!prepared || hasErrors(blocking)) return blockedResult(op, blocking);
   const { manifest } = prepared.project;
   const { compiled } = prepared;
   let review = await reviewForRender(p, prepared);
@@ -1157,7 +1482,6 @@ export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoS
   const requestedFps = qualityFps(p.quality, p.fps, manifest.canvas.fps);
   const nominal = deriveVideoTimeline(manifest, requestedFps);
   const renderProfile = await resolveNativeRenderProfile(
-    p.videoDirAbs,
     compositionMeta({ htmlPath: '', html: compiled.html, manifest, durationSec: nominal.durationSec }),
     p.quality,
     requestedFps,
@@ -1179,6 +1503,7 @@ export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoS
     product: prepared.project.product, fps });
   if (hasErrors(frameIssues)) return blockedResult(op, frameIssues);
   const timeline = deriveVideoTimeline(manifest, fps);
+  const mixedSources = audioSourceIds(manifest);
   const { width, height } = manifest.canvas;
 
   await fs.mkdir(p.segmentCacheDirAbs, { recursive: true });
@@ -1261,12 +1586,52 @@ export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoS
 
     if (pending.length) {
       await sweepStaleWorkDirs(p.segmentCacheDirAbs);
+      await sweepIdleSegmentCaches(p.segmentCacheDirAbs);
       p.onProgress?.({
         phase: 'video.render',
         message: `Rendering ${pending.length} of ${jobs.length} scene(s); ${reusedCount} unchanged.`,
         data: { segmentsTotal: jobs.length, segmentsToRender: pending.length, segmentsCached: reusedCount },
       });
       const segmentsToRender = pending.length;
+      const cutSources = new Map<string, number | undefined>();
+      for (const job of pending.splice(0)) {
+        p.signal?.throwIfAborted();
+        const cut = await directCutForScene({ prepared, scene: job.scene, fps, ffprobe, sources: cutSources, signal: p.signal });
+        if (!cut) {
+          pending.push(job);
+          continue;
+        }
+        const stagingDirAbs = path.join(stagingRootAbs, job.key.slice(0, 12));
+        await fs.rm(stagingDirAbs, { recursive: true, force: true });
+        await fs.mkdir(stagingDirAbs, { recursive: true });
+        const reportCut = () => p.onProgress?.({
+          phase: 'video.render.capture',
+          message: `Encoding scene "${job.scene.id}".`,
+          data: { sceneId: job.scene.id, directCut: true },
+        });
+        reportCut();
+        const heartbeat = setInterval(reportCut, 30_000);
+        let encoded: boolean;
+        try {
+          encoded = await encodeDirectCut({ cut, frameCount: job.scene.frameCount, width, height, fps, ffmpeg, ffprobe,
+            output: path.join(stagingDirAbs, 'segment.mp4'), quality: p.quality, signal: p.signal });
+        } finally {
+          clearInterval(heartbeat);
+        }
+        p.signal?.throwIfAborted();
+        if (encoded) {
+          await publishSceneSegment(job, fps, stagingDirAbs);
+          renderedCount += 1;
+        } else {
+          await fs.rm(stagingDirAbs, { recursive: true, force: true });
+          pending.push(job);
+          p.onProgress?.({
+            phase: 'video.render.capture',
+            message: `Scene "${job.scene.id}" will be rendered in a composition window.`,
+            data: { sceneId: job.scene.id, directCutFallback: true },
+          });
+        }
+      }
       const attempts = new Map<string, number>();
       let consecutiveSetupFailures = 0;
       while (pending.length) {
@@ -1393,7 +1758,8 @@ export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoS
         const decision = shouldNormalizeLoudness(before, p.quality);
         loudness = { before, decision };
         if (decision.normalize) {
-          loudness.normalize = await normalizeAudioInPlace(ffmpeg, tempOutputAbs, p.signal);
+          // Its own measurement drives the pass, so the render is at the delivery loudness.
+          loudness.normalize = await normalizeAudioInPlace(ffmpeg, tempOutputAbs, p.signal, before);
           probe = await probeMedia(ffprobe, tempOutputAbs, p.signal);
         }
       }
@@ -1410,12 +1776,24 @@ export async function renderVideoTimeline(p: VideoRenderOptions): Promise<VideoS
       }
 
       stage = 'finalize';
+      const audioSources: Array<readonly [string, string]> = [];
+      for (const id of mixedSources) {
+        const source = prepared.facts.get(id);
+        const stat = source && isPathAllowed(source.absPath, p.allowedRoots)
+          ? await fs.stat(source.absPath).catch(() => null) : null;
+        if (!stat?.isFile() || !source?.sha256 || source.stamp !== assetStamp(stat)) {
+          return { ok: false, op, errorCode: 'E_RENDER_AUDIO_CHANGED', message: 'An audio source changed during rendering. Render again using the current sources.' };
+        }
+        audioSources.push([id, source.sha256]);
+      }
+      p.signal?.throwIfAborted();
       await fs.rename(tempOutputAbs, p.outputAbsPath);
       // Losing this loses a check at delivery, never the render.
       const outputSha256 = await sha256OfFileStream(p.outputAbsPath).catch(() => null);
       if (!outputSha256) review = { ...review, status: 'unavailable' };
       await updateLastRender(p, {
         output: path.relative(p.productionDirAbs, p.outputAbsPath), source_sha256: sourceSha256,
+        audio_sources_sha256: audioSourcesDigest(audioSources),
         visual_render: { output_sha256: outputSha256 ?? '', review },
       }).catch((err) => {
         review = { ...review, status: 'unavailable' };
@@ -1471,6 +1849,13 @@ export function locateTimelineFrame(timeline: DerivedTimeline, tSec: number): { 
 }
 
 type SampleRequest = { label: string; timeSec: number };
+
+function sceneSheetFrames(scene: DerivedScene): Array<{ label: string; frame: number }> {
+  return [
+    { label: `${scene.id}-start`, frame: 0 },
+    { label: `${scene.id}-end`, frame: scene.frameCount - 1 },
+  ];
+}
 
 /** One still per clip visible on a frame, extracted on demand: a sheet touches a
  *  few frames of a video, so whole clips are never extracted for it. */
@@ -1531,17 +1916,17 @@ function sheetRequests(timeline: DerivedTimeline, options: VideoSheetOptions): S
   if (options.times?.length) {
     return options.times.slice(0, SHEET_MAX_FRAMES).map((timeSec, index) => ({ label: `t${index + 1}`, timeSec }));
   }
-  return timeline.scenes.flatMap((scene) => {
-    const last = scene.startFrame + scene.frameCount - 1;
-    return [
-      { label: `${scene.id}-start`, timeSec: scene.startFrame / timeline.fps },
-      { label: `${scene.id}-end`, timeSec: last / timeline.fps },
-    ];
-  }).slice(0, SHEET_MAX_FRAMES);
+  return timeline.scenes.flatMap((scene) => sceneSheetFrames(scene).map(({ label, frame }) => ({
+    label, timeSec: (scene.startFrame + frame) / timeline.fps,
+  }))).slice(0, SHEET_MAX_FRAMES);
 }
 
 /** Frames of the video as it stands, without rendering it. */
-export async function sheetVideoTimeline(p: VideoSheetOptions): Promise<VideoStudioResult> {
+export function sheetVideoTimeline(p: VideoSheetOptions): Promise<VideoStudioResult> {
+  return withActiveSegmentCache(p.segmentCacheDirAbs, () => sheetTimeline(p));
+}
+
+async function sheetTimeline(p: VideoSheetOptions): Promise<VideoStudioResult> {
   const op = 'video.sheet' as const;
   const { ffmpeg, ffprobe } = bundledFfmpegPaths();
   if (!ffmpeg || !ffprobe) return { ok: false, op, errorCode: 'E_FFMPEG_MISSING', message: 'Bundled ffmpeg not found.' };
@@ -1587,7 +1972,7 @@ export async function sheetVideoTimeline(p: VideoSheetOptions): Promise<VideoStu
             dirAbs: path.join(workDirAbs, 'frames'),
             ...(p.signal ? { signal: p.signal } : {}),
           });
-          const captured = await showAndCaptureJump({
+          const captured = await captureTimelineFrame({
             win,
             sceneId: scene.id,
             tSec: frame / fps,
@@ -1595,6 +1980,8 @@ export async function sheetVideoTimeline(p: VideoSheetOptions): Promise<VideoStu
             caption: cueAt(sceneCues(manifest, scene, fps, prepared.facts), frame),
             width,
             height,
+            jump: true,
+            ...(p.signal ? { signal: p.signal } : {}),
             timeoutMessage: `scene "${scene.id}" timed out capturing a preview frame.`,
           });
           const normalized = normalizeCapturedFrame(captured, width, height);
@@ -1639,18 +2026,126 @@ export async function sheetVideoTimeline(p: VideoSheetOptions): Promise<VideoStu
 
 export type VideoCheckOptions = VideoProjectPaths & {
   segmentCacheDirAbs: string;
+  /** Existing temporary directory for an optional sheet of the checked scene endpoints. */
+  previewOutputDirAbs?: string;
   signal?: AbortSignal;
   onProgress?: VideoProgress;
   /** Checks earlier in this run that asked to move words off the product. */
   wordsOnProductAsked?: number;
   /** Called when this check asks to move words off the product. */
   onWordsOnProductAsked?: () => void;
+  /** Checks earlier in this run that pointed out empty or still scenes, and small text. */
+  stillScenesAsked?: number;
+  onStillScenesAsked?: () => void;
+  smallTextAsked?: number;
+  onSmallTextAsked?: () => void;
+  /** Checks earlier in this run that pointed out screens shown without a step done on them. */
+  screenStepsAsked?: number;
+  onScreenStepsAsked?: () => void;
 };
+
+/** Said where the next decision is made, as a question: a still the measure takes for a
+ *  screen can be a flat-lay photograph, and a promotion can keep a screen still on purpose. */
+export function screenStepMessage(sceneIds: readonly string[]): string {
+  return `${sceneIds.length > 1 ? `Scenes ${sceneIds.join(', ')} show` : `Scene ${sceneIds[0]} shows`} what looks like a screen of a site or app, with nothing done on it. Where the line says what someone does there, show it done on that screen with ./assets/vendor/screen-demo.js (timeline.md): tap or type where it happens, cut to the screen it leads to, and ring what the line points at. A photograph needs none of this.`;
+}
+
+const CAPTURE_FOLDERS_READ = 40;
+
+/** What product.capture recorded about the pictures it saved, by their bytes, so a crop
+ *  copied out of its capture folder keeps it: page tiles and interface crops are screens,
+ *  photos and video frames are not. A card of words says neither. */
+export async function capturedPictureKinds(productionDirAbs: string): Promise<Map<string, boolean>> {
+  const roots = [path.join(productionDirAbs, 'assets', 'product')];
+  const videos = await fs.readdir(path.join(productionDirAbs, 'videos'), { withFileTypes: true }).catch(() => []);
+  for (const entry of videos) if (entry.isDirectory()) roots.push(path.join(productionDirAbs, 'videos', entry.name, 'assets', 'product'));
+  const kinds = new Map<string, boolean>();
+  let read = 0;
+  for (const root of roots) {
+    const folders = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const folder of folders) {
+      if (!folder.isDirectory() || read >= CAPTURE_FOLDERS_READ) continue;
+      read += 1;
+      const dir = path.join(root, folder.name);
+      let record: { tiles?: Array<{ path?: unknown } | null>; images?: Array<{ path?: unknown; content?: unknown } | null> } | null = null;
+      try { record = JSON.parse(await fs.readFile(path.join(dir, 'capture.json'), 'utf8')); } catch { continue; }
+      const pictures = [
+        ...(Array.isArray(record?.tiles) ? record.tiles : []).map((tile) => ({ file: tile?.path, screen: true as boolean | null })),
+        ...(Array.isArray(record?.images) ? record.images : []).map((image) => ({
+          file: image?.path,
+          screen: image?.content === 'panel_ui' ? true : image?.content === 'media' || image?.content === 'panel_media' ? false : null,
+        })),
+      ];
+      for (const picture of pictures) {
+        if (picture.screen === null || typeof picture.file !== 'string') continue;
+        const abs = path.join(dir, path.basename(picture.file));
+        const sha = await sha256OfFileStream(abs).catch(() => null);
+        if (sha) kinds.set(sha, picture.screen);
+      }
+    }
+  }
+  return kinds;
+}
+
+/** Still pictures in this timeline that look like screens rather than photographs. */
+async function screenAssetIds(
+  facts: ReadonlyMap<string, { record: { kind: string }; absPath: string }>,
+  timeline: { scenes: ReadonlyArray<{ clips: ReadonlyArray<{ assetId: string }> }> },
+  productionDirAbs: string,
+): Promise<Set<string>> {
+  const used = new Set(timeline.scenes.flatMap((scene) => scene.clips.map((clip) => clip.assetId)));
+  const screens = new Set<string>();
+  let nativeImage: typeof import('electron').nativeImage | undefined;
+  try {
+    nativeImage = (await import('electron')).nativeImage;
+  } catch {
+    nativeImage = undefined;
+  }
+  // Without the app's image reader this says nothing, and the rest of the check goes on.
+  if (!nativeImage) return screens;
+  let captured: Map<string, boolean> | null = null;
+  for (const id of used) {
+    const fact = facts.get(id);
+    if (!fact || fact.record.kind !== 'image') continue;
+    captured ??= await capturedPictureKinds(productionDirAbs);
+    if (captured.size) {
+      const sha = await sha256OfFileStream(fact.absPath).catch(() => null);
+      const known = sha ? captured.get(sha) : undefined;
+      if (known !== undefined) {
+        if (known) screens.add(id);
+        continue;
+      }
+    }
+    if (await pictureLooksLikeScreen(fact.absPath, nativeImage)) screens.add(id);
+  }
+  return screens;
+}
+
+/** Whether a still picture file looks like a screen of a site or app; false when it cannot be read. */
+export async function pictureLooksLikeScreen(
+  absPath: string,
+  images?: typeof import('electron').nativeImage,
+): Promise<boolean> {
+  try {
+    const nativeImage = images ?? (await import('electron')).nativeImage;
+    const image = nativeImage.createFromPath(absPath);
+    if (image.isEmpty()) return false;
+    const small = image.resize({ width: 160, quality: 'good' });
+    const size = small.getSize();
+    return looksLikeScreen(small.toBitmap(), size.width, size.height);
+  } catch {
+    return false;
+  }
+}
 
 /** Everything that can be wrong before rendering: structure and files without a
  *  window, then layout and page errors from the real page at a few frames of each
  *  scene. Bounded to three frames a scene, whatever the video's length. */
-export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStudioResult> {
+export function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStudioResult> {
+  return withActiveSegmentCache(p.segmentCacheDirAbs, () => checkTimeline(p));
+}
+
+async function checkTimeline(p: VideoCheckOptions): Promise<VideoStudioResult> {
   const op = 'video.check' as const;
   const { ffmpeg, ffprobe } = bundledFfmpegPaths();
   if (!ffmpeg || !ffprobe) return { ok: false, op, errorCode: 'E_FFMPEG_MISSING', message: 'Bundled ffmpeg not found.' };
@@ -1673,40 +2168,47 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
       assets: prepared.project.assets,
       videoDirAbs: p.videoDirAbs,
       productionDirAbs: p.productionDirAbs,
-    }))]
+    })), ...silentSceneIssues(prepared.project.manifest)]
     : prepareIssues;
   // Lines of words found on a marked product, in the order the scenes play.
   const wordsOnProduct: Array<{ text: string; sceneId: string }> = [];
   const wordsOnProductMessage = () => `Words cover the product in ${wordsOnProduct.slice(0, WORDS_ON_PRODUCT_NAMED)
     .map((line) => `"${line.text}" (${line.sceneId})`).join(', ')}. Move the copy or the crop until the product is clear, then check again before rendering.`;
   const asksWordsOffProduct = () => wordsOnProduct.length > 0 && (p.wordsOnProductAsked ?? 0) < WORDS_ON_PRODUCT_ASKS;
+  // Scenes that hold a picture of a screen with no step done on it, in the order they play.
+  const screensWithoutStep: string[] = [];
   const respond = async (all: Array<ContractIssue | Issue>, extra: Record<string, unknown> = {}): Promise<VideoStudioResult> => {
     const errors = all.filter((issue) => issue.severity === 'error');
     const warnings = all.filter((issue) => issue.severity !== 'error');
     const scenesWith = (...codes: string[]) => [...new Set(warnings.flatMap((issue) => (
       codes.includes(issue.code) ? [(issue as { sceneId?: string }).sceneId ?? 'the page'] : []
     )))];
-    const looksEmpty = scenesWith('SCENE_MOSTLY_EMPTY', 'SCENE_STATIC');
-    const tooSmall = scenesWith('FONT_TOO_SMALL');
+    const looksEmpty = (p.stillScenesAsked ?? 0) < VISUAL_HINT_ASKS ? scenesWith('SCENE_MOSTLY_EMPTY', 'SCENE_STATIC') : [];
+    const tooSmall = (p.smallTextAsked ?? 0) < VISUAL_HINT_ASKS ? scenesWith('FONT_TOO_SMALL') : [];
+    const idleScreens = (p.screenStepsAsked ?? 0) < SCREEN_STEP_ASKS ? screensWithoutStep : [];
     // A warning in a list gets read past. What decides whether this reads as an ad goes
     // where the next decision is made.
     const needsWork = [
-      looksEmpty.length ? `${looksEmpty.length} scene(s) are mostly empty or do not move: ${looksEmpty.join(', ')}. This will read as slides. Before rendering, give each one real footage or a product image filling the frame, or motion that changes what is seen.` : '',
-      tooSmall.length ? `Text in ${tooSmall.join(', ')} is too small to read on a phone. If you did not choose that size, look for a CSS error that dropped the page's styles. Fix it before rendering.` : '',
+      looksEmpty.length ? `${looksEmpty.length} scene(s) look mostly empty or do not move: ${looksEmpty.join(', ')}, which can read as slides. Compare them with the frames: give the ones that need it real footage, a product image filling the frame, or motion that changes what is seen, and say why you keep the rest.` : '',
+      tooSmall.length ? smallTextMessage(tooSmall, warnings) : '',
       asksWordsOffProduct() ? wordsOnProductMessage() : '',
+      idleScreens.length ? screenStepMessage(idleScreens) : '',
     ].filter(Boolean);
     const summary = summarizeCheckWarnings(warnings);
     const review = visualReview(errors.length || !inputSha256 ? 'unavailable' : summary.length ? 'has_findings' : 'no_findings', summary);
     await saveReview(review);
     if (!errors.length && asksWordsOffProduct()) p.onWordsOnProductAsked?.();
+    if (!errors.length && looksEmpty.length) p.onStillScenesAsked?.();
+    if (!errors.length && tooSmall.length) p.onSmallTextAsked?.();
+    if (!errors.length && idleScreens.length) p.onScreenStepsAsked?.();
     return errors.length
-      ? { ok: false, op, errorCode: 'E_VIDEO_CHECK_BLOCKED', message: errors[0].message, issues: errors, warnings: summary, visual_review: review, ...extra }
+      // visual_review carries the warnings; a second copy would be read on every later request.
+      ? { ok: false, op, errorCode: 'E_VIDEO_CHECK_BLOCKED', message: errors[0].message, issues: errors, visual_review: review, ...extra }
       : {
         ok: true,
         op,
         visual_review: review,
         ...(needsWork.length ? { message: needsWork.join(' ') } : {}),
-        warnings: summary,
         ...extra,
       };
   };
@@ -1724,6 +2226,9 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
   const pageErrors: string[] = [];
   const found: Array<ContractIssue | Issue> = [...issues];
   const notShown: Issue[] = [];
+  const previewSamples: Array<{ label: string; time_seconds: number; path: string }> = [];
+  const previewLayout = p.previewOutputDirAbs ? sheetLayoutFor(width, height) : undefined;
+  let previewFailed = false;
   try {
     await fs.mkdir(workDirAbs, { recursive: true });
     const compiledHtmlPath = path.join(workDirAbs, 'index.html');
@@ -1731,6 +2236,16 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
     const meta = compositionMeta({ htmlPath: compiledHtmlPath, html: prepared.compiled.html, manifest, durationSec: timeline.durationSec });
     await withCompositionWindow(meta, { compositionDirAbs: p.videoDirAbs }, async (win) => {
       await assertPageTimelines(win, manifest);
+      const screens = await screenAssetIds(prepared.facts, timeline, p.productionDirAbs).catch(() => new Set<string>());
+      if (screens.size) {
+        const demoed = await win.webContents.executeJavaScript(SCREEN_DEMO_CLIPS_SCRIPT, true).catch(() => []) as unknown;
+        const shownInUse = new Set(Array.isArray(demoed) ? demoed.map(String) : []);
+        for (const scene of timeline.scenes) {
+          const idle = scene.clips.some((clip) => screens.has(clip.assetId) && !shownInUse.has(clip.id)
+            && clip.frameCount / fps >= SCREEN_STEP_MIN_SEC);
+          if (idle) screensWithoutStep.push(scene.id);
+        }
+      }
       const inspected: Issue[] = [];
       const sceneHashes = new Map<string, Set<string>>();
       const sceneEmptyShare = new Map<string, number>();
@@ -1759,7 +2274,7 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
             dirAbs: path.join(workDirAbs, 'frames'),
             ...(p.signal ? { signal: p.signal } : {}),
           });
-          const captured = await showAndCaptureJump({
+          const captured = await captureTimelineFrame({
             win,
             sceneId: scene.id,
             tSec: frame / fps,
@@ -1767,6 +2282,8 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
             caption: cueAt(cues, frame),
             width,
             height,
+            jump: true,
+            ...(p.signal ? { signal: p.signal } : {}),
             timeoutMessage: `scene "${scene.id}" timed out capturing a check frame.`,
           });
           const sampled = await win.webContents.executeJavaScript(buildInspectScript(meta, frame / fps, scene.id), true) as Issue[];
@@ -1782,6 +2299,26 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
           if (!Array.isArray(shown) || shown.includes(scene.id)) sceneOnPage = true;
           else shown.forEach((id) => shownInstead.add(id));
           const frameImage = normalizeCapturedFrame(captured, width, height).image;
+          if (previewLayout && !previewFailed && previewSamples.length < SHEET_MAX_FRAMES
+              && (frame === 0 || frame === lastFrame)) {
+            try {
+              const framePath = path.join(workDirAbs, `preview-${previewSamples.length}.png`);
+              const thumb = frameImage.resize({
+                width: Math.max(1, Math.min(width, previewLayout.thumbWidth)),
+                height: Math.max(1, Math.min(height, previewLayout.thumbHeight)),
+                quality: 'best',
+              });
+              await fs.writeFile(framePath, thumb.toPNG());
+              for (const sample of sceneSheetFrames(scene)) {
+                if (sample.frame === frame) previewSamples.push({
+                  label: sample.label, time_seconds: (scene.startFrame + frame) / fps, path: framePath,
+                });
+              }
+            } catch (err) {
+              previewFailed = true;
+              log.warn('checked frame preview unavailable', { error: logErrorSummary(err) });
+            }
+          }
           hashes.add(analyzeNativeImage(frameImage).hash);
           const probe = frameImage.resize({ width: EMPTY_FRAME_PROBE_WIDTH, quality: 'good' });
           const probeSize = probe.getSize();
@@ -1849,7 +2386,16 @@ export async function checkVideoTimeline(p: VideoCheckOptions): Promise<VideoStu
     }
     // A page whose script died shows nothing for that reason, and that is the one to fix.
     if (!scriptErrors.length) found.push(...notShown);
-    return respond(found, facts);
+    let contactSheet: string | undefined;
+    if (p.previewOutputDirAbs && previewLayout && previewSamples.length && !previewFailed && !p.signal?.aborted
+        && !found.some((issue) => issue.severity === 'error')) {
+      try {
+        contactSheet = await writeFrameContactSheet(p.previewOutputDirAbs, previewSamples, { labelOnly: true, ...previewLayout });
+      } catch (err) {
+        log.warn('checked frame sheet unavailable', { error: logErrorSummary(err) });
+      }
+    }
+    return respond(found, { ...facts, ...(contactSheet && !p.signal?.aborted ? { contact_sheet: contactSheet } : {}) });
   } catch (err) {
     if (err instanceof PageContractError) {
       found.push({ code: err.errorCode, severity: 'error', message: err.message, source: SOURCE });

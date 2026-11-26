@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { SRC_ROOT } from '../paths';
 import { createLogger } from '../logger';
 import { hardenedWebPreferences, installExternalNavigationGuard, installHtmlPreviewNavigationGuard } from '../util/window-security';
+import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import { subscribeBus } from './group_chat';
 
@@ -16,6 +17,7 @@ const options = z.object({
   cid: id.nullish(), projectId: id.nullish(), absPath: text.optional(),
   projectScoped: z.boolean().optional(), autoplay: z.boolean().optional(),
   readOnly: z.boolean().optional(),
+  fileRevision: z.string().max(128).optional(),
   startTime: z.number().finite().optional(), duration: z.number().finite().optional(), ended: z.boolean().optional(),
 }).strict();
 const imageItem = z.object({
@@ -34,8 +36,11 @@ const sourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('artifact'), cid: id, artifactId: id, agentId: text.optional(), title: text }).strict(),
 ]);
 export type PreviewSource = z.infer<typeof sourceSchema>;
+type FileSource = Extract<PreviewSource, { kind: 'file' }>;
+type AllowMarkdownLink = (source: FileSource, target: string) => Promise<boolean>;
 type Record = { win: BrowserWindow; owner: WebContents; uid: string; source: PreviewSource; dirty: boolean;
   ready: boolean; next?: PreviewSource; dispose?: () => void;
+  markdownLinkPending?: boolean;
   revealPending?: boolean;
   artifactRevision?: number };
 const records = new Map<number, Record>();
@@ -53,6 +58,15 @@ function canReplaceContent(current: PreviewSource, next: PreviewSource): boolean
   return ['image', 'file', 'video'].includes(current.kind) && ['image', 'file', 'video'].includes(next.kind);
 }
 
+function canRefocusPreview(current: PreviewSource, next: PreviewSource): boolean {
+  if (next.kind === 'image' || sourceKey(current) !== sourceKey(next)) return false;
+  if ((next.kind === 'file' || next.kind === 'video') && 'options' in current) {
+    return current.options.fileRevision === next.options.fileRevision
+      && current.options.readOnly === next.options.readOnly;
+  }
+  return true;
+}
+
 function owned(uid: string, sender: WebContents): Record {
   const record = records.get(sender.id);
   if (!record || record.uid !== uid || record.win.isDestroyed()) throw new Error('Preview is unavailable.');
@@ -65,6 +79,38 @@ function showPreview(record: Record) {
   if (record.win.isDestroyed() || !record.win.isFocusable()) return;
   if (record.win.isMinimized()) record.win.restore();
   record.win.show(); record.win.focus();
+}
+
+function installPreviewNavigation(record: Record, allowMarkdownLink?: AllowMarkdownLink) {
+  const contents = record.win.webContents;
+  installHtmlPreviewNavigationGuard(contents, (event, url) => {
+    const target = chatMediaLocalPathFromUrl(url.href);
+    if (!/\.(?:md|markdown)$/i.test(target)) return false;
+    const source = record.source;
+    const frame = event.frame;
+    // Only the active file viewer's own HTML frame can request a handoff.
+    // Nested frames, popups and a stale frame must never select native content.
+    if (!allowMarkdownLink || !record.ready || record.next || record.markdownLinkPending
+        || source.kind !== 'file' || !frame || frame.parent !== contents.mainFrame || event.initiator !== frame
+        || url.host !== 'local' || url.username || url.password
+        || !path.isAbsolute(target) || target.includes('\0') || target.length > 8192
+        || path.normalize(chatMediaLocalPathFromUrl(frame.url)) !== path.normalize(source.path)) return true;
+
+    record.markdownLinkPending = true;
+    const frameUrl = frame.url;
+    void allowMarkdownLink(source, target).then(allowed => {
+      if (!allowed || record.win.isDestroyed() || !record.ready || record.next
+          || record.source !== source || frame.url !== frameUrl) return;
+      const { cid, projectId, projectScoped } = source.options;
+      record.next = {
+        kind: 'file', path: target, title: path.basename(target),
+        options: { cid, projectId, projectScoped, readOnly: true },
+      };
+      contents.send('preview-windows:replace-request', {});
+    }).catch(() => log.warn('Markdown preview link validation failed', { code: 'validation_failed' }))
+      .finally(() => { record.markdownLinkPending = false; });
+    return true;
+  });
 }
 
 function cancelOwnerRequests(record: Record) {
@@ -120,7 +166,7 @@ export async function replacePreview(uid: string, sender: WebContents, accepted:
   }
 }
 
-export async function openPreview(uid: string, owner: WebContents, payload: unknown) {
+export async function openPreview(uid: string, owner: WebContents, payload: unknown, allowMarkdownLink?: AllowMarkdownLink) {
   if ((JSON.stringify(payload)?.length || 0) > 8 * 1024 * 1024) throw new Error('Preview is too large.');
   const source = sourceSchema.parse(payload);
   if (records.has(owner.id)) throw new Error('Open previews from the main window.');
@@ -128,8 +174,7 @@ export async function openPreview(uid: string, owner: WebContents, payload: unkn
     && (source.kind === 'app' ? sourceKey(r.source) === sourceKey(source) : r.source.kind !== 'app'));
   if (existing) {
     if (source.kind !== 'app') {
-      const unchanged = source.kind !== 'image' && sourceKey(existing.source) === sourceKey(source);
-      existing.next = unchanged ? undefined : source;
+      existing.next = canRefocusPreview(existing.source, source) ? undefined : source;
       if (existing.next) {
         // Raise the window only after replacement. File and media swaps keep the shell
         // visible in place; other kinds hide the document being navigated away.
@@ -176,7 +221,7 @@ export async function openPreview(uid: string, owner: WebContents, payload: unkn
   }
   ownerState.windows.add(win);
   installExternalNavigationGuard(win.webContents, url => shell.openExternal(url), () => log.warn('external link failed', { code: 'open_failed' }));
-  installHtmlPreviewNavigationGuard(win.webContents);
+  installPreviewNavigation(record, allowMarkdownLink);
   win.on('close', event => {
     if (!record.dirty) return;
     event.preventDefault();

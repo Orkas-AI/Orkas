@@ -98,6 +98,11 @@ function normalizeSearch(value: unknown): string {
   }
 }
 
+function setupDescription(entry: CatalogEntry, language: Lang): string | null {
+  const description = localized(entry as unknown as Record<string, unknown>, 'description', language);
+  return [description, entry.setup_scope_note].filter(Boolean).join(' ') || null;
+}
+
 export function connectorSetupKind(entry: CatalogEntry): ConnectorSetupKind {
   if (entry.connection_setup?.requirement === 'business_qualification') {
     return 'enterprise_qualification';
@@ -301,6 +306,7 @@ export function searchConnectorSetups(
     .map(({ entry, matchedTerms }) => ({
       connector_id: entry.id,
       name: localized(entry as unknown as Record<string, unknown>, 'display_name', language),
+      description: setupDescription(entry, language),
       category: entry.category,
       setup_type: connectorSetupKind(entry),
       requires_extra_configuration: connectorSetupKind(entry) !== 'one_click_oauth',
@@ -322,7 +328,7 @@ export function inspectConnectorSetup(
   const summary = {
     connector_id: entry.id,
     name: localized(entry as unknown as Record<string, unknown>, 'display_name', language),
-    description: localized(entry as unknown as Record<string, unknown>, 'description', language),
+    description: setupDescription(entry, language),
     category: entry.category,
     auth_mode: entry.auth_mode,
     setup_type: kind,

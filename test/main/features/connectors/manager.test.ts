@@ -2092,7 +2092,7 @@ describe('features/connectors/manager authorization recovery', () => {
     await vi.waitFor(() => expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledOnce());
     expect(mocks.events.broadcastOAuthConnectOutcome).toHaveBeenCalledWith(expect.objectContaining({
       attempt_id: started.attempt_id, result: 'failure', code: 'local_cli_authorization_failed',
-      authorization_detail: reason,
+      authorization_detail: reason, display_name: 'DingTalk', display_name_zh: '钉钉',
     }));
     expect(registry.load(TEST_UID).connections.dingtalk).toBeUndefined();
     expect(mocks.events.broadcastOAuthConnectProgress).not.toHaveBeenCalled();
@@ -2155,6 +2155,63 @@ describe('OAuth refresh ownership', () => {
     expect(await manager.verifyUsableConnectors(TEST_UID)).toBe(0);
     expect(registry.load(TEST_UID).connections.gsheets.status.kind).toBe('error');
     expect(mocks.mcp.connect).not.toHaveBeenCalled();
+  });
+
+  it('reads OpenSEO data, rejects unreviewed actions, and reconnects after a revoked grant', async () => {
+    let authorization = 0;
+    mocks.dcr.startMcpDcrOAuth = vi.fn(async () => ({
+      grant: {
+        access_token: `fixture-access-${++authorization}`, refresh_token: `fixture-refresh-${authorization}`, expires_at: Date.now() + 3_600_000,
+        scopes: ['mcp', 'offline_access'], token_type: 'Bearer',
+      },
+      client: { client_id: 'fixture-client', token_endpoint: 'https://app.openseo.so/api/auth/oauth2/token' },
+    }));
+    const tools = [
+      { name: 'get_search_console_performance', description: 'Read search performance.', input_schema: { type: 'object' } },
+      { name: 'save_ai_visibility_tracker', description: 'Save tracking.', input_schema: { type: 'object' }, annotations: { readOnlyHint: true } },
+      { name: 'future_workspace_admin', description: 'Unknown action.', input_schema: { type: 'object' }, annotations: { readOnlyHint: true } },
+    ];
+    mocks.mcp.listTools = vi.fn(async () => tools);
+    const response = {
+      content: [{ type: 'text', text: 'Search Console performance for one query.' }],
+      structuredContent: { ok: true, rows: [{ keys: ['fixture query'], clicks: 7, impressions: 91, ctr: 7 / 91, position: 8 }] },
+    };
+    mocks.mcp.callTool = vi.fn(async () => response);
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const { resolveVisibleConnectors, formatNativeMcpResult } = await import('../../../../src/main/features/connectors/tools-adapter');
+
+    const connected = await manager.connectViaOAuth(TEST_UID, 'openseo');
+    expect(connected).toMatchObject({ id: 'openseo', status: { kind: 'connected' } });
+    expect(connected.tools_cache).toEqual([
+      expect.objectContaining({ name: 'get_search_console_performance', orkas_action_policy: expect.objectContaining({ risk: 'R' }) }),
+      expect.objectContaining({ name: 'save_ai_visibility_tracker', orkas_action_policy: expect.objectContaining({ risk: 'H', sensitive_operation: 'money' }) }),
+    ]);
+    await expect(manager.callTool(TEST_UID, 'openseo', 'future_workspace_admin', {})).rejects.toThrow('connector_tool_not_allowed');
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+    const input = { projectId: 'fixture-project', dimensions: ['query'] };
+    const result = await manager.callTool(TEST_UID, 'openseo', 'get_search_console_performance', input);
+    expect(result).toEqual(response);
+    expect(formatNativeMcpResult(result).content).toContain('"clicks":7');
+    expect(mocks.mcp.callTool).toHaveBeenCalledWith('get_search_console_performance', input);
+    expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1);
+
+    mocks.dcr.refreshDcrIfStale = vi.fn(async () => {
+      throw Object.assign(new Error('Authorization expired. Please reconnect'), { code: 'connector_reconnect_required' });
+    });
+    await registry.update(TEST_UID, 'openseo', row => ({
+      ...row, oauth_grant: { ...row.oauth_grant!, expires_at: Date.now() - 1 },
+    }));
+    await manager.refreshTools(TEST_UID, 'openseo');
+    expect(manager.getInstance(TEST_UID, 'openseo')?.status).toMatchObject({ kind: 'error' });
+    expect((await resolveVisibleConnectors(TEST_UID)).some(({ instance }) => instance.id === 'openseo')).toBe(false);
+    expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1);
+
+    mocks.dcr.refreshDcrIfStale = vi.fn(async (_provider, grant) => grant);
+    const reconnected = await manager.connectViaOAuth(TEST_UID, 'openseo');
+    expect(reconnected).toMatchObject({ status: { kind: 'connected' }, oauth_grant: { refresh_token: 'fixture-refresh-2' } });
+    expect((await resolveVisibleConnectors(TEST_UID)).find(({ instance }) => instance.id === 'openseo')?.tools.map(tool => tool.name))
+      .toContain('get_search_console_performance');
   });
 
   it('filters remote commerce tools at discovery and denies direct calls outside catalog policy', async () => {

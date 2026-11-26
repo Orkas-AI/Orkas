@@ -107,6 +107,7 @@ test.describe('interactive CLI lifecycle', () => {
         // input must contain the actual tool rejection before the valid start.
         expect(JSON.stringify(modelOrkas.modelRequests[2])).toContain('E_BAD_INPUT');
         expect(JSON.stringify(modelOrkas.modelRequests[2])).toContain('interactive_cli(start) does not accept: session_id');
+        expect(JSON.stringify(modelOrkas.modelRequests[2])).toContain('Use read or send to continue an existing session.');
       }
       const interactiveTool = expect.objectContaining({
         function: expect.objectContaining({ name: 'interactive_cli' }),
@@ -115,6 +116,18 @@ test.describe('interactive CLI lifecycle', () => {
       // only the request's SDK definitions determine whether it is exposed.
       expect(modelOrkas.modelRequests[0].tools).not.toEqual(expect.arrayContaining([interactiveTool]));
       expect(modelOrkas.modelRequests[1].tools).toEqual(expect.arrayContaining([interactiveTool]));
+      expect(modelOrkas.modelRequests[1].tools).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          function: expect.objectContaining({
+            name: 'interactive_cli',
+            parameters: expect.objectContaining({
+              properties: expect.objectContaining({
+                session_id: expect.objectContaining({ description: expect.stringContaining('Omit for start.') }),
+              }),
+            }),
+          }),
+        }),
+      ]));
       expect(JSON.stringify(modelOrkas.modelRequests)).not.toContain('secret-code-42');
     });
   }

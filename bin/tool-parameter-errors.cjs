@@ -40,13 +40,19 @@ function formatParameterError(content, isError) {
   return match ? parameterErrorContent(match[2], undefined, match[1]) : content;
 }
 
+function zodIssueFields(issue, limit = Infinity) {
+  const parts = (issue.path || []).map(part => typeof part === 'object' ? part.key : part);
+  const field = parts.length ? parts.map(String).join('.') : '$';
+  return issue.code === 'unrecognized_keys'
+    ? issue.keys.slice(0, limit).map(key => field === '$' ? key : `${field}.${key}`)
+    : [field];
+}
+
 /** Called only with the owning Zod validator's structured issues. No values. */
 function zodParameterError(issues) {
   return parameterErrorContent('Invalid tool arguments.', issues.flatMap(issue => {
-    const parts = (issue.path || []).map(part => typeof part === 'object' ? part.key : part);
-    const field = parts.length ? parts.map(String).join('.') : '$';
     if (issue.code === 'unrecognized_keys') {
-      return issue.keys.map(key => ({ field: field === '$' ? key : `${field}.${key}`, reason: 'unsupported_field', expected: 'Only declared fields are accepted here.' }));
+      return zodIssueFields(issue).map(field => ({ field, reason: 'unsupported_field', expected: 'Only declared fields are accepted here.' }));
     }
     // Zod messages describe constraints; do not echo received argument values.
     let expected = issue.message || (issue.expected ? `Expected ${issue.expected === 'int' ? 'integer' : issue.expected}.` : 'Use the declared parameter schema.');
@@ -55,7 +61,7 @@ function zodParameterError(issues) {
       if (issue.code === 'too_small') expected = `Minimum: ${issue.minimum}; inclusive: ${issue.inclusive}.`;
       if (issue.code === 'too_big') expected = `Maximum: ${issue.maximum}; inclusive: ${issue.inclusive}.`;
     }
-    return [{ field, reason: issue.code, expected }];
+    return [{ field: zodIssueFields(issue)[0], reason: issue.code, expected }];
   }));
 }
 
@@ -66,3 +72,4 @@ exports.parameterError = (message, fields = [], reason = 'invalid_arguments', de
 });
 exports.formatParameterError = formatParameterError;
 exports.zodParameterError = zodParameterError;
+exports.zodIssueFields = zodIssueFields;

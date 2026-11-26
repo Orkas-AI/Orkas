@@ -658,6 +658,70 @@ describe('util/proxy-dispatcher per-request system routing', () => {
     expect(resolveProxy).toHaveBeenCalledTimes(2);
   });
 
+  it('validates redirects from Electron before routing the next binary request', async () => {
+    const first = 'https://source.example.test/start.png';
+    const intermediate = 'https://source.example.test/intermediate.png';
+    const final = 'https://cdn.example.test/final.png';
+    const rejected = 'https://source.example.test/rejected.png';
+    const requestOptions: Array<{ url: string; redirect: string }> = [];
+    const sentHeaders = new Map<string, Map<string, string>>();
+    const aborted: string[] = [];
+    const redirects = new Map([
+      [first, '/intermediate.png'],
+      [intermediate, final],
+      [rejected, 'http://cdn.example.test/final.png'],
+    ]);
+    vi.doMock('electron', () => ({ session: { defaultSession: {} }, net: {
+      request(options: { url: string; redirect: string }) {
+        const { url } = options;
+        requestOptions.push(options);
+        const headers = new Map<string, string>();
+        sentHeaders.set(url, headers);
+        const emitter = new EventEmitter();
+        return Object.assign(emitter, {
+          setHeader: (name: string, value: string) => headers.set(name.toLowerCase(), value),
+          abort: () => aborted.push(url),
+          end: () => {
+            const location = redirects.get(url);
+            if (location) {
+              emitter.emit('redirect', 302, 'GET', location);
+            } else {
+              const response = Object.assign(new EventEmitter(), { statusCode: 200 });
+              emitter.emit('response', response);
+              response.emit('data', Buffer.from('fixture'));
+              response.emit('end');
+            }
+          },
+        });
+      },
+    } }));
+    const resolveProxy = vi.fn(async (_url: string) => 'PROXY proxy.example.test:8080');
+    const addressPolicy = vi.fn(() => true);
+    const options = {
+      label: 'reference delivery',
+      headers: { Authorization: 'Bearer fixture', Accept: 'image/png' },
+      isAllowedDirectAddress: addressPolicy,
+      validateRedirectUrl: (url: URL) => url.protocol === 'https:',
+    };
+    try {
+      expect(await installSystemProxyDispatcher(hostFetch, resolveProxy)).toBe(true);
+      await expect(downloadBinaryWithProxyPolicy(first, options)).resolves.toMatchObject({ body: Buffer.from('fixture') });
+      await expect(downloadBinaryWithProxyPolicy(rejected, options)).rejects.toThrow(/disallowed URL/);
+      expect(requestOptions.map(({ url, redirect }) => [url, redirect])).toEqual(
+        [first, intermediate, final, rejected].map(url => [url, 'manual']),
+      );
+      expect(resolveProxy.mock.calls.map(([url]) => new URL(url).origin)).toEqual([
+        new URL(first).origin, new URL(final).origin,
+      ]);
+      expect(aborted).toEqual([first, intermediate, rejected]);
+      expect(sentHeaders.get(intermediate)?.get('authorization')).toBe('Bearer fixture');
+      expect(sentHeaders.get(final)).toEqual(new Map([['accept', 'image/png']]));
+      expect(addressPolicy).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('electron');
+    }
+  });
+
   it('checks the address selected by a direct connection before sending its GET', async () => {
     let requestCount = 0;
     const server = createServer((_req, res) => {

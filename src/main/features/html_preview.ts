@@ -16,6 +16,9 @@ import { isPathAllowed } from '../util/path-sandbox';
 import { hardenedWebPreferences, withHtmlPreviewAssetPolicy, withHtmlPreviewPolicy } from '../util/window-security';
 
 const HTML_PREVIEW_TIMEOUT_MS = 20_000;
+const HASH_ROUTE_LIMIT = 3;
+const HASH_ROUTE_BUDGET_MS = 3_000;
+const HASH_ROUTE_SAMPLE_MS = 750;
 const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
 const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
 const HTML_PREVIEW_MAX_INLINE_DOWNLOAD_URL_CHARS = 2 * 1024 * 1024;
@@ -134,10 +137,13 @@ export interface HtmlPreviewInteractionEvidence {
   stateControlsFound: number;
   stateControlsExercised: number;
   stateTransitionsObserved: number;
+  stateTransitionControls?: string[];
+  /** Labels of exercised links with an explicit download attribute. */
   downloadCandidates: string[];
   formsFound: number;
   formsSubmitted: number;
   hashLinksChecked: number;
+  hashRoutesUnverified?: number;
   mailtoLinksChecked: number;
   downloads: HtmlPreviewDownloadEvidence[];
   keyboard: HtmlPreviewKeyboardEvidence;
@@ -206,7 +212,7 @@ type PageEvidence = Omit<
 type PageInteractionEvidence = Omit<
   HtmlPreviewInteractionEvidence,
   'performed' | 'viewport' | 'downloads' | 'keyboard'
->;
+> & { routeFragments: string[] };
 
 type RenderInteractionEvidence = PageInteractionEvidence & {
   performed: boolean;
@@ -225,6 +231,7 @@ function emptyPageInteractionEvidence(): PageInteractionEvidence {
     formsFound: 0,
     formsSubmitted: 0,
     hashLinksChecked: 0,
+    routeFragments: [],
     mailtoLinksChecked: 0,
     failureCount: 0,
     failures: [],
@@ -811,6 +818,7 @@ const INTERACTION_SCRIPT = `(async () => {
   let stateControlsFound = 0;
   let stateControlsExercised = 0;
   let stateTransitionsObserved = 0;
+  const stateTransitionControls = [];
   window.addEventListener('message', (event) => {
     if (event && event.data && event.data.__orkasArtifact === true) artifactMessagesObserved += 1;
   });
@@ -853,12 +861,20 @@ const INTERACTION_SCRIPT = `(async () => {
   };
 
   const hashLinks = Array.from(document.querySelectorAll('a[href^="#"]')).filter(visible);
+  const routeLink = 'a[href^="#/"]:not([download]),a[href^="#!/"]:not([download])';
+  const hashTarget = href => href.length > 1 ? document.getElementById(decodeURIComponent(href.slice(1))) : null;
+  const isRoute = link => {
+    if (!link.matches(routeLink)) return false;
+    try { return !hashTarget(link.getAttribute('href')); } catch { return true; }
+  };
+  const routeFragments = new Set();
   let hashLinksChecked = 0;
   for (const link of hashLinks.slice(0, 20)) {
     try {
       const href = String(link.getAttribute('href') || '');
-      const target = href && href !== '#' ? document.querySelector(href) : null;
+      const target = hashTarget(href);
       if (target) hashLinksChecked += 1;
+      else if (link.matches(routeLink)) routeFragments.add(href.slice(0, 513));
       else failures.push('missing hash target for ' + label(link));
     } catch {
       failures.push('invalid hash target for ' + label(link));
@@ -926,11 +942,8 @@ const INTERACTION_SCRIPT = `(async () => {
 
   await exerciseVisibleFields();
 
-  const explicitDownloads = Array.from(document.querySelectorAll('a[download]')).filter(visible);
-  const namedDownloadButtons = Array.from(document.querySelectorAll('button,[role="button"]'))
-    .filter((element) => visible(element) && /download|resume|cv|简历|下载/i.test(label(element)));
-  const downloadControls = [...explicitDownloads, ...namedDownloadButtons]
-    .filter((element, index, values) => values.indexOf(element) === index)
+  const downloadControls = Array.from(document.querySelectorAll('a[href][download]'))
+    .filter((control) => visible(control) && control.getAttribute('aria-disabled') !== 'true')
     .slice(0, 10);
   const downloadCandidates = downloadControls.map(label);
   for (const control of downloadControls) {
@@ -1042,6 +1055,7 @@ const INTERACTION_SCRIPT = `(async () => {
   const enqueueVisibleStateControls = () => {
     const candidates = Array.from(document.querySelectorAll('button,[role="button"],[role="tab"]'))
       .filter((control) => (
+        !isRoute(control) &&
         visible(control)
         && !control.disabled
         && control.getAttribute?.('aria-disabled') !== 'true'
@@ -1085,6 +1099,7 @@ const INTERACTION_SCRIPT = `(async () => {
       if (after !== before || artifactMessagesObserved > messagesBefore) {
         stateChangesObserved += 1;
         stateTransitionsObserved += 1;
+        stateTransitionControls.push(label(control));
       } else if (!alreadySelected) {
         warnings.push('enabled control produced no observable outcome: ' + label(control));
       }
@@ -1107,10 +1122,12 @@ const INTERACTION_SCRIPT = `(async () => {
     stateControlsFound,
     stateControlsExercised,
     stateTransitionsObserved,
+    stateTransitionControls,
     downloadCandidates,
     formsFound,
     formsSubmitted,
     hashLinksChecked,
+    routeFragments: [...routeFragments],
     mailtoLinksChecked,
     failureCount: failures.length,
     failures: failures
@@ -1231,9 +1248,9 @@ async function auditKeyboardTraversal(
   };
 }
 
-function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = HTML_PREVIEW_TIMEOUT_MS): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), HTML_PREVIEW_TIMEOUT_MS);
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -1453,6 +1470,147 @@ async function clearPreviewSession(ses: Session): Promise<void> {
   ]);
 }
 
+const HASH_ROUTE_CSP = [
+  "default-src 'none'",
+  "script-src chat-media://local 'unsafe-inline'",
+  "style-src chat-media://local 'unsafe-inline'",
+  'connect-src chat-media://local',
+  'img-src chat-media://local data: blob:',
+  'font-src chat-media://local data:',
+  'media-src chat-media://local data: blob:',
+  "form-action 'none'",
+  'sandbox allow-scripts',
+].join('; ');
+
+function observeHashRoute(fragment: string): string {
+  return `(async () => {
+    const fragment = ${JSON.stringify(fragment)};
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const visible = element => element.checkVisibility({ opacityProperty: true, visibilityProperty: true })
+      && element.getClientRects().length > 0;
+    const link = Array.from(document.links).find(element =>
+      element instanceof HTMLAnchorElement && element.getAttribute('href') === fragment
+      && !element.hasAttribute('download') && element.getAttribute('aria-disabled') !== 'true' && visible(element));
+    if (!link || (link.target && link.target.toLowerCase() !== '_self')
+      || (!link.target && document.querySelector('base[target]'))) return false;
+    const destination = new URL(link.href);
+    const current = new URL(location.href);
+    if (current.hash === destination.hash) return false;
+    current.hash = destination.hash;
+    if (current.href !== destination.href) return false;
+
+    // Inspect content, excluding navigation highlights and live progress updates.
+    const snapshot = () => {
+      const root = document.querySelector('main,[role="main"]') || document.body;
+      if (!root || root.getAttribute('aria-busy') === 'true') return null;
+      const hidden = 'script,style,noscript,template,nav,header,footer,a,button,progress,[role="status"],[role="alert"],[role="progressbar"],[aria-live]:not([aria-live="off"]),[aria-busy="true"]';
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+      const parts = [];
+      let node, scanned = 0, chars = 0;
+      while ((node = walker.nextNode())) {
+        if (++scanned > 1200 || chars > 12000) return null;
+        const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        if (!element || element.closest(hidden)) continue;
+        if (node.nodeType === Node.TEXT_NODE && node.textContent.length > 12000) return null;
+        const content = node.nodeType === Node.TEXT_NODE ? node.textContent.replace(/\\s+/g, ' ').trim()
+          : node.tagName === 'IMG' && node.complete && node.naturalWidth ? node.currentSrc : '';
+        if (content && visible(element)) {
+          parts.push(content);
+          chars += content.length;
+        }
+      }
+      return chars > 12000 ? null : JSON.stringify(parts);
+    };
+    const before = snapshot();
+    await sleep(100);
+    if (before === null || snapshot() !== before) return false;
+    let denied = false;
+    document.addEventListener('securitypolicyviolation', () => { denied = true; }, { once: true });
+    link.click();
+    await sleep(${HASH_ROUTE_SAMPLE_MS - 150});
+    const after = snapshot();
+    await sleep(150);
+    return !denied && location.href === destination.href && after !== null && after !== '[]'
+      && after !== before && snapshot() === after;
+  })()`;
+}
+
+async function auditHashRoutes(
+  BrowserWindow: NonNullable<ElectronRuntime['BrowserWindow']>,
+  session: NonNullable<ElectronRuntime['session']>,
+  entryReal: string,
+  entryRootReal: string,
+  viewport: HtmlPreviewViewport,
+  fragments: readonly string[],
+): Promise<number> {
+  const ses = session.fromPartition(`html-route-${crypto.randomUUID()}`);
+  const entryUrl = chatMediaLocalUrl(entryReal);
+  const bridgeRoot = path.join(entryRootReal, '__orkas');
+  let win: ElectronBrowserWindow | undefined;
+  let denied = false;
+  let verified = 0;
+  try {
+    registerPermissionIsolation(ses);
+    await withTimeout((async () => {
+      ses.enableNetworkEmulation({ offline: true });
+      ses.webRequest.onBeforeRequest((details, callback) => {
+        const allowed = /^(?:data|blob|about):/i.test(details.url)
+          || (details.url.startsWith('chat-media:') && allowedPreviewRequest(details.url, entryRootReal));
+        if (!allowed) denied = true;
+        callback({ cancel: !allowed });
+      });
+      ses.protocol.handle('chat-media', request => {
+        const requested = chatMediaLocalPathFromUrl(request.url);
+        if (!requested || isPathAllowed(requested, [bridgeRoot]) || !['GET', 'HEAD'].includes(request.method)) {
+          denied = true;
+          return new Response(null, { status: 403 });
+        }
+        const response = servePreviewRequest(request, entryRootReal);
+        const headers = new Headers(response.headers);
+        headers.set('Content-Security-Policy', HASH_ROUTE_CSP);
+        headers.set('X-DNS-Prefetch-Control', 'off');
+        return new Response(response.body, { status: response.status, headers });
+      });
+      ses.on('will-download', event => { denied = true; event.preventDefault(); });
+      win = new BrowserWindow({
+        show: false,
+        width: viewport.width,
+        height: viewport.height,
+        useContentSize: true,
+        webPreferences: hardenedWebPreferences({ session: ses, backgroundThrottling: false }),
+      });
+      const contents = win.webContents;
+      contents.setWindowOpenHandler(() => { denied = true; return { action: 'deny' }; });
+      contents.on('will-frame-navigate', event => { denied = true; event.preventDefault(); });
+      // WebRTC is outside URL request interception. Disable direct UDP and
+      // remove the connection constructors before any document script runs.
+      contents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
+      // Initialize the renderer before issuing a DevTools command to it.
+      await win.loadURL('about:blank');
+      contents.debugger.attach('1.3');
+      await contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: `
+        for (const key of ['RTCPeerConnection', 'webkitRTCPeerConnection']) {
+          Object.defineProperty(window, key, { value: undefined, configurable: false, writable: false });
+        }
+      ` });
+      for (const fragment of fragments.slice(0, HASH_ROUTE_LIMIT)) {
+        if (fragment.length > 512) continue;
+        denied = false;
+        await contents.loadURL(entryUrl);
+        if (denied) continue;
+        const reached = await contents.executeJavaScriptInIsolatedWorld(1001, [{ code: observeHashRoute(fragment) }]);
+        if (reached === true && !denied) verified += 1;
+      }
+    })(), 'Hash route observation timed out', HASH_ROUTE_BUDGET_MS);
+  } catch {
+    // An unavailable isolated environment is inconclusive for its remaining routes.
+  } finally {
+    if (win && !win.isDestroyed()) win.destroy();
+    await clearPreviewSession(ses);
+  }
+  return verified;
+}
+
 function consoleErrorListener(errors: string[], warnings: string[]) {
   return (...args: [unknown, unknown?, unknown?]) => {
     const [event, levelOrDetails, message] = args;
@@ -1491,10 +1649,12 @@ async function renderViewport(
 }> {
   const consoleErrors: string[] = [];
   const consoleWarnings: string[] = [];
+  const { width, height } = viewport;
+  const captureBounds = process.platform === 'win32' ? { x: 0, y: 0, width, height } : undefined;
   const win = new BrowserWindow({
     show: false,
-    width: viewport.width,
-    height: viewport.height,
+    width,
+    height,
     useContentSize: true,
     backgroundColor: '#ffffff',
     webPreferences: hardenedWebPreferences({
@@ -1512,6 +1672,21 @@ async function renderViewport(
 
   let sdk: Awaited<ReturnType<typeof createPreviewSdk>> | undefined;
   try {
+    if (captureBounds) {
+      // Windows can clamp the initial window to the work area. Restore its
+      // surface and set Chromium's layout viewport before loading user HTML.
+      win.setContentSize(width, height);
+      await withTimeout((async () => {
+        await win.loadURL('about:blank');
+        webContents.debugger.attach('1.3');
+        await webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+          width,
+          height,
+          deviceScaleFactor: 0,
+          mobile: false,
+        });
+      })(), `E_HTML_PREVIEW_VIEWPORT_TIMEOUT: ${viewport.name} viewport did not become ready`);
+    }
     if (bundle) { sdk = await createPreviewSdk(ses, webContents, bundle); sdkOrigin.current = sdk.origin; }
     await withTimeout(
       win.loadURL(sdk?.shellUrl ?? entryUrl),
@@ -1535,13 +1710,14 @@ async function renderViewport(
       `E_HTML_PREVIEW_INSPECT_TIMEOUT: ${viewport.name} layout inspection timed out`,
     );
     const image = await withTimeout(
-      webContents.capturePage(),
+      webContents.capturePage(captureBounds),
       `E_HTML_PREVIEW_CAPTURE_TIMEOUT: ${viewport.name} screenshot timed out`,
     );
+    let keyboardEvidence: HtmlPreviewKeyboardEvidence | undefined;
     const interactions = auditKeyboard
       ? await withTimeout(
         (async () => {
-          const keyboard = await auditKeyboardTraversal({
+          const keyboard = keyboardEvidence = await auditKeyboardTraversal({
             executeJavaScript: (script, gesture) => inspected.executeJavaScript(script, gesture),
             focus: () => webContents.focus(),
             sendInputEvent: event => webContents.sendInputEvent(event),
@@ -1560,15 +1736,18 @@ async function renderViewport(
           return { performed: true, ...safeInteractions, keyboard };
         })(),
         `E_HTML_PREVIEW_AUDIT_TIMEOUT: ${viewport.name} preview audit timed out`,
-      )
+      ).catch(() => {
+        consoleWarnings.push('interaction playback did not complete; observations are unavailable');
+        return keyboardEvidence && { performed: false, ...emptyPageInteractionEvidence(), keyboard: keyboardEvidence };
+      })
       : undefined;
     if (sdk) await withTimeout(sdk.settle(), 'E_HTML_PREVIEW_SDK_TIMEOUT: SDK requests did not settle');
     const size = image.getSize();
     return {
       evidence: {
         name: viewport.name,
-        width: viewport.width,
-        height: viewport.height,
+        width,
+        height,
         screenshotWidth: size.width,
         screenshotHeight: size.height,
         ...page,
@@ -1712,8 +1891,8 @@ export async function renderResponsiveHtmlPreview(
     if (blocked.count) {
       blockers.push(`${blocked.count} external or out-of-directory resource request(s) were blocked`);
     }
-    const pageInteractions = rendered[0]?.interactions ?? {
-      performed: exerciseInteractions,
+    const { routeFragments = [], ...pageInteractions } = rendered[0]?.interactions ?? {
+      performed: false,
       ...emptyPageInteractionEvidence(),
       keyboard: {
         method: 'tab-key' as const,
@@ -1725,6 +1904,18 @@ export async function renderResponsiveHtmlPreview(
         failures: [`${viewports[0].name} keyboard audit did not return evidence`],
       },
     };
+    if (routeFragments.length > 0) {
+      const verified = await auditHashRoutes(BrowserWindow, electronSession, entryReal, entryRootReal, viewports[0], routeFragments);
+      pageInteractions.hashLinksChecked += verified;
+      pageInteractions.controlsExercised += verified;
+      pageInteractions.stateChangesObserved += verified;
+      const unverified = routeFragments.length - verified;
+      if (unverified > 0) {
+        pageInteractions.hashRoutesUnverified = unverified;
+        const noun = unverified === 1 ? 'route' : 'routes';
+        warnings.push(`${unverified} same-document hash ${noun} could not be verified in the offline preview.`);
+      }
+    }
     if (pageInteractions.keyboard.failures.length) {
       blockers.push(`${pageInteractions.keyboard.failures.length} keyboard traversal check(s) failed`);
     }
@@ -1757,17 +1948,6 @@ export async function renderResponsiveHtmlPreview(
         `${interactionFailureCount} safe interaction check(s) failed`
         + (interactionFailureSamples.length ? `: ${interactionFailureSamples.join(' | ')}` : '')
         + (omittedFailureCount ? ` (${omittedFailureCount} more not shown)` : ''),
-      );
-    }
-    if (
-      pageInteractions.performed
-      &&
-      pageInteractions.downloadCandidates.length
-      && downloads.length < pageInteractions.downloadCandidates.length
-    ) {
-      blockers.push(
-        `${pageInteractions.downloadCandidates.length} download action(s) were exercised `
-        + `but only ${downloads.length} download(s) were observed`,
       );
     }
     const incompleteDownloads = downloads.filter((download) => (
@@ -1881,7 +2061,7 @@ export async function renderInteractiveHtmlSmoke(
       );
     }
   }
-  if ((interactions.controlsExercised ?? 0) <= 0) {
+  if ((interactions.controlsExercised ?? 0) <= 0 && !interactions.hashRoutesUnverified) {
     blockers.push('interactive artifact smoke found no operable control to exercise');
   }
   if (

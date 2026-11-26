@@ -56,7 +56,7 @@ ui-artifacts/<task-slug>/
 Add files only when the task needs them:
 
 - `DESIGN.md` for reusable multi-screen/system/brand work, formal handoff, or an explicit user request. Do not create it for an ordinary single-screen fast-path artifact.
-- `data/` and provenance files for a live-ready artifact, following `ui-live-artifact`.
+- Data and provenance files for a live-ready artifact, following `ui-live-artifact`.
 - Local CSS/JavaScript modules when a self-contained `index.html` would become fragile or hard to edit.
 - Source-specific entry files for an explicit alternate format.
 

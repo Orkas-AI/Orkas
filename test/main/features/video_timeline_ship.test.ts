@@ -8,13 +8,28 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import sharp from 'sharp';
 
-import { parseVisualHints, recordProductionVoice, shipVideoFile, writeDeliveredFrameSheet } from '../../../src/main/features/video_timeline_ship';
+import { deliveredFrameSamples, parseVisualHints, recordProductionVoice, shipVideoFile, writeDeliveredFrameSheet } from '../../../src/main/features/video_timeline_ship';
+import * as storage from '../../../src/main/storage';
 import { bundledFfmpegPaths } from '../../../src/main/util/bundled-runtime';
+import * as fileHash from '../../../src/main/util/sha256';
 import { driftingCuts, makeBeatMontage } from '../../fixtures/beat-montage';
 
 // The gate judges the file, so these cases build files the way a model might, by
 // hand with ffmpeg, and never through the renderer. That is the 2026-08-10 lesson:
 // a check attached to one tool disappears when the model uses another.
+
+const { deliveryWarning } = vi.hoisted(() => ({ deliveryWarning: vi.fn() }));
+vi.mock('../../../src/main/logger', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/main/logger')>();
+  return { ...actual, createLogger: (name: string) => {
+    const logger = actual.createLogger(name);
+    if (name !== 'video-timeline-ship') return logger;
+    return { ...logger, warn: (...args: Parameters<typeof logger.warn>) => {
+      deliveryWarning(...args);
+      logger.warn(...args);
+    } };
+  } };
+});
 
 const roots: string[] = [];
 
@@ -72,6 +87,57 @@ function timeline(scenes: unknown[], extra: Record<string, unknown> = {}) {
 }
 
 describe('shipVideoFile against a timeline', () => {
+  it('advises on the kept original sound in the published file, even if it has a different soundtrack', async () => {
+    const root = makeRoot();
+    const { production, video } = project(root, timeline([
+      { id: 'intro', duration: 2 },
+      { id: 'dialogue', clips: [{ id: 'a', asset: 'episode', in: 1, dur: 3, audio: 'keep' }] },
+    ]), [{ id: 'episode', kind: 'video', label: 'Episode', path: 'episode.mp4', origin: 'upload' }]);
+    const source = path.join(production, 'episode.mp4');
+    const replacement = path.join(root, 'replacement.mp4');
+    const kept = path.join(root, 'kept.mp4');
+    const covered = path.join(root, 'covered.mp4');
+    const noise = (seed: number, volume: string) => `anoisesrc=d=5:c=pink:r=16000:a=${volume}:seed=${seed}`;
+    for (const [file, seed] of [[source, 1], [replacement, 2]] as const) {
+      ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=s=360x640:r=30:d=5', '-f', 'lavfi', '-i', noise(seed, '0.3'),
+        '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', file]);
+    }
+    for (const [file, level, bed] of [[kept, '0.65', '0.04'], [covered, '0.15', '0.6']] as const) {
+      const original = `[0:a]atrim=start=1:end=4,asetpts=N/SR/TB,volume=${level},adelay=2000:all=1[original]`;
+      ffmpeg(['-i', source, '-f', 'lavfi', '-i', noise(2, bed), '-filter_complex',
+        `${original};[1:a][original]amix=inputs=2:duration=first:normalize=0[mix]`,
+        '-map', '0:v', '-map', '[mix]', '-c:v', 'copy', '-c:a', 'aac', file]);
+    }
+    const warningCode = 'DELIVERY_ORIGINAL_AUDIO_UNVERIFIED';
+    const options = { productionDirAbs: production, videoDirAbs: video, allowedRoots: [root] };
+    const ship = (file: string) => shipVideoFile({ ...options, videoPathAbs: file });
+    const checkWarning = (result: Awaited<ReturnType<typeof ship>>) => {
+      expect(result).toMatchObject({
+        ok: true, version: { warnings: expect.arrayContaining([warningCode]) },
+        warnings: expect.arrayContaining([expect.objectContaining({
+          code: warningCode, severity: 'warning', message: expect.stringMatching(/2\.00s.*5\.00s/),
+        })]),
+      });
+      expect(codes(result, 'warnings')).not.toContain('DELIVERY_SILENT_STRETCH');
+    };
+    const original = await ship(kept);
+    expect(original.ok).toBe(true);
+    expect(codes(original, 'warnings')).not.toContain(warningCode);
+    checkWarning(await ship(replacement));
+
+    // Original sound still exists in the covered export, so the finding is uncertainty.
+    checkWarning(await ship(covered));
+    // Policy output and repeats are checked against what the user's version actually plays.
+    checkWarning(await shipVideoFile({ ...options, videoPathAbs: kept, finalize: async (file) => {
+      fs.copyFileSync(replacement, file);
+    } }));
+    checkWarning(await ship(kept));
+
+    const standalone = await shipVideoFile({ ...options, videoDirAbs: undefined, videoPathAbs: replacement });
+    expect(standalone.ok).toBe(true);
+    expect(codes(standalone, 'warnings')).not.toContain(warningCode);
+  }, 60_000);
+
   it('refuses a silent hand-made file for a narrated timeline', async () => {
     const root = makeRoot();
     const { production, video } = project(root, timeline(
@@ -212,16 +278,13 @@ describe('shipVideoFile against a timeline', () => {
     expect(await shipVideoFile({ productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: within })).toMatchObject({ ok: true });
     const off = path.join(root, 'off.mp4');
     picture(off, 3);
-    const result = await shipVideoFile({ productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: off });
+    const result = await shipVideoFile({
+      productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: off, expect: { durationSec: 3 },
+    });
+    expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
     expect(codes(result)).toContain('DELIVERY_DURATION_DRIFT');
     expect(JSON.stringify(result)).not.toMatch(/approved plan/);
     expect(JSON.stringify(result)).toContain('Narration and captions are timed against');
-    // A file cut without a timeline is held to the length the Agent passed, and told how to
-    // correct that number rather than to stretch the file.
-    const cut = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: off, expect: { durationSec: 4 } });
-    expect(codes(cut)).toContain('DELIVERY_DURATION_DRIFT');
-    expect(JSON.stringify(cut)).toContain('deliver it again with its real length as expect_duration_sec');
-    expect(JSON.stringify(cut)).not.toContain('Narration and captions');
   });
 
   it('refuses a file of the wrong shape', async () => {
@@ -466,6 +529,24 @@ describe('shipVideoFile and narration made for a video that plays none', () => {
     expect(await ship(silent())).toMatchObject({ ok: true, version: { id: 'v2' } });
   });
 
+  it('gives a usable timeline repair for the single saved narration take', async () => {
+    const { voice, write, silent, voiced, ship } = setUp();
+    const scenes = [{ id: 'a', duration: 2 }, { id: 'b', duration: 2 }];
+    await voice('voice/all.m4a', 3);
+    write(timeline(scenes), [allRow]);
+
+    const result = await ship(silent());
+    const message = (finding(result) as { message?: string } | undefined)?.message ?? '';
+    const example = message.match(/\{[^{}]+\}/)?.[0];
+    expect(example).toBeDefined();
+    const track = JSON.parse(example!);
+    expect(track).toEqual({ kind: 'narration', asset: 'voice-all', volume: 1 });
+    expect(message).toContain('video_id "main"');
+
+    write(timeline(scenes, { tracks: [track] }), [allRow]);
+    expect(await ship(voiced())).toMatchObject({ ok: true, version: { id: 'v1', video_id: 'main' } });
+  });
+
   it('delivers when a scene speaks one of the lines', async () => {
     const { voice, write, voiced, ship } = setUp();
     await voice('voice/a.m4a', 1);
@@ -668,7 +749,18 @@ describe('shipVideoFile for a video made with ffmpeg alone', () => {
     expect(codes(plain, 'warnings')).not.toContain('DELIVERY_CUTS_OFF_BEAT');
   }, 60_000);
 
-  it('holds the file to what the caller says it should be', async () => {
+  it('tells the Agent when a video said to be cut to the beat shows one picture throughout', async () => {
+    const root = makeRoot();
+    const file = path.join(root, 'still.mp4');
+    makeBeatMontage(file, 16, []);
+    const checked = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file, cutToBeat: true });
+    expect(checked).toMatchObject({ ok: true });
+    expect(codes(checked, 'warnings')).toContain('DELIVERY_NO_CUTS');
+    const plain = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file });
+    expect(codes(plain, 'warnings')).not.toContain('DELIVERY_NO_CUTS');
+  }, 60_000);
+
+  it('blocks missing required audio and a wrong aspect ratio while reporting a requested length separately', async () => {
     const root = makeRoot();
     const file = path.join(root, 'cut.mp4');
     picture(file, 3);
@@ -678,15 +770,60 @@ describe('shipVideoFile for a video made with ffmpeg alone', () => {
       videoPathAbs: file,
       expect: { durationSec: 10, hasAudio: true, aspect: '16:9' },
     });
-    expect(codes(result)).toEqual(expect.arrayContaining(['DELIVERY_DURATION_DRIFT', 'DELIVERY_NO_AUDIO', 'DELIVERY_ASPECT_MISMATCH']));
+    expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+    expect(codes(result)).toEqual(['DELIVERY_ASPECT_MISMATCH', 'DELIVERY_NO_AUDIO']);
+    expect(codes(result, 'warnings')).toContain('DELIVERY_REQUESTED_DURATION_DRIFT');
+    expect(fs.existsSync(path.join(root, 'versions.json'))).toBe(false);
   });
 
-  it('refuses a file whose sound stops long before its picture', async () => {
+  // On 2026-11-19 "one of them stops early" left a tutorial (picture 30.6 s, sound 22.2 s) asking
+  // for its narration to be recorded again rather than filling or cutting the silent end.
+  it('refuses a file whose sound stops long before its picture, and says to fill the silent end or cut the picture to the sound', async () => {
     const root = makeRoot();
     const file = path.join(root, 'cut.mp4');
     withTone(file, 4, 2);
-    expect(codes(await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file }))).toContain('DELIVERY_AV_DURATION_MISMATCH');
+    const result = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file });
+    const issue = (result.issues as Array<{ code: string; message: string }>).find((item) => item.code === 'DELIVERY_AV_DURATION_MISMATCH');
+    expect(issue?.message).toBe('The picture runs 4.00s and the sound 2.00s, so the last 2.00s have no sound. Give that stretch sound, such as another narration line or music under the end, or cut the picture to 2.00s, then deliver again.');
   });
+
+  it('refuses a file whose sound runs on past its picture, and says to cut the sound or extend the picture', async () => {
+    const root = makeRoot();
+    const file = path.join(root, 'cut.mp4');
+    withTone(file, 2, 4);
+    const result = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file });
+    const issue = (result.issues as Array<{ code: string; message: string }>).find((item) => item.code === 'DELIVERY_AV_DURATION_MISMATCH');
+    expect(issue?.message).toBe('The picture runs 2.00s and the sound 4.00s, so the sound runs 2.00s past the picture. Cut the sound to 2.00s or extend the picture, then deliver again.');
+  });
+
+  it('asks to reuse the original narration when a shorter output track cuts the recorded line off', async () => {
+    const root = makeRoot();
+    const voice = path.join(root, 'voice.wav');
+    const footage = path.join(root, 'picture.mp4');
+    const broken = path.join(root, 'broken.mp4');
+    const repaired = path.join(root, 'repaired.mp4');
+    picture(footage, 4);
+    ffmpeg(['-f', 'lavfi', '-i', 'anoisesrc=d=3.9:c=pink:r=16000:a=0.3:seed=17', voice]);
+    fs.writeFileSync(path.join(root, 'assets.json'), JSON.stringify({ assets: [
+      { id: 'narration', kind: 'audio', path: 'voice.wav', origin: 'generated', prompt: '确认导出完成后，再打开保存目录。' },
+    ] }));
+    await recordProductionVoice({ workspaceAbs: root, fileAbs: voice, seconds: 3.9 });
+
+    const assemble = (output: string, soundLength: number) => ffmpeg([
+      '-i', footage, '-i', voice, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac',
+      '-af', `atrim=duration=${soundLength}`, output,
+    ]);
+    const ship = (videoPathAbs: string) => shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs });
+    assemble(broken, 2.8);
+    const refused = await ship(broken);
+    expect(refused).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED', message: expect.stringMatching(/rebuild the mix from the original narration/i) });
+    expect(codes(refused)).toContain('DELIVERY_AV_DURATION_MISMATCH');
+    expect(codes(refused)).toContain('DELIVERY_NARRATION_CUT_OFF');
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'versions.json'), 'utf8')).versions).toEqual([]);
+
+    assemble(repaired, 3.9);
+    expect(await ship(repaired)).toMatchObject({ ok: true, version: { id: 'v1', duration_sec: 4 } });
+  }, 60_000);
 
   it('accepts sound and picture that differ by less than the tolerance', async () => {
     const root = makeRoot();
@@ -703,6 +840,36 @@ describe('shipVideoFile for a video made with ffmpeg alone', () => {
     expect(codes(result)).toContain('DELIVERY_VIDEO_UNREADABLE');
   });
 
+  // 2026-11-20 benchmark: a recap played one narration line twice, the first time cut off, and
+  // delivery passed it. Lines made since the last delivery are matched against the file's sound.
+  it('stops a delivery that plays a narration line made for it twice, and passes the same line played once', async () => {
+    const root = makeRoot();
+    fs.mkdirSync(path.join(root, 'voice'), { recursive: true });
+    const line = path.join(root, 'voice', 'hook.wav');
+    ffmpeg(['-f', 'lavfi', '-i', 'anoisesrc=d=3:c=pink:r=16000:a=0.3:seed=7', '-ac', '1', line]);
+    fs.writeFileSync(path.join(root, 'assets.json'), JSON.stringify({ assets: [
+      { id: 'hook', kind: 'audio', path: 'voice/hook.wav', origin: 'generated', prompt: '合同从三十天变成九十天。' },
+    ] }));
+    fs.writeFileSync(path.join(root, 'versions.json'), JSON.stringify({ versions: [], voices_since_delivery: [{ path: 'voice/hook.wav', seconds: 3 }] }));
+    const cut = (name: string, starts: number[]) => {
+      const file = path.join(root, name);
+      const placed = starts.map((start, index) => `[${index + 1}:a]adelay=${start * 1000}:all=1[p${index}]`).join(';');
+      const mix = `[bed]${starts.map((_s, index) => `[p${index}]`).join('')}amix=inputs=${starts.length + 1}:normalize=0:duration=first[a]`;
+      ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=s=360x640:r=30:d=10', ...starts.flatMap(() => ['-i', line]),
+        '-f', 'lavfi', '-i', 'sine=frequency=220:sample_rate=48000:duration=10',
+        '-filter_complex', `${placed};[${starts.length + 1}:a]volume=0.05[bed];${mix}`,
+        '-map', '0:v', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-t', '10', file]);
+      return file;
+    };
+    const twice = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: cut('twice.mp4', [1, 6]) });
+    expect(twice).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+    const repeated = ((twice as { issues?: Array<{ code: string; message: string }> }).issues ?? []).find((issue) => issue.code === 'DELIVERY_NARRATION_REPEATED');
+    expect(repeated?.message).toMatch(/^The narration line "合同从三十天变成九十天。" plays twice, from 1\.0 s and from 6\.0 s\. Keep it once, then deliver again\.$/);
+    const once = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: cut('once.mp4', [1]) });
+    expect(codes(once)).not.toContain('DELIVERY_NARRATION_REPEATED');
+    expect(codes(once)).not.toContain('DELIVERY_NARRATION_CUT_OFF');
+  }, 120_000);
+
   it('refuses a path outside the task\'s files before reading it', async () => {
     const root = makeRoot();
     const elsewhere = makeRoot();
@@ -711,10 +878,269 @@ describe('shipVideoFile for a video made with ffmpeg alone', () => {
     const result = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file });
     expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_OUT_OF_SCOPE' });
     expect(JSON.stringify(result)).not.toContain(elsewhere);
+    // 2026-11-20: a recreation copied its absolute path one character wrong twice and gave up on
+    // "out of scope"; the refusal now says how to pass the path.
+    expect((result as { message: string }).message).toBe('That file is outside the files this task can use. Pass its path relative to the production folder, such as render/main.mp4, and run it again.');
   });
 });
 
 describe('shipVideoFile hints and overrides', () => {
+  // 2026-11-15–21: three of eleven users who got a video called it pictures and cards ("只是圖片組合"),
+  // one delivered with 82% still and only a warning. A video that promotes something now stops
+  // when its pictures and words stand still for over half its length; footage that holds is not counted.
+  // 2026-11-22: a site promo held its screenshots 59% of the time without writing product.json, and
+  // explainers that named their topic there were stopped for diagrams that hold while the voice
+  // explains, so only still pictures count, whatever product.json says.
+  describe('a video built from held stills', () => {
+    function promo(root: string, product = true, scenes = [
+      { id: 'hook', clips: [{ id: 'hook-shot', asset: 'shot', in: 0, dur: 2 }] },
+      { id: 'site', clips: [{ id: 'site-shot', asset: 'shot', in: 0, dur: 2 }] },
+      { id: 'street', clips: [{ id: 'street-walk', asset: 'walk', in: 0, dur: 2 }] },
+    ] as Array<Record<string, unknown>>) {
+      const made = project(root, timeline(scenes), [
+        { id: 'shot', kind: 'image', label: 'Site', path: 'shot.png', origin: 'upload' },
+        { id: 'walk', kind: 'video', label: 'Street', path: 'walk.mp4', origin: 'stock', duration: 2 },
+      ]);
+      ffmpeg(['-f', 'lavfi', '-i', 'color=c=0x336699:s=360x640:d=1', '-frames:v', '1', path.join(made.production, 'shot.png')]);
+      picture(path.join(made.production, 'walk.mp4'), 2);
+      if (product) fs.writeFileSync(path.join(made.production, 'product.json'), JSON.stringify({ name: 'PetCare', facts: [], images: [] }));
+      return made;
+    }
+    /** Six seconds: still where `still` says, moving elsewhere. */
+    function cut(file: string, still: 'start' | 'end', colour = '0x336699'): void {
+      const parts = still === 'start'
+        ? [`color=c=${colour}:s=360x640:r=30:d=4`, 'testsrc2=s=360x640:r=30:d=2']
+        : ['testsrc2=s=360x640:r=30:d=4', 'color=c=0x336699:s=360x640:r=30:d=2'];
+      ffmpeg([...parts.flatMap((source) => ['-f', 'lavfi', '-i', source]),
+        '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', file]);
+    }
+
+    it('stops it and names the scenes that stand still', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root);
+      const file = path.join(production, 'render.mp4');
+      cut(file, 'start');
+      const result = await shipVideoFile({ productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file });
+      expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+      const held = ((result as { issues?: Array<{ code: string; message: string }> }).issues ?? []).find((issue) => issue.code === 'DELIVERY_HELD_STILLS');
+      expect(held?.message).toMatch(/^6[0-9]% of this video is a still frame held for a second or more, so it plays as a slideshow\. It stands still in scenes "(hook|site)" \(2\.0 s\), "(hook|site)" \(2\.0 s\)\. Make those scenes move, then render and deliver again: where the shot need not be the user's own, such as a place or people using this kind of thing, cut to suitable available footage; where it is the user's own product or photo, move across it with a slow push in, pan or scroll; on a screen of a site or app, show the step the line names done on it with \.\/assets\/vendor\/screen-demo\.js \(timeline\.md\)\.$/);
+      expect(codes(result, 'warnings')).not.toContain('DELIVERY_MOSTLY_STATIC');
+    }, 60_000);
+
+    it('stops still pictures held over half the video when nothing is promoted', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root, false, [
+        { id: 'screens', clips: [{ id: 'screens-shot', asset: 'shot', in: 0, dur: 4 }] },
+        { id: 'street', clips: [{ id: 'street-walk', asset: 'walk', in: 0, dur: 2 }] },
+      ]);
+      const file = path.join(production, 'render.mp4');
+      cut(file, 'start');
+      const result = await shipVideoFile({ productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file });
+      expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+      const held = ((result as { issues?: Array<{ code: string; message: string }> }).issues ?? []).find((issue) => issue.code === 'DELIVERY_HELD_STILLS');
+      expect(held?.message).toMatch(/^6[0-9]% of this video is a still frame held for a second or more, so it plays as a slideshow\. It stands still in scene "screens" \(4\.0 s\)\. Make those scenes move/);
+    }, 60_000);
+
+    it('only warns about a page drawn and held, even with its topic in product.json, and never counts footage that holds still', async () => {
+      // An explainer's diagrams are drawn in the page and hold while the voice explains them.
+      const plain = makeRoot();
+      const unpromoted = promo(plain, true, [
+        { id: 'diagram', duration: 4 },
+        { id: 'street', clips: [{ id: 'street-walk', asset: 'walk', in: 0, dur: 2 }] },
+      ]);
+      const slides = path.join(unpromoted.production, 'render.mp4');
+      cut(slides, 'start');
+      const shipped = await shipVideoFile({ productionDirAbs: unpromoted.production, videoDirAbs: unpromoted.video, allowedRoots: [plain], videoPathAbs: slides });
+      expect(shipped).toMatchObject({ ok: true });
+      expect(codes(shipped, 'warnings')).toContain('DELIVERY_MOSTLY_STATIC');
+
+      const footage = makeRoot();
+      const promoted = promo(footage);
+      const stillFootage = path.join(promoted.production, 'render.mp4');
+      cut(stillFootage, 'end');
+      const result = await shipVideoFile({ productionDirAbs: promoted.production, videoDirAbs: promoted.video, allowedRoots: [footage], videoPathAbs: stillFootage });
+      expect(result).toMatchObject({ ok: true });
+      expect(codes(result)).not.toContain('DELIVERY_HELD_STILLS');
+    }, 60_000);
+
+    it('counts the pictures in a scene that also plays footage, and only the footage\'s own still time is left out', async () => {
+      // 2026-11-23: one stock clip and four screenshots in a single scene went out 69% still.
+      const mixed = [{ id: 'story', clips: [
+        { id: 'story-shot', asset: 'shot', in: 0, dur: 4 },
+        { id: 'story-walk', asset: 'walk', in: 0, dur: 2 },
+      ] }];
+      const stills = makeRoot();
+      const held = promo(stills, false, mixed);
+      const slideshow = path.join(held.production, 'render.mp4');
+      cut(slideshow, 'start');
+      const stopped = await shipVideoFile({ productionDirAbs: held.production, videoDirAbs: held.video, allowedRoots: [stills], videoPathAbs: slideshow });
+      expect(stopped).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+      const issue = ((stopped as { issues?: Array<{ code: string; message: string }> }).issues ?? []).find((item) => item.code === 'DELIVERY_HELD_STILLS');
+      expect(issue?.message).toMatch(/^6[0-9]% of this video is a still frame held for a second or more, so it plays as a slideshow\. It stands still in scene "story" \(4\.0 s\)\./);
+
+      const footage = makeRoot();
+      const holding = promo(footage, false, mixed);
+      const stillClip = path.join(holding.production, 'render.mp4');
+      cut(stillClip, 'end');
+      const delivered = await shipVideoFile({ productionDirAbs: holding.production, videoDirAbs: holding.video, allowedRoots: [footage], videoPathAbs: stillClip });
+      expect(delivered).toMatchObject({ ok: true });
+      expect(codes(delivered)).not.toContain('DELIVERY_HELD_STILLS');
+
+      // Footage holding still for most of the same scene is still not counted.
+      const recording = makeRoot();
+      const screen = promo(recording, false, [{ id: 'story', clips: [
+        { id: 'story-shot', asset: 'shot', in: 0, dur: 2 },
+        { id: 'story-walk', asset: 'walk', in: 0, dur: 2 },
+        { id: 'story-walk-2', asset: 'walk', in: 0, dur: 2 },
+      ] }]);
+      const holds = path.join(screen.production, 'render.mp4');
+      ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=s=360x640:r=30:d=2', '-f', 'lavfi', '-i', 'color=c=0x336699:s=360x640:r=30:d=4',
+        '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', holds]);
+      const kept = await shipVideoFile({ productionDirAbs: screen.production, videoDirAbs: screen.video, allowedRoots: [recording], videoPathAbs: holds });
+      expect(kept).toMatchObject({ ok: true });
+      expect(codes(kept)).not.toContain('DELIVERY_HELD_STILLS');
+    }, 60_000);
+
+    it('gives a stopped video one round of changes: its next file is delivered with a warning', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root);
+      const ship = (file: string) => shipVideoFile({ productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file });
+      const stopped = () => (JSON.parse(fs.readFileSync(path.join(production, 'versions.json'), 'utf8')) as { held_stills_stopped?: Record<string, string> }).held_stills_stopped;
+      const first = path.join(production, 'render.mp4');
+      cut(first, 'start');
+      expect(await ship(first)).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+      expect(Object.values(stopped() ?? {})).toHaveLength(1);
+      // The same file again has not been changed.
+      expect(await ship(first)).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+
+      const changed = path.join(production, 'render-2.mp4');
+      cut(changed, 'start', '0x993366');
+      const delivered = await ship(changed);
+      expect(delivered).toMatchObject({ ok: true });
+      const warning = ((delivered as { warnings?: Array<{ code: string; message: string }> }).warnings ?? []).find((issue) => issue.code === 'DELIVERY_HELD_STILLS');
+      expect(warning?.message).toMatch(/^6[0-9]% of this video still stands still after one round of changes, in scenes "(hook|site)" \(2\.0 s\), "(hook|site)" \(2\.0 s\)\. It is delivered as it is: say in your reply which scenes still hold still, so the user can ask for more movement\.$/);
+      expect(stopped()).toBeUndefined();
+
+      // A delivery starts the next round: the next held file is stopped again.
+      const next = path.join(production, 'render-3.mp4');
+      cut(next, 'start', '0x669933');
+      expect(await ship(next)).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+    }, 120_000);
+
+    it('keeps the delivery finding when recording fails and sends only diagnostic metadata to the logger', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root);
+      const file = path.join(production, 'render.mp4');
+      cut(file, 'start');
+      const failure = Object.assign(new Error('EACCES: open /fixture/private-video-project/versions.json'), { code: 'EACCES' });
+      const write = vi.spyOn(storage, 'writeBytesAtomic').mockRejectedValueOnce(failure);
+      deliveryWarning.mockClear();
+      try {
+        const result = await shipVideoFile({ productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file });
+        expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+        expect(codes(result)).toContain('DELIVERY_HELD_STILLS');
+        expect(deliveryWarning).toHaveBeenCalledWith('held stills stop not recorded', {
+          error: { error_code: 'EACCES', error_type: 'Error', message_hash: expect.any(String), message_chars: failure.message.length },
+        });
+        expect(JSON.stringify(deliveryWarning.mock.calls)).not.toContain('private-video-project');
+      } finally {
+        write.mockRestore();
+      }
+    }, 60_000);
+
+    it.each(['confirm', 'dismiss', 'replace_file', 'newer_version', 'stale_request'] as const)(
+      'binds the canvas still-frame decision to the file and version (%s)', async (decision) => {
+        const root = makeRoot();
+        const { production, video } = promo(root);
+        const file = path.join(production, 'render.mp4');
+        const ledger = path.join(production, 'versions.json');
+        cut(file, 'start');
+        const reviewHeldStills = vi.fn(async (finding: { percent: number; scenes: { id: string }[] }) => {
+          expect(finding.percent).toBeGreaterThan(50);
+          expect(finding.scenes.map(scene => scene.id).sort()).toEqual(['hook', 'site']);
+          expect(fs.existsSync(ledger)).toBe(false);
+          if (decision === 'replace_file') cut(file, 'start', '0x993366');
+          if (decision === 'newer_version') {
+            fs.writeFileSync(ledger, JSON.stringify({ versions: [{ id: 'v1', video_id: 'main', path: 'versions/recent.mp4', sha256: 'fixture' }] }));
+          }
+          return decision === 'dismiss' ? null : () => decision !== 'stale_request';
+        });
+        const finalize = vi.fn(async () => {});
+        const result = await shipVideoFile({
+          productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file, reviewHeldStills, finalize,
+        });
+        expect(reviewHeldStills).toHaveBeenCalledOnce();
+        if (decision === 'confirm') {
+          expect(result).toMatchObject({ ok: true, version: { id: 'v1', override: { codes: ['DELIVERY_HELD_STILLS'] } } });
+          expect(fs.readFileSync(path.join(production, 'versions', 'main-v1.mp4'))).toEqual(fs.readFileSync(file));
+          expect(finalize).toHaveBeenCalledOnce();
+        } else {
+          expect(result.ok).toBe(false);
+          expect(fs.existsSync(path.join(production, 'versions'))).toBe(false);
+          expect(finalize).not.toHaveBeenCalled();
+          if (decision === 'newer_version') expect(JSON.parse(fs.readFileSync(ledger, 'utf8')).versions).toHaveLength(1);
+          else expect(fs.existsSync(ledger)).toBe(false);
+        }
+      }, 60_000);
+
+    it('does not offer a still-frame review for a file replaced during the delivery checks', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root);
+      const file = path.join(production, 'render.mp4');
+      const replacement = path.join(production, 'replacement.mp4');
+      cut(file, 'start');
+      picture(replacement, 1);
+      const hash = fileHash.sha256OfFileStream;
+      const hashReads = vi.spyOn(fileHash, 'sha256OfFileStream').mockImplementation(async (candidate) => {
+        if (candidate === file && fs.existsSync(replacement)) fs.renameSync(replacement, file);
+        return hash(candidate);
+      });
+      const reviewHeldStills = vi.fn(async () => () => true);
+      try {
+        const result = await shipVideoFile({
+          productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file, reviewHeldStills,
+        });
+        expect(fs.existsSync(replacement)).toBe(false);
+        expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_REVIEW_EXPIRED' });
+        expect(reviewHeldStills).not.toHaveBeenCalled();
+        expect(fs.existsSync(path.join(production, 'versions.json'))).toBe(false);
+      } finally {
+        hashReads.mockRestore();
+      }
+    }, 60_000);
+
+    it('offers a still-frame review only when the render meets the other delivery checks', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root, true, [
+        { id: 'hook', clips: [{ id: 'hook-shot', asset: 'shot', in: 0, dur: 2 }] },
+        { id: 'site', clips: [{ id: 'site-shot', asset: 'shot', in: 0, dur: 2 }] },
+      ]);
+      const file = path.join(production, 'render.mp4');
+      cut(file, 'start');
+      const reviewHeldStills = vi.fn(async () => () => true);
+      const result = await shipVideoFile({
+        productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file, reviewHeldStills,
+      });
+      expect(result.ok).toBe(false);
+      expect(codes(result)).toEqual(expect.arrayContaining(['DELIVERY_HELD_STILLS', 'DELIVERY_DURATION_DRIFT']));
+      expect(reviewHeldStills).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(production, 'versions'))).toBe(false);
+    }, 60_000);
+
+    it('delivers when the user chose stills that hold', async () => {
+      const root = makeRoot();
+      const { production, video } = promo(root);
+      const file = path.join(production, 'render.mp4');
+      cut(file, 'start');
+      const result = await shipVideoFile({
+        productionDirAbs: production, videoDirAbs: video, allowedRoots: [root], videoPathAbs: file,
+        override: { codes: ['DELIVERY_HELD_STILLS'], reason: '就要图文轮播，不用动' },
+      });
+      expect(result).toMatchObject({ ok: true });
+    }, 60_000);
+  });
+
   it('warns about a mostly static video without blocking it', async () => {
     const root = makeRoot();
     const file = path.join(root, 'slides.mp4');
@@ -761,11 +1187,12 @@ describe('shipVideoFile hints and overrides', () => {
       productionDirAbs: root,
       allowedRoots: [root],
       videoPathAbs: file,
-      expect: { durationSec: 10 },
+      expect: { durationSec: 10, aspect: '16:9' },
       override: { codes: ['DELIVERY_AV_DURATION_MISMATCH'], reason: 'x' },
     });
     expect(result).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
-    expect(codes(result)).toEqual(['DELIVERY_DURATION_DRIFT']);
+    expect(codes(result)).toEqual(['DELIVERY_ASPECT_MISMATCH']);
+    expect(codes(result, 'warnings')).toContain('DELIVERY_REQUESTED_DURATION_DRIFT');
   });
 
   it('gives the same file the same version when shipped again, and a new file the next one', async () => {
@@ -885,6 +1312,7 @@ describe('parseVisualHints', () => {
       '[freezedetect @ 0x1] lavfi.freezedetect.freeze_start: 8',
     ].join('\n');
     expect(parseVisualHints(stderr, 10).staticShare).toBeCloseTo(0.4, 5);
+    expect(parseVisualHints(stderr, 10).frozen).toEqual([{ startSec: 1, endSec: 3 }, { startSec: 8, endSec: 10 }]);
   });
 
   it('counts one shot per detected cut plus the opening', () => {
@@ -896,7 +1324,7 @@ describe('parseVisualHints', () => {
   });
 
   it('reports nothing for clean output', () => {
-    expect(parseVisualHints('', 10)).toEqual({ staticShare: 0, shots: 1 });
+    expect(parseVisualHints('', 10)).toEqual({ staticShare: 0, shots: 1, frozen: [] });
   });
 });
 
@@ -953,6 +1381,29 @@ describe('writeDeliveredFrameSheet', () => {
     expect(await dominantChannel(sheet as string, at(lastCellLeft + 100), at(lastCellTop + 200), at(40), at(40))).toBe('blue');
   }, 60_000);
 
+  // 2026-11-17 benchmark: a tutorial ended on the export spinner while its last line said the
+  // file was saved, and another dropped the click its narration named. The twelve evenly
+  // spaced frames showed the spinner, but nothing tied it to the line that claimed otherwise.
+  it('takes each frame where a heard line ends, so its words sit over what it claims', async () => {
+    const root = makeRoot();
+    const file = path.join(root, 'two-colours.mp4');
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'color=red:s=1080x1920:r=30:d=1',
+      '-f', 'lavfi', '-i', 'color=blue:s=1080x1920:r=30:d=1',
+      '-filter_complex', '[0:v][1:v]concat=n=2:v=1[v]', '-map', '[v]',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', file,
+    ]);
+    const output = path.join(root, 'sheet');
+    fs.mkdirSync(output);
+    const heard = [{ startSec: 0.1, endSec: 0.9, text: 'Open settings.' }, { startSec: 1.2, endSec: 1.95, text: 'It is saved.' }];
+    const sheet = await writeDeliveredFrameSheet({ videoPathAbs: file, outputDirAbs: output, durationSec: 2, width: 1080, height: 1920, heard });
+    const { width = 0 } = await sharp(sheet as string).metadata();
+    const scale = width / (2 * 270 + 3 * 16);
+    const at = (value: number) => Math.round(value * scale);
+    expect(await dominantChannel(sheet as string, at(16 + 100), at(16 + 200), at(40), at(40))).toBe('red');
+    expect(await dominantChannel(sheet as string, at(16 + 270 + 16 + 100), at(16 + 200), at(40), at(40))).toBe('blue');
+  }, 60_000);
+
   it('gives up without throwing on a file it cannot read or a video with no length', async () => {
     const root = makeRoot();
     const broken = path.join(root, 'broken.mp4');
@@ -963,6 +1414,72 @@ describe('writeDeliveredFrameSheet', () => {
   }, 60_000);
 });
 
+
+// Whether a delivery carries a voice decides if its frames are matched to what is said. A
+// music cut transcribed anyway reads as words (2026-11-18: "(字幕:J Chong)" over a café
+// montage, "多谢 小伙伴们" over a guesthouse one), so only a voiced video is listened to.
+describe('shipVideoFile records whether the video carries a voice', () => {
+  it('marks a delivery voiced once narration was made for it, and keeps the mark for the next', async () => {
+    const root = makeRoot();
+    const production = path.join(root, 'ad');
+    fs.mkdirSync(path.join(production, 'render'), { recursive: true });
+    fs.writeFileSync(path.join(production, 'assets.json'), JSON.stringify({ assets: [] }));
+    // Different lengths: the same bytes again would be the same delivery.
+    const ship = async (name: string, seconds: number) => {
+      const file = path.join(production, 'render', name);
+      withTone(file, seconds);
+      const result = await shipVideoFile({ productionDirAbs: production, allowedRoots: [root], videoPathAbs: file });
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      return (result as unknown as { version: Record<string, unknown> }).version;
+    };
+
+    expect((await ship('music.mp4', 2)).voiced).toBeUndefined();
+    const voice = path.join(production, 'voice', 'line.m4a');
+    fs.mkdirSync(path.dirname(voice), { recursive: true });
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1', '-c:a', 'aac', voice]);
+    await recordProductionVoice({ workspaceAbs: root, fileAbs: voice, seconds: 1 });
+    expect((await ship('narrated.mp4', 2.5)).voiced).toBe(true);
+    // The made voice was delivered; a revision of the same video is still a voiced one.
+    expect((await ship('narrated-v2.mp4', 3)).voiced).toBe(true);
+  }, 60_000);
+});
+
+describe('deliveredFrameSamples', () => {
+  const line = (startSec: number, endSec: number, text = 'x') => ({ startSec, endSec, text });
+
+  it('spreads twelve frames from first to last when no voice was heard', () => {
+    const samples = deliveredFrameSamples(10.1);
+    expect(samples).toHaveLength(12);
+    expect(samples[0]).toMatchObject({ atSec: 0, label: '0.0s' });
+    expect(samples.at(-1)!.atSec).toBeCloseTo(10, 6);
+    expect(samples.every((sample) => sample.heard === undefined)).toBe(true);
+  });
+
+  it('takes a frame just before each heard line ends, numbered, then the last frame', () => {
+    expect(deliveredFrameSamples(23.2, [line(0, 4.86, 'a'), line(16.64, 21.3, 'saved')])).toEqual([
+      { atSec: 4.76, label: '#1 4.8s', heard: 'a' },
+      { atSec: 21.2, label: '#2 21.2s', heard: 'saved' },
+      { atSec: 23.1, label: '#3 23.1s (last frame)' },
+    ]);
+  });
+
+  it('does not repeat the last frame when the last line ends there', () => {
+    const samples = deliveredFrameSamples(23.2, [line(16.64, 23.3, 'saved')]);
+    expect(samples).toEqual([{ atSec: 23.1, label: '#1 23.1s', heard: 'saved' }]);
+  });
+
+  it('shows thirteen clauses of a tutorial whole, and keeps the first and last of many more', () => {
+    const clauses = Array.from({ length: 13 }, (_item, index) => line(index * 2, index * 2 + 1.5, `clause ${index}`));
+    expect(deliveredFrameSamples(30.7, clauses).filter((sample) => sample.heard).map((sample) => sample.heard))
+      .toEqual(clauses.map((clause) => clause.text));
+    const many = Array.from({ length: 30 }, (_item, index) => line(index, index + 0.8, `line ${index}`));
+    const samples = deliveredFrameSamples(31, many);
+    expect(samples).toHaveLength(17);
+    expect(samples[0].heard).toBe('line 0');
+    expect(samples[15].heard).toBe('line 29');
+    expect(samples[16].heard).toBeUndefined();
+  });
+});
 
 describe('delivery output filesystem boundary', () => {
   it.each(['video directory', 'run directory', 'frame file'])(

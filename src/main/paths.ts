@@ -329,6 +329,10 @@ export const projectInstructionsFile = (uid: string, pid: string) => path.join(p
 export const projectMemoryFile       = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'MEMORY.md');
 // Goal-driven driver-loop opt-in config (synced with the project). Absent = off.
 export const projectDriverFile       = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'driver.json');
+// The project's goal, success criteria and status.
+// Its own file: older clients rewrite project.json with only the fields they
+// know. Absent = no goal. Read/write goes through features/project_goal.ts.
+export const projectGoalFile         = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'goal.json');
 // Account-global backlog driver. Keep its synced config outside `cloud/tasks/`
 // because that directory is scanned as one-task-per-json-file.
 export const userTodoDriverFile      = (uid: string) => path.join(userCloudConfigDir(uid), 'todo-driver.json');
@@ -382,6 +386,8 @@ export const projectLibraryVectorDbPath = (uid: string, pid: string) => path.joi
 // (like auto_task_claims). Lives in local/ so a device's advance cadence, daily
 // count, and in-flight lease stay local to the machine that runs the advances.
 export const projectDriverStateFile = (uid: string, pid: string) => path.join(projectLocalDir(uid, assertProjectSegment(pid)), 'driver-state.json');
+// When the project page and Commander last showed the user the project's changes (machine-private).
+export const projectRecapStateFile = (uid: string, pid: string) => path.join(projectLocalDir(uid, assertProjectSegment(pid)), 'recap-state.json');
 export const userTodoDriverStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'todo-driver-state.json');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');

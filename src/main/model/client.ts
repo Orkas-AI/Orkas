@@ -187,6 +187,8 @@ export interface ChatOptions {
   historyBoundaryMessageId?: string;
   /** Host-owned final delivery versus intermediate work for Commander. */
   outputDelivery?: 'final' | 'process';
+  /** The host started this turn to run a to-do; see core-agent runner. */
+  hostTodoRun?: boolean;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Caller (group_chat
@@ -220,15 +222,18 @@ export interface ChatOptions {
    * executed). Group Chat sets this only for top-level CoreAgent turns. */
   richSteerEnabled?: boolean;
   /** Fired with the absolute path of every file produced by the local-exec
-   * tools (`write_file`, `create_pdf`, `bash`)
+   * tools (`write_file`, `create_pdf`)
    * during this run.
    * `features/chats` uses this to attach a `produced[]` list to the
    * assistant message so the UI can offer a "reveal in Finder" chip. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
+  /** A shared-workspace change or manifest entry eligible for explicit selection. */
+  onShellFileObserved?: (absPath: string, version: string) => void | Promise<void>;
   /** Accepts the model's complete final-deliverable declaration for this
    * turn and returns the subset eligible for resource display. Paths are
    * absolute before this callback runs. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  imageStudioNativePngDelivery?: import('../features/image_studio_delivery').ImageStudioNativePngDelivery;
   /** Predicate: true when the given absolute path was already written by
    * this caller's session (typically: a `Set` populated by `onFileWritten`
    * earlier in the same turn). Used by the write-style tools' uniquify

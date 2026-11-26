@@ -4,7 +4,7 @@
 
 Orkas は、オープンソース（MIT）でローカルファーストのマルチエージェント・デスクトップアプリです。チームとして働く AI アシスタントです。必要なことを **Commander** に伝えてください。多くのタスクは Commander が自分で仕上げます。大きな仕事では手順を計画し、専門エージェントに加えて、すでにお使いのコーディングエージェントやパーソナルエージェント（**Claude Code、Codex、OpenCode、OpenClaw、Hermes-Agent**）を呼び込み、協力して取り組ませます。
 
-Orkas は、1 つのプロンプトに答えるだけでなく、プロジェクトを前に進め続けるために作られています。**プロジェクト**には目標、ルール、メモリ、ファイルが保存されるため、新しい会話はいつも前回の続きから始まります。**ToDo** は仕事を人とエージェントで分担し、**自動推進**はチームが次の ToDo に自ら取りかかれるようにし、**定期自動化**は定型作業を毎時・毎日・毎週・毎月繰り返します。データはすべてあなたのコンピューターに残り、完成した成果物はレビューのためにあなたのもとへ戻ってきます。だからこそ、ビジネスの継続的な仕事を安心して Orkas に任せられます。
+Orkas は、1 つのプロンプトに答えるだけでなく、プロジェクトを前に進め続けるために作られています。**プロジェクト**には目標、ルール、メモリ、ファイルが保存されるため、新しい会話はいつも前回の続きから始まります。**ToDo** は仕事を人とエージェントで分担し、**自動推進**はチームが次の ToDo に自ら取りかかれるようにし、**定期オートメーション**は定型作業を毎時・毎日・毎週・毎月繰り返します。データはすべてあなたのコンピューターに残り、完成した成果物はレビューのためにあなたのもとへ戻ってきます。だからこそ、ビジネスの継続的な仕事を安心して Orkas に任せられます。
 
 **[⬇ macOS & Windows 版 Orkas をダウンロード](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — 無料で、内蔵の Orkas モデル用に 500 クレジットが付属するので、API キーなしで始められます。自分のキーを使いたい場合は、Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao、またはローカルの OpenAI 互換エンドポイントを利用できます。
 
@@ -16,7 +16,7 @@ Orkas は、1 つのプロンプトに答えるだけでなく、プロジェク
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 [![Website: orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
 
-[English](./README.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md)
+[English](./README.en.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md) · [한국어](./README.ko.md) · [Español](./README.es.md) · [Bahasa Indonesia](./README.id.md) · [Español (Latinoamérica)](./README.es-419.md) · [Русский](./README.ru.md) · [Português (Brasil)](./README.pt-BR.md) · [Türkçe](./README.tr.md) · [繁體中文](./README.zh-TW.md) · [Tiếng Việt](./README.vi.md) · [Deutsch](./README.de.md) · [ไทย](./README.th.md) · [Français](./README.fr.md) · [Italiano](./README.it.md) · [Português (Portugal)](./README.pt-PT.md) · [العربية](./README.ar.md)
 
 ---
 
@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## チームが届けるもの
 
-- **動画、ナレーション、画像** — VideoStudio、VoiceStudio、ImageStudio
+- **動画、ナレーション音声、画像** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)、VoiceStudio、ImageStudio
 - **リサーチレポート、SEO 監査、市場分析** — DeepResearcher、SeoGeoAgent、StockAnalyser
 - **投稿、記事、ニュースレター、スライド資料** — ContentWriter、PptMaker
 - **Web サイト、UI、コード** — UIDesigner、ProductDeveloper
@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 - **EC 業務** — 5 つの EC エージェントによる商品リサーチ、出品、レビュー分析、売上分析、カタログ変更
 - **複数のエージェントが必要な複雑な仕事** — Commander が仕事を分割し、各部分を適切なエージェントに渡して結果をまとめます。たとえば、市場調査からレポート、スライド資料、ローンチ動画までを作成できます
 
-アプリには 16 の専門エージェントが同梱されており、それぞれが独自のスキル、メモリ、ツールを持っています。[エージェントマーケットプレイス](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas)で 30 以上のエージェントを探せるほか、必要な役割を説明すれば Commander がカスタムエージェントを作成します。
+アプリには 16 の専門エージェントが同梱されており、それぞれが独自のスキル、メモリ、ツールを持っています。[Agentマーケット](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas)で 30 以上のエージェントを探せるほか、必要な役割を説明すれば Commander がカスタムエージェントを作成します。
 
 <details>
 <summary><b>16 の内蔵エージェント一覧</b></summary>
@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | コンテンツ・メディア | **ContentWriter** | 目標、資料、ラフ原稿から、そのまま公開できる投稿、記事、ニュースレター、事例紹介を作成 |
 | | **PptMaker** | トピック、アウトライン、ドキュメントから、編集・レビュー可能な PPTX 資料を作成 |
 | | **ImageStudio** | ポスター、カバー画像、SNS 用画像、インフォグラフィック |
-| | **VideoStudio** | ナレーション、AI プレゼンター、字幕と吹き替え、ハイライトクリップ、ローカライズ、そして自分のコンテンツと映像を使った参考動画の再現 |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | ナレーション、AI プレゼンター、字幕と吹き替え、ハイライトクリップ、ローカライズ、そして自分のコンテンツと映像を使った参考動画の再現 |
 | | **VoiceStudio** | ナレーション、複数話者の音声、文字起こしと字幕、音声の編集とミキシング |
 | | **UIDesigner** | プロダクトの目標、PRD、スクリーンショット、Figma の素材から、編集可能な HTML ファーストの UI を作成 |
 | 開発・オフィス | **ProductDeveloper** | リポジトリを理解したエンジニアリング — PRD の実装、バグ修正、リファクタリング、レビューを、検証可能な結果とともに実施 |
@@ -82,19 +82,19 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 - **プロジェクト** — 目標とルール、メモリ、ファイルを、プロジェクト内のすべての会話の出発点にします。毎回ゼロから説明し直す必要はありません。
 - **ToDo と自動推進** — すべてのプロジェクトに、人とエージェントのための ToDo リストがあります。自動推進をオンにすると、チームが次の項目に自ら取りかかり、完成した成果物をレビューのために戻してくれます。
-- **定期自動化** — どんなタスクでも毎時・毎日・毎週・毎月実行できます。Orkas はあなたのコンピューター上で動作します。v1.9 以降、コンピューターのスリープ解除時や Orkas の起動時に、各自動化は 12 時間以内に逃した直近の実行を 1 回分取り戻します。
+- **定期オートメーション** — どんなタスクでも毎時・毎日・毎週・毎月実行できます。Orkas はあなたのコンピューター上で動作します。v1.9 以降、コンピューターのスリープ解除時や Orkas の起動時に、各オートメーションは 12 時間以内に逃した直近の実行を 1 回分取り戻します。
 - **コネクター** — Gmail、Google Calendar、Sheets、Drive、Notion、Slack、Shopify、Stripe など多数に対応しています。デフォルトでは、Orkas は何かを送信、投稿、削除する前に確認を求めます。
 - **アプリ** — ツールの内容を説明すると、Orkas がデスクトップアプリ内のローカルアプリとして構築します。パッケージ版アプリでは、有料プランなら公開リンク付きの Web アプリとして公開することもできます。
 - **共有プロジェクト** *（パッケージ版アプリ）* — チームメイトやアシスタント（VA）を招待し、各 ToDo を人またはエージェントに割り当てられます。
 
 > [!NOTE]
-> 共有プロジェクト、クラウド同期、Web アプリの公開はパッケージ版アプリのみの機能で、オープンソース版はまだ対応していません。利用するには、**[macOS & Windows 版 Orkas をダウンロード](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)**してください（無料、開始時に 500 クレジット付き）。
+> 共有プロジェクト、クラウド同期、Web アプリの公開はパッケージ版アプリのみの機能で、オープンソース版はまだ対応していません。利用するには、**[macOS & Windows 版 Orkas をダウンロード](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** してください（無料、開始時に 500 クレジット付き）。
 
 音声入力はソースビルドでも利用できます。**設定 → モデル**で **Orkas API Key** を設定し、入力欄の横にあるマイクをクリックしてください。確認が表示されたらマイクへのアクセスを許可します。音声は認識のために Orkas へ送信され、キー所有者の Orkas クレジットを消費します。もう一度クリックすると停止するので、テキストを確認してから自分で送信してください。アクセスを拒否してしまった場合は、システム設定でマイクを有効にしてください。
 
 ---
 
-## Claude Code、Codex、OpenCode、OpenClaw、Hermes-Agent を一緒に動かす
+## Claude Code、Codex、OpenCode、OpenClaw、Hermes-Agent をひとつのチームにまとめて動かす
 
 Orkas は、すでにインストール済みの CLI エージェント（コーディングエージェントの **Claude Code、Codex、OpenCode**、パーソナルエージェントの **OpenClaw と Hermes-Agent**）を、独自の専門エージェントと並べてローカルセッションとして実行します。Commander は各エージェントに得意な部分を任せつつ、全体で 1 つの計画を保つので、1 つのチャットでバグを修正し、変更をレビューし、リリースノートの下書きまで作れます。HyperFrames などのオープンソースツールも同じ方法で組み込めます。
 
@@ -118,7 +118,7 @@ Orkas は、すでにインストール済みの CLI エージェント（コー
 
 | | パッケージ版アプリ（推奨） | ソースから実行 |
 | --- | --- | --- |
-| プラットフォーム | macOS 12+（Apple Silicon & Intel）、Windows 10+ | macOS、Windows、glibc 2.34+ Linux x64/arm64 |
+| 対応プラットフォーム | macOS 12 以降（Apple Silicon および Intel）、Windows 10 以降 | macOS、Windows、glibc 2.34 以降の Linux x64/arm64 |
 | アカウント | サインイン — 500 クレジット無料 | 不要 |
 | モデル | 内蔵の Orkas モデル、または自分のキー | 自分のキーまたはローカルエンドポイント |
 | その他の機能 | プロジェクトでの共同作業、アプリの公開、クラウド同期など | — |
@@ -141,16 +141,16 @@ Orkas は、すでにインストール済みの CLI エージェント（コー
 
 ---
 
-## 他ツールとの比較
+## Orkas と他ツールの比較
 
 | ツール | 概要 | Orkas との違い |
 | --- | --- | --- |
-| **Claude Code** | Anthropic のエージェント型コーディングツール。ターミナル、IDE、デスクトップ、Web で利用でき、Claude モデルを基盤としています。 | どちらか一方を選ぶ必要はありません。Orkas は Claude Code をエージェントの 1 つとして実行します。その周りに、リサーチ、コンテンツ、動画など、コード以外の仕事を担うモデル非依存のチームを加え、プロジェクト、ToDo、自動化で仕事を前に進め続けます。[Orkas vs Claude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
+| **Claude Code** | Anthropic のエージェント型コーディングツール。ターミナル、IDE、デスクトップ、Web で利用でき、Claude モデルを基盤としています。 | どちらか一方を選ぶ必要はありません。Orkas は Claude Code をエージェントの 1 つとして実行します。さらに Orkas は、その周りにリサーチ、コンテンツ、動画など、コード以外の仕事を担うモデル非依存のチームを加え、プロジェクト、ToDo、オートメーションで仕事を前に進め続けます。[Orkas vs Claude Code →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
 | **Codex** | OpenAI のコーディングエージェント。ターミナル、エディター、クラウドで利用できます。 | どちらか一方を選ぶ必要はありません。Orkas は Codex を、Claude Code や OpenCode と並ぶエージェントの 1 つとして実行します。Commander はコーディングを Codex に、レビューを別のエージェントに任せたうえで、ドキュメント、ローンチ投稿、動画といったリリースのコード以外の半分もカバーできます。[Orkas vs Codex →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
-| **Claude Cowork** | Anthropic の日常業務向けエージェントで、現在は Claude の一部です。有料の Claude プランで、デスクトップ、Web、モバイルから利用できます。デフォルトでは Anthropic のクラウドで動作し、Claude モデルを基盤としています。 | Claude Cowork のオープンソース（MIT）代替で、500 クレジット付きで無料で始められます。エージェントはあなたのコンピューター上で動作し、データはデフォルトでローカルに保存されます。モデルは内蔵の Orkas モデル、自分のプロバイダーキー、ローカルエンドポイントから選べます。Commander は Claude Code、Codex などの CLI エージェントも呼び込めます。その代わり Orkas にはコンピューターの起動が必要ですが、Cowork のクラウドタスクはコンピューターがなくても動き続けられます。[Claude Cowork の代替ツール →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
-| **Manus** | デフォルトで Manus のクラウド上でタスクを計画・実行する AI エージェントです。デスクトップアプリの Manus Studio（macOS、Windows）は選択したフォルダーでも作業できますが、タスクの計画はクラウドで行われます。 | Manus のオープンソース（MIT）代替です。エージェントはあなたのコンピューター上で動作し、データはデフォルトでローカルに保存されます。モデルは内蔵の Orkas モデル、自分のプロバイダーキー、ローカルエンドポイントから選べ、プロジェクト、ToDo、自動化で仕事を前に進め続けます。その代わり Orkas にはコンピューターの起動が必要ですが、Manus のクラウドタスクはコンピューターがなくても動き続けられます。[オープンソースの Manus 代替 →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
+| **Claude Cowork** | Anthropic の日常業務向けエージェントで、現在は Claude の一部です。有料の Claude プランで、デスクトップ、Web、モバイルから利用できます。デフォルトでは Anthropic のクラウドで動作し、Claude モデルを基盤としています。 | Claude Cowork のオープンソース（MIT）代替で、500 クレジット付きで無料で始められます。Orkas のエージェントはあなたのコンピューター上で動作し、データはデフォルトでローカルに保存されます。モデルは内蔵の Orkas モデル、自分のプロバイダーキー、ローカルエンドポイントから選べます。Commander は Claude Code、Codex などの CLI エージェントも呼び込めます。その代わり Orkas にはコンピューターの起動が必要ですが、Cowork のクラウドタスクはコンピューターがなくても動き続けられます。[Claude Cowork の代替ツール →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
+| **Manus** | デフォルトで Manus のクラウド上でタスクを計画・実行する AI エージェントです。デスクトップアプリの Manus Studio（macOS、Windows）は選択したフォルダーでも作業できますが、タスクの計画はクラウドで行われます。 | Manus のオープンソース（MIT）代替です。Orkas のエージェントはあなたのコンピューター上で動作し、データはデフォルトでローカルに保存されます。モデルは内蔵の Orkas モデル、自分のプロバイダーキー、ローカルエンドポイントから選べ、プロジェクト、ToDo、オートメーションで仕事を前に進め続けます。その代わり Orkas にはコンピューターの起動が必要ですが、Manus のクラウドタスクはコンピューターがなくても動き続けられます。[オープンソースの Manus 代替 →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
 | **LangChain** | LLM アプリやエージェントを構築するための開発者向けフレームワーク／ライブラリ。コードファーストで、自分の Python/JS アプリに組み込んで使います。 | Orkas はオーケストレーションのコードを書くのではなく、チャットで指示するデスクトップアプリです。データはデフォルトでローカルに保存されます。 |
-| **CrewAI** | ロールプレイ型の自律エージェントをオーケストレーションするための Python フレームワーク。クルーとエージェントをコードで定義します。 | Orkas はマルチエージェントのオーケストレーションをデスクトップアプリで提供し、プロジェクト、ToDo、自動化、エージェントごとの自己改善を標準で備えています。 |
+| **CrewAI** | ロールプレイ型の自律エージェントをオーケストレーションするための Python フレームワーク。クルーとエージェントをコードで定義します。 | Orkas はマルチエージェントのオーケストレーションをデスクトップアプリで提供し、プロジェクト、ToDo、オートメーション、エージェントごとの自己改善を標準で備えています。 |
 | **OpenClaw** | メッセージング連携、マルチエージェントのルーティング、サブエージェントを備えたパーソナルエージェントプラットフォーム。 | Orkas は、完成した成果物のためのデスクトップワークスペースを提供し、内蔵の専門エージェントと、Claude Code、Codex、OpenCode などの CLI エージェントとの連携を備えています。OpenClaw も CLI エージェントとしてそのワークフローに参加できます。 |
 | **Hermes-Agent** | Nous Research による自己改善型エージェント。メモリとスキルを持つ単一のエージェントで、CLI、メッセージングゲートウェイ、デスクトップアプリとして利用できます。 | Orkas はチームを統括します。Commander が多くの専門エージェントやほかの CLI エージェントを指揮し、Hermes-Agent もその 1 つとして組み込まれます。 |
 
@@ -160,7 +160,7 @@ Orkas は、すでにインストール済みの CLI エージェント（コー
 
 **コーディングエージェントを比較検討中ですか？** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code の代替ツール](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**詳しい比較はこちら →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**詳しい比較はこちら →** [Claude Code との比較](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [Codex との比較](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [Cline との比較](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [LangChain との比較](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [ChatGPT との比較](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [OpenClaw との比較](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [Hermes-Agent との比較](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
 
 ---
 
@@ -241,7 +241,7 @@ Orkas は、オープンソース（MIT）でローカルファーストのマ�
 **Orkas はローカル LLM ですか？**
 いいえ。Orkas はあなたのマシン上で動作し、選択したモデル（内蔵の Orkas モデル、自分の API キー、ローカルモデルのエンドポイント）を呼び出します。エージェントとツールをオーケストレーションするものであり、それ自体はモデルではありません。
 
-**自分のドキュメントをもとに、引用付きで質問に答えられますか？**
+**Orkas は手元のドキュメントをもとに、引用付きで質問に答えられますか？**
 はい。PDF やドキュメントをローカルのライブラリに追加すると、Orkas はそれらを検索し、出典箇所への引用付きで回答できます。元の資料を開いて確認できます。インデックスはあなたのマシン上で作成されます。
 
 **Ollama や LM Studio などのローカルモデルは使えますか？**
@@ -254,7 +254,7 @@ Orkas は、オープンソース（MIT）でローカルファーストのマ�
 ソースビルドは、ローカルモデルのエンドポイントを使えば完全にオフラインで動作します。パッケージ版アプリはサインインが必要で、クラウドモデルにはネットワーク接続が必要です。
 
 **コンピューターの電源が切れていても動き続けますか？**
-いいえ。Orkas はあなたのコンピューター上で動作するため、自動推進と自動化には、コンピューターが起動していて Orkas が実行中である必要があります。v1.9 以降、コンピューターのスリープ解除時や Orkas の起動時に、各自動化は 12 時間以内に逃した直近の実行を 1 回分取り戻します。
+いいえ。Orkas はあなたのコンピューター上で動作するため、自動推進とオートメーションには、コンピューターが起動していて Orkas が実行中である必要があります。v1.9 以降、コンピューターのスリープ解除時や Orkas の起動時に、各オートメーションは 12 時間以内に逃した直近の実行を 1 回分取り戻します。
 
 **アプリを作成して公開できますか？**
 はい。Orkas 内で動作するローカルアプリは無料です。Web アプリを公開リンクで公開するには有料プランが必要です（Lite は 5 個、Pro は 8 個、Max は 15 個まで）。また、公開された Web アプリでは、Orkas 内で使えるすべての機能が利用できるわけではありません。
@@ -265,7 +265,7 @@ Orkas は、オープンソース（MIT）でローカルファーストのマ�
 **Orkas は Claude Code などの CLI エージェントを操作できますか？**
 はい。Orkas は 5 つの外部 CLI エージェント（コーディングエージェントの Claude Code、Codex、OpenCode と、パーソナルエージェントの OpenClaw、Hermes-Agent）をローカルのサブプロセスとして操作でき、HyperFrames などのオープンソースプロジェクトも取り込めます。すべて同じチャットから指示できます。
 
-**Orkas は Claude Code / Codex / CrewAI / LangChain とどう違いますか？**
+**Orkas は Claude Code / Codex / CrewAI / LangChain と比べてどこが違いますか？**
 Claude Code と Codex はコーディングエージェントです。Orkas はその両方をチームのメンバーとして実行するので、どちらかを選ぶ必要はありません。CrewAI と LangChain はコードファーストのフレームワークです。Orkas はオープンソースのデスクトップアプリで、Commander が専門エージェントのチームとあなたの CLI エージェントを統括します。どのモデルプロバイダーでも使え、データとキーはローカルに保たれます。[詳しい比較](https://orkas.ai/compare/?source=gh-orkas)をご覧ください。
 
 **Orkas はどのプラットフォームに対応していますか？**

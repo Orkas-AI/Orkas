@@ -39,7 +39,8 @@ vi.mock('../../../../src/main/features/video_gen', () => ({
 vi.mock('../../../../src/main/util/path-sandbox', () => ({
   isPathAllowed: (p: string) => !h.outOfScope.includes(p),
 }));
-vi.mock('../../../../src/main/util/uniquify-path', () => ({
+vi.mock('../../../../src/main/util/uniquify-path', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
   uniquifyPath: async (p: string) => ({ finalPath: p, renamed: false }),
   renderRenameSignal: () => '',
 }));
@@ -99,14 +100,14 @@ describe('generate_video tool › failure surfacing', () => {
     expect(h.generateVideo).not.toHaveBeenCalled();
   });
 
-  it('advertises model-specific duration, resolution, adaptive ratio and audio controls without changing the tool surface', async () => {
+  it('keeps configured video controls optional and explains when to use them', async () => {
     const { createVideoGenTool } = await import('../../../../src/main/model/core-agent/video-gen-tool');
     const tool = createVideoGenTool({ userId: 'u1' });
     const properties = (tool.inputSchema as any).properties;
-    expect(properties.duration.description).toContain('30');
-    expect(properties.duration.description).toContain('Omni');
-    expect(properties.resolution.description).toContain('768p');
-    expect(properties.ratio.description).toContain('adaptive');
+    expect(tool.inputSchema.required).toEqual(['prompt', 'output_path']);
+    expect(properties.duration.description).toMatch(/whole seconds.*omit.*service default/i);
+    expect(properties.resolution.description).toMatch(/resolution.*service default/i);
+    expect(properties.ratio.description).toMatch(/adaptive only where supported/i);
     expect(properties.generate_audio.description).toContain('supported');
     expect(tool.name).toBe('generate_video');
   });
@@ -221,7 +222,6 @@ describe('generate_video tool › failure surfacing', () => {
 describe('generate_video tool › first and last frames', () => {
   const FIRST_FRAME = 'Image the video must open on: a local path in workspace/attachments, or an https or asset:// URL. Some models cannot also take reference images or videos.';
   const LAST_FRAME = 'Image the video must end on, given like first_frame. Requires first_frame; not every model supports it.';
-  const RATIO = 'Aspect ratio: 16:9, 9:16, 1:1, 4:3, 3:4, 21:9 or adaptive, where supported by the configured model. Default 16:9; with first_frame, or for Seedance 2.5 editing, adaptive where supported.';
   let dir = '';
 
   beforeEach(() => { dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-video-frames-'))); });
@@ -239,11 +239,11 @@ describe('generate_video tool › first and last frames', () => {
   const tool = async (opts: Record<string, unknown> = {}) => (await import('../../../../src/main/model/core-agent/video-gen-tool'))
     .createVideoGenTool({ userId: 'u1', cid: 'c1', ...opts } as any);
 
-  it('advertises the frames and the ratio they default to', async () => {
+  it('advertises generation frames and when the source determines ratio', async () => {
     const properties = ((await tool()).inputSchema as any).properties;
     expect(properties.first_frame).toEqual({ type: 'string', description: FIRST_FRAME });
     expect(properties.last_frame).toEqual({ type: 'string', description: LAST_FRAME });
-    expect(properties.ratio.description).toBe(RATIO);
+    expect(properties.ratio.description).toMatch(/omit when the model takes the ratio from the first frame or edit source/i);
   });
 
   it('passes a local frame as a path and a linked one as a URL', async () => {

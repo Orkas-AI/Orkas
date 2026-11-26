@@ -6,7 +6,9 @@ import {
   compileVideoPage,
   deriveVideoTimeline,
   dominantFlatShare,
+  looksLikeScreen,
   pagePictureIssues,
+  silentSceneIssues,
   pagePictureRefs,
   sheetLayoutFor,
   summarizeCheckWarnings,
@@ -126,6 +128,68 @@ describe('deriveVideoTimeline', () => {
     expect(timeline.fps).toBe(15);
     expect(timeline.totalFrames).toBe(75);
   });
+
+  // 2026-11-17 benchmark: ten photos of one 128 BPM bar each (1.875s = 56.25 frames at 30fps)
+  // came out 56 frames apiece, so the sixth cut onward was more than a frame before its beat.
+  it('puts each scene cut on the frame nearest its place in the music, not a running sum of rounded scenes', () => {
+    const bar = 1.875;
+    const timeline = deriveVideoTimeline(video({
+      scenes: Array.from({ length: 10 }, (_item, index) => ({ id: `photo${index}`, duration: bar })),
+    }));
+    const cutFrames = timeline.scenes.slice(1).map((scene) => scene.startFrame);
+    // Bar k starts at 56.25k frames: 168.75, 225, 281.25, 393.75, 450 and 506.25 round to these.
+    expect([cutFrames[2], cutFrames[3], cutFrames[4], cutFrames[6], cutFrames[7], cutFrames[8]])
+      .toEqual([169, 225, 281, 394, 450, 506]);
+    cutFrames.forEach((frame, index) => {
+      expect(Math.abs(frame - (index + 1) * bar * 30)).toBeLessThanOrEqual(0.5);
+    });
+    expect(Math.abs(timeline.totalFrames - 10 * bar * 30)).toBeLessThanOrEqual(0.5);
+  });
+
+  it('keeps every scene and clip edge within half a frame of where its seconds put it, back to back', () => {
+    const manifest = video({
+      scenes: [
+        { id: 'open', duration: 1.848 },
+        { id: 'run', clips: [0, 1, 2].map((index) => ({ id: `beat${index}`, asset: 'shot', in: index, dur: 0.47 })) },
+        { id: 'hold', duration: 2.3333 },
+        { id: 'pair', clips: [{ id: 'p1', asset: 'shot', in: 0, dur: 0.9 }, { id: 'p2', asset: 'photo', in: 0, dur: 1.27 }] },
+        { id: 'end', duration: 1.1 },
+      ],
+    });
+    const timeline = deriveVideoTimeline(manifest);
+    let authoredSec = 0;
+    let cursor = 0;
+    for (const [index, scene] of timeline.scenes.entries()) {
+      expect(scene.startFrame).toBe(cursor);
+      expect(Math.abs(scene.startFrame - authoredSec * 30)).toBeLessThanOrEqual(0.5 + 1e-9);
+      let clipSec = authoredSec;
+      let clipCursor = 0;
+      for (const clip of scene.clips) {
+        expect(clip.startFrame).toBe(clipCursor);
+        expect(Math.abs(scene.startFrame + clip.startFrame - clipSec * 30)).toBeLessThanOrEqual(0.5 + 1e-9);
+        clipSec += clip.durSec;
+        clipCursor += clip.frameCount;
+      }
+      if (scene.clips.length) expect(clipCursor).toBe(scene.frameCount);
+      const authored = manifest.scenes[index];
+      authoredSec += authored.clips ? authored.clips.reduce((sum, clip) => sum + clip.dur, 0) : authored.duration!;
+      cursor += scene.frameCount;
+    }
+    expect(timeline.totalFrames).toBe(cursor);
+    expect(Math.abs(timeline.totalFrames - authoredSec * 30)).toBeLessThanOrEqual(0.5 + 1e-9);
+  });
+
+  it('gives a scene shorter than a frame one frame and still starts the next scenes where their seconds put them', () => {
+    const timeline = deriveVideoTimeline(video({
+      scenes: [{ id: 'flash', duration: 0.01 }, { id: 'a', duration: 1 }, { id: 'b', duration: 1 }],
+    }));
+    expect(timeline.scenes.map((scene) => [scene.id, scene.startFrame, scene.frameCount])).toEqual([
+      ['flash', 0, 1],
+      ['a', 1, 29],
+      ['b', 30, 30],
+    ]);
+    expect(timeline.totalFrames).toBe(60);
+  });
 });
 
 describe('validateVideoTimeline', () => {
@@ -137,9 +201,20 @@ describe('validateVideoTimeline', () => {
     expect(check(video({ scenes: [{ id: 'a', clips: clips.map(c => ({ ...c, dur: 1 / 30 })) }] }))).toEqual([]);
   });
 
+  it('keeps a one-frame clip whole when it follows a scene shorter than a frame', () => {
+    const manifest = video({ scenes: [
+      { id: 'flash', duration: 0.01 },
+      { id: 'tick', clips: [{ id: 't', asset: 'shot', in: 0, dur: 1 / 30 }] },
+      { id: 'rest', duration: 1 },
+    ] });
+    expect(deriveVideoTimeline(manifest).scenes[1].clips[0].frameCount).toBe(1);
+    expect(check(manifest)).toEqual([]);
+  });
+
   it('applies the duration limit to rendered frames as well as nominal seconds', () => {
+    // Each 0.4s scene still gets its one frame at 1fps: 240.4s of seconds render as 601s.
     const manifest = video({ canvas: { width: 1080, height: 1920, fps: 1 },
-      scenes: Array.from({ length: 601 }, (_, n) => ({ id: `s${n}`, duration: 0.99 })) });
+      scenes: Array.from({ length: 601 }, (_, n) => ({ id: `s${n}`, duration: 0.4 })) });
     expect(deriveVideoTimeline(manifest).durationSec).toBe(601);
     expect(check(manifest)).toContain('TIMELINE_TOO_LONG');
     expect(check({ ...manifest, scenes: manifest.scenes.slice(0, 600) })).toEqual([]);
@@ -234,6 +309,50 @@ describe('validateVideoTimeline', () => {
     const over = validateVideoTimeline({ manifest, assets: ASSETS, product: null, mediaDurations: new Map([['voice', 2.6]]) });
     expect(codes(fits)).toEqual([]);
     expect(codes(over)).toContain('TIMELINE_NARRATION_OVERRUNS_SCENE');
+  });
+
+  // 2026-11-17 benchmark: a tutorial's whole 19.7s voice-over went on its 3s first scene. The
+  // check said only "lengthen the scene or shorten the line", and the run stopped there.
+  describe('narration made for more than its scene', () => {
+    const overrun = (sceneIndex: number, voiceSec: number, alsoVoiced?: number) => {
+      const scenes: VideoManifestV3['scenes'] = [
+        { id: 'intro', duration: 3 }, { id: 'open', duration: 8 }, { id: 'save', duration: 9 }, { id: 'done', duration: 9 },
+      ];
+      scenes[sceneIndex] = { ...scenes[sceneIndex], narration: { text: 'The whole walkthrough.', asset: 'voice' } };
+      if (alsoVoiced !== undefined) scenes[alsoVoiced] = { ...scenes[alsoVoiced], narration: { text: 'Saved.', asset: 'voice-2' } };
+      const assets: VideoAssetRecord[] = [...ASSETS, { id: 'voice-2', kind: 'audio', label: 'Voice 2', path: 'assets/voice-2.mp3', origin: 'generated' }];
+      const issues = validateVideoTimeline({ manifest: video({ scenes }), assets, product: null,
+        mediaDurations: new Map([['voice', voiceSec], ['voice-2', 2]]) });
+      return issues.filter((issue) => issue.code === 'TIMELINE_NARRATION_OVERRUNS_SCENE');
+    };
+
+    it('names the narration track when the file covers the scenes from the start', () => {
+      const [issue] = overrun(0, 19.7);
+      expect(issue.severity).toBe('error');
+      expect(issue.message).toContain('19.7s');
+      expect(issue.message).toContain('"tracks"');
+      expect(issue.message).toContain('{ "kind": "narration", "asset": "voice", "volume": 1 }');
+      expect(issue.message).toContain('remove "asset" from the narration of scene "intro"');
+    });
+
+    it('does not offer a track that would play over another scene\'s own voice', () => {
+      const [issue] = overrun(0, 19.7, 2);
+      expect(issue.message).toContain('one narration file per scene');
+      expect(issue.message).not.toContain('"tracks"');
+    });
+
+    it('asks for one narration per scene when the file starts in a later scene', () => {
+      const [issue] = overrun(1, 15);
+      expect(issue.message).toContain('one narration file per scene');
+      expect(issue.message).not.toContain('"tracks"');
+    });
+
+    it('asks to lengthen or shorten when the file is longer than the rest of the video', () => {
+      const [issue] = overrun(0, 40);
+      expect(issue.message).toContain('Lengthen the scene or shorten the line');
+      expect(issue.message).not.toContain('"tracks"');
+      expect(issue.message).not.toContain('per scene');
+    });
   });
 
   // On 2026-11-07 a launch video cut 23–30s of the site's demo into one scene and 26–33s into the
@@ -704,6 +823,52 @@ describe('dominantFlatShare', () => {
   });
 });
 
+describe('looksLikeScreen', () => {
+  function bitmap(width: number, height: number, pixel: (x: number, y: number) => [number, number, number]): Uint8Array {
+    const out = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) out.set([...pixel(x, y), 255], (y * width + x) * 4);
+    }
+    return out;
+  }
+  // A page: light background, a header bar, cards, a button, and rows of dark text.
+  const screen = (x: number, y: number): [number, number, number] => {
+    if (y < 12) return [230, 120, 40];
+    if (y > 100 && y < 112 && x > 20 && x < 140) return [220, 110, 50];
+    const inCard = x > 8 && x < 152 && ((y > 20 && y < 50) || (y > 60 && y < 90));
+    const text = inCard && x % 7 < 4 && (y % 10 === 4 || y % 10 === 5) && x < 120;
+    if (text) return [40, 40, 40];
+    // Anti-aliased glyph edges: a ring of in-between greys around every letter.
+    const edge = inCard && x < 121 && x % 7 < 5 && (y % 10 === 3 || y % 10 === 6);
+    if (edge) return [80 + ((x * 7 + y * 3) % 12) * 14, 80 + ((x * 7 + y * 3) % 12) * 14, 80 + ((x * 7 + y * 3) % 12) * 14];
+    return inCard ? [255, 255, 255] : [245, 243, 240];
+  };
+  // Continuous tone: light falling across a subject and its surroundings.
+  const photo = (x: number, y: number): [number, number, number] => [
+    (x * 3 + y) % 256, (y * 2 + 40 + ((x * y) % 17)) % 256, (x + y * 3 + 90) % 256,
+  ];
+
+  it('takes a page of flat colours for a screen', () => {
+    expect(looksLikeScreen(bitmap(160, 120, screen), 160, 120)).toBe(true);
+  });
+
+  it('does not take a photograph for a screen', () => {
+    expect(looksLikeScreen(bitmap(160, 120, photo), 160, 120)).toBe(false);
+  });
+
+  it('does not take a product shot on a plain backdrop for a screen', () => {
+    // Most of the frame is the backdrop; the product itself is continuous tone.
+    const packshot = (x: number, y: number): [number, number, number] => (
+      x > 60 && x < 100 && y > 40 && y < 80 ? photo(x, y) : [255, 255, 255]
+    );
+    expect(looksLikeScreen(bitmap(160, 120, packshot), 160, 120)).toBe(false);
+  });
+
+  it('says nothing about a picture too small to read', () => {
+    expect(looksLikeScreen(bitmap(4, 4, screen), 4, 4)).toBe(false);
+  });
+});
+
 describe('captionCues', () => {
   it('splits on sentence punctuation and shares time by length', () => {
     const cues = captionCues('今天聊视频。开头三秒最重要！', 6);
@@ -888,5 +1053,61 @@ describe('pictures a page places by file', () => {
     expect(longest).toContain('places 7 pictures from assets.json');
     expect(longest.endsWith(fix)).toBe(true);
     expect(reported(ids(1, 40))).toContain('places a picture from assets.json straight in its page markup, so the canvas cannot show or swap it. Add it');
+  });
+});
+
+describe('a narrated video with scenes that would be silent', () => {
+  // 2026-11-17: explainers made without a requested length voiced their first one or two
+  // scenes and delivered 16-24 s of silence after them.
+  const voiced = (id: string, sec: number) => ({ id, duration: sec, narration: { text: 'A line.', asset: `voice-${id}` } });
+  const quiet = (id: string, sec: number) => ({ id, duration: sec });
+  const scenes = [voiced('hook', 3.4), voiced('force', 5), quiet('pressure', 4), quiet('angle', 4), quiet('myth', 4), quiet('close', 4)];
+
+  it('names the run of scenes before rendering, with how long it lasts and how to fix it', () => {
+    expect(silentSceneIssues(video({ scenes }))).toEqual([{
+      code: 'TIMELINE_SCENES_SILENT',
+      severity: 'error',
+      source: 'orkas-video-timeline',
+      selector: 'manifest.json#scenes.2',
+      sceneId: 'pressure',
+      message: 'Scenes pressure, angle, myth and close (16.0s) have no narration and nothing else plays under them, so they would be silent. Give each a line with generate_speech, or put music under the video, then check again.',
+    }]);
+    expect(silentSceneIssues(video({ scenes: [voiced('hook', 3), quiet('close', 4)] }))[0].message).toBe(
+      'Scene close (4.0s) has no narration and nothing else plays under it, so it would be silent. Give it a line with generate_speech, or put music under the video, then check again.',
+    );
+  });
+
+  it('reports each silent run apart, and none shorter than three seconds', () => {
+    const issues = silentSceneIssues(video({ scenes: [quiet('a', 3), voiced('b', 2), quiet('c', 1), quiet('d', 1.5), voiced('e', 2), quiet('f', 2.9)] }));
+    expect(issues.map((issue) => issue.sceneId)).toEqual(['a']);
+    expect(silentSceneIssues(video({ scenes: [voiced('a', 2), quiet('b', 1.5), quiet('c', 1.5)] }))[0].message).toMatch(/^Scenes b and c \(3\.0s\)/);
+  });
+
+  it('counts music or a narration track under the video, and a clip that keeps its own sound', () => {
+    expect(silentSceneIssues(video({ scenes, tracks: [{ kind: 'music', asset: 'bed', volume: 0.3 }] } as Partial<VideoManifestV3>))).toEqual([]);
+    expect(silentSceneIssues(video({ scenes, tracks: [{ kind: 'narration', asset: 'vo' }] } as Partial<VideoManifestV3>))).toEqual([]);
+    const withSound = [voiced('hook', 3), { id: 'shot', clips: [{ id: 'c', asset: 'shot', in: 0, dur: 5, audio: 'keep' }] }, quiet('end', 1)];
+    expect(silentSceneIssues(video({ scenes: withSound } as Partial<VideoManifestV3>))).toEqual([]);
+  });
+
+  it('names narration that was written for the scenes and never voiced', () => {
+    // 2026-11-17: 2 of 5 explainers made without a requested length wrote a line for every
+    // scene, never called generate_speech and shipped 27-40 s of silent captions.
+    const scripted = (id: string, sec: number) => ({ id, duration: sec, narration: { text: 'A line.' } });
+    expect(silentSceneIssues(video({ scenes: [scripted('hook', 4), scripted('deflect', 5), scripted('close', 4)] }))).toEqual([{
+      code: 'TIMELINE_NARRATION_UNVOICED',
+      severity: 'error',
+      source: 'orkas-video-timeline',
+      selector: 'manifest.json#scenes.0',
+      sceneId: 'hook',
+      message: 'Scenes hook, deflect and close (13.0s) have narration text but no voice, and nothing else plays under them, so the video would be silent. Voice each line with generate_speech, or put music under the video. If the user asked for no sound, put the lines on screen as text instead of narration. Then check again.',
+    }]);
+    expect(silentSceneIssues(video({ scenes: [scripted('hook', 4), quiet('logo', 2)] }))[0].message).toMatch(/^Scene hook \(4\.0s\) has narration text but no voice, and nothing else plays under it, so the video would be silent\. /);
+    expect(silentSceneIssues(video({ scenes: [scripted('hook', 2.5)] }))).toEqual([]);
+    expect(silentSceneIssues(video({ scenes: [scripted('hook', 4)], tracks: [{ kind: 'music', asset: 'bed', volume: 0.3 }] } as Partial<VideoManifestV3>))).toEqual([]);
+  });
+
+  it('leaves alone a video that narrates nothing', () => {
+    expect(silentSceneIssues(video({ scenes: [quiet('a', 5), quiet('b', 5)] }))).toEqual([]);
   });
 });

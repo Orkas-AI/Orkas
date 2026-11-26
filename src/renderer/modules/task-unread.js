@@ -9,12 +9,14 @@
 
 const _TASK_UNREAD_STORAGE_PREFIX = 'task_unread_v1_';
 const _TASK_UNREAD_MAX_RECORDS = 500;
+const _TASK_UNREAD_SCOPE_BATCH = 25; // conversations.getMany limit
 
 let _taskUnreadOwnerUserId = '';
-let _taskUnreadScopeRefreshPromise = null;
+let _taskUnreadScopeLookupScheduled = false;
 const _taskUnreadByCid = new Map(); // cid -> { projectId: string|null, finishedAt: number, status?: string, entryPoint?: string }
 const _taskReadAtByCid = new Map(); // cid -> last acknowledged terminal timestamp
 const _taskUnreadPendingTerminals = new Map(); // cid -> { finishedAt, status, entryPoint } received before initUser
+const _taskUnreadPendingScopes = new Set();
 // Terminal states that make a run unread; the home page shows the same
 // statuses next to each unread task.
 const _TASK_UNREAD_STATUSES = new Set(['completed', 'stopped', 'failed', 'waiting_input']);
@@ -69,6 +71,7 @@ function _taskUnreadLoadOwner(userId) {
   _taskUnreadOwnerUserId = userId;
   _taskUnreadByCid.clear();
   _taskReadAtByCid.clear();
+  _taskUnreadPendingScopes.clear();
   if (!userId) return;
   try {
     const raw = localStorage.getItem(_taskUnreadStorageKey(userId));
@@ -138,7 +141,9 @@ function _taskUnreadSave() {
     const keepUnread = new Set(unread.map((row) => row.cid));
     const keepRead = new Set(read.map((row) => row.cid));
     for (const cid of Array.from(_taskUnreadByCid.keys())) {
-      if (!keepUnread.has(cid)) _taskUnreadByCid.delete(cid);
+      if (keepUnread.has(cid)) continue;
+      _taskUnreadByCid.delete(cid);
+      _taskUnreadPendingScopes.delete(cid);
     }
     for (const cid of Array.from(_taskReadAtByCid.keys())) {
       if (!keepRead.has(cid)) _taskReadAtByCid.delete(cid);
@@ -213,20 +218,45 @@ function _taskUnreadProjectCount(projectId) {
   return count;
 }
 
-function _taskUnreadResolveUnknownScopesSoon() {
-  if (_taskUnreadScopeRefreshPromise || typeof loadConversations !== 'function') return;
-  _taskUnreadScopeRefreshPromise = Promise.resolve()
-    // The bounded startup list intentionally omits conversations under
-    // collapsed projects. A terminal event can still arrive for one of those
-    // tasks, so resolving an unknown cid must request the authoritative full
-    // list or its Projects/project parent dots would never light up.
-    .then(() => loadConversations({ full: true }))
-    .then(() => {
-      _taskUnreadHydrateScopes();
-      _refreshUnreadTaskIndicators();
-    })
-    .catch(() => {})
-    .finally(() => { _taskUnreadScopeRefreshPromise = null; });
+function _taskUnreadResolveUnknownScope(cid) {
+  if (typeof window.orkas?.invoke !== 'function' || !_taskUnreadByCid.has(cid)) return;
+  _taskUnreadPendingScopes.add(cid);
+  if (_taskUnreadScopeLookupScheduled) return;
+  _taskUnreadScopeLookupScheduled = true;
+  queueMicrotask(_taskUnreadResolvePendingScopes);
+}
+
+async function _taskUnreadResolvePendingScopes() {
+  try {
+    // The startup list can omit collapsed projects. Look up only the unread
+    // conversations' ownership, leaving the navigation cache and views alone.
+    while (_taskUnreadPendingScopes.size) {
+      const userId = _taskUnreadEnsureOwner();
+      const cids = Array.from(_taskUnreadPendingScopes).slice(0, _TASK_UNREAD_SCOPE_BATCH);
+      const records = new Map(cids.map(id => [id, _taskUnreadByCid.get(id)]));
+      for (const id of cids) _taskUnreadPendingScopes.delete(id);
+      if (!userId || !cids.length) continue;
+      let response;
+      try { response = await window.orkas.invoke('conversations.getMany', { cids }); }
+      catch (_) { continue; }
+      if (_taskUnreadEnsureOwner() !== userId || response?.ok === false || !Array.isArray(response?.conversations)) continue;
+      let changed = false;
+      for (const row of response.conversations) {
+        const id = row?.conversation_id;
+        const record = _taskUnreadByCid.get(id);
+        if (!record || record !== records.get(id) || typeof row.project_id !== 'string'
+            || _taskUnreadConversationScope(id).known || record.projectId === row.project_id) continue;
+        record.projectId = row.project_id;
+        changed = true;
+      }
+      if (changed) {
+        _taskUnreadSave();
+        _refreshUnreadTaskIndicators();
+      }
+    }
+  } finally {
+    _taskUnreadScopeLookupScheduled = false;
+  }
 }
 
 function _markConversationUnread(cid, options = {}) {
@@ -257,7 +287,7 @@ function _markConversationUnread(cid, options = {}) {
   });
   _taskUnreadSave();
   _refreshUnreadTaskIndicators();
-  if (!scope.known) _taskUnreadResolveUnknownScopesSoon();
+  if (!scope.known) _taskUnreadResolveUnknownScope(id);
   return true;
 }
 
@@ -274,6 +304,7 @@ function _markConversationRead(cid, options = {}) {
   );
   const changed = !!unread || readAt > (_taskReadAtByCid.get(id) || 0);
   _taskUnreadByCid.delete(id);
+  _taskUnreadPendingScopes.delete(id);
   _taskReadAtByCid.set(id, readAt);
   if (changed) {
     _taskUnreadSave();
@@ -288,6 +319,7 @@ function _forgetUnreadConversation(cid) {
   _taskUnreadEnsureOwner();
   _taskUnreadPendingTerminals.delete(id);
   const removedUnread = _taskUnreadByCid.delete(id);
+  _taskUnreadPendingScopes.delete(id);
   const removedRead = _taskReadAtByCid.delete(id);
   const changed = removedUnread || removedRead;
   if (changed) {

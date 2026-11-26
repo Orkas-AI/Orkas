@@ -130,7 +130,7 @@ test('repeated refresh preserves live indicators, rename focus and status transi
   await expect(page.locator('[data-cid="c2"] .conv-status-badge')).toHaveCount(2);
 });
 
-test('background CLI questions show attention in every sidebar copy and clear after answer, withdrawal or stop', async ({ page }, info) => {
+test('pinned running tasks retain their live dots while questions need answers in every sidebar copy', async ({ page }, info) => {
   await setup(page, 8);
   const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
   const sidebar = index.slice(index.indexOf('<aside class="sidebar">'), index.indexOf('</aside>') + 8);
@@ -152,9 +152,9 @@ test('background CLI questions show attention in every sidebar copy and clear af
       cli_answer: { message_id: data.message_id, answers: data.answers },
     } });
     w.conversations = [
-      { conversation_id: 'a', title: '需要确认的任务 · A very long task title for sidebar clipping checks', last_active_at: new Date().toISOString() },
+      { conversation_id: 'a', title: '需要确认的任务 · A very long task title for sidebar clipping checks', pinned_at: new Date().toISOString(), last_active_at: new Date().toISOString() },
       { conversation_id: 'b', title: 'Another running task', last_active_at: new Date().toISOString() },
-      { conversation_id: 'p', title: 'Project task', project_id: 'project', last_active_at: new Date().toISOString() },
+      { conversation_id: 'p', title: 'Project task', project_id: 'project', pinned_at: new Date().toISOString(), last_active_at: new Date().toISOString() },
       { conversation_id: 'old', title: 'Historical unanswered question', created_at: '2020-01-01' },
     ];
     const render = (rows: any[]) => rows.map(c => w._renderConversationSidebarItem(c)).join('');
@@ -173,7 +173,8 @@ test('background CLI questions show attention in every sidebar copy and clear af
   const labels = page.locator('[data-cid="a"] .conv-item-status-label.is-waiting');
   await expect(labels).toHaveCount(2);
   await expect(labels.first()).toHaveText('待回答');
-  await expect(page.locator('[data-cid="a"] .conv-status-badge')).toHaveCount(0);
+  await expect(page.locator('[data-cid="a"].is-pinned .conv-status-badge.is-streaming')).toHaveCount(2);
+  await expect(page.locator('[data-cid="a"] .conv-item-row > :first-child').first()).toHaveClass('conv-status-badge is-streaming');
   await expect(page.locator('[data-cid="old"] .conv-item-status-label.is-waiting')).toHaveCount(0);
   await expect(page.locator('#today-running-chip')).toHaveCount(0);
   await expect(page.locator('#tasks-running-chip')).toHaveText('执行中 1');
@@ -207,6 +208,7 @@ test('background CLI questions show attention in every sidebar copy and clear af
   });
   await expect(page.locator('[data-project-running-chip]')).toBeHidden();
   await expect(page.locator('[data-cid="p"] .conv-item-status-label.is-waiting')).toHaveText('Needs answer');
+  await expect(page.locator('[data-cid="p"].is-pinned .conv-status-badge.is-streaming')).toHaveCount(1);
   await page.evaluate(() => { document.getElementById('today-list')!.hidden = false; });
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.screenshot({ path: info.outputPath('waiting-project-en.png') });
@@ -215,10 +217,15 @@ test('background CLI questions show attention in every sidebar copy and clear af
   await page.evaluate(() => {
     const w = window as any;
     w.CliAsyncInput.observe('a', { ...w.question, id: 'q2' });
+    // Exercise the Stop path, including a request stream still draining after
+    // the bus's abort event. An unanswered question must not keep its dot alive.
+    w.pendingConvs.get('a').controller = { abort() {} };
+    w.abortConvStream('a');
     w._handleGroupBusEvent('a', null, { type: 'aborted' });
   });
   await expect(labels).toHaveCount(0);
-  await expect(page.locator('#tasks-running-chip')).toHaveText('2 running');
+  await expect(page.locator('[data-cid="a"] .conv-status-badge')).toHaveCount(0);
+  await expect(page.locator('#tasks-running-chip')).toHaveText('1 running');
 });
 
 test('task status stays at the trailing edge beside the menu when replies become unread', async ({ page }, info) => {

@@ -69,6 +69,7 @@ function loadConversation(overrides: Record<string, any> = {}, surface = 'PC') {
     t: (key: string) => key,
     currentCid: '',
     conversations: [],
+    pendingConvs: new Map(),
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     document: {
       readyState: 'loading',
@@ -354,7 +355,9 @@ describe('conversation send ownership across navigation', () => {
     }
     context._saveDraft('task-a');
     const sending = context.handleChatSubmit();
-    await waiting;
+    await Promise.race([waiting, sending.then(() => {
+      throw new Error('Send finished before reaching the navigation checkpoint');
+    })]);
     // Let the attachment continuation reach the held floor write.
     await Promise.resolve();
     const navigates = !['unchanged', 'new-draft'].includes(phase);
@@ -547,6 +550,50 @@ describe('composer attachment send lifecycle', () => {
     expect(context._chatAttachList(cid).map((item: any) => item.name)).toEqual(['chosen.txt']);
   });
 
+  it.each(['attachments', 'recipient'])('keeps the draft when Stop crosses the %s check', async (phase) => {
+    const { context, elements, inputId, cid, submit, sends, alerts } = setup('conversation');
+    context.pendingConvs = new Map();
+    context._beginTaskSurfaceAbortRefresh = () => ({ settled: false });
+    context._refreshTaskSurfacesAfterAbort = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context._updateConvSendUI = () => {};
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => { resume = resolve; });
+    let reached!: () => void;
+    const waiting = new Promise<void>((resolve) => { reached = resolve; });
+    const fetch = context.apiFetch;
+    const abortRequests: unknown[] = [];
+    context.apiFetch = async (url: string, options: any) => {
+      if (url.endsWith('/abort')) {
+        abortRequests.push(JSON.parse(options.body || '{}'));
+        return { json: async () => ({ ok: true }) };
+      }
+      if (url.endsWith('/attachments')) {
+        reached();
+        if (phase === 'attachments') await held;
+      }
+      return fetch(url, options);
+    };
+    if (phase === 'recipient') {
+      context.floorWait = held;
+      vm.runInContext("_floorSyncByCid.set('task-a', floorWait)", context);
+    }
+    const sending = submit();
+    await waiting;
+    // Let the recipient variant pass the attachment check and reach its own wait.
+    if (phase === 'recipient') await new Promise((resolve) => setImmediate(resolve));
+    context.abortConvStream(cid, { userInitiated: true });
+    resume();
+    await sending;
+
+    expect(sends).toHaveLength(0);
+    expect(alerts).toEqual([]);
+    expect(elements[inputId].value).toBe('Send this text');
+    expect(abortRequests).toEqual([{ keep_queue: true }]);
+    await submit();
+    expect(sends).toHaveLength(1);
+  });
+
   it.each(['new-chat', 'conversation', 'project'])('ignores repeated %s submit during an empty attachment preflight', async (entry) => {
     const fixture = setup(entry);
     const { context, submit, sends, alerts, requests } = fixture;
@@ -613,7 +660,9 @@ describe('composer attachment send lifecycle', () => {
       return { json: async () => ({ ok: true }) };
     };
     const first = submit();
-    await waiting;
+    await Promise.race([waiting, first.then(() => {
+      throw new Error('Send finished before reaching the held response');
+    })]);
     await submit();
     resume();
     await first;

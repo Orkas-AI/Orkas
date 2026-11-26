@@ -498,6 +498,21 @@ describe('projects › bindings CRUD', () => {
     if (r1.ok) expect(r1.bindings.agents).toEqual([]);
   });
 
+  it('keeps distinct Agent bindings written concurrently', async () => {
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Concurrent members');
+    if (!created.ok) throw new Error('precondition');
+    const pid = created.project.project_id;
+
+    const results = await Promise.all([
+      projects.addAgentBinding(TEST_UID, pid, 'agent-new-a'),
+      projects.addAgentBinding(TEST_UID, pid, 'agent-new-b'),
+      projects.addAgentBinding(TEST_UID, pid, 'agent-new-a'),
+    ]);
+    expect(results.every(result => result.ok)).toBe(true);
+    expect((await projects.getBindings(TEST_UID, pid)).agents.sort()).toEqual(['agent-new-a', 'agent-new-b']);
+  });
+
   it('returns not_found when binding into a non-existent project', async () => {
     const projects = await loadProjects();
     const r = await projects.addAgentBinding(TEST_UID, 'p_nosuch00', 'a');
@@ -508,6 +523,42 @@ describe('projects › bindings CRUD', () => {
 });
 
 describe('projects › resolveProjectScope', () => {
+  it('makes built-in Agents available in a project without adding them, leaving membership unchanged', async () => {
+    const projects = await loadProjects();
+    const paths = await import('../../../src/main/paths');
+    const writeAgent = (root: string, id: string, install?: Record<string, unknown>) => {
+      fs.mkdirSync(path.join(root, id), { recursive: true });
+      fs.writeFileSync(path.join(root, id, 'agent.json'), JSON.stringify({
+        agent_id: id, name: id, description: id, created_at: 't', updated_at: 't',
+      }));
+      if (install) fs.writeFileSync(path.join(root, id, '_install.json'), JSON.stringify(install));
+    };
+    writeAgent(paths.userMarketplaceAgentsDir(TEST_UID), 'builtin-studio', { seed_source: 'builtin' });
+    writeAgent(paths.userMarketplaceAgentsDir(TEST_UID), 'platform-agent');
+    writeAgent(paths.userAgentsDir(TEST_UID), 'custom-agent');
+    const result = await projects.createProject(TEST_UID, 'Built-ins everywhere');
+    if (!result.ok) throw new Error('Project fixture failed');
+    const pid = result.project.project_id;
+
+    const scope = await projects.resolveProjectScope(TEST_UID, pid);
+    expect(scope?.agents).toContain('builtin-studio');
+    expect(scope?.agents).not.toContain('platform-agent');
+    expect(scope?.agents).not.toContain('custom-agent');
+    expect((await projects.getBindings(TEST_UID, pid)).agents).toEqual([]);
+    expect(fs.existsSync(paths.projectBindingsFile(TEST_UID, pid))).toBe(false);
+    expect(await projects.isAgentAvailableInProject(TEST_UID, pid, 'builtin-studio')).toBe(true);
+    expect(await projects.isAgentAvailableInProject(TEST_UID, pid, 'platform-agent')).toBe(false);
+    expect(await projects.isAgentAvailableInProject(TEST_UID, pid, 'custom-agent')).toBe(false);
+
+    expect((await projects.addAgentBinding(TEST_UID, pid, 'platform-agent')).ok).toBe(true);
+    expect(await projects.isAgentAvailableInProject(TEST_UID, pid, 'platform-agent')).toBe(true);
+    expect((await projects.availableProjectAgentIds(TEST_UID, pid)).sort())
+      .toEqual(['builtin-studio', 'platform-agent']);
+    expect((await projects.getBindings(TEST_UID, pid)).agents).toEqual(['platform-agent']);
+    // A missing project still exposes nothing rather than the built-ins.
+    expect(await projects.isAgentAvailableInProject(TEST_UID, 'p_nosuch00', 'builtin-studio')).toBe(false);
+  });
+
   it('returns null for null / empty projectId (orphan conversation)', async () => {
     const projects = await loadProjects();
     expect(await projects.resolveProjectScope(TEST_UID, null)).toBeNull();

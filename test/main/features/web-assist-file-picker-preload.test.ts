@@ -3,7 +3,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
-function preload() {
+function preload(isMainFrame = true) {
   let controlled = false;
   const listeners = new Map<string, (event: any) => void>();
   const native = vi.fn(async function(this: unknown, ...args: unknown[]) { return { receiver: this, args }; });
@@ -17,6 +17,7 @@ function preload() {
   };
   const context = { window: main, Proxy, Reflect, Event, DOMException };
   vm.runInNewContext(readFileSync(path.resolve(__dirname, '../../../src/main/features/web_assist_file_picker_preload.js'), 'utf8'), {
+    process: { isMainFrame },
     window: { addEventListener: (type: string, listener: (event: any) => void) => listeners.set(type, listener) },
     require: () => ({ ipcRenderer: { sendSync }, contextBridge: {
       executeInMainWorld: ({ func }: any) => vm.runInNewContext(`(${func.toString()})()`, context),
@@ -38,5 +39,11 @@ describe('website file-system picker compatibility', () => {
     const result = await p.main[name].call(receiver, options);
     expect(result.receiver).toBe(receiver); expect(result.args[0]).toBe(options);
     expect(p.native).toHaveBeenCalledTimes(1);
+  });
+  it('leaves native file system pickers unchanged in child frames', () => {
+    const p = preload(false);
+    p.control(true);
+    expect(p.main.showDirectoryPicker).toBe(p.native);
+    expect(p.sendSync).not.toHaveBeenCalled();
   });
 });
