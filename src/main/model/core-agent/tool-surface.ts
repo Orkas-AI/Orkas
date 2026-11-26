@@ -10,6 +10,7 @@ import {
   hostManagedToolNames,
   isAgentFallbackToolGroup,
   isLoadableToolGroup,
+  isModelToolName,
   toolNamesForGroups,
   type ToolGroupId,
 } from './tool-catalog';
@@ -85,7 +86,7 @@ export function createToolSurfaceController(input: {
   allowLegacyAll?: boolean;
   persist?: (state: ToolSurfaceState) => void;
 }): ToolSurfaceController {
-  const available = new Set(input.availableToolNames);
+  const available = new Set(input.availableToolNames.filter(isModelToolName));
   const dynamicLoadable = new Set(
     (input.dynamicLoadableToolNames ?? input.availableToolNames)
       .filter((name) => available.has(name)),

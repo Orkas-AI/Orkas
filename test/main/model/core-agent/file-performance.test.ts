@@ -39,8 +39,9 @@ afterEach(async () => {
   await closeOfficeExtraction(); await drainMainRuntimeForTest();
   if (previous === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previous;
-  fs.rmSync(root, { recursive: true, force: true });
-});
+  // Large repository fixtures can contain thousands of Windows directory entries.
+  await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}, 120_000);
 async function tools() {
   const local = (await import('../../../../src/main/model/core-agent/local-tools')).createLocalTools({ userId: uid, cid: 'fixture' });
   const ctx = { workingDir: dir, state: { readFileState: new Map() } } as any;
@@ -53,6 +54,38 @@ function revision(content: string): string {
 function complete(actual: Buffer, expected: Buffer) {
   if (!actual.equals(expected)) throw new Error('Incomplete or duplicated file bytes');
 }
+// Keep counts only. Mock call histories retain every megabyte read and
+// written during the loop and can create GC pauses in the measured workload.
+function countFileTraffic(readsFile: (file: fs.PathOrFileDescriptor) => boolean,
+  writesFile?: (file: fs.PathOrFileDescriptor) => boolean, replacementTarget?: string) {
+  const traffic = { reads: 0, readBytes: 0, writes: 0, writtenBytes: 0, replacements: 0 };
+  const read = fs.readFileSync, write = fs.writeFileSync, rename = fs.renameSync;
+  fs.readFileSync = ((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+    const result = (read as Function)(file, ...args) as string | Buffer;
+    if (readsFile(file)) { traffic.reads++; traffic.readBytes += Buffer.byteLength(result); }
+    return result;
+  }) as typeof read;
+  if (writesFile) {
+    fs.writeFileSync = ((file: fs.PathOrFileDescriptor, data: string | Buffer, ...args: unknown[]) => {
+      const result = (write as Function)(file, data, ...args);
+      if (writesFile(file)) { traffic.writes++; traffic.writtenBytes += Buffer.byteLength(data); }
+      return result;
+    }) as typeof write;
+  }
+  if (replacementTarget) {
+    fs.renameSync = (from, to) => {
+      rename(from, to);
+      if (to === replacementTarget) traffic.replacements++;
+    };
+  }
+  syncBuiltinESMExports();
+  return { traffic, stop() {
+    fs.readFileSync = read;
+    if (writesFile) fs.writeFileSync = write;
+    if (replacementTarget) fs.renameSync = rename;
+    syncBuiltinESMExports();
+  } };
+}
 it('PF-03 measures fixed final bytes across chunk counts without accepting truncation or replay', async () => {
   const call = await tools(), measurements = [];
   for (const finalBytes of [256 * 1024, 1024 * 1024, 8 * 1024 * 1024]) {
@@ -64,14 +97,8 @@ it('PF-03 measures fixed final bytes across chunk counts without accepting trunc
       const first = await call('write_file', { path: target, content: chunk });
       expect(first.isError).not.toBe(true); let base = revision(first.content);
       const costs = ATTRIBUTION ? profileSyncCosts(file => String(file) === target) : null;
-      const original = fs.readFileSync;
-      let sourceReads = 0, sourceReadBytes = 0, maxAppendMs = 0;
-      const spy = vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
-        const result = (original as Function)(file, ...args);
-        if (String(file) === target) { sourceReads++; sourceReadBytes += Buffer.byteLength(result); }
-        return result;
-      }) as typeof fs.readFileSync);
-      syncBuiltinESMExports();
+      const { traffic, stop } = countFileTraffic(file => String(file) === target);
+      let maxAppendMs = 0;
       let measured;
       try {
         measured = await measure(async () => {
@@ -83,9 +110,10 @@ it('PF-03 measures fixed final bytes across chunk counts without accepting trunc
             if (arrival === 'paced') await new Promise(resolve => setImmediate(resolve));
           }
         });
-      } finally { spy.mockRestore(); syncBuiltinESMExports(); costs?.stop(); }
+      } finally { stop(); costs?.stop(); }
       complete(fs.readFileSync(target), expected);
       // Tap validity only, NOT a requirement to preserve the inefficient number of reads.
+      const { reads: sourceReads, readBytes: sourceReadBytes } = traffic;
       expect(sourceReads).toBeGreaterThan(0); expect(sourceReadBytes).toBeGreaterThan(0);
       measurements.push({ arrival, finalBytes, chunks, sourceReads, sourceReadBytes, readAmplification: sourceReadBytes / finalBytes, maxAppendMs, ...(costs ? { callerCosts: costs.report } : {}), ...measured.metrics });
     }
@@ -97,6 +125,13 @@ it('PF-03 measures fixed final bytes across chunk counts without accepting trunc
     { elapsedMs: sample.eventLoopDelayMs }, BULK_MAIN_GAP_LIMIT_MS);
 }, 30000);
 
+function isPatchStage(target: string, value: unknown): boolean {
+  const file = String(value);
+  return path.dirname(file) === path.dirname(target)
+    && path.basename(file).startsWith(`.${path.basename(target)}.core-agent-patch-`)
+    && file.endsWith('.tmp');
+}
+
 it.each(['burst', 'paced'] as const)('PF-03 preserves replay and stale-write protection after a long %s append/edit sequence', async arrival => {
   const call = await tools(), target = path.join(dir, 'editable.txt');
   const source = 'HEAD_0000\n' + '界x'.repeat(256 * 1024) + '\nTAIL';
@@ -105,21 +140,12 @@ it.each(['burst', 'paced'] as const)('PF-03 preserves replay and stale-write pro
   expect((await call('append_file', append)).isError).not.toBe(true);
   expect((await call('append_file', append)).isError).not.toBe(true);
   complete(fs.readFileSync(target), Buffer.from(source + '\nNEW'));
-  const costs = ATTRIBUTION ? profileSyncCosts(file => String(file) === target) : null;
+  // The isolated workspace contains the target and any sibling staging writes.
+  const inWorkspace = (file: unknown) => typeof file === 'string' && path.dirname(file) === dir;
+  const costs = ATTRIBUTION ? profileSyncCosts(inWorkspace) : null;
   let maxEditMs = 0;
-  const traffic = { reads: 0, readBytes: 0, writes: 0, writtenBytes: 0 };
-  const originalRead = fs.readFileSync, originalWrite = fs.writeFileSync;
-  const read = vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
-    const result = (originalRead as Function)(file, ...args);
-    if (String(file) === target) { traffic.reads++; traffic.readBytes += Buffer.byteLength(result); }
-    return result;
-  }) as typeof fs.readFileSync);
-  const write = vi.spyOn(fs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Buffer, ...args: unknown[]) => {
-    const result = (originalWrite as Function)(file, data, ...args);
-    if (String(file) === target) { traffic.writes++; traffic.writtenBytes += Buffer.byteLength(data); }
-    return result;
-  }) as typeof fs.writeFileSync);
-  syncBuiltinESMExports();
+  let committedBytes = 0;
+  const { traffic, stop } = countFileTraffic(file => file === target, inWorkspace, target);
   let measured;
   try { measured = await measure(async () => {
     for (let n = 0; n < 100; n++) {
@@ -128,9 +154,10 @@ it.each(['burst', 'paced'] as const)('PF-03 preserves replay and stale-write pro
         new_string: `HEAD_${String(n + 1).padStart(4, '0')}` });
       maxEditMs = Math.max(maxEditMs, performance.now() - operationStart);
       expect(result.isError, `edit ${n}`).not.toBe(true);
+      committedBytes += result.observations?.fileChanges?.[0]?.afterBytes ?? 0;
       if (arrival === 'paced') await new Promise(resolve => setImmediate(resolve));
     }
-  }); } finally { read.mockRestore(); write.mockRestore(); costs?.stop(); syncBuiltinESMExports(); }
+  }); } finally { stop(); costs?.stop(); }
   const expected = Buffer.from(source.replace('HEAD_0000', 'HEAD_0100') + '\nNEW');
   complete(fs.readFileSync(target), expected);
   const external = Buffer.concat([expected, Buffer.from('\nEXTERNAL')]); fs.writeFileSync(target, external);
@@ -138,8 +165,10 @@ it.each(['burst', 'paced'] as const)('PF-03 preserves replay and stale-write pro
   expect(stale.isError).toBe(true); expect(stale.content).toContain('E_STALE');
   complete(fs.readFileSync(target), external);
   expect(warnings).toEqual(['edit_file freshness reject']); expect(logs.error).toBe(0);
-  console.log('[PF-03 repeated edit]', JSON.stringify({ arrival, edits: 100, traffic, maxEditMs, ...(costs ? { callerCosts: costs.report } : {}), finalBytes: expected.length, ...measured.metrics, capturedLogs: logs, expectedWarnings: warnings }));
+  console.log('[PF-03 repeated edit]', JSON.stringify({ arrival, edits: 100, traffic: { ...traffic, committedBytes }, maxEditMs, ...(costs ? { callerCosts: costs.report } : {}), finalBytes: expected.length, ...measured.metrics, capturedLogs: logs, expectedWarnings: warnings }));
   expect(traffic.readBytes).toBeGreaterThan(0); expect(traffic.writtenBytes).toBeGreaterThan(0);
+  expect(traffic.replacements).toBe(100);
+  expect(committedBytes).toBe(100 * expected.length);
   checkLatencyBudget(`100 ${arrival} edits caller delay`, { elapsedMs: measured.metrics.eventLoopDelayMs }, BULK_MAIN_GAP_LIMIT_MS);
 }, 30000);
 
@@ -445,32 +474,93 @@ it.each(mutationNames)('PF-03 keeps the completed %s receipt when cancellation a
   expect(f.notice.calls).toBe(1); expectMutationLogs();
 });
 
-it.each(mutationNames)('PF-03 reports partial %s failure without retrying, publishing success or leaking its lock', async name => {
-  const f = await mutationFixture(name), method = name === 'append_file' ? 'appendFileSync' : 'writeFileSync';
-  const original = fs[method]; let attempts = 0;
-  const spy = vi.spyOn(fs, method).mockImplementation(((file: any, value: any, ...args: any[]) => {
-    if (String(file) !== f.file) return (original as Function)(file, value, ...args);
-    attempts++; (original as Function)(file, Buffer.from(value).subarray(0, 2));
-    throw Object.assign(new Error('fixture partial write'), { code: 'EIO' });
-  }) as any);
+it('PF-03 reports partial append_file failure and preserves the damaged bytes for explicit recovery', async () => {
+  const f = await mutationFixture('append_file');
+  const original = fs.appendFileSync;
+  let attempts = 0;
+  const spy = vi.spyOn(fs, 'appendFileSync').mockImplementation((file, value, options) => {
+    if (file !== f.file) return original(file, value, options);
+    attempts++;
+    const bytes = typeof value === 'string' ? Buffer.from(value) : value;
+    original(file, bytes.subarray(0, 2), options);
+    throw Object.assign(new Error('fixture partial append'), { code: 'EIO' });
+  });
   syncBuiltinESMExports();
   try {
     const failed = await f.invoke();
-    expect(failed.isError).toBe(true); expect(failed.content).toContain(name === 'append_file' ? 'E_APPEND_FAILED' : 'E_EDIT_FAILED');
+    expect(failed.isError).toBe(true); expect(failed.content).toContain('E_APPEND_FAILED');
     expect(attempts).toBe(1); expect(f.notice.calls).toBe(0);
-    complete(fs.readFileSync(f.file), name === 'append_file'
-      ? Buffer.concat([Buffer.from(f.before), Buffer.from('追加🙂\r\n').subarray(0, 2)])
-      : Buffer.from(f.expected).subarray(0, 2));
+    complete(fs.readFileSync(f.file), Buffer.concat([Buffer.from(f.before), Buffer.from('追加🙂\r\n').subarray(0, 2)]));
   } finally { spy.mockRestore(); syncBuiltinESMExports(); }
   const partial = fs.readFileSync(f.file);
   // The injected two-byte append bisects a UTF-8 character. A retry must
   // preserve those bytes and refuse the invalid file before revision checks.
   const stale = await f.invoke(); expect(stale.isError).toBe(true);
-  expect(stale.content).toContain(name === 'append_file' ? 'E_NOT_EDITABLE' : 'E_STALE');
+  expect(stale.content).toContain('E_NOT_EDITABLE');
   complete(fs.readFileSync(f.file), partial); expect(f.notice.calls).toBe(0);
-  const other = await mutationFixture(name, '-recovery');
+  const other = await mutationFixture('append_file', '-recovery');
   expect((await other.invoke()).isError).not.toBe(true); complete(fs.readFileSync(other.file), Buffer.from(other.expected));
-  expectMutationLogs(name === 'edit_file' ? ['edit_file write failed', 'edit_file freshness reject'] : []);
+  expectMutationLogs();
+});
+
+it('PF-03 discards a partial staged edit and allows an explicit retry', async () => {
+  const f = await mutationFixture('edit_file');
+  const original = fs.writeFileSync;
+  let attempts = 0;
+  const spy = vi.spyOn(fs, 'writeFileSync').mockImplementation((file, value, options) => {
+    const writesFixture = typeof file === 'string' && path.dirname(file) === dir && String(value) === f.expected;
+    if (!writesFixture) return original(file, value, options);
+    attempts++;
+    original(file, Buffer.from(value).subarray(0, 2), options);
+    throw Object.assign(new Error('fixture partial staged write'), { code: 'EIO' });
+  });
+  syncBuiltinESMExports();
+  try {
+    const failed = await f.invoke();
+    expect(failed.isError).toBe(true);
+    expect(failed.content).toContain('E_EDIT_FAILED');
+    expect(failed.observations?.fileChanges).toBeUndefined();
+    expect(attempts).toBe(1);
+    expect(f.notice.calls).toBe(0);
+    complete(fs.readFileSync(f.file), Buffer.from(f.before));
+    expect(fs.readdirSync(dir)).toEqual([path.basename(f.file)]);
+  } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  expect((await f.invoke()).isError).not.toBe(true);
+  complete(fs.readFileSync(f.file), Buffer.from(f.expected));
+  expect(f.notice.calls).toBe(1);
+  expectMutationLogs(['edit_file write failed']);
+});
+
+it('PF-03 preserves the original file after edit publication fails and allows an explicit retry', async () => {
+  const f = await mutationFixture('edit_file');
+  const original = fs.renameSync;
+  let attempts = 0;
+  let stagedBytes: Buffer | undefined;
+  let originalBytes: Buffer | undefined;
+  const spy = vi.spyOn(fs, 'renameSync').mockImplementation((staged, destination) => {
+    if (destination !== f.file) return original(staged, destination);
+    attempts++;
+    stagedBytes = fs.readFileSync(staged);
+    originalBytes = fs.readFileSync(f.file);
+    throw Object.assign(new Error('fixture edit publication failure'), { code: 'EIO' });
+  });
+  syncBuiltinESMExports();
+  try {
+    const failed = await f.invoke();
+    expect(failed.isError).toBe(true);
+    expect(failed.content).toContain('E_EDIT_FAILED');
+    expect(failed.observations?.fileChanges).toBeUndefined();
+    expect(attempts).toBe(1);
+    expect(f.notice.calls).toBe(0);
+    expect(stagedBytes).toEqual(Buffer.from(f.expected));
+    expect(originalBytes).toEqual(Buffer.from(f.before));
+    complete(fs.readFileSync(f.file), Buffer.from(f.before));
+    expect(fs.readdirSync(dir)).toEqual([path.basename(f.file)]);
+  } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  expect((await f.invoke()).isError).not.toBe(true);
+  complete(fs.readFileSync(f.file), Buffer.from(f.expected));
+  expect(f.notice.calls).toBe(1);
+  expectMutationLogs(['edit_file write failed']);
 });
 
 it.each(mutationNames)('PF-03 serializes competing %s callers without losing either accepted bytes or stale-write rejection', async name => {

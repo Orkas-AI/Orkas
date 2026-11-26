@@ -1712,3 +1712,33 @@ describe('local provider failure context through the model client', () => {
     expect(JSON.stringify(data)).not.toContain('PRIVATE_');
   });
 });
+
+it.each(['aborted', 'completed'] as const)('reports observed cache usage and keeps three local high-write requests when %s', async (status) => {
+  const { redact } = await vi.importActual<typeof import('../../../../src/main/logger')>('../../../../src/main/logger');
+  const controller = new AbortController();
+  h.makeStream = async function* () {
+    const observe = h.lastBuildRunnerParams!.onRequestUsage as (usage: object, position: object) => void;
+    const failure = h.lastBuildRunnerParams!.onRequestFailure as (failure: object) => void;
+    failure({ phase: 'before_request', source: 'payload', lastEvent: 'none', aborted: false,
+      code: 'context_capacity_insufficient', elapsedMs: 0, requestRound: 2, contextBudget: { version: 1, candidate_index: 1 } });
+    for (const [index, cacheWriteTokens] of [10, 1000, 30, 40, 0].entries()) {
+      const usage = { inputTokens: 7, outputTokens: 3, cacheReadTokens: 4000, cacheWriteTokens };
+      observe(usage, { requestRound: index + 1, candidateIndex: 2, attempt: 1 });
+      yield { type: 'provider_call', outcome: 'completed', durationMs: 1, usage };
+    }
+    if (status === 'aborted') controller.abort();
+    else yield completedEvent('finished');
+  };
+  await drain({ abortSignal: controller.signal });
+  const finish = redact(h.logEntries.find(row => row.message === 'model turn finish')?.data) as Record<string, unknown>;
+  expect(finish.top_cache_write_requests).toEqual([
+    { request_round: 2, candidate_index: 2, attempt: 1, cache_write_tokens: 1000, cache_read_tokens: 4000, input_tokens: 7 },
+    { request_round: 4, candidate_index: 2, attempt: 1, cache_write_tokens: 40, cache_read_tokens: 4000, input_tokens: 7 },
+    { request_round: 3, candidate_index: 2, attempt: 1, cache_write_tokens: 30, cache_read_tokens: 4000, input_tokens: 7 },
+  ]);
+  expect(finish.observed_usage_only).toBe(status === 'aborted' ? true : undefined);
+  expect(finish.diagnostics).toMatchObject({ usage: status === 'aborted'
+    ? { inputTokens: 35, outputTokens: 15, cacheReadTokens: 20000, cacheWriteTokens: 1080 }
+    : { inputTokens: 1, outputTokens: 1, totalTokens: 2 } });
+  expect(h.logEntries.find(row => row.message === 'provider request failed')?.data).toMatchObject({ request_round: 2 });
+});

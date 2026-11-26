@@ -48,6 +48,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   vi.doUnmock('../../../src/main/features/auth');
   await (await import('../../../src/main/features/search/indexer')).flushAll();
   await closeLogWorkers();
@@ -797,7 +798,9 @@ describe('runner › buildRunner auth gate', () => {
     expect(payloads).toHaveLength(2);
     expect(payloads.map(payload => payload.model)).toEqual([modelId, modelId]);
     expect(payloads[0].reasoning?.effort).toBeUndefined();
-    expect(payloads[1].reasoning?.effort).toBe('low');
+    expect(payloads[0].input.some((item: any) => item.type === 'configuration_update')).toBe(false);
+    expect(payloads[1].reasoning).toMatchObject({ effort: 'low' });
+    expect(payloads[1].input.some((item: any) => item.type === 'configuration_update')).toBe(false);
   });
 
   it('passes an arbitrary OpenRouter ID to pi-ai as the resolved custom model', async () => {
@@ -1679,63 +1682,112 @@ describe('runner › scoped tool loading', () => {
     expect(plain.initialReadFileState).toBeUndefined();
   });
 
-  it('keeps non-project Commander to-dos global through loading, CRUD and denied project requests', async () => {
+  it.each([true, false])('lets non-project Commander read another project without gaining write access (goals enabled: %s)', async (goalsEnabled) => {
+    // Plan §6, second phase R1-R4 (2026-11-18): read-only outside the project.
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    vi.stubEnv('ORKAS_PROJECT_RECAP_TAB_ENABLED', goalsEnabled ? '1' : undefined);
     const uid = 'runner-unbound-project-tasks';
     await configureUser(uid);
     const projects = await import('../../../src/main/features/projects');
     const tasks = await import('../../../src/main/features/project_tasks');
+    const goals = await import('../../../src/main/features/project_goal');
     const project = await projects.createProject(uid, 'PRIVATE_PROJECT');
     if (!project.ok) throw new Error('project fixture failed');
     const privateTask = await tasks.createTask(uid, project.project.project_id, { content: 'PRIVATE_PROJECT_TASK' });
     if (!privateTask.ok) throw new Error('task fixture failed');
+    expect((await tasks.updateTask(uid, project.project.project_id, privateTask.task.id,
+      { status: 'review', note: 'List in q4-list.xlsx' })).ok).toBe(true);
+    expect((await goals.saveProjectGoal(uid, project.project.project_id,
+      { goal: 'Reach 100k a month', success_criteria: ['Two months at 100k'] }, 'ui')).ok).toBe(true);
     const chats = await import('../../../src/main/features/chats');
     await chats.createConversation(uid, { conversationId: 'outside-project', title: 'Direct work' });
     const before = await tasks.listTasks(uid, project.project.project_id);
     const names = vi.spyOn(projects, 'listProjectNameRows');
     const { buildRunner } = await loadRunner();
     const built = await buildRunner({ sessionId: 'gconv-unbound-project-tasks', userId: uid, cid: 'outside-project' });
+    // Building the turn lists no projects; only a read the model asks for does.
+    expect(names).not.toHaveBeenCalled();
     const tools = (built.runner as any).tools;
     expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('todo_tasks');
     expect(built.turnEphemeral).not.toContain('## Global open work');
-    expect(built.turnEphemeral).toContain('except that Commander can manage the project it creates for this conversation during this turn immediately');
+    const projectFacts = goalsEnabled ? 'goal and to-dos' : 'to-dos';
+    expect(built.turnEphemeral).toContain(`When the user asks how another project is going, read its ${projectFacts} with todo_tasks`);
+    expect(built.turnEphemeral.includes('and any goal and success criteria')).toBe(goalsEnabled);
+    expect(built.turnEphemeral).not.toContain('Commander can manage the project it creates');
     expect(built.turnEphemeral.match(/## Global to-do scope/g)).toHaveLength(1);
     const context = { workingDir: tmpDir, state: {} };
     expect((await tools.get('tool_load').execute({ groups: ['management.todos'] }, context)).isError).toBeFalsy();
     expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('project_setup');
     const tool = tools.get('todo_tasks');
-    expect(tool.inputSchema.properties.project.type).toBe('string');
-    expect(tool.inputSchema.properties.project.description).toContain('Only that new project ID is accepted');
-    expect(tool.inputSchema.properties.action.enum).not.toContain('list_projects');
-    expect(tool.inputSchema.properties.project.description).toContain('other projects are unavailable');
-    expect(tool.description).not.toContain('When asked about them, explain');
-    const created = JSON.parse((await tool.execute({ action: 'create', project: '__global__', content: 'Global work' }, context)).content);
+    expect(tool.description).toContain(`or read another project's ${projectFacts}`);
+    expect(tool.inputSchema.properties.project.description).toContain('For list and get only');
+    expect(tool.inputSchema.properties.action.enum).toContain('list_projects');
+    const call = async (request: Record<string, unknown>) => {
+      const result = await tool.execute(request, context);
+      return { isError: !!result.isError, body: JSON.parse(result.content) };
+    };
+    // Global work is unchanged.
+    const created = (await call({ action: 'create', project: '__global__', content: 'Global work' })).body;
     expect(created).toMatchObject({ ok: true, outcome: 'task_created' });
-    const id = created.task.id;
-    expect(await tasks.getTask(uid, '', id)).toMatchObject({ content: 'Global work', status: 'todo', origin_cid: 'outside-project' });
-    expect((await tool.execute({ action: 'update', task_id: id, status: 'review' }, context)).isError).toBeFalsy();
-    expect((await tool.execute({ action: 'complete', task_id: id }, context)).isError).toBeFalsy();
-    expect(await tasks.getTask(uid, '', id)).toMatchObject({ status: 'done' });
+    expect((await call({ action: 'complete', task_id: created.task.id })).isError).toBe(false);
+    expect(await tasks.getTask(uid, '', created.task.id)).toMatchObject({ status: 'done' });
+    // Reads of another project, by name or id, with its goal.
+    expect((await call({ action: 'list_projects' })).body.projects)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ project_id: project.project.project_id, name: 'PRIVATE_PROJECT' })]));
+    const listed = await call({ action: 'list', project: 'PRIVATE_PROJECT' });
+    expect(listed.isError).toBe(false);
+    expect(listed.body.tasks.map((task: any) => task.content)).toEqual(['PRIVATE_PROJECT_TASK']);
+    expect(listed.body.project).toMatchObject({ project_id: project.project.project_id, name: 'PRIVATE_PROJECT' });
+    if (goalsEnabled) {
+      expect(listed.body.project.goal).toEqual({ goal: 'Reach 100k a month', success_criteria: ['Two months at 100k'], status: 'active' });
+    } else {
+      expect(listed.body.project).not.toHaveProperty('goal');
+    }
+    const got = await call({ action: 'get', project: project.project.project_id, task_id: privateTask.task.id });
+    expect(got.body.task).toMatchObject({ content: 'PRIVATE_PROJECT_TASK', status: 'review', note: 'List in q4-list.xlsx' });
+    expect(Object.hasOwn(got.body.project, 'goal')).toBe(goalsEnabled);
+    // Every write to it is refused with the confirmed receipt, and nothing changes.
     for (const request of [
-      { action: 'list_projects' },
-      { action: 'list', project: 'PRIVATE_PROJECT' },
-      { action: 'get', project: project.project.project_id, task_id: privateTask.task.id },
-      { action: 'get', task_id: privateTask.task.id },
-      { action: 'complete', task_id: privateTask.task.id },
       { action: 'create', project: project.project.project_id, content: 'Forbidden' },
-      { action: 'create', project: 'missing-project', content: 'Forbidden' },
-    ]) expect((await tool.execute(request, context)).isError).toBe(true);
+      { action: 'update', project: 'PRIVATE_PROJECT', task_id: privateTask.task.id, status: 'done' },
+      { action: 'complete', project: 'PRIVATE_PROJECT', task_id: privateTask.task.id },
+      { action: 'delete', project: 'PRIVATE_PROJECT', task_id: privateTask.task.id },
+      { action: 'add_attachment', project: 'PRIVATE_PROJECT', task_id: privateTask.task.id, source_path: path.join(tmpDir, 'x.txt') },
+    ]) {
+      const refused = await call(request);
+      expect(refused.isError, JSON.stringify(request)).toBe(true);
+      expect(refused.body).toMatchObject({ ok: false, error: 'project_read_only',
+        message: "Another project's to-dos are read-only here; changing them requires a conversation in that project." });
+    }
+    // A project task id without the project is still not a global task; unknown projects fail.
+    expect((await call({ action: 'get', task_id: privateTask.task.id })).isError).toBe(true);
+    expect((await call({ action: 'list', project: 'missing-project' })).body).toMatchObject({ ok: false, error: 'project_not_found' });
+    // Programmatic reads use the same executor; programmatic writes stay refused.
     const program = tools.get('run_program');
-    expect(program).toBeDefined();
-    const denied = await program.execute({ code: 'const result = await tools.todo_tasks({action:"get",project:"PRIVATE_PROJECT",task_id:"' + privateTask.task.id + '"}); console.log(result);' }, context);
-    expect(denied.content).toContain('project_scope_mismatch');
-    expect(denied.content).not.toContain('PRIVATE_PROJECT_TASK');
+    const read = await program.execute({ code: 'const result = await tools.todo_tasks({action:"get",project:"PRIVATE_PROJECT",task_id:"' + privateTask.task.id + '"}); json(result);' }, context);
+    expect(read.content).toContain('PRIVATE_PROJECT_TASK');
+    const write = await program.execute({ code: 'const result = await tools.todo_tasks({action:"complete",project:"PRIVATE_PROJECT",task_id:"' + privateTask.task.id + '"}); json(result);' }, context);
+    expect(write.content).toContain('project_read_only');
     expect(await tasks.listTasks(uid, project.project.project_id)).toEqual(before);
-    expect(names).not.toHaveBeenCalled();
+    // Nothing from another project is injected without a read.
     expect(built.resolvedSystemPrompt + built.turnEphemeral).not.toContain('PRIVATE_PROJECT_TASK');
-    const next = await buildRunner({ sessionId: 'gconv-unbound-project-tasks', userId: uid, cid: 'outside-project' });
-    expect(next.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('todo_tasks');
     names.mockRestore();
+  }, 60_000); // Includes cold runner loading and QuickJS bridge startup.
+
+  it('keeps a non-project named Agent on global to-dos with the original scope sentence', async () => {
+    process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
+    const uid = 'runner-unbound-agent-tasks';
+    await configureUser(uid);
+    const projects = await import('../../../src/main/features/projects');
+    const project = await projects.createProject(uid, 'PRIVATE_PROJECT');
+    if (!project.ok) throw new Error('project fixture failed');
+    const chats = await import('../../../src/main/features/chats');
+    await chats.createConversation(uid, { conversationId: 'outside-agent', title: 'Agent work' });
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gmember-unbound-agent', userId: uid, cid: 'outside-agent',
+      agentId: 'a_writer', outputDelivery: 'final' } as any);
+    expect(built.turnEphemeral).toContain('Project to-dos require a conversation in that project, except that Commander can manage the project it creates for this conversation during this turn immediately.');
+    expect(built.turnEphemeral).not.toContain('When the user asks how another project is going');
   });
 
   it('keeps shared member discovery absent from each public global and private turn', async () => {
@@ -1803,8 +1855,7 @@ describe('runner › scoped tool loading', () => {
     expect(added.isError).toBeFalsy();
     const addedId = JSON.parse(added.content).task.id;
     expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ content: 'Agent-created item' });
-    // The conversation's first open project to-do links back to it.
-    expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ origin_cid: 'agent-result' });
+    expect(await tasks.getTask(uid, first.project.project_id, addedId)).not.toHaveProperty('origin_cid');
     expect((await bound.execute({ action: 'update', task_id: addedId, content: 'Edited by Agent\nNew detail' }, context)).isError).toBeFalsy();
     expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ content: 'Edited by Agent\nNew detail' });
     for (const project of [second.project.project_id, '__global__']) {
@@ -2760,6 +2811,30 @@ describe('runner › scoped tool loading', () => {
     expect(excluded.resolvedSystemPrompt).not.toContain('@skill/web-app-sdk');
   });
 
+  // Review 2026-11-16 S3-1: the app SDK guide was resident for every named Agent, about 246
+  // tokens, although only those that declare app authoring can act on it.
+  it('lists the app SDK guide only for named Agents that declare app authoring', async () => {
+    const uid = 'runner-web-sdk-declared';
+    await configureUser(uid);
+    const paths = await import('../../../src/main/paths');
+    fs.cpSync(path.resolve(process.cwd(), 'resources/builtin/system/skills'), paths.userSystemSkillsDir(uid), {recursive:true});
+    const { buildRunner } = await loadRunner();
+    const named = (agentId: string, toolList: string[]) => buildRunner({sessionId:`gmember-sdk-${agentId}`,userId:uid,agentId,
+      toolList, systemSkillList:['web-app-sdk']});
+    const designer = await named('designer', ['workspace.read', 'workspace.artifact']);
+    expect(designer.resolvedSystemPrompt).toContain('@skill/web-app-sdk');
+    // A parent group declares its children, app authoring included.
+    expect((await named('builder', ['workspace'])).resolvedSystemPrompt).toContain('@skill/web-app-sdk');
+    const office = await named('office', ['workspace.read', 'office.word']);
+    expect(office.resolvedSystemPrompt).not.toContain('## System skills');
+    expect(office.resolvedSystemPrompt).not.toContain('@skill/web-app-sdk');
+    const read = (office.runner as any).tools.get('read_files');
+    const unlisted = await read.execute({paths:[{path:'@skill/web-app-sdk'}]}, {workingDir:tmpDir,state:new Map(),signal:undefined});
+    expect(unlisted.isError).toBe(true);
+    const commander = await buildRunner({sessionId:'gconv-sdk-commander',userId:uid,systemSkillList:['web-app-sdk']});
+    expect(commander.resolvedSystemPrompt).toContain('@skill/web-app-sdk');
+  });
+
   it('keeps both LLM and CLI Agent editors on a fixed host-only surface', async () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'runner-scoped-agent-editor-boundary';
@@ -2951,7 +3026,7 @@ describe('runner › scoped tool loading', () => {
     expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({
       status: 'done',
     });
-    expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({ origin_cid: 'task-origin' });
+    expect(await todos.getTask(uid, pid, receipt.todoId)).not.toHaveProperty('origin_cid');
     expect(await automations.getTask(uid, receipt.autoId)).toMatchObject({
       title: 'Edited automation', content: 'Full automation detail', project_id: pid, enabled: false,
     });
@@ -3167,6 +3242,54 @@ describe('runner › scoped tool loading', () => {
     expect(refreshed.inputSchema.properties?.code?.description)
       .toContain('{ok,content}');
     expect(runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('write_file');
+  });
+
+  it.each(['scoped', 'legacy'] as const)('exposes apply_patch and runs saved legacy edits in %s mode', async (mode) => {
+    process.env.ORKAS_TOOL_LOADING_MODE = mode;
+    const uid = 'runner-single-editor';
+    await configureUser(uid);
+    const userWorkspace = await import('../../../src/main/features/user_workspace');
+    const workspace = path.join(tmpDir, 'single-editor');
+    fs.mkdirSync(workspace);
+    expect(userWorkspace.setWorkspacePath(uid, workspace).ok).toBe(true);
+    const target = path.join(workspace, 'settings.txt');
+    const initial = 'key=old\r\nkey=old\nkeep\n';
+    fs.writeFileSync(target, initial);
+    const expectedHash = `sha256:${createHash('sha256').update(initial).digest('hex')}`;
+    fs.writeFileSync(path.join(workspace, 'existing-program.js'), [
+      'const result = await tools.edit_file({',
+      `  path: "settings.txt", old_string: "old", new_string: "new", replace_all: true, expected_hash: "${expectedHash}"`,
+      '});',
+      'if (!result.ok) throw new Error(result.content);',
+      'text(result.content);',
+    ].join('\n'));
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: `gconv-single-editor-${mode}`, userId: uid });
+    const runner = built.runner as any;
+    const ctx = { workingDir: workspace, state: {} };
+    if (mode === 'scoped') {
+      const loaded = await runner.tools.get('tool_load').execute({ groups: ['workspace.write.edit'] }, ctx);
+      expect(JSON.parse(loaded.content).newly_activated_tools).toContain('apply_patch');
+      expect(JSON.parse(loaded.content).newly_activated_tools).not.toContain('edit_file');
+    }
+    expect(runner.getActiveToolDefinitions().map((tool: { name: string }) => tool.name))
+      .toContain('apply_patch');
+    expect(runner.getActiveToolDefinitions().map((tool: { name: string }) => tool.name))
+      .not.toContain('edit_file');
+    expect(built.resolvedSystemPrompt).not.toMatch(/`edit_file` —/);
+    const result = await runner.tools.get('run_program').execute({ path: 'existing-program.js' }, ctx);
+    expect(result.isError, result.content).toBeFalsy();
+    expect(result.content).toMatch(/edited="2".*revision="file_rev_/);
+    expect(fs.readFileSync(target)).toEqual(Buffer.from('key=new\r\nkey=new\nkeep\n'));
+    const editContext = { workingDir: workspace, state: { readFileState: new Map() } };
+    const read = await runner.tools.get('read_files').execute({ paths: [{ path: 'settings.txt' }] }, editContext);
+    expect(read.isError, read.content).toBeFalsy();
+    const patched = await runner.tools.get('apply_patch').execute({ patch: [
+      '*** Begin Patch', '*** Update File: settings.txt', '@@', '-keep', '+kept', '*** End Patch',
+    ].join('\n') }, editContext);
+    expect(patched.isError, patched.content).toBeFalsy();
+    expect(JSON.parse(patched.content).files[0].revision).toMatch(/^file_rev_/);
+    expect(fs.readFileSync(target)).toEqual(Buffer.from('key=new\r\nkey=new\nkept\n'));
   });
 
   it('keeps Commander Management schemas deferred until tool_load activates them', async () => {
@@ -3701,14 +3824,18 @@ describe('runner › conversation-history scope exposure', () => {
       expect(prompt.indexOf('Use supplied context first')).toBeLessThan(prompt.indexOf('## Runtime injection'));
       expect(built.turnEphemeral).not.toContain('even without a user lookup request');
       const schema = built.toolDefs.find((tool) => tool.name === 'chat_history')!.inputSchema as any;
-      expect(schema.properties.action.description).toContain('Follow next_read');
+      expect(schema.properties.action.description).toMatch(/(?:follow|copy) next_read unchanged/i);
+      for (const group of ['read', 'process', 'output']) {
+        expect(schema.properties[group].properties).toHaveProperty('cursor');
+        expect(schema.properties[group].properties).toHaveProperty('max_tokens');
+      }
       expect(schema.properties.read.properties).toHaveProperty('record_id');
       expect(schema.properties.process.required).toEqual(['record_id', 'process_index']);
       expect(schema.properties.process.properties.process_index.minimum).toBe(0);
       expect(schema.properties.output.required).toEqual(['record_id', 'tool_call_id']);
       expect(schema.properties.search.required).toEqual(['query']);
       expect(schema.properties.search.properties.query.type).toBe('string');
-      for (const legacy of ['page', 'query', 'record_id', 'process_index', 'tool_call_id', 'output_cursor']) {
+      for (const legacy of ['page', 'query', 'record_id', 'process_index', 'tool_call_id', 'output_cursor', 'cursor', 'max_tokens']) {
         expect(schema.properties).not.toHaveProperty(legacy);
       }
     }

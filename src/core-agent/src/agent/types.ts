@@ -296,6 +296,8 @@ export type AgentRunEvent =
         | "active_process_compaction_start"
         | "active_process_compaction_done"
         | "active_process_compaction_failed"
+        /** The one candidate summary is ready to use if a main request commits. */
+        | "candidate_summary_done"
         /** Layered compaction could not hold the request under the ceiling, so
          *  raw tool output was dropped without a summary. Distinct from the
          *  phases above because information was lost, not condensed. */

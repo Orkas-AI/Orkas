@@ -37,6 +37,7 @@ it('keeps fallback and loaded video model names aligned for new and saved profil
     const sandbox = loadSettingsSandbox();
     const models = Object.entries(VIDEO_MODEL_SPECS).flatMap(([provider, specs]) => specs.map(spec => ({ provider, ...spec })));
     expect(sandbox._settingsVideoProviderOptions()).toHaveLength(21);
+    expect(models).toEqual(expect.arrayContaining([expect.objectContaining({ provider: 'doubao', id: 'doubao-seedance-2-5-flash' })]));
     for (const model of models) {
       expect(sandbox._videoProviderLabel(model.provider, model.id)).toBe(model.name);
     }

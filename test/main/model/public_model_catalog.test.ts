@@ -25,19 +25,16 @@ describe('public model catalog', () => {
     }
   });
 
-  it('offers GPT-6 tiers while retaining the GPT-5.6 selections', () => {
-    const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
-    expect(PUBLIC_PROVIDER_MODELS.openai?.map((model) => model.id)).toEqual([
-      ...expected.slice(0, 2), 'gpt-6.1-terra', ...expected.slice(2),
-    ]);
-    expect(PUBLIC_PROVIDER_MODELS['openai-codex']?.map((model) => model.id)).toEqual([
-      ...expected.slice(0, 2), 'gpt-6.1-terra', ...expected.slice(2),
-    ]);
+  it('offers GPT tiers newest first while retaining the GPT-5.6 selections', () => {
+    const expected = ['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6.1-terra',
+      'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+    expect(PUBLIC_PROVIDER_MODELS.openai?.map((model) => model.id)).toEqual(expected);
+    expect(PUBLIC_PROVIDER_MODELS['openai-codex']?.map((model) => model.id)).toEqual(expected);
     expect(PUBLIC_PROVIDER_MODELS.openai?.every((model) => model.maxInputImages === 20)).toBe(true);
     expect(PUBLIC_PROVIDER_MODELS['openai-codex']?.every((model) => model.maxInputImages === 20)).toBe(true);
   });
 
-  it('tracks recent Anthropic models and the Gemini 3.1 Pro exception', () => {
+  it('tracks recent Anthropic models', () => {
     expect(PUBLIC_PROVIDER_MODELS.anthropic?.map((model) => model.id)).toEqual([
       'claude-opus-5-5',
       'claude-opus-5',
@@ -48,13 +45,29 @@ describe('public model catalog', () => {
       'claude-sonnet-5',
       'claude-haiku-5-5',
     ]);
-    expect(PUBLIC_PROVIDER_MODELS.google?.map((model) => model.id)).toEqual([
-      'gemini-3.8-flash',
+  });
+
+  it('orders stable Gemini choices newest first on both supported routes', () => {
+    const expected = [
+      'gemini-4-neon',
+      'gemini-4-hydrogen',
+      'gemini-4-carbon',
       'gemini-4-argon',
+      'gemini-3.8-flash',
+      'gemini-3.5-flash-lite',
+    ];
+    const google = PUBLIC_PROVIDER_MODELS.google;
+    const openrouter = PUBLIC_PROVIDER_MODELS.openrouter.filter(model => model.id.startsWith('google/'));
+    expect(google.filter(model => !model.hiddenFromPicker).map(model => model.id)).toEqual(expected);
+    expect(openrouter.filter(model => !model.hiddenFromPicker).map(model => model.id))
+      .toEqual(expected.map(id => `google/${id}`));
+    const hidden = [
       'gemini-3.7-flash',
       'gemini-3.1-pro-preview',
-      'gemini-3.5-flash-lite',
-    ]);
+    ];
+    expect(google.filter(model => model.hiddenFromPicker).map(model => model.id)).toEqual(hidden);
+    expect(openrouter.filter(model => model.hiddenFromPicker).map(model => model.id))
+      .toEqual(hidden.map(id => `google/${id}`));
   });
 
   it('leaves Terra protocol, pricing and windows to its native SDK entries', () => {
@@ -68,8 +81,12 @@ describe('public model catalog', () => {
     }
   });
 
-  it('keeps the MiMo V2.5 output reservation within its documented 64K ceiling', () => {
-    expect(PUBLIC_PROVIDER_MODELS.openrouter.find(model => model.id === 'xiaomi/mimo-v2.5')?.maxTokens).toBe(65_536);
+  it('keeps only compatibility records for retired OpenRouter MiMo 2.5 models', () => {
+    expect(PUBLIC_PROVIDER_MODELS.openrouter.filter(model => model.id.startsWith('xiaomi/mimo-v2.5')))
+      .toEqual([
+        expect.objectContaining({ id: 'xiaomi/mimo-v2.5-pro', hiddenFromPicker: true }),
+        expect.objectContaining({ id: 'xiaomi/mimo-v2.5', hiddenFromPicker: true }),
+      ]);
   });
 
   it('publishes DeepSeek V4.1 Flash and the V4 models with their window and the host output reservation', () => {
@@ -131,19 +148,24 @@ describe('public model catalog', () => {
       'anthropic/claude-sonnet-5.5',
       'anthropic/claude-sonnet-5',
       'anthropic/claude-haiku-5.5',
-      'openai/gpt-6-astra',
+      'openai/gpt-6.2-astra',
+      'openai/gpt-6.2-sol',
       'openai/gpt-6.1-sol',
       'openai/gpt-6.1-terra',
+      'openai/gpt-6-astra',
       'openai/gpt-6-sol',
       'openai/gpt-6-luna',
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
-      'google/gemini-3.8-flash',
+      'google/gemini-4-neon',
+      'google/gemini-4-hydrogen',
+      'google/gemini-4-carbon',
       'google/gemini-4-argon',
+      'google/gemini-3.8-flash',
+      'google/gemini-3.5-flash-lite',
       'google/gemini-3.7-flash',
       'google/gemini-3.1-pro-preview',
-      'google/gemini-3.5-flash-lite',
       'deepseek/deepseek-v4.1-flash',
       'deepseek/deepseek-v4-pro',
       'deepseek/deepseek-v4-flash-0731',
@@ -167,7 +189,7 @@ describe('public model catalog', () => {
   it('declares compatibility metadata for models newer than older runtimes', () => {
     for (const provider of ['openai', 'openai-codex'] as const) {
       // GPT windows belong to the SDK catalog, including compatibility templates.
-      expect(PUBLIC_PROVIDER_MODELS[provider]?.[0]).toEqual({
+      expect(PUBLIC_PROVIDER_MODELS[provider]?.find(model => model.id === 'gpt-6-astra')).toEqual({
         id: 'gpt-6-astra',
         name: 'GPT-6 Astra',
         maxTokens: 128_000,

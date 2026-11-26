@@ -84,7 +84,7 @@ const PYTHON_PREVIEW_ACCESS_RE = /^127\.0\.0\.1 - - \[[^\]\r\n]{1,80}\] "(?:GET|
 const PYTHON_PREVIEW_REBUILD_RE = /^127\.0\.0\.1 - - \[[^\]\r\n]{1,80}\] rebuilt localized preview \/[^\s\r\n]{0,8192}\?lang=[a-z]{2}(?:-[a-z0-9]{2,3})?$/;
 // WebKit's MediaSessionManagerInterface release logs and typed dump rows.
 // Only a launch-bound WebKit producer may use this non-error native format.
-const WEBKIT_MEDIA_RECORD_RE = /^\[WebKitWin:Media:-\] MediaSessionManagerInterface::(?:sessionWillBeginPlayback\(0\) \d{1,20}(?: returning (?:true|false))?|setCurrentSession\(0\) \d{1,20}, size = \d{1,10}|dumpSessionStates\(0\)  Sessions:)$/;
+const WEBKIT_MEDIA_RECORD_RE = /^\[WebKitWin:Media:-\] MediaSessionManagerInterface::(?:(?:sessionWillBeginPlayback|startSessionAdmission)\(0\) \d{1,20}(?: returning (?:true|false))?|setCurrentSession\(0\) \d{1,20}, size = \d{1,10}|dumpSessionStates\(0\)  Sessions:)$/;
 const WEBKIT_MEDIA_DUMP_RE = /^\[WebKitWin:Media:-\] MediaSessionManagerInterface::dumpSessionStates\(0\)  Sessions:$/;
 const WEBKIT_MEDIA_SESSION_RE = /^\([a-fA-F0-9]{1,16}\): (?:(?:None|Video|VideoAudio|Audio|WebAudio|DOMMediaSession), (?:Idle|Autoplaying|Playing|Paused|Interrupted)(?:, [^\x00-\x1f\x7f]{0,1024})?|null)$/;
 
@@ -189,7 +189,12 @@ export function normalizePytestLogFrame(line) {
 }
 
 /** `onFinding(finding, line)` lets a caller keep its own bounded, redacted
- * signature of the analyzed line; the collector itself never retains text. */
+ * signature of the analyzed line; the collector itself never retains text.
+ * @param {string} phase
+ * @param {{ maxLineChars?: number, pytestProgress?: boolean,
+ *   producer?: 'python-http-preview' | 'firefox-native-browser' | 'webkit-native-browser' | 'chromium-headless-browser' | 'rolling-deploy',
+ *   onFinding?: (finding: { severity: 'warning' | 'error', code: string, source?: string }, line?: string) => void }} [options]
+ */
 export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_LINE_CHARS, onFinding, producer, pytestProgress = false } = {}) {
   if (producer !== undefined && producer !== 'python-http-preview' && producer !== 'firefox-native-browser' && producer !== 'webkit-native-browser' && producer !== 'chromium-headless-browser') throw new Error('Unknown process log producer');
   const state = {

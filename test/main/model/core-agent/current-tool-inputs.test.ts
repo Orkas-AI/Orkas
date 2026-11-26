@@ -23,7 +23,11 @@ describe('current-only model tool inputs', () => {
     const tool = createChatHistoryTool({ userId: 'retired-input-fixture', currentCid: 'fixture', allowedScopes: ['current'] });
     const result = await tool.execute({ action: 'search', scope: 'current', ...selectors }, { state: {} });
     expect(result.isError).toBe(true);
-    expect(JSON.parse(result.content)).toMatchObject({ code: 'unsupported_fields', fields: expect.arrayContaining(['k']) });
+    expect(JSON.parse(result.content)).toMatchObject({
+      code: 'unsupported_fields',
+      fields: expect.arrayContaining(['k']),
+      issues: [{ field: 'k', expected_path: 'search.k' }],
+    });
   });
 
   it('does not clear a plan through an operation absent from the current snapshot contract', async () => {

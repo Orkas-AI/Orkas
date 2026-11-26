@@ -174,6 +174,43 @@ describe('own model capacity preference', () => {
     expect(budget.compaction_attempts ?? 0).toBe(0);
     expect(events.some(event => event.type === 'compaction')).toBe(false);
   });
+
+  // 2026-11-02 review S1-7: a user model answering 503 at once is not out for the
+  // run, but while the fallback model does the work it must not set the budget.
+  it('prices the fallback window while the user model keeps failing with 503', async () => {
+    const calls: Call[] = [];
+    const session = new Session();
+    seed(session, 4, 26000, 40000);
+    const fetch = { name: 'fetch', description: 'Fetch a page', inputSchema: { type: 'object' },
+      async execute() { return { content: 'p'.repeat(150000) }; } };
+    const unavailable = () => Object.assign(new Error('503 Service Unavailable'), { status: 503 });
+    const own = backend('own', calls, () => unavailable());
+    const fallback = backend('fallback', calls, n => n === 0 ? fetchRound('fallback-model', 'fallback-0') : finished('fallback-model'));
+    const byName = candidates(own, fallback);
+    const rotating = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [byName.own, byName.fallback] });
+    const providers = new ProviderRegistry();
+    providers.registerFactory('custom', () => rotating);
+    const runner = new AgentRunner({
+      session, providers, tools: [defineTool(fetch)],
+      config: createConfig({
+        agent: { defaultProvider: 'custom', defaultModel: 'own-model', maxRetries: 0 },
+        evolution: { enabled: false },
+        models: { catalog: {
+          'own-model': { provider: 'custom', model: 'own-model', contextWindow: 131072, maxOutputTokens: 32768 },
+          'fallback-model': { provider: 'custom', model: 'fallback-model', contextWindow: 272000, maxOutputTokens: 32000 },
+        } },
+      }),
+    });
+    const { events, error } = await drain(runner);
+    expect(error).toBeUndefined();
+    // The first request pays the in-place retries; the next one tries the user model once.
+    expect(mainCalls(calls).map(call => call.who)).toEqual(['own', 'own', 'own', 'own', 'fallback', 'own', 'fallback']);
+    const budget = mainCalls(calls).at(-1)!.params.requestMetadata!.contextBudgetDiagnostics as Record<string, unknown>;
+    expect(budget.preparation_context_window).toBe(272000);
+    expect(budget.compaction_attempts ?? 0).toBe(0);
+    expect(events.some(event => event.type === 'compaction')).toBe(false);
+  });
   it('prepares again only once and then surfaces the original failure', async () => {
     let streams = 0;
     const repeating: LLMProvider = {
