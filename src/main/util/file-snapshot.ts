@@ -1,7 +1,7 @@
 import * as fsp from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 
-function signature(stat: Stats): string {
+export function fileSnapshotSignature(stat: Stats): string {
   return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 }
 
@@ -24,7 +24,7 @@ export class FileSnapshotCache<T> {
       // Preserve the owner's handling of missing, malformed or denied sources.
       return load();
     }
-    const stamp = signature(before);
+    const stamp = fileSnapshotSignature(before);
     const cached = this.entries.get(file);
     if (cached?.signature === stamp) {
       this.entries.delete(file); this.entries.set(file, cached);
@@ -38,7 +38,7 @@ export class FileSnapshotCache<T> {
       const after = await fsp.stat(file).catch(() => null);
       // Atomic replacement or an in-place sync during a read must not publish
       // the old value under a newer file identity, or replace a newer flight.
-      if (this.pending.get(file)?.run === run && after && signature(after) === stamp) {
+      if (this.pending.get(file)?.run === run && after && fileSnapshotSignature(after) === stamp) {
         this.drop(file);
         if (value !== null) {
           const weight = Math.max(1, this.size(value));

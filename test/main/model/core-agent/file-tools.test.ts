@@ -865,6 +865,22 @@ describe('file-tools › reference media reads', () => {
 });
 
 describe('file-tools › read_file (image)', () => {
+  it('reports the source canvas alongside the resized image returned to the model', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'portrait.png');
+    const { default: sharp } = await import('sharp');
+    const original = await sharp({ create: { width: 1200, height: 1500, channels: 3, background: '#324c69' } })
+      .png().toBuffer();
+    fs.writeFileSync(file, original);
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: file }] });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('source_dimensions="1200x1500"');
+    expect(result.content).toContain('preview_dimensions="819x1024"');
+    expect(result.images).toHaveLength(1);
+    expect(await sharp(Buffer.from(result.images[0].data, 'base64')).metadata()).toMatchObject({ width: 819, height: 1024 });
+    expect(fs.readFileSync(file)).toEqual(original);
+  });
+
   it('preserves reference colors in the model-facing image bytes', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'chart.png');
@@ -3174,6 +3190,33 @@ describe('file-tools › search_files', () => {
       expect(searchResults(result.content).files.map(file => file.name)).toEqual([target]);
       expect(result.content).toContain('complete=true');
     } finally { process.env.PATH = originalPath; }
+  });
+
+  it('finds literal opening brackets in filenames while preserving valid bracket globs', async () => {
+    const { tools, wsDir } = await buildTools();
+    for (const name of ['invoice [draft.txt', 'invoice 1.txt', 'invoice 7.txt']) {
+      fs.writeFileSync(path.join(wsDir, name), '');
+    }
+    const search = getTool(tools, 'search_files');
+    for (const [query, wanted] of [
+      ['[draft', 'invoice [draft.txt'],
+      ['*[draft.txt', 'invoice [draft.txt'],
+      ['invoice [1-3].txt', 'invoice 1.txt'],
+    ]) {
+      const result = await run(search, { root: wsDir, query });
+      expect(searchResults(result.content).files.map(file => file.name)).toEqual([wanted]);
+    }
+  });
+
+  it('keeps a valid filename character class alongside an unclosed bracket in the same glob', async () => {
+    const { tools, wsDir } = await buildTools();
+    for (const name of ['invoice 1 [draft.txt', 'invoice 7 [draft.txt', 'invoice 2 final.txt']) {
+      fs.writeFileSync(path.join(wsDir, name), '');
+    }
+    for (const query of ['invoice [1-3] [draft.txt', 'invoice [1-3] [d*.txt']) {
+      const result = await run(getTool(tools, 'search_files'), { root: wsDir, query });
+      expect(searchResults(result.content).files.map(file => file.name)).toEqual(['invoice 1 [draft.txt']);
+    }
   });
 
   it('reports cancellation as incomplete without scanning or claiming no matches', async () => {

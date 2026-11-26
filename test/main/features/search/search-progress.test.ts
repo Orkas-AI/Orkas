@@ -29,14 +29,19 @@ afterEach(async () => {
 
 it('retains every candidate while reading only requested summaries and publishes fast summaries before a held source', async () => {
   const chats = await import('../../../../src/main/features/chats');
-  const store = await import('../../../../src/main/features/search/chat_store');
+  const { appendJsonl } = await import('../../../../src/main/storage');
+  const { conversationMessageFile } = await import('../../../../src/main/util/project-layout');
+  const { reconcileChatsIndex } = await import('../../../../src/main/features/search/indexer');
   const ids: string[] = [];
   for (let i = 0; i < 12; i++) {
     const cid = (await chats.createConversation(uid, { title: `Result ${i}` })).conversation_id;
     ids.push(cid);
-    fs.writeFileSync(path.join(root, uid, 'cloud/chats', cid + '.jsonl'), JSON.stringify({ text: 'needle' }) + '\n');
-    store.replaceConversation(uid, cid, [{ cid, msgIndex: 0, role: 'user', time: '', text: 'needle' }], { mtime: 1, size: 1, next: 1 });
+    await appendJsonl(conversationMessageFile(uid, cid, null), {
+      id: `message-${i}`, from: 'user', to: ['commander'], ts: new Date(0).toISOString(), text: 'needle',
+    });
   }
+  // Hydration starts with a built index, as it does after the desktop metadata page.
+  expect((await reconcileChatsIndex(uid)).complete).toBe(true);
   const held = gate();
   const read = vi.spyOn(await import('../../../../src/main/features/search/chat-snippets'), 'readChatSnippets')
     .mockImplementation(async file => {
@@ -44,6 +49,9 @@ it('retains every candidate while reading only requested summaries and publishes
       return new Map([[0, { snippet: 'needle', visible: true }]]);
     });
   const search = await import('../../../../src/main/features/search');
+  const preview = await search.searchChats(uid, 'needle', { limit: 200, includeSnippets: false });
+  expect(preview.map(row => row.cid).sort()).toEqual([...ids].sort());
+  expect(read).not.toHaveBeenCalled();
   const pages: any[] = [];
   const pending = (async () => {
     for await (const page of search.streamSearch(uid, 'needle', { scope: 'chat', limit: 200,

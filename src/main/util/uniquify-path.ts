@@ -38,24 +38,58 @@ export interface UniquifyResult {
   renamed: boolean;
 }
 
+/** Reserve a name while a long-running producer makes its bytes. The same
+ * registry serves ordinary writes, so neither can take the other's name. */
+export async function reserveUniquePath(
+  absPath: string,
+  isMine: (p: string) => boolean,
+  signal?: AbortSignal,
+  possiblePaths?: (candidate: string) => readonly string[],
+): Promise<UniquifyResult & { release: () => void }> {
+  const requested = path.resolve(absPath);
+  const { decision, claimedPaths } = await fileEditLock(path.dirname(requested)).runExclusive(async () => {
+    signal?.throwIfAborted();
+    const decision = possiblePaths
+      ? await findUniquePath(requested, async (candidate) => (
+          await Promise.all(possiblePaths(candidate).map((p) => pathIsAvailable(p, isMine, reservedWritePaths)))
+        ).every(Boolean))
+      : await uniquifyPath(requested, isMine, reservedWritePaths);
+    const claimedPaths = possiblePaths?.(decision.finalPath) ?? [decision.finalPath];
+    for (const p of claimedPaths) reservedWritePaths.add(p);
+    return { decision, claimedPaths };
+  });
+  let released = false;
+  return { ...decision, release: () => {
+    if (released) return;
+    released = true;
+    for (const p of claimedPaths) reservedWritePaths.delete(p);
+  } };
+}
+
 /** Cap on rename attempts. A single basename growing past `<name>-9999<ext>`
  *  almost certainly means a runaway directory or an `isMine` predicate that
  *  always returns false against itself — fail loud rather than spin. */
 const MAX_ATTEMPTS = 10000;
 
-export async function uniquifyPath(
+export function uniquifyPath(
   absPath: string,
   isMine: (p: string) => boolean,
   unavailable?: ReadonlySet<string>,
 ): Promise<UniquifyResult> {
-  if (!unavailable?.has(absPath) && (isMine(absPath) || !(await pathExists(absPath)))) return { finalPath: absPath, renamed: false };
+  return findUniquePath(absPath, (p) => pathIsAvailable(p, isMine, unavailable));
+}
+
+async function pathIsAvailable(p: string, isMine: (p: string) => boolean, unavailable?: ReadonlySet<string>): Promise<boolean> {
+  return !unavailable?.has(p) && (isMine(p) || !(await pathExists(p)));
+}
+
+async function findUniquePath(absPath: string, isAvailable: (p: string) => Promise<boolean>): Promise<UniquifyResult> {
+  if (await isAvailable(absPath)) return { finalPath: absPath, renamed: false };
 
   const { dir, name, ext } = path.parse(absPath);
   for (let n = 2; n < MAX_ATTEMPTS; n++) {
     const candidate = path.join(dir, `${name}-${n}${ext}`);
-    if (unavailable?.has(candidate)) continue;
-    if (isMine(candidate)) return { finalPath: candidate, renamed: true };
-    if (!(await pathExists(candidate))) return { finalPath: candidate, renamed: true };
+    if (await isAvailable(candidate)) return { finalPath: candidate, renamed: true };
   }
   throw new Error(`uniquifyPath: exhausted ${MAX_ATTEMPTS} attempts under ${dir}`);
 }
@@ -82,17 +116,13 @@ export async function uniquifyPathForWrite<T>(
   const requested = path.resolve(absPath);
   const lock = fileEditLock(requested);
   const release = signal ? await acquireWithAbort(() => lock.acquire(), signal) : await lock.acquire();
-  let decision: UniquifyResult | undefined;
+  let decision: Awaited<ReturnType<typeof reserveUniquePath>> | undefined;
   try {
     // Hold the directory lock only for allocation, never generation/write.
-    await fileEditLock(path.dirname(requested)).runExclusive(async () => {
-      signal?.throwIfAborted();
-      decision = await uniquifyPath(requested, isMine, reservedWritePaths);
-      reservedWritePaths.add(decision.finalPath);
-    });
-    return await write(decision!);
+    decision = await reserveUniquePath(requested, isMine, signal);
+    return await write({ finalPath: decision.finalPath, renamed: decision.renamed });
   } finally {
-    if (decision) reservedWritePaths.delete(decision.finalPath);
+    decision?.release();
     release();
   }
 }

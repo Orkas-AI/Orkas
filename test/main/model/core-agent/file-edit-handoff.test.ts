@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -107,6 +109,113 @@ it('keeps edit evidence when a valid UTF-8 file is read with an explicit utf-8 l
   expect(read.content).not.toContain('encoding=');
   expect((await call('edit_file', { path: 'target.py', old_string: 'value = 1', new_string: 'value = 2' })).isError).toBeFalsy();
   expect(fs.readFileSync(target, 'utf8')).toBe('value = 2\n');
+});
+
+it.each([
+  ['edit_file', 'E_EDIT_FAILED'],
+  ['apply_patch', 'E_PATCH_STAGE_FAILED'],
+] as const)('preserves existing file bytes when %s runs out of space during the write', async (toolName, errorCode) => {
+  const { workingDir, target, call, patch } = await setup();
+  const original = 'value = 1\nother = 2\n';
+  const edited = 'value = 3\nother = 2\n';
+  fs.writeFileSync(target, original);
+  expect((await call('read_files', { paths: [{ path: 'target.py' }] })).isError).toBeFalsy();
+
+  const write = nativeFs.writeFileSync;
+  let faultInjected = false;
+  const spy = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation((file, data, options) => {
+    if (typeof file === 'string' && path.dirname(file) === workingDir && String(data) === edited) {
+      faultInjected = true;
+      write(file, edited.slice(0, 6), options);
+      throw Object.assign(new Error('Controlled partial file write'), { code: 'ENOSPC' });
+    }
+    write(file, data, options);
+  });
+  syncBuiltinESMExports();
+
+  const edit = toolName === 'edit_file'
+    ? { path: 'target.py', old_string: 'value = 1', new_string: 'value = 3' }
+    : patch('value = 1', 'value = 3');
+  try {
+    const result = await call(toolName, edit);
+    expect(faultInjected).toBe(true);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain(errorCode);
+    expect.soft(fs.readFileSync(target)).toEqual(Buffer.from(original));
+    expect(fs.readdirSync(workingDir)).toEqual(['target.py']);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  const retry = await call(toolName, edit);
+  expect.soft(retry.isError).toBeFalsy();
+  expect.soft(fs.readFileSync(target)).toEqual(Buffer.from(edited));
+});
+
+it('leaves the prior version at its original path until a single patch publishes', async () => {
+  const { workingDir, target, call, patch } = await setup();
+  fs.writeFileSync(target, 'value = 1\n');
+  expect((await call('read_files', { paths: [{ path: 'target.py' }] })).isError).toBeFalsy();
+  const rename = nativeFs.renameSync;
+  let contentsAtPublish: string | undefined;
+  const spy = vi.spyOn(nativeFs, 'renameSync').mockImplementation((source, destination) => {
+    if (destination === target && String(source).endsWith('.tmp')) {
+      contentsAtPublish = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : undefined;
+      throw Object.assign(new Error('Controlled rename failure'), { code: 'EBUSY' });
+    }
+    rename(source, destination);
+  });
+  syncBuiltinESMExports();
+  try {
+    expect((await call('apply_patch', patch('value = 1', 'value = 2'))).content)
+      .toContain('E_PATCH_COMMIT_FAILED');
+    expect(contentsAtPublish).toBe('value = 1\n');
+    expect(fs.readFileSync(target, 'utf8')).toBe('value = 1\n');
+    expect(fs.readdirSync(workingDir)).toEqual(['target.py']);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  expect((await call('apply_patch', patch('value = 1', 'value = 2'))).isError).toBeFalsy();
+  expect(fs.readFileSync(target, 'utf8')).toBe('value = 2\n');
+});
+
+it('preserves a concurrent external revision when it arrives during patch staging', async () => {
+  const { workingDir, target, call, patch } = await setup();
+  fs.writeFileSync(target, 'value = 1\n');
+  expect((await call('read_files', { paths: [{ path: 'target.py' }] })).isError).toBeFalsy();
+  const write = nativeFs.writeFileSync;
+  const external = 'value = 100\n';
+  const spy = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation((file, data, options) => {
+    write(file, data, options);
+    if (String(file).endsWith('.tmp')) write(target, external);
+  });
+  syncBuiltinESMExports();
+  try {
+    const result = await call('apply_patch', patch('value = 1', 'value = 2'));
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('source changed before publication');
+    expect(fs.readFileSync(target, 'utf8')).toBe(external);
+    expect(fs.readdirSync(workingDir)).toEqual(['target.py']);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  expect((await call('read_files', { paths: [{ path: 'target.py' }] })).isError).toBeFalsy();
+  expect((await call('apply_patch', patch('value = 100', 'value = 2'))).isError).toBeFalsy();
+  expect(fs.readFileSync(target, 'utf8')).toBe('value = 2\n');
+});
+
+it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('keeps a read-only target intact during native and legacy updates', async () => {
+  const { workingDir, target, call, patch } = await setup();
+  fs.writeFileSync(target, 'value = 1\n', { mode: 0o444 });
+  expect((await call('read_files', { paths: [{ path: 'target.py' }] })).isError).toBeFalsy();
+  expect((await call('apply_patch', patch('value = 1', 'value = 2'))).isError).toBe(true);
+  const edit = { path: 'target.py', old_string: 'value = 1', new_string: 'value = 2' };
+  expect((await call('edit_file', edit)).isError).toBe(true);
+  expect(fs.readFileSync(target, 'utf8')).toBe('value = 1\n');
+  expect(fs.statSync(target).mode & 0o777).toBe(0o444);
+  expect(fs.readdirSync(workingDir)).toEqual(['target.py']);
 });
 
 it('hands the refreshed source byte size from a raced read to one replay-safe append', async () => {
