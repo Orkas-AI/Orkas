@@ -228,15 +228,24 @@ function buildCases(root: string, clipFile: string): Case[] {
         const reference = await project(root, 'direct-cut-reference', assets);
         await Promise.all([compiled.writeManifest(manifest(scenes)), reference.writeManifest(manifest(scenes))]);
         await reference.writePage(page(scenes.map(({ id }) => `<section data-scene-id="${id}"></section>`).join('')));
-        const progress: Array<{ data?: { directCut?: boolean; directCutFallback?: boolean } }> = [];
+        const progress: Array<{ data?: { sceneId?: string; directCut?: boolean; directCutFallback?: boolean } }> = [];
         const direct = await timelineApi.renderVideoTimeline({ ...compiled.renderOptions(), onProgress: (event: typeof progress[number]) => progress.push(event) });
         const rendered = await timelineApi.renderVideoTimeline(reference.renderOptions());
         assertWindow(rendered);
         if (!direct.ok || !rendered.ok) return [`render failed: ${direct.message || rendered.message}`];
         const expected = [...range(7, 17), ...range(24, 14), ...range(68, 16)];
         const failures = [...diff(await decodeFrameNumbers(compiled.out), expected), ...diff(await decodeFrameNumbers(reference.out), expected)];
-        if (progress.filter((event) => event.data?.directCut).length !== 2
-          || progress.some((event) => event.data?.directCutFallback)) failures.push('expected two direct cuts and one page-rendered cut');
+        const directScenes = progress.flatMap(event => event.data?.directCut ? [event.data.sceneId] : []);
+        const fallbackScenes = progress.flatMap(event => event.data?.directCutFallback ? [event.data.sceneId] : []);
+        if (directScenes.length !== 2 || fallbackScenes.length) {
+          failures.push(`expected two direct cuts and one page-rendered cut; direct=${JSON.stringify(directScenes)} fallback=${JSON.stringify(fallbackScenes)}`);
+          const probe = await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_streams', '-show_format', '-of', 'json', source]);
+          const versions = await Promise.all([ffmpeg, ffprobe].map(binary => run(binary, ['-version'])));
+          const summary = versions.map(result => result.stdout.toString().split(/\r?\n/, 1)[0]);
+          const data = probe.code === 0 ? JSON.parse(probe.stdout.toString()) : undefined;
+          if (data?.format) delete data.format.filename;
+          failures.push(`direct-cut fixture: ${JSON.stringify({ versions: summary, probeExit: probe.code, stream: data?.streams?.[0], format: data?.format })}`);
+        }
         const readOutput = async (file: string, args: string[]) => {
           const decoded = await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', file, ...args, 'pipe:1']);
           if (decoded.code !== 0 || decoded.stderr) throw new Error(`output decode failed: ${decoded.stderr}`);
