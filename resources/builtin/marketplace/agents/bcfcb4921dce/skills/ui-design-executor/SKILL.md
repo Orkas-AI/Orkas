@@ -23,7 +23,7 @@ A design request is not that instruction. "Redesign this screen", "this UI is ug
 
 Without the instruction the repo is read-only for every tool you hold, not only the obvious ones:
 
-- No `write_file`, `edit_file`, `apply_patch`, or `delete_file` under the repo.
+- Do not create, modify, or delete files in the repo through file tools or scripts, including `apply_patch` and `run_program`.
 - No `bash` that writes there either: `mv`, `cp`, `rm`, `>`/`>>`, `sed -i`, `git apply/checkout/stash`, or a script that regenerates tracked files.
 - Writing beside an existing file instead of into it is not a loophole. A write that lands as `<name>-2.<ext>` means you were writing where you should have been proposing: remove it and propose.
 

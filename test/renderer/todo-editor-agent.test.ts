@@ -81,6 +81,17 @@ describe('todo editor assignment', () => {
     expect(patch).toEqual({ projectId: '', taskId: 't_aabbccddeeff', content: 'New', attachment_order: [] });
   });
 
+  it('offers built-in Agents as project to-do owners even when the project never added them', async () => {
+    const h = harness(async (channel) => {
+      if (channel === 'projects.bindings.list') return { ok: true,
+        agentDetails: [{ agent_id: 'a', name: 'Alpha' }],
+        availableAgents: [{ agent_id: 'a', name: 'Alpha' }, { agent_id: 'video', name: 'VideoStudio', builtin: true }] };
+      return { ok: true };
+    });
+    await h.open(null, 'p');
+    expect(h.selects['project-todo-agent'].state.options.map((o: any) => o.value)).toEqual(['', 'commander', 'a', 'video']);
+  });
+
   it('keeps an unavailable project owner under its stored name without offering it as a new choice', async () => {
     const h = harness(async (channel) => {
       if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [
@@ -92,7 +103,9 @@ describe('todo editor assignment', () => {
     await h.open({ id: 't_aabbccddeeff', content: 'Old', status: 'todo', owner_agent_id: 'removed', owner_agent: 'Previous owner' }, 'p');
     const options = h.selects['project-todo-agent'].state.options;
     expect(options.map((o: any) => o.value)).toEqual(['', 'commander', 'a', 'removed']);
-    expect(options.find((o: any) => o.value === 'removed').label).toBe('Previous owner');
+    expect(options.find((o: any) => o.value === 'removed')).toMatchObject({
+      label: 'Previous owner', displayOnly: true,
+    });
     expect(h.selects['project-todo-agent'].getValue()).toBe('removed');
   });
 

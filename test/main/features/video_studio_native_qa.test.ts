@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { BrowserWindow, NativeImage } from 'electron';
 
 
 import {
@@ -18,6 +19,8 @@ import {
   buildInspectScript,
   buildFrameEncoderArgs,
   buildVideoTrackRemuxArgs,
+  capturePresentedCompositionFrame,
+  COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
   isCompositionRequestUrlAllowed,
   isWindowsNativeRuntimeIncompatible,
   pruneSegmentCache,
@@ -79,6 +82,121 @@ function writeExecutable(file: string, body: string) {
   fs.writeFileSync(file, body, 'utf8');
   fs.chmodSync(file, 0o755);
 }
+
+describe('software composition frame presentation', () => {
+  function captureFixture() {
+    let subscribed: ((image: NativeImage) => void) | undefined;
+    const execute = vi.fn<(source: string) => Promise<void>>(async () => {});
+    const end = vi.fn(() => { subscribed = undefined; });
+    const capturePage = vi.fn<() => Promise<NativeImage>>(() => new Promise(() => {}));
+    const win = {
+      isDestroyed: () => false,
+      destroy: vi.fn(),
+      webContents: {
+        beginFrameSubscription: (_dirtyOnly: boolean, callback: (image: NativeImage) => void) => { subscribed = callback; },
+        endFrameSubscription: end,
+        executeJavaScript: execute,
+        invalidate: vi.fn(),
+        capturePage,
+      },
+    } as unknown as BrowserWindow;
+    // The source is a 125% frame. Do not reproduce the host's sampling logic.
+    function frame(colors: readonly string[] = []) {
+      const bytes = Buffer.alloc(250 * 125 * 4, 28);
+      for (const [column, color] of colors.entries()) {
+        const start = Math.round(column * 5);
+        for (let x = start; x < start + 5; x++) {
+          for (let y = 0; y < 5; y++) {
+            const o = (y * 250 + x) * 4;
+            bytes.set(color === 'lime' ? [0, 250, 0, 255] : [250, 0, 250, 255], o);
+          }
+        }
+      }
+      return {
+        isEmpty: () => false,
+        getSize: () => ({ width: 250, height: 125 }),
+        crop: ({ width, height }: { width: number; height: number }) => ({
+          toBitmap: () => Buffer.concat(Array.from({ length: height }, (_, y) => bytes.subarray(y * 1000, y * 1000 + width * 4))),
+        }),
+      } as unknown as NativeImage;
+    }
+    return { win, execute, end, capturePage, frame, deliver: (image: NativeImage) => subscribed?.(image) };
+  }
+
+  it('waits for the requested marker, then returns the presentation with the marker removed', async () => {
+    const fixture = captureFixture();
+    const clean = fixture.frame();
+    const other = fixture.frame(['lime', 'lime']);
+    let marked: NativeImage;
+    fixture.execute.mockImplementationOnce(async (script) => {
+      const colors = Array.from(script.matchAll(/(magenta|lime) \d+px \d+px/g), (item) => item[1]);
+      expect(colors.length).toBeGreaterThan(2);
+      marked = fixture.frame(colors);
+      fixture.deliver(clean);
+      fixture.deliver(other);
+      fixture.deliver(marked);
+    }).mockImplementationOnce(async () => {
+      fixture.deliver(marked);
+    });
+    fixture.capturePage.mockResolvedValueOnce(clean);
+    const render = vi.fn(async () => {});
+    await expect(capturePresentedCompositionFrame({ win: fixture.win, width: 200, height: 100,
+      render, timeoutMessage: 'target frame did not arrive' })).resolves.toBe(clean);
+    expect(render).toHaveBeenCalledOnce();
+    expect(fixture.capturePage).toHaveBeenCalledOnce();
+    expect(fixture.end).toHaveBeenCalledOnce();
+  });
+
+  it('ignores a snapshot that still carries the marker', async () => {
+    const fixture = captureFixture();
+    const clean = fixture.frame();
+    fixture.execute.mockImplementationOnce(async (script) => {
+      const colors = Array.from(script.matchAll(/(magenta|lime) \d+px \d+px/g), (item) => item[1]);
+      const marked = fixture.frame(colors);
+      fixture.capturePage.mockResolvedValueOnce(marked).mockImplementationOnce(async () => {
+        fixture.deliver(clean);
+        return clean;
+      });
+      fixture.deliver(marked);
+    });
+    const pending = capturePresentedCompositionFrame({ win: fixture.win, width: 200, height: 100,
+      render: async () => {}, timeoutMessage: 'target frame did not arrive' });
+    await expect(pending).resolves.toBe(clean);
+    expect(fixture.capturePage).toHaveBeenCalledTimes(2);
+    expect(fixture.end).toHaveBeenCalledOnce();
+  });
+
+  it('releases its presentation subscription when the render is stopped', async () => {
+    const fixture = captureFixture();
+    const stop = new AbortController();
+    const render = vi.fn(async () => {});
+    const pending = capturePresentedCompositionFrame({ win: fixture.win, width: 200, height: 100,
+      render, timeoutMessage: 'target frame did not arrive', signal: stop.signal });
+    const failure = expect(pending).rejects.toThrow('test cancellation');
+    await vi.waitFor(() => expect(fixture.capturePage).toHaveBeenCalledOnce());
+    stop.abort(new Error('test cancellation'));
+    await failure;
+    expect(fixture.end).toHaveBeenCalledOnce();
+  });
+
+  it('reports a missing presentation as a capture timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = captureFixture();
+      const pending = capturePresentedCompositionFrame({ win: fixture.win, width: 200, height: 100,
+        render: async () => {}, timeoutMessage: 'target frame did not arrive' });
+      const failure = expect(pending).rejects.toMatchObject({
+        errorCode: 'E_RENDER_CAPTURE_TIMEOUT',
+        message: 'target frame did not arrive',
+      });
+      await Promise.all([failure, vi.advanceTimersByTimeAsync(COMPOSITION_RENDER_FRAME_TIMEOUT_MS)]);
+      expect(fixture.win.destroy).toHaveBeenCalledOnce();
+      expect(fixture.end).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('native VideoStudio rendering', () => {
 

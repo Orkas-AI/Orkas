@@ -1320,6 +1320,11 @@ export function getConfiguredProviderModels(providerId: string): { models: Provi
   };
 }
 
+export function hasServerProviderModelList(providerId: string): boolean {
+  const catalog = normalizeModelCatalogConfig(clientConfig.getServerValue('model_catalog'));
+  return Object.prototype.hasOwnProperty.call(catalog.providers, providerId);
+}
+
 export function getConfiguredImageGenCapability(providerId: string): ImageGenCapabilityOverride | null {
   const id = normalizeKey(providerId);
   if (!id) return null;

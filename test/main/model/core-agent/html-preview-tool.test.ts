@@ -303,18 +303,10 @@ describe('programmatic html_preview', () => {
     expect(nextModelImages(result)).toEqual([]);
   });
 
-  it.each(['failed-checks', 'browser-unavailable'])('withholds misleading screenshots after %s and permits an explicit recovery', async failure => {
+  it('returns a browser failure without images and permits an explicit recovery', async () => {
     const { tool, workspace, render } = await buildTool();
     fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><button>Review</button>');
-    if (failure === 'failed-checks') {
-      const original = render.getMockImplementation()!;
-      render.mockImplementationOnce(async (...args) => {
-        const result = await original(...args);
-        result.evidence.ok = false;
-        result.evidence.blockers = ['mobile: horizontal overflow is 28px'];
-        return result;
-      });
-    } else render.mockRejectedValueOnce(new Error('E_HTML_PREVIEW_BROWSER_UNAVAILABLE: browser unavailable'));
+    render.mockRejectedValueOnce(new Error('E_HTML_PREVIEW_BROWSER_UNAVAILABLE: browser unavailable'));
     const result = await runProgramWithTools([tool], `
       const failed = await tools.html_preview({ path: 'index.html', screenshots: true });
       if (failed.ok) throw Error('Failed preview reported success');
@@ -324,8 +316,7 @@ describe('programmatic html_preview', () => {
       text('Recovery passed');
     `, workspace, UID);
     expect(result.isError, result.content).not.toBe(true);
-    expect(result.content).toContain(failure === 'failed-checks'
-      ? 'deterministic_checks_failed' : 'E_HTML_PREVIEW_BROWSER_UNAVAILABLE');
+    expect(result.content).toContain('E_HTML_PREVIEW_BROWSER_UNAVAILABLE');
     expect(result.content).toContain('Recovery passed');
     expect(render).toHaveBeenCalledTimes(2);
     expect(nextModelImages(result)).toEqual([]);
@@ -418,14 +409,19 @@ describe('html_preview tool', () => {
   });
 
   it.each([
-    {}, { artifact_id: '' }, { artifact_id: 123 }, { artifact_id: null },
-    { artifact_id: 'app', path: 'index.html' }, { artifact_id: 'app', path: '' },
-    { artifact_id: 'app', path: null },
-  ])('rejects missing or ambiguous preview sources before rendering: %j', async (input) => {
+    [{}, 'missing_source'],
+    [{ artifact_id: '' }], [{ artifact_id: 123 }], [{ artifact_id: null }],
+    [{ artifact_id: 'app', path: 'index.html' }, 'conflicting_sources'],
+    [{ artifact_id: 'app', path: '' }, 'conflicting_sources'],
+    [{ artifact_id: 'app', path: null }, 'conflicting_sources'],
+  ] as Array<[Record<string, unknown>, string?]>)('rejects missing or ambiguous preview sources before rendering: %j', async (input, reason) => {
     const { tool, render, context } = await buildTool();
     const result = await tool.execute(input, context);
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_BAD_INPUT');
+    if (reason) expect(JSON.parse(result.content)).toMatchObject({ issues: [
+      { field: 'path', reason }, { field: 'artifact_id', reason },
+    ] });
     expect(render).not.toHaveBeenCalled();
   });
 
@@ -484,7 +480,7 @@ describe('html_preview tool', () => {
     expect(render).not.toHaveBeenCalled();
   });
 
-  it('retains app layout failures and withholds screenshots without exposing its storage path', async () => {
+  it('returns app screenshots with layout findings without exposing its storage path', async () => {
     const { context, render, tool } = await buildTool({ ok: false, blockers: ['mobile: horizontal overflow is 28px'] });
     const artifacts = await import('../../../../src/main/features/chat_artifacts');
     const created = await artifacts.createArtifact(UID, CID, '', {
@@ -492,11 +488,11 @@ describe('html_preview tool', () => {
     });
     if (!created.ok) throw new Error('fixture creation failed');
     const result = await tool.execute({ artifact_id: created.artifactId, screenshots: true }, context);
-    expect(result.isError).toBe(true);
-    expect(result.images).toBeUndefined();
+    expect(result.isError).toBeUndefined();
+    expect(result.images).toHaveLength(1);
     expect(JSON.parse(result.content)).toMatchObject({
       artifact_id: created.artifactId, blockers: ['mobile: horizontal overflow is 28px'],
-      visual_evidence: { attached: false, reason: 'deterministic_checks_failed' },
+      visual_evidence: { attached: true, viewports: ['desktop'] },
     });
     expect(result.content).not.toContain(root);
     render.mockRejectedValueOnce(new Error(`cannot load ${root}/private-artifact/index.html`));
@@ -519,7 +515,6 @@ describe('html_preview tool', () => {
       visual_evidence: {
         attached: false,
         reason: 'not_requested',
-        policy: 'attach_only_when_requested_after_preview_checks_passed',
       },
     });
     expect(render).toHaveBeenCalledWith(path.join(workspace, 'index.html'), [
@@ -631,8 +626,8 @@ describe('html_preview tool', () => {
     ], {}, { fileViewer: true });
   });
 
-  it('returns deterministic diagnostics without model images when rendered checks fail', async () => {
-    const { tool, workspace, context } = await buildTool({
+  it.each([true, false])('retains layout findings and honors screenshots=%s', async requested => {
+    const { tool, workspace, context, screenshots } = await buildTool({
       ok: false,
       blockers: ['mobile: horizontal overflow is 28px'],
     });
@@ -641,11 +636,18 @@ describe('html_preview tool', () => {
     const result = await tool.execute({
       path: 'index.html',
       target: 'responsive',
-      screenshots: true,
+      screenshots: requested,
     }, context);
 
-    expect(result.isError).toBe(true);
-    expect(result.images).toBeUndefined();
+    expect(result.isError).toBeUndefined();
+    if (requested) {
+      expect(result.images).toHaveLength(2);
+      for (const [i, screenshot] of screenshots.entries()) {
+        await expectLosslessImageMatch(result.images![i], screenshot);
+      }
+    } else {
+      expect(result.images).toBeUndefined();
+    }
     expect(JSON.parse(result.content)).toMatchObject({
       ok: false,
       blockers: ['mobile: horizontal overflow is 28px'],
@@ -653,11 +655,9 @@ describe('html_preview tool', () => {
         formsSubmitted: 1,
         downloads: [{ filename: 'resume.txt' }],
       },
-      visual_evidence: {
-        attached: false,
-        reason: 'deterministic_checks_failed',
-        policy: 'attach_only_after_requested_preview_checks_pass',
-      },
+      visual_evidence: requested
+        ? { attached: true, viewports: ['desktop', 'mobile'] }
+        : { attached: false, reason: 'not_requested' },
       viewports: [{ name: 'desktop' }, { name: 'mobile', horizontalOverflowPx: 28 }],
     });
   });

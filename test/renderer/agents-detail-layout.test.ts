@@ -180,7 +180,9 @@ describe('external CLI Agent detail layout', () => {
     const source = fs.readFileSync(path.join(rendererRoot, 'modules/agents.js'), 'utf8');
     const ast = ts.createSourceFile('agents.js', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const entry = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === '_renderAgentDetailRuntime');
+    const badgeLabel = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === '_cliBadgeLabel');
     expect(entry).toBeDefined();
+    expect(badgeLabel).toBeDefined();
     // A minimal DOM ownership double; the native CLI E2E separately verifies
     // the real controls, locale text and installer invocation count.
     class Element {
@@ -220,12 +222,17 @@ describe('external CLI Agent detail layout', () => {
         mount.options = options; const trigger = new Element(); trigger.className = 'ai-select-trigger'; mount.appendChild(trigger);
       },
     });
+    vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'shared/local-cli-defaults.js'), 'utf8'), context);
+    vm.runInContext(badgeLabel!.getText(ast), context);
     vm.runInContext(entry!.getText(ast), context);
     const agent = { agent_id: 'one', runtime: { kind: 'cli', cli: 'claude' } };
     const runs = [context._renderAgentDetailRuntime(agent), context._renderAgentDetailRuntime(agent)];
     expect.soft(slot.querySelector('.local-cli-upgrade-control')).toBe(feedback);
     for (const index of olderFirst ? [0, 1] : [1, 0]) {
-      resolveDiscovery[index]([{ type: 'claude', available: true, version: index === 0 ? '2.1.112' : '2.1.113' }]);
+      resolveDiscovery[index]([
+        { type: 'claude', available: true, version: index === 0 ? '2.1.112' : '2.1.113' },
+        { type: 'kimi', available: true, version: '99.0.0' },
+      ]);
       await runs[index];
     }
     expect(slot.querySelector('.local-cli-upgrade-control')).toBe(feedback);

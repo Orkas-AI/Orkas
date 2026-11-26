@@ -25,7 +25,9 @@ describe('project_instructions tool', () => {
     const def = toToolDefinition(createProjectInstructionsTool(stubHandler().handler));
     const instructions = (def.inputSchema.properties as any).instructions;
     expect(estimateTextTokens(def.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
-    expect(def.description).toContain('standing goal and rules');
+    expect(def.description).toContain('standing rules');
+    expect(def.description).not.toContain('goal and rules');
+    expect(def.description).toContain('project_setup set_goal');
     expect(def.description).toContain('todo_tasks');
     expect(def.description).toContain('project memory');
     expect(instructions.description).toContain('Complete replacement');

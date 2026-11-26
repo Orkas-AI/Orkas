@@ -68,6 +68,8 @@ export interface CrossSessionMemoryToolOptions {
   projectTierReadOnly?: boolean;
   /** Only Commander may mutate account-global user/shared memory. */
   globalTiersReadOnly?: boolean;
+  /** The caller's reply supports the native group-chat handback marker. */
+  supportsCapabilityHandback?: boolean;
 }
 
 type MemoryAction = 'add' | 'replace' | 'remove' | 'list' | 'batch';
@@ -87,7 +89,9 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
   const projectReadOnly = !!opts.includeProjectTier && !!opts.projectTierReadOnly;
   const description = opts.globalTiersReadOnly
     ? 'Use intended scope, not write access. ' + MEMORY_ADMISSION_RULE
-      + ' User/shared writes belong to Commander: hand back those changes without substituting or duplicating them in another store.'
+      + (opts.supportsCapabilityHandback
+        ? ' Hand the original user/shared memory write request back to Commander with <handback reason="capability_boundary" />.'
+        : ' User/shared writes belong to Commander: hand back those changes without substituting or duplicating them in another store.')
       + (projectReadOnly ? PROJECT_READONLY_NOTE : '')
     : opts.includeProjectTier
     ? TOOL_DESCRIPTION_WITH_PROJECT + (projectReadOnly ? PROJECT_READONLY_NOTE : '')

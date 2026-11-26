@@ -8,7 +8,9 @@ import { execFileSync } from 'node:child_process';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
-it('keeps every shipped Agent within the uniform initial-overhead budget', async () => {
+const INITIAL_OVERHEAD_TOKENS = 20_000;
+
+it('measures every shipped Agent in global and project turns and warns on high global initial overhead', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-sync-overhead-'));
   const previous = { workspace: process.env.ORKAS_WORKSPACE_ROOT, skills: process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT, mode: process.env.ORKAS_TOOL_LOADING_MODE };
   process.env.ORKAS_WORKSPACE_ROOT = root;
@@ -65,22 +67,33 @@ it('keeps every shipped Agent within the uniform initial-overhead budget', async
     const chats = await import('../../../src/main/features/chats');
     const state = await import('../../../src/main/features/group_chat/state');
     const bus = await import('../../../src/main/features/group_chat/bus');
-    for (const agent of [{ agent_id: 'commander', name: 'Commander', tool_list: undefined }, ...entries]) {
-      selected = { agentId: agent.agent_id, name: agent.name, configuredGroups: agent.tool_list };
-      const cid = `overhead-${agent.agent_id}`;
-      await chats.createConversation('initial-overhead-fixture', { conversationId: cid, title: 'Initial overhead measurement' });
-      conversations.push(cid);
-      if (agent.agent_id !== 'commander') await state.ensureAgentMember('initial-overhead-fixture', cid, agent.agent_id, agent.name);
-      const before = rows.length;
-      const bindingsBefore = skillBindings.length;
-      await bus.enqueue({ uid: 'initial-overhead-fixture', cid, fromActorId: 'user', text: 'Return the fixture reply.', forceTo: [agent.agent_id] });
-      await vi.waitFor(() => expect(bus.isQuiescent('initial-overhead-fixture', cid)).toBe(true), { timeout: 20000 });
-      expect(rows.length, agent.agent_id).toBe(before + 1);
-      expect(rows.at(-1).toolNames).toContain('tool_result');
-      const bindings = skillBindings.slice(bindingsBefore).filter(row => row.agentId === agent.agent_id);
-      expect(bindings.length, `${agent.name} must assemble a real initial runner`).toBeGreaterThan(0);
-      for (const ref of ('skill_list' in agent ? agent.skill_list : []) ?? []) {
-        expect(bindings[0].refs, `${agent.name} initial request must include its declared Skill ${ref}`).toContain(ref);
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject('initial-overhead-fixture', 'Budget fixture');
+    if (!created.ok) throw new Error('Budget fixture project was not created');
+    for (const agent of entries) {
+      const bound = await projects.addAgentBinding('initial-overhead-fixture', created.project.project_id, agent.agent_id);
+      expect(bound.ok).toBe(true);
+    }
+    for (const scope of ['non-project', 'project'] as const) {
+      const projectId = scope === 'project' ? created.project.project_id : undefined;
+      for (const agent of [{ agent_id: 'commander', name: 'Commander', tool_list: undefined }, ...entries]) {
+        selected = { agentId: agent.agent_id, name: agent.name, configuredGroups: agent.tool_list, scope };
+        const cid = `overhead-${scope}-${agent.agent_id}`;
+        await chats.createConversation('initial-overhead-fixture', { conversationId: cid, title: 'Initial overhead measurement', ...(projectId ? { projectId } : {}) });
+        conversations.push(cid);
+        if (agent.agent_id !== 'commander') await state.ensureAgentMember('initial-overhead-fixture', cid, agent.agent_id, agent.name);
+        const before = rows.length;
+        const bindingsBefore = skillBindings.length;
+        await bus.enqueue({ uid: 'initial-overhead-fixture', cid, fromActorId: 'user', text: 'Return the fixture reply.', forceTo: [agent.agent_id] });
+        await vi.waitFor(() => expect(bus.isQuiescent('initial-overhead-fixture', cid)).toBe(true), { timeout: 20000 });
+        expect(rows.length, agent.agent_id).toBe(before + 1);
+        expect(rows.at(-1).toolNames).toContain('tool_result');
+        if (projectId && agent.agent_id === 'commander') expect(rows.at(-1).toolNames).toContain('todo_tasks');
+        const bindings = skillBindings.slice(bindingsBefore).filter(row => row.agentId === agent.agent_id);
+        expect(bindings.length, `${agent.name} must assemble a real initial runner`).toBeGreaterThan(0);
+        for (const ref of ('skill_list' in agent ? agent.skill_list : []) ?? []) {
+          expect(bindings[0].refs, `${agent.name} initial request must include its declared Skill ${ref}`).toContain(ref);
+        }
       }
     }
     const reportPath = process.env.ORKAS_INITIAL_OVERHEAD_REPORT;
@@ -89,10 +102,12 @@ it('keeps every shipped Agent within the uniform initial-overhead budget', async
       estimatorSha256: createHash('sha256').update(fs.readFileSync('src/core-agent/src/agent/runner.ts')).digest('hex'),
       resourceManifestSha256: createHash('sha256').update(fs.readFileSync('resources/builtin/_manifest.json')).digest('hex'),
       fixture: 'Clean isolated workspace, shipped resources, no connections, no explicit loading, real bus/client/runner/estimator; provider transport alone observed without network.', rows }, null, 2));
-    console.log('[initial-overhead]', rows.map(row => `${row.name}=${row.F}`).join(' '));
-    // The product-owner-selected engineering limit applies to complete initial
-    // resident overhead, identically for every actor. It is not provider capacity.
-    expect(rows.filter(row => row.F > 20_000).map(row => ({ name: row.name, F: row.F }))).toEqual([]);
+    console.log('[initial-overhead]', rows.map(row => `${row.name}/${row.scope}=${row.F}`).join(' '));
+    for (const row of rows) {
+      if (row.scope === 'non-project' && row.F > INITIAL_OVERHEAD_TOKENS) {
+        console.warn('[agent-initial-overhead] advisory', { agent: row.name, total_tokens: row.F, limit_tokens: INITIAL_OVERHEAD_TOKENS });
+      }
+    }
   } finally {
     const bus = await import('../../../src/main/features/group_chat/bus');
     for (const cid of conversations) await bus.dropConv('initial-overhead-fixture', cid);

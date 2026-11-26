@@ -565,6 +565,28 @@ describe("augmentPath", () => {
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin");
   });
 
+  it("keeps host architecture available to Windows programs without exposing unrelated variables", () => {
+    vi.stubEnv("PROCESSOR_ARCHITECTURE", "x86");
+    vi.stubEnv("PROCESSOR_ARCHITEW6432", "ARM64");
+    vi.stubEnv("ORKAS_TEST_ENV_UNRELATED", "test-only-value");
+    try {
+      const windows = buildSandboxEnv(undefined, "win32");
+      expect(windows).toMatchObject({ PROCESSOR_ARCHITECTURE: "x86", PROCESSOR_ARCHITEW6432: "ARM64" });
+      expect(windows).not.toHaveProperty("ORKAS_TEST_ENV_UNRELATED");
+      const posix = buildSandboxEnv(undefined, "linux");
+      expect(posix).not.toHaveProperty("PROCESSOR_ARCHITECTURE");
+      expect(posix).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
+      vi.stubEnv("PROCESSOR_ARCHITEW6432", undefined);
+      const native = buildSandboxEnv(undefined, "win32");
+      expect(native.PROCESSOR_ARCHITECTURE).toBe("x86");
+      expect(native).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
+      vi.stubEnv("PROCESSOR_ARCHITECTURE", undefined);
+      expect(buildSandboxEnv(undefined, "win32")).not.toHaveProperty("PROCESSOR_ARCHITECTURE");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("defaults Windows Python subprocesses to UTF-8 stdio", () => {
     const env = buildSandboxEnv(undefined, "win32");
     expect(env.PYTHONIOENCODING).toBe("utf-8");

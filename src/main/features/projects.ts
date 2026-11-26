@@ -23,11 +23,18 @@
  *
  * **Scope semantics** (CLAUDE.md §6, outer intersection BEFORE the 4
  * enable-filter sites):
- *   conversation in project P → only agents in `bindings.json` are
- *   visible to the LLM. Orphan conversation (no project_id) → unchanged
- *   global visibility. `resolveProjectScope` is the single resolver
- *   threaded through the runTurn pipeline (alongside the workspace
- *   resolver) — do not re-read bindings per tool call.
+ *   conversation in project P → every built-in Agent, plus the added Agents, is visible to the LLM. Orphan
+ *   conversation (no project_id) → unchanged global visibility.
+ *   `resolveProjectScope` is the single resolver threaded through the runTurn
+ *   pipeline (alongside the workspace resolver) — do not re-read bindings per
+ *   tool call. Other access checks use `availableProjectAgentIds` /
+ *   `isAgentAvailableInProject`.
+ *
+ * **Built-in Agents** (product decision 2026-11-23) are available in every
+ * project without being added: a project created without adding Agents left
+ * Commander with no specialist, so video work never reached VideoStudio.
+ * Bindings remain the project's added membership — listing, sharing and
+ * publishing read `getBindings`, which never gains the implicit built-ins.
  *
  * **Per-user enable/disable** still applies AFTER project bindings, via
  * the existing 4 filter sites; do not add a 5th.
@@ -57,6 +64,7 @@ import { purgeProjectWorkspace } from './user_workspace';
 import { limitNameDisplayText } from '../util/name-limit';
 import { PROJECT_INSTRUCTIONS_CHAR_LIMIT } from '../../../bin/project-instructions-contract.cjs';
 import { FileSnapshotCache } from '../util/file-snapshot';
+import { fileEditLock } from '../util/locks';
 
 const log = createLogger('projects');
 
@@ -763,7 +771,32 @@ export async function resolveProjectScope(
   if (!projectId) return null;
   await _ensurePromoted(uid);
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return null;
-  return _readBindings(uid, projectId);
+  const bindings = await _readBindings(uid, projectId);
+  return { ...bindings, agents: await _withBuiltinAgents(bindings.agents) };
+}
+
+/** Ids of the built-in Agents in the active account's catalog. Disabled ones
+ * are included: the per-user enable filters still apply after project scope. */
+async function _builtinAgentIds(): Promise<string[]> {
+  const agents = await import('./agents');
+  return (await agents.listAgentSummaries())
+    .filter((agent) => agents.agentPrioritySource(agent) === 'builtin')
+    .map((agent) => agent.agent_id);
+}
+
+async function _withBuiltinAgents(ids: readonly string[]): Promise<string[]> {
+  return [...new Set([...ids, ...await _builtinAgentIds()])];
+}
+
+/** Agents usable inside the project: its added Agents plus every built-in.
+ * A missing project has none. Use for access checks, never for membership. */
+export async function availableProjectAgentIds(uid: string, projectId: string): Promise<string[]> {
+  if (!projectId || !fs.existsSync(projectMetaFile(uid, projectId))) return [];
+  return _withBuiltinAgents((await getBindings(uid, projectId)).agents);
+}
+
+export async function isAgentAvailableInProject(uid: string, projectId: string, agentId: string): Promise<boolean> {
+  return !!agentId && (await availableProjectAgentIds(uid, projectId)).includes(agentId);
 }
 
 async function _mutateBindings(
@@ -771,14 +804,25 @@ async function _mutateBindings(
   fn: (b: ProjectBindings) => ProjectBindings,
 ): Promise<{ ok: true; bindings: ProjectBindings } | { ok: false; error: ProjectError }> {
   await _ensurePromoted(uid);
-  if (!fs.existsSync(projectMetaFile(uid, projectId))) return { ok: false, error: 'not_found' };
-  const cur = await _readBindings(uid, projectId);
-  const next = fn(cur);
-  await _writeBindings(uid, projectId, next);
-  // Touch the project's updated_at so sidebar ordering reflects activity.
-  const p = await _readProject(uid, projectId);
-  if (p) await _writeProject(uid, { ...p, updated_at: nowIso() });
-  return { ok: true, bindings: next };
+  return fileEditLock(projectBindingsFile(uid, projectId)).runExclusive(async () => {
+    if (!fs.existsSync(projectMetaFile(uid, projectId))) return { ok: false, error: 'not_found' };
+    const next = fn(await _readBindings(uid, projectId));
+    await _writeBindings(uid, projectId, next);
+    // Touch the project's updated_at so sidebar ordering reflects activity.
+    const p = await _readProject(uid, projectId);
+    if (p) await _writeProject(uid, { ...p, updated_at: nowIso() });
+    return { ok: true, bindings: next };
+  });
+}
+
+/** Confirm a binding when a later write or response failed. An unavailable
+ * roster cannot prove absence. */
+export async function isProjectAgentBound(uid: string, pid: string, agentId: string): Promise<boolean> {
+  try {
+    return (await getBindings(uid, pid)).agents.includes(agentId);
+  } catch {
+    return false;
+  }
 }
 
 export async function addAgentBinding(

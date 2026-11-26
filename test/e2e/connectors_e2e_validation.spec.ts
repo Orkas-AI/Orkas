@@ -100,6 +100,26 @@ rl.on('line', (line) => {
 }
 
 test.describe('connectors', () => {
+  test('finds OpenSEO with the bundled official brand icon', async ({ connectorOrkas }, testInfo) => {
+    const page = connectorOrkas.page!;
+    await openSidebarEntry(page, '#connectors-btn');
+    await page.locator('#connectors-search-input').fill('OpenSEO');
+    const card = page.locator('#connectors-grid-available .connector-card[data-id="openseo"]');
+    await expect(card).toBeVisible();
+    await expect(card.getByText('OpenSEO', { exact: true })).toBeVisible();
+    await expect(card.locator('[data-act="connect"]')).toBeEnabled();
+    const icon = card.locator('.connector-card-icon img');
+    await expect(icon).toHaveAttribute('src', 'assets/connectors/openseo.png');
+    await expect.poll(() => icon.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(192);
+    await card.screenshot({ path: testInfo.outputPath('openseo-card.png') });
+
+    await page.setViewportSize({ width: 760, height: 820 });
+    await page.evaluate(() => (window as any).setLang('zh'));
+    await expect(card).toContainText('部分操作消耗 OpenSEO 额度');
+    await expect(card.getByRole('button', { name: '连接', exact: true })).toBeVisible();
+    await card.screenshot({ path: testInfo.outputPath('openseo-card-zh-narrow.png') });
+  });
+
   test('browses available connectors by category with localized chips and a narrow layout', async ({ connectorOrkas }, testInfo) => {
     // A local catalog fixture keeps this browse journey independent of network recovery.
     const appPage = connectorOrkas.page!;
@@ -489,6 +509,7 @@ test.describe('connectors', () => {
   // Availability has its own journey and deadline; approval/trust coverage above
   // remains complete instead of sharing a cumulative multi-journey timeout.
   test('connects to a real local MCP server, toggles availability, and disconnects', async ({ modelOrkas }) => {
+    test.setTimeout(120_000);
     const { page, instance, card, callStatePath, startConnectorChat } = await connectLocalMcp(modelOrkas);
     // Warm the real connector through an agent call before disabling it, so
     // stale tool visibility cannot hide behind a never-used instance.

@@ -9,6 +9,7 @@
 
 import { readTextPreview } from '../util/text-preview';
 import { fileFailureKind, type FileFailureKind } from '../util/app-error';
+import type { BeforeLocalEntryDelete } from '../util/file-import';
 import * as fs from 'node:fs';
 import { isUtf8 } from 'node:buffer';
 import { MAX_TEXT_FILE_BYTES, MAX_PROJECT_TEXT_PROCESSING_BYTES } from '../util/file-size-limits';
@@ -565,7 +566,7 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
 }
 
 export async function deleteProjectEntry(
-  userId: string, projectId: string, name: string, beforeDelete?: () => boolean,
+  userId: string, projectId: string, name: string, beforeDelete?: BeforeLocalEntryDelete,
 ): Promise<Result> {
   let safeName: string;
   let pid: string;
@@ -586,7 +587,8 @@ export async function deleteProjectEntry(
 
   const files = await filesUnderEntry(abs, root);
   try {
-    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
+    const check = beforeDelete?.();
+    if (check === false || (check && check !== true && !(await check)())) return { ok: false, error: 'source_changed' };
     if (st.isDirectory()) fs.rmSync(abs, { recursive: true, force: false });
     else fs.unlinkSync(abs);
   } catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -693,7 +695,7 @@ async function validateProjectCopySource(sourceAbs: string): Promise<Result<{ fi
     }
     if (TEXT_EXTS.has(ext)) {
       try {
-        if (!await isUtf8File(current)) return { ok: false, error: 'unsupported_destination' };
+        if (!await isUtf8File(current)) return { ok: false, error: 'invalid_source_encoding' };
       } catch { return { ok: false, error: 'read_failed' }; }
     }
     fileCount += 1;

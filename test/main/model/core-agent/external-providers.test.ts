@@ -1,3 +1,5 @@
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
+import type { Message } from '#core-agent';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 const coreAgentMocks = vi.hoisted(() => ({createPiProvider:vi.fn(({provider}: {provider:string}) => ({id:provider,name:provider,complete:vi.fn(),stream:vi.fn(),validateAuth:vi.fn()}))}));
@@ -14,6 +16,7 @@ import {
   omitReservedOutputLimitForProvider,
   buildCustomOpenAICompatibleModel,
   buildCustomAnthropicModel,
+  buildCustomResponsesModel,
   buildDeepSeekModel,
   buildDoubaoModel,
   buildMoonshotModel,
@@ -874,3 +877,109 @@ describe('public discovered catalog contracts',()=>{
   });
 });
 
+describe('dynamic tool declarations on actual model routes', () => {
+  const options = { baseUrl: 'https://fixture.invalid/v1', contextWindow: 128_000, maxTokens: 4096 };
+  const routes = [
+    ['anthropic', 'claude-fable-5-2', 'tool_addition'],
+    ['anthropic', 'claude-haiku-5-5', 'tool_addition'],
+    ['anthropic', 'claude-opus-5-5', 'tool_addition'],
+    ['anthropic', 'claude-sonnet-5-5', 'tool_addition'],
+    ['openai', 'gpt-6-luna', 'additional_tools'],
+    ['openai', 'gpt-6.2-sol', 'additional_tools'],
+    ['openai-codex', 'gpt-6-luna', 'additional_tools'],
+    ['moonshot', 'kimi-k3', 'system_tools'],
+    ['kimi-coding', 'k3', 'system_tools'],
+    ['anthropic', 'claude-sonnet-4-6', 'top_level'],
+    ['anthropic', 'claude-sonnet-5', 'top_level'],
+    ['openai', 'gpt-5.5', 'top_level'],
+    ['moonshot', 'kimi-k2.7-code', 'top_level'],
+    ['google', 'gemini-4-argon', 'top_level'],
+    ['google', 'gemini-3.8-flash', 'top_level'],
+    ['deepseek', 'deepseek-v4.1-flash', 'top_level'],
+    ['zai', 'glm-5.3', 'top_level'],
+    ['minimax', 'MiniMax-M3.1-Flash', 'top_level'],
+    ['doubao', 'doubao-2.1-pro', 'top_level'],
+    ['openrouter', 'anthropic/claude-fable-5.2', 'top_level'],
+    ['openrouter', 'openai/gpt-6-luna', 'top_level'],
+    ['openrouter', 'moonshotai/kimi-k3', 'top_level'],
+    ['custom', 'anthropic', 'top_level'],
+    ['custom', 'responses', 'top_level'],
+    ['custom', 'openai', 'top_level'],
+  ] as const;
+
+  it.each(routes)('%s / %s advertises the authorized tool via %s', async (route, modelId, expected) => {
+    const { createPiProvider } = await vi.importActual<typeof import('#core-agent')>('#core-agent');
+    const model = await (async () => {
+      switch (route) {
+        case 'moonshot': return buildRuntimeMoonshotModel(modelId);
+        case 'deepseek': return buildDeepSeekModel(modelId);
+        case 'doubao': return buildDoubaoModel(modelId);
+        case 'custom': {
+          const id = 'claude-haiku-5-5';
+          if (modelId === 'anthropic') return buildCustomAnthropicModel(id, options);
+          if (modelId === 'responses') return buildCustomResponsesModel(id, options);
+          return buildCustomOpenAICompatibleModel(id, options);
+        }
+        default:
+          return buildConfiguredOpenAICompatibleModel(route, modelId) ?? getBuiltinModel(route as never, modelId as never);
+      }
+    })();
+    expect(model).toBeTruthy();
+    if (!model) throw new Error('Missing model route fixture');
+    const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
+    let payload: any;
+    const provider = createPiProvider({
+      provider: route, customModel: model,
+      apiKey: route === 'openai-codex' ? `fixture.${token}.fixture` : 'fixture-auth',
+      onPayload(value) { payload = value; throw new Error('tool declaration captured before sending'); },
+    });
+    const schema = (name: string) => ({ name, description: name, inputSchema: { type: 'object' } });
+    const first = schema('first_tool');
+    const last = schema('last_tool');
+    const added = schema('connector_lookup');
+    const start: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'Start the task' }] }];
+    const steer: Message = { role: 'user', content: [{ type: 'text', text: 'Use the selected connector' }] };
+    const withGrant: Message = { ...steer, toolsAddedAfter: [added.name, 'no_longer_authorized', added.name] };
+    const capture = async (messages: Message[], tools: typeof first[]) => {
+      payload = undefined;
+      await expect(provider.complete({
+        model: model.id, systemPrompt: 'Stable instructions', reasoning: 'low',
+        messages, tools, onRequestFailure() {},
+      })).rejects.toThrow('tool declaration captured before sending');
+      return JSON.parse(JSON.stringify(payload));
+    };
+    const granted = await capture([...start, withGrant], [first, added, last]);
+    const wire = JSON.stringify(granted);
+    expect(wire).toContain(added.name);
+    expect(wire).not.toContain('no_longer_authorized');
+    if (expected === 'top_level') {
+      expect(granted).toEqual(await capture([...start, steer], [first, added, last]));
+    } else {
+      const before = await capture(start, [first, last]);
+      expect(granted.tools).toEqual(before.tools);
+      expect(granted.system).toEqual(before.system);
+      expect(granted.instructions).toEqual(before.instructions);
+      if (expected === 'additional_tools') {
+        expect(granted.input[0]).toEqual(before.input[0]);
+        const deltas = granted.input.filter((row: any) =>
+          row.type === 'additional_tools' && row.tools.some((tool: any) => tool.name === added.name));
+        expect(deltas).toEqual([expect.objectContaining({ tools: [expect.objectContaining({ name: added.name })] })]);
+      } else if (expected === 'tool_addition') {
+        const deltas = granted.messages.flatMap((row: any) => row.content).filter((part: any) => part?.type === 'tool_addition');
+        expect(deltas).toEqual([expect.objectContaining({
+          tool: expect.objectContaining({ definition: expect.objectContaining({ name: added.name }) }),
+        })]);
+      } else {
+        const deltas = granted.messages.filter((row: any) => row.role === 'system' && row.tools);
+        expect(deltas).toEqual([expect.objectContaining({
+          tools: [expect.objectContaining({ function: expect.objectContaining({ name: added.name }) })],
+        })]);
+      }
+      expect(wire.indexOf(added.name)).toBeGreaterThan(wire.indexOf('Use the selected connector'));
+    }
+    const revoked = await capture([...start, withGrant], [first, last]);
+    expect(revoked).toEqual(await capture([...start, steer], [first, last]));
+    const toolsOff = await capture([...start, withGrant], []);
+    expect(toolsOff).toEqual(await capture([...start, steer], []));
+  });
+});

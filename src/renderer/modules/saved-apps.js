@@ -270,7 +270,7 @@
     ];
     for (const [action, label, danger] of defs) {
       if (app?.source === 'builtin' && action !== 'edit') continue;
-      _appendRowMenuItem(el, action, app?.source === 'builtin' ? _t('apps.edit_copy', 'Edit a copy') : label, danger, action === 'edit' && !!_editRequest, () => {
+      _appendRowMenuItem(el, action, app?.source === 'builtin' ? _t('apps.edit_copy', 'Edit') : label, danger, action === 'edit' && !!_editRequest, () => {
         const id = _rowMenuAppId;
         _closeRowMenu(true);
         if (!id) return;

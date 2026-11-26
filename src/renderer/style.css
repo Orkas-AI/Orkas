@@ -1160,32 +1160,49 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  container-type: inline-size;
 }
 .project-detail-tabs {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: stretch;
-  gap: 16px;
+  gap: 0 16px;
   min-height: 44px;
-  border-bottom: 1px solid var(--border);
+  /* The hairline sits under the tab line, also when the tools wrap below it. */
+  background: linear-gradient(var(--border), var(--border)) 0 43px / 100% 1px no-repeat;
 }
 .project-detail-tabs > .project-detail-tab-group {
   flex: 0 0 auto;
+  max-width: 100%;
+  height: 44px;
   align-items: stretch;
   gap: 24px;
-  min-height: 0;
-  margin-bottom: -1px;
   padding: 0;
   border-radius: 0;
   background: transparent;
 }
+/* Narrow columns (What's new makes four tabs): tighter tabs, and as a last
+   resort the strip scrolls sideways instead of cutting a tab off. */
+@container (max-width: 480px) {
+  .project-detail-tabs > .project-detail-tab-group {
+    gap: 12px;
+    /* Leave end clearance for fractional tab bounds at the native scroll limit. */
+    padding-inline-end: 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+}
+.project-detail-tabs > .project-detail-tab-group::-webkit-scrollbar { display: none; }
 .project-detail-tabs .project-detail-tab {
   align-self: stretch;
+  flex-shrink: 0;
   min-height: 0;
   padding: 0;
   border-radius: 0;
   border-bottom: 2px solid transparent;
   font-size: 13px;
+  white-space: nowrap;
 }
 .project-detail-tabs .project-detail-tab:hover {
   color: var(--text);
@@ -1210,6 +1227,9 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   background: var(--primary-soft);
   color: var(--primary-text);
 }
+/* The active tab's tools, at the end of the tab row. When they do not fit
+   beside the tabs they take their own line under the hairline, and they wrap
+   within their own box, so the tab line keeps its height. */
 .project-tab-tools {
   flex: 1 1 auto;
   min-width: 0;
@@ -1351,6 +1371,7 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   font-weight: 600;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
 }
+.project-detail-tab[hidden] { display: none; }
 .project-detail-tab-count {
   min-width: 0;
   padding: 0;
@@ -1468,6 +1489,125 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   line-height: 1.4;
 }
 .project-context-status:empty { min-height: 0; }
+
+/* Goal tab: the optional goal (P6 status, then the goal and its criteria). The
+   goal is optional, so its empty state is one quiet button. */
+.project-goal-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.project-goal-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 99px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.project-goal-status:empty { display: none; }
+.project-goal-status.is-active {
+  background: var(--primary-soft);
+  color: var(--primary-text);
+}
+.project-goal-status.is-achieved { color: var(--success-text); background: var(--success-soft); }
+.project-goal-status.is-achieved::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.18);
+}
+.project-goal-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.project-goal-body[hidden],
+.project-goal-empty[hidden] { display: none; }
+.project-goal-text {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.project-goal-criteria {
+  margin: 0 0 12px;
+  padding-inline-start: 20px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.project-goal-criteria[hidden] { display: none; }
+.project-goal-empty { padding: 2px 0 12px; }
+
+/* What's new (plan §3.6): the first workspace tab, present only with news;
+   its panel lists P15 rows (`.home-list` / `.home-row`). */
+.project-recap-list { flex: 0 0 auto; }
+.project-recap-more {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Goal editor (P18): the goal, then up to five optional criteria rows. */
+.project-goal-dialog { max-width: 560px; }
+.project-goal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.project-goal-dialog .project-goal-input { min-height: 96px; }
+.project-goal-counter { align-self: flex-end; }
+.project-goal-field { margin-top: 4px; }
+.project-goal-criteria-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.project-goal-criteria-editor:empty { display: none; }
+.project-goal-criterion {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.project-goal-criterion-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13.5px;
+  outline: none;
+}
+.project-goal-criterion-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+.project-goal-criterion-remove-icon { width: 14px; height: 14px; }
+.project-goal-criteria-add {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.project-goal-criteria-add-icon { width: 14px; height: 14px; }
+
+/* Editor dialog — one text field, sized for writing a page of rules. */
 .project-instructions-dialog {
   max-width: 640px;
   padding: 24px;
@@ -1564,6 +1704,11 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   background: transparent;
 }
 
+.project-side-resources .project-side-card-head-tabs {
+  gap: 4px;
+  padding-block-start: 8px;
+}
+
 .project-side-card-title-wrap {
   display: flex;
   align-items: baseline;
@@ -1646,6 +1791,7 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s;
 }
+.project-side-tab[hidden] { display: none; }
 .project-side-tab:hover { color: var(--text); }
 .project-side-tab.is-active {
   border-bottom-color: var(--primary);
@@ -1661,6 +1807,7 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   overflow: hidden;
 }
 .project-side-panel[hidden] { display: none; }
+.project-side-goal-panel,
 .project-side-instructions-panel,
 .project-side-memory-panel {
   padding: 14px 16px 16px;
@@ -1896,6 +2043,7 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   opacity: 1;
 }
 .project-todo-assign.is-empty:hover { color: var(--primary); border-color: transparent; background: transparent; }
+.project-todo-assign.btn[aria-expanded="true"] { border-color: var(--primary); background: var(--primary-soft); }
 .project-todo-assign.btn:disabled { cursor: default; opacity: 1; }
 .project-todo-assignee { order: 1; position: relative; display: inline-flex; min-width: 0; max-width: 116px; }
 .project-todo-assign-clear {
@@ -2341,7 +2489,7 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 8px;
+  padding: 4px 8px 8px;
 }
 
 .project-agent-row {
@@ -2446,17 +2594,14 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   width: 14px;
   height: 14px;
 }
-#project-agents-empty {
-  flex: 1;
-  min-height: 84px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 14px;
-  text-align: center;
-  font-size: 13px;
-  line-height: 1.6;
-  white-space: pre-line;
+/* Built-in Agents work in every project; the rail lists only added ones. */
+.project-agents-builtin-note {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  text-wrap: pretty;
 }
 
 .project-library-side-head {
@@ -2671,6 +2816,18 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   background: var(--surface);
 }
 .project-binding-picker-item:hover { border-color: var(--border-strong); }
+/* Built-in Agents are already available in every project: greyed, no Add
+   control, with the state in words next to them (not only the dimming). */
+.project-binding-picker-item.is-disabled { background: var(--surface-2); }
+.project-binding-picker-item.is-disabled:hover { border-color: var(--border); }
+.project-binding-picker-item.is-disabled .project-binding-main { opacity: 0.6; }
+.project-binding-available {
+  flex-shrink: 0;
+  line-height: 24px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
 .project-binding-picker-item > .btn {
   display: inline-flex;
   align-items: center;
@@ -8859,12 +9016,15 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   color: var(--primary);
 }
 .chat-app-nav-btn-page-icon-svg,
-.chat-app-nav-btn-page-icon.is-brand svg {
+.chat-app-nav-btn-page-icon.is-brand :is(svg, img) {
   width: 16px;
   height: 16px;
 }
-.chat-app-nav-btn-page-icon.is-brand svg {
+.chat-app-nav-btn-page-icon.is-brand :is(svg, img) {
   display: block;
+}
+.chat-app-nav-btn-page-icon.is-brand img {
+  border-radius: 4px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -9506,6 +9666,11 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   transition: background 0.15s, border-color 0.15s;
 }
 
+.chat-queue-item:has(.chat-queue-shortcut) {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
 .chat-queue-item:hover {
   background: #f1f5f9;
   border-color: var(--border-strong);
@@ -9538,6 +9703,10 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   text-overflow: ellipsis;
 }
 
+.chat-queue-item:has(.chat-queue-shortcut) > .chat-queue-text {
+  flex-basis: 6em;
+}
+
 .chat-queue-skill {
   display: inline-block;
   margin-right: 6px;
@@ -9562,6 +9731,13 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   flex-shrink: 0;
 }
 
+.chat-queue-actions:has(.chat-queue-shortcut) {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-inline-size: 100%;
+  margin-inline-start: auto;
+}
+
 .chat-queue-btn {
   padding: 2px 8px;
   background: transparent;
@@ -9577,6 +9753,26 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   background: #fff;
   color: var(--text);
   border-color: var(--border-strong);
+}
+
+.chat-queue-btn[aria-keyshortcuts] {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.chat-queue-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  direction: ltr;
+}
+
+.chat-queue-shortcut .ui-icon {
+  width: 14px;
+  height: 14px;
 }
 
 .chat-queue-btn.danger:hover {
@@ -15507,6 +15703,59 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   font-size: 12px;
 }
 
+.ai-select-popover.is-searchable:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.ai-select-search {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  margin: 0 0 4px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--muted);
+}
+.ai-select-search:focus-within { border-color: var(--primary); }
+.ai-select-search-icon { flex: none; width: 14px; height: 14px; }
+.ai-select-search input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+.ai-select-search-clear:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.ai-select-search-clear:hover { background: var(--surface-2); color: var(--text); }
+.ai-select-results { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.ai-select-group-label {
+  padding: 4px 10px;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+}
+.ai-select-popover.is-searchable .ai-select-item { padding-block: 5px; }
+.ai-select-popover.is-searchable .ai-select-item.active .ai-select-check { color: var(--primary-text); }
+
 /* Opt-in calendar multi-selection reuses the ordinary select chrome. */
 .ai-select-multiple-row {
   --orkas-ui-layer: chrome;
@@ -17900,6 +18149,12 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .connector-card[data-id="sentry"] .connector-card-icon.is-svg {
   padding: 4px;
 }
+.connector-card-icon img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+}
 .connector-card-icon.is-svg svg {
   width: 100%;
   height: 100%;
@@ -18519,6 +18774,15 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .video-canvas-card-kind .ui-icon { flex: none; width: 14px; height: 14px; }
 .video-canvas-meta { font-size: 12px; color: var(--text-2); }
 .video-canvas-card-title + .video-canvas-meta { margin-top: 2px; }
+.video-canvas-credit {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: none;
+}
+a.video-canvas-credit:hover { color: var(--primary-text); text-decoration: underline; }
 .video-canvas-media {
   overflow: hidden;
   aspect-ratio: 4 / 3;
@@ -18827,15 +19091,6 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 /* The button and parameters sit in their own redrawn part, laid out as if they were not there. */
 .video-canvas-take-row > [data-part="action"] { display: contents; }
 .video-canvas-take-model { flex: 0 1 auto; min-width: 0; max-width: 220px; }
-.video-canvas-take-model-name {
-  overflow: hidden;
-  max-width: 200px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-2);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
 .video-canvas-take-params { flex: 0 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .video-canvas-take-bar .btn { flex: none; margin-left: auto; }
 /* The settings over a shot's panel (decided 2026-11-10, plan 27.21): rows of buttons like the
@@ -19362,15 +19617,19 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   min-width: 0;
   max-width: 100%;
 }
+.video-canvas-status-row.is-review .video-canvas-status-text { flex-basis: 100%; color: var(--warn-text); }
 .local-cli-upgrade-control .agents-detail-cli-note { margin: 0; overflow-wrap: anywhere; }
 .local-cli-upgrade-warning { flex: 1 1 200px; overflow-wrap: anywhere; }
 .local-cli-upgrade-feedback {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   max-width: 100%;
-  white-space: nowrap;
 }
+.local-cli-upgrade-feedback [role="status"]:empty { display: none; }
+.local-cli-upgrade-elapsed { font-variant-numeric: tabular-nums; }
 .local-cli-upgrade-details {
   padding: 0;
   gap: 4px;

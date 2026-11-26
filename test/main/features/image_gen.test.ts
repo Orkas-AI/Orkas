@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from 'undici';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from 'undici';
 
 // Tests cover the parts that *aren't* obvious from reading the code:
 //   - pickImageGenProfile's filter/match contract (the OAuth-skip + capability
@@ -42,7 +42,7 @@ afterEach(async () => {
     const fixtureDispatcher = getGlobalDispatcher();
     setGlobalDispatcher(previousDispatcher);
     previousDispatcher = undefined;
-    await fixtureDispatcher.close();
+    if (fixtureDispatcher !== getGlobalDispatcher()) await fixtureDispatcher.close();
     vi.unstubAllEnvs();
   }
   vi.unstubAllGlobals();
@@ -436,6 +436,25 @@ describe('image_gen › generateImage', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('preserves a file written by another process while a reserved image was generating', async () => {
+    writeProfilesFile({}, [], [
+      { id: 'own', provider: 'doubao', model: 'doubao-seedream-5-0-flash-260915', apiKey: 'fixture', createdAt: 1 },
+    ]);
+    const outputAbsPath = path.join(tmpDir, 'reserved');
+    const finalPath = `${outputAbsPath}.png`;
+    const fetch = vi.fn(async () => {
+      fs.writeFileSync(finalPath, 'independent file');
+      return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const { generateImage } = await import('../../../src/main/features/image_gen');
+    expect(await generateImage({ prompt: 'A still', outputAbsPath, assertNewOutputPath: () => {} }))
+      .toMatchObject({ ok: false, errorCode: 'IO_ERROR' });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(finalPath, 'utf8')).toBe('independent file');
+    expect(fs.readdirSync(tmpDir).filter((name) => name.startsWith('reserved'))).toEqual(['reserved.png']);
   });
 });
 

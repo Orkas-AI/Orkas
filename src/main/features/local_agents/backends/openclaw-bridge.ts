@@ -5,7 +5,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { bindAbort, killProcessTree, spawnCli, stripAnsi, type BackendRunOptions } from './base';
 
-const SETUP_ERROR = 'OpenClaw could not load this run’s Orkas tools. Check that its config is valid and its version supports MCP configuration.';
+export class OpenClawSetupError extends Error {
+  constructor(message: string, readonly status: 'failed' | 'timeout' = 'failed', readonly exitCode?: number) {
+    super(`${message} The task did not start.`);
+  }
+}
 
 /** Forward only the native global profile selectors to the read-only config command. */
 function profileArgs(args: readonly string[]): string[] {
@@ -33,7 +37,7 @@ async function configPathForRun(opts: BackendRunOptions): Promise<string> {
       killProcessTree(child, 'SIGKILL');
     }
   });
-  // Config errors may include credentials. Only the fixed recovery error leaves this boundary.
+  // Config diagnostics may include credentials. Report only process facts.
   child.stderr.resume();
   const timeoutMs = Math.max(1, Math.min(10_000, opts.timeoutMs,
     opts.deadlineAt === undefined ? Infinity : opts.deadlineAt - Date.now()));
@@ -41,16 +45,21 @@ async function configPathForRun(opts: BackendRunOptions): Promise<string> {
   const timer = setTimeout(() => { timedOut = true; killProcessTree(child, 'SIGKILL'); }, timeoutMs);
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
-      child.once('error', () => reject(new Error(SETUP_ERROR)));
+      child.once('error', () => reject(new OpenClawSetupError('Could not start the OpenClaw configuration check.')));
       child.once('close', resolve);
     });
     if (opts.signal.aborted) throw new Error('OpenClaw tool setup cancelled.');
-    if (code !== 0 || timedOut || overflow) throw new Error(SETUP_ERROR);
+    if (timedOut) throw new OpenClawSetupError('The OpenClaw configuration check timed out.', 'timeout');
+    if (overflow) throw new OpenClawSetupError('The OpenClaw configuration check exceeded its output limit.');
+    if (code === null) throw new OpenClawSetupError('The OpenClaw configuration check stopped without an exit code.');
+    if (code !== 0) throw new OpenClawSetupError(`The OpenClaw configuration check returned exit code ${code}.`, 'failed', code);
     // Native 2026.4.11 may print a doctor notice before the config location.
     // The command's final nonempty line is the path; never select a path from
     // an earlier diagnostic when the final line is invalid.
     const value = stripAnsi(stdout).trim().split(/\r?\n/).at(-1)?.trim();
-    if (!value || /[\r\n\0]/.test(value)) throw new Error(SETUP_ERROR);
+    if (!value || /[\r\n\0]/.test(value)) {
+      throw new OpenClawSetupError('OpenClaw did not return a valid configuration location.');
+    }
     // Native `config file` displays home-relative paths as ~, or
     // $OPENCLAW_HOME when that override is set. Expand only these known forms.
     const osHome = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || os.homedir();
@@ -60,7 +69,7 @@ async function configPathForRun(opts: BackendRunOptions): Promise<string> {
       ? path.resolve(home, value.slice(2))
       : /^\$OPENCLAW_HOME[\\/]/.test(value) && process.env.OPENCLAW_HOME?.trim()
         ? path.resolve(home, value.slice('$OPENCLAW_HOME/'.length)) : value;
-    if (!path.isAbsolute(resolved)) throw new Error(SETUP_ERROR);
+    if (!path.isAbsolute(resolved)) throw new OpenClawSetupError('OpenClaw did not return a valid configuration location.');
     return resolved;
   } finally {
     clearTimeout(timer);
@@ -101,6 +110,6 @@ export async function prepareOpenclawBridge(opts: BackendRunOptions): Promise<{
     return { env: { ...process.env, OPENCLAW_CONFIG_PATH: overlay }, cleanup };
   } catch {
     cleanup();
-    throw new Error(SETUP_ERROR);
+    throw new OpenClawSetupError('Orkas could not write the temporary configuration for OpenClaw.');
   }
 }

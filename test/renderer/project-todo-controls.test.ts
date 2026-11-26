@@ -31,6 +31,26 @@ function cardNodes(node: any): any[] {
   return [node, ...(node.children || []).flatMap(cardNodes)];
 }
 
+function todoPickerHarness() {
+  let picker: any;
+  return {
+    mount(_element: any, config: any) {
+      return {
+        open() { picker = config; },
+        close() { config.onClose?.(); },
+      };
+    },
+    get options() { return picker?.options || []; },
+    get value() { return picker?.value; },
+    dismiss() { picker.onClose?.(); },
+    pick(value: string) {
+      if (picker.value === value) return;
+      picker.onClose?.();
+      return picker.onChange(value);
+    },
+  };
+}
+
 describe('project to-do asynchronous ownership and recovery', () => {
   function harness(elements: Record<string, any> = {}, invoke = vi.fn(async () => ({ ok: true }))) {
     const context = vm.createContext({
@@ -433,13 +453,13 @@ describe('project to-do controls', () => {
   });
 
   it('offers only usable Agents for assignment when a bound Agent is unavailable', () => {
-    let menu: any[] = [];
+    const picker = todoPickerHarness();
     const context = vm.createContext({
       currentUserId: 'me',
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
-      document: { readyState: 'loading', addEventListener() {} },
+      document: { readyState: 'loading', addEventListener() {}, createElement: () => ({}) },
       window: { addEventListener() {}, orkas: { async invoke() { return { ok: true }; } } },
-      showContextMenu(_event: any, items: any[]) { menu = items; },
+      _aiSelectMount: picker.mount,
       t: (key: string) => key,
       setTimeout, clearTimeout,
     });
@@ -450,9 +470,9 @@ describe('project to-do controls', () => {
       { agent_id: 'deleted01', name: '', source: 'custom', enabled: false, unavailable: true },
       { agent_id: 'a', name: 'Alpha' },
     ] };
-    context._openTodoAssignMenu({}, 't_a', scope);
-    expect(menu.map((item) => item.label)).toEqual(['chat.recipient_commander', 'Alpha']);
-    expect(menu.some((item) => item.trailingIcon === 'check')).toBe(false);
+    context._openTodoAssignPicker({}, 't_a', scope);
+    expect(picker.options.map((option: any) => option.label)).toEqual(['chat.recipient_commander', 'Alpha']);
+    expect(picker.options.some((option: any) => option.value === picker.value)).toBe(false);
   });
 
   it.each(['todo', 'progress', 'review', 'done'])('offers immediate processing only for unfinished %s tasks', async (status) => {
@@ -692,10 +712,10 @@ describe('project to-do controls', () => {
     ]);
   });
 
-  it('assigns and reassigns a todo owner from the row menu', async () => {
+  it('assigns and clears a todo owner from the card', async () => {
     const invocations: Array<{ channel: string; payload: Record<string, unknown> }> = [];
     const listeners: Record<string, (event: any) => Promise<void>> = {};
-    let menuItems: Array<{ label: string; icon?: string; disabled?: boolean; onClick?: () => void }> = [];
+    const picker = todoPickerHarness();
     // The post-mutation re-fetch reads persisted state back through the list
     // channel, so the shim tracks the owner the same way the backend would.
     let currentTask: Record<string, unknown> = { id: 't_abc123def456', title: 'Task', status: 'todo' };
@@ -745,7 +765,7 @@ describe('project to-do controls', () => {
           },
         },
       },
-      showContextMenu(_evt: unknown, items: any[]) { menuItems = items; },
+      _aiSelectMount: picker.mount,
       t: (key: string) => key,
       escapeHtml: (value: unknown) => String(value == null ? '' : value),
       uiAlert() {},
@@ -757,6 +777,7 @@ describe('project to-do controls', () => {
     vm.runInContext(
       "_projectDetailPid = 'p_test';"
       + " _projectDetailMeta = { agentDetails: [{ agent_id: 'a_researcher', name: 'Researcher', icon: 'ic', color: 'co' }] };"
+      + " _projectTodos = [{ id: 't_abc123def456', status: 'todo' }];"
       + ' _bindProjectTodos();',
       context,
     );
@@ -773,10 +794,10 @@ describe('project to-do controls', () => {
 
     // Unassigned task: the menu offers the bound agent and no "unassign" entry.
     await listeners.click({ target: assignTarget });
-    expect(menuItems.map((item) => item.label)).toEqual(['chat.recipient_commander', 'Researcher']);
+    expect(picker.options.map((option: any) => option.label)).toEqual(['chat.recipient_commander', 'Researcher']);
 
     // Picking the agent writes owner_agent + owner_agent_id via projects.tasks.update.
-    await menuItems.find(item => item.label === 'Researcher')!.onClick!();
+    await picker.pick('a_researcher');
     let updates = invocations.filter((call) => call.channel === 'projects.tasks.update');
     expect(updates).toHaveLength(1);
     expect(updates[0].payload).toMatchObject({
@@ -789,7 +810,9 @@ describe('project to-do controls', () => {
     // The post-assign re-fetch now reports the owner. The menu only switches
     // agents; clearing moved to the × revealed directly on the assigned chip.
     await listeners.click({ target: assignTarget });
-    expect(menuItems.map((item) => item.label)).toEqual(['chat.recipient_commander', 'Researcher']);
+    expect(picker.options.map((option: any) => option.label)).toEqual(['chat.recipient_commander', 'Researcher']);
+    expect(picker.value).toBe('a_researcher');
+    picker.dismiss();
 
     // Clicking that × clears both owner fields (empty strings → backend drops
     // the owner) without opening the assignment menu.

@@ -368,6 +368,7 @@ import {
 } from '../../../src/main/features/web_assist';
 import { estimateToolResultTokens } from '../../../src/main/util/tool-result-cap';
 import { installWindowPresentationEvents } from '../../../src/main/util/window-presentation';
+import { buildConversationBrowserTool } from '../../../src/main/features/group_chat/browser_tool';
 import {
   beginBrowserTaskRun, finishBrowserTaskRun,
 } from '../../../src/main/features/web_assist_lifecycle';
@@ -417,6 +418,55 @@ describe('Web Assist controlled connector lifecycle', () => {
       closeWebAssist(electronMock.renderer);
       vi.restoreAllMocks();
       electronMock.pageText = 'Create an app';
+    });
+
+    it('provides private comparison evidence only for complete, task-owned observations', async () => {
+      const cid = 'c-observe-evidence';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      beginBrowserTaskRun('u1', cid, 'observation-evidence');
+      try {
+        const started = await openModelWebAssist('u1', cid, { url: 'https://example.com/read' });
+        const tabId = String(started.active_tab_id);
+        const tool = buildConversationBrowserTool('u1', cid);
+        const observe = (text_offset?: number) => tool.execute({
+          operation: 'observe', tab_id: tabId, ...(text_offset === undefined ? {} : { text_offset }),
+        }, { state: {} });
+        const first = await observe();
+        const second = await observe();
+        const evidence = first.observations?.browserObservation;
+        expect(evidence).toMatchObject({ target: expect.any(String), fingerprint: expect.any(String) });
+        expect(second.observations?.browserObservation).toEqual(evidence);
+        expect(JSON.parse(first.content).page_id).not.toBe(JSON.parse(second.content).page_id);
+        expect(first.content).not.toContain(JSON.stringify(evidence));
+        const wait = () => tool.execute({ operation: 'wait', tab_id: tabId, timeout_ms: 1000 }, { state: {} });
+        expect((await wait()).observations?.browserObservation).toBeUndefined();
+        const page = electronMock.page;
+        page.loading = true;
+        expect((await observe()).observations?.browserObservation).toBe('reset');
+        const pendingWait = wait();
+        try {
+          await vi.waitFor(() => expect(webAssistState(electronMock.renderer).state.assistant_action).toBe('waiting'));
+        } finally { page.loading = false; }
+        const completedWait = await pendingWait;
+        expect(JSON.parse(completedWait.content)).toMatchObject({ ok: true });
+        expect(completedWait.observations?.browserObservation).toBe('reset');
+        expect((await observe(1)).observations?.browserObservation).toBe('reset');
+        electronMock.pageText = 'New result is ready';
+        const changed = (await observe()).observations?.browserObservation;
+        expect(changed).toMatchObject({ target: (evidence as { target: string }).target });
+        expect(changed).not.toEqual(evidence);
+        electronMock.pageText = 'Long page '.repeat(700);
+        expect((await observe()).observations?.browserObservation).toBe('reset');
+        electronMock.pageText = 'Create an app';
+        await page.loadURL('https://example.com/another-page');
+        const anotherPage = (await observe()).observations?.browserObservation;
+        expect(anotherPage).toMatchObject({ target: expect.not.stringMatching((evidence as { target: string }).target) });
+        page.emit('before-input-event', {}, { type: 'keyDown', code: 'KeyA', isComposing: false });
+        expect((await observe()).observations?.browserObservation).toBe('reset');
+        page.emit('before-input-event', {}, { type: 'keyUp', code: 'KeyA', isComposing: false });
+      } finally {
+        finishBrowserTaskRun('u1', cid, 'observation-evidence');
+      }
     });
 
     async function pendingObservation(entry: 'browser' | 'connector', scope: 'full' | 'meta' = 'full') {

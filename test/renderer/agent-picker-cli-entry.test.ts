@@ -182,7 +182,7 @@ describe('agent picker › coding-CLI entry markup and style', () => {
     expect(picker).toMatch(/id="agent-picker-cli-footer"[^>]*\shidden/);
     // Both lines are translated: the action, and the CLIs it stands for.
     expect(picker).toContain('data-i18n="agents.connect_cli_btn"');
-    expect(picker).toContain('data-i18n="agents.connect_cli_sub"');
+    expect(picker).toContain('data-i18n="sidebar.connect_agent_sub"');
   });
 
   it('puts the chevron on the trailing edge', () => {

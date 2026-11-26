@@ -38,8 +38,10 @@ function _agentUiIconHtml(name, className) {
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
-/** Return only the CLI brand name for the agent card's runtime chip. */
+/** Return the external Agent's product name for cards and runtime choices. */
 function _cliBadgeLabel(type) {
+  const label = window.LOCAL_CLI_DEFAULTS?.[type]?.label;
+  if (label) return label;
   const key = 'agent.external_badge.' + type;
   const v = t(key);
   return (!v || v === key) ? type : v;
@@ -2024,9 +2026,7 @@ async function _renderAgentDetailRuntime(agent) {
 
   const currentType = agent.runtime.cli;
   const runtimeKey = `${agent.agent_id}::${currentType}`;
-  const baseLabel = t('agent_modal.runtime_cli_' + currentType);
-  const labelText = (baseLabel && baseLabel !== 'agent_modal.runtime_cli_' + currentType)
-    ? baseLabel : currentType;
+  const labelText = _cliBadgeLabel(currentType);
 
   // Do not hold the entire section behind asynchronous CLI discovery. The
   // persisted runtime is already enough to render a stable first frame; the
@@ -2081,7 +2081,7 @@ async function _renderAgentDetailRuntime(agent) {
   for (const e of available) {
     options.push({
       value: `cli:${e.type}`,
-      label: `${t('agent_modal.runtime_cli_' + e.type)}${e.version ? ` (${e.version})` : ''}`,
+      label: `${_cliBadgeLabel(e.type)}${e.version ? ` (${e.version})` : ''}`,
     });
   }
   if (!seen.has(currentType)) {
@@ -2127,7 +2127,8 @@ async function _renderAgentDetailRuntime(agent) {
       const curDescLocal = pickDesc(agent, lang).trim();
       // Same default-like detection as the create modal: bare default OR
       // dedup-style "<default> 2" / "(2)" suffixes count as untouched.
-      const nameUntouched = _isDefaultlikeName(curName, prev?.name);
+      const nameUntouched = _isDefaultlikeName(curName, prev?.name)
+        || _isDefaultlikeName(curName, prev?.legacyName);
       const descUntouched = !curDescLocal || (prev && curDescLocal === prevDescLocal);
       if (next2 && nameUntouched) updates.name = next2.name;
       if (next2) {
@@ -3063,7 +3064,8 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(_extActiveCli) : null;
   const prevDescLocalized = prev ? pickDesc(prev, lang) : '';
 
-  const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name);
+  const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name)
+    || _isDefaultlikeName(nameEl.value, prev?.legacyName);
   const descUntouched = force
     || descEl.value === ''
     || (prev && descEl.value === prevDescLocalized);
@@ -3884,7 +3886,8 @@ async function _refreshAgentPickerProjectContext(anchorId) {
     try {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: _pickerProjectId });
       if (refreshSeq === _pickerProjectContextSeq && res?.ok) {
-        _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+        // Added Agents plus every built-in: built-ins work in every project.
+        _pickerBoundAgentIds = new Set(projectAvailableAgentIds(res));
         const target = _targetFromPickerAnchor(anchorId);
         if (target !== 'auto' && typeof validateRecipientAgainstProject === 'function') {
           await validateRecipientAgainstProject(target, _pickerProjectId, [..._pickerBoundAgentIds]);
@@ -4075,9 +4078,9 @@ function _renderAgentPickerListRows(filterText) {
          <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
        </div>`
     : '';
-  // When the active context is a project AND the project has zero agents
-  // bound, surface a hint above the commander entry so the user knows
-  // "this isn't broken — go bind an agent first". Suppressed on user search
+  // When the active context is a project AND it has no usable agent (no
+  // enabled built-in and none added), surface a hint above the commander
+  // entry so the user knows "this isn't broken — go add an agent first". Suppressed on user search
   // (they're explicitly typing) so the search "no match" message owns the
   // empty rendering.
   const projectEmptyHint = (!q && _pickerBoundAgentIds && _pickerBoundAgentIds.size === 0)

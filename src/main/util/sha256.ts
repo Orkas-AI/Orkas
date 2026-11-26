@@ -14,10 +14,10 @@ export function sha256OfFile(absPath: string): string | undefined {
 
 /** Streaming sha256 of a file, hex. Large media (rendered videos) must not be
  *  buffered whole into the main process just to be hashed. */
-export function sha256OfFileStream(absPath: string): Promise<string> {
+export function sha256OfFileStream(absPath: string, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(absPath);
+    const stream = fs.createReadStream(absPath, { signal });
     stream.on('data', (chunk: Buffer) => hash.update(chunk));
     stream.on('error', reject);
     stream.on('end', () => resolve(hash.digest('hex')));

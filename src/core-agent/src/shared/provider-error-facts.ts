@@ -121,7 +121,9 @@ function headerValue(headers: unknown, name: string): string | undefined {
 
 /** Milliseconds the provider asked us to wait before retrying a 429, or
  * undefined when no parsable hint exists (the runner then keeps its default
- * backoff; it clamps honored values to 120s).
+ * backoff). The value is returned as given, with no upper bound: the runner
+ * honours it only when recovering a stream cut off by a rate limit, and gives
+ * up instead of waiting once the recovery's total wait would pass its cap.
  *
  * SDK-level errors (OpenAI/Anthropic `APIError`, undici response errors)
  * expose the failing response's headers as `.headers` or `.response.headers`;

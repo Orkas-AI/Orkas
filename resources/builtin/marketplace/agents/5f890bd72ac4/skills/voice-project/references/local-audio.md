@@ -1,6 +1,6 @@
 # Local transcription, editing and delivery
 
-For video audio extraction, format conversion, export specifications or background music ducking, read [media-delivery.md](media-delivery.md). Pure extraction/conversion preserves levels and timing; ordinary project rendering retains its loudness-normalization default.
+For video audio extraction, format conversion, export specifications or background music ducking, read [media-delivery.md](media-delivery.md).
 
 For timed overlays or supplied-music transitions, read [timeline-mixing.md](timeline-mixing.md). For word-time transcription or selecting transcript units to cut, read [word-editing.md](word-editing.md); those timings are estimates, not forced alignment.
 

@@ -971,9 +971,10 @@ export async function downloadBinaryWithProxyPolicy(
 ): Promise<BinaryFetchResult> {
   return await retryAsync(options.label, async () => {
     const validateRedirectUrl = options.validateRedirectUrl;
-    const result = validateRedirectUrl
-      ? await fetchCheckedBinaryRedirects(url, options, validateRedirectUrl)
-      : await fetchBinaryWithProxyPolicy(url, options);
+    const download = () => validateRedirectUrl
+      ? fetchCheckedBinaryRedirects(url, options, validateRedirectUrl)
+      : fetchBinaryWithProxyPolicy(url, options);
+    const result = await download();
     if (result.status < 200 || result.status >= 300) {
       throw new BinaryDownloadHttpError(result.status, options.label);
     }

@@ -34,6 +34,15 @@ export const MIN_VERSIONS: Readonly<Record<LocalCliType, string>> = {
   // ACP protocolVersion=1 and sessionUpdate envelopes observed with Hermes
   // 0.9 are the baseline used by _acp.ts, not a claim about earlier releases.
   hermes: '0.9.0',
+  // The live protocol is also negotiated for these integrations
+  // before session setup; a version cannot establish account capabilities.
+  kimi: '2.6.3',
+  dsh: '0.2.2',
+  traecli: '2.0.0',
+  zcode: '0.17.0',
+  copilot: '1.0.109',
+  cursor: '2026.10.22',
+  antigravity: '1.5.1',
 };
 
 /** Anthropic's upstream CHANGELOG.md, 2.1.81: --bare was introduced for

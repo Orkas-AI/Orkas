@@ -5,7 +5,9 @@ import * as path from 'node:path';
 const PROMPTS = path.join(__dirname, '..', '..', '..', 'src', 'main', 'prompts');
 // The shared history rule and adjacent Library section own the removed copies.
 const COMMANDER_RESOURCE_CEILING = 1_100;
-const AGENT_CONTEXT_CEILING = 1_000;
+// 2026-11-19: its line repeating the Core task input pointer was removed
+// (67 characters); the ceiling keeps the same headroom.
+const AGENT_CONTEXT_CEILING = 933;
 
 function section(file: string, heading: string): string {
   const body = fs.readFileSync(path.join(PROMPTS, file), 'utf8');

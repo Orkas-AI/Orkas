@@ -39,3 +39,15 @@ it('does not erase governed commits when the checker is deleted and reintroduced
   // A genuinely later event base keeps its narrow scope.
   expect(run(reintroduced).status).toBe(0);
 });
+
+it('accepts scoped behavior-preserving prompt maintenance through the checker', () => {
+  const { validateCommitMetadata } = require('../../../scripts/check-prompt-commit-metadata.cjs');
+  const changed = ['PC/src/main/prompts/example.md'];
+  const audit = 'Prompt audit:\n- Drop: duplicate instruction\n  Type: Pitfall\n  Why: one canonical owner remains\n';
+  const equivalent = 'Behavior preserved: All affected actors still receive the rule from its owner.';
+  expect(validateCommitMetadata(equivalent, changed)).toContain('missing complete Prompt audit metadata');
+  expect(validateCommitMetadata(audit, changed)).toContain('missing scoped Prompt confirmation or Behavior preserved metadata');
+  expect(validateCommitMetadata(audit + 'Behavior preserved:   ', changed)).toContain('missing scoped Prompt confirmation or Behavior preserved metadata');
+  expect(validateCommitMetadata(audit + equivalent, changed)).toEqual([]);
+  expect(validateCommitMetadata(audit + 'Prompt confirmation:\n- Confirmed-by: requester\n  Scope: changed instructions and actors\n', changed)).toEqual([]);
+});

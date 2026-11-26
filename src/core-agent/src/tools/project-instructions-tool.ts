@@ -23,7 +23,7 @@ export interface ProjectInstructionsToolHandler {
 }
 
 const TOOL_DESCRIPTION =
-  'Replace the project\'s standing goal and rules with the complete supplied text. Preserve applicable existing content; use todo_tasks for work status and project memory for durable facts or decisions.';
+  'Replace the project\'s standing rules with the complete supplied text. Preserve applicable existing content; set or close the project goal with project_setup set_goal, use todo_tasks for work status and project memory for durable facts or decisions.';
 
 export function createProjectInstructionsTool(handler: ProjectInstructionsToolHandler): AgentTool {
   return {

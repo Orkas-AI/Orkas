@@ -7,6 +7,7 @@
   "errors.conversation_recovery_conflict": "此任务需要恢复后才能打开。现有副本均已保留，请联系支持协助恢复。",
   "connectors.account_choice.title": "选择要连接的账号",
   "connectors.account_choice.message": "请选择本次连接要使用的已授权账号或店铺。",
+  "image_studio.native_png_missing": "ImageStudio 尚未完成 PNG 导出。请重试以检查并导出设计。",
   "chat.skill_creation_correcting": "Skill 创建内容需要修正，正在尝试一次。",
   "chat.skill_creation_corrected": "已修正并创建 Skill。",
   "chat.skill_creation_correction_failed": "尝试修正一次后，仍未能创建 Skill。",
@@ -367,7 +368,7 @@
   "notification.automation.waiting_input.title": "有自动化运行等你回复",
   "notification.automation.waiting_input.title_many": "{count} 个自动化运行等你回复",
   "errors.model_rate_limited_all_configured": "你配置的模型都被限流了，通常一两分钟后恢复，到时再点重试。",
-  "errors.model_request_rejected_repeated": "这个请求已连续被拒绝，原样重试也不会有不同结果。可以在「设置」里换一个模型再试；如果带了图片或附件，也可以去掉后再发。",
+  "errors.model_request_rejected_repeated": "模型服务连续拒绝了多次请求。如有错误详情，请先查看，再尝试调整请求，或在「设置」中换用其他模型。",
   "errors.provider_reply_detail": "服务商返回：{detail}",
   "cli_agent.repeated_failure_hint": "「{name}」又失败了，可以先改用 @指挥官 接手这个任务。",
   "desktop.open": "打开 Orkas",
@@ -376,5 +377,13 @@
   "errors.model_request_rejected_no_retry": "模型服务拒绝了本次请求，已停止自动重试。",
   "errors.model_context_capacity_insufficient": "当前上下文超过所选模型的安全容量，本次模型调用尚未发出。请选择上下文窗口更大的模型，或开启新对话。",
   "video.delivery_retained": "附件 {index}：已保留交付版本 {version}。",
-  "video.delivery_later_edits": "后续修改尚未包含在该版本中。"
+  "video.delivery_later_edits": "后续修改尚未包含在该版本中。",
+  "cli_agent.sign_in_required": "请登录 {cli} 后重试。",
+  "cli_agent.session_start_failed": "{cli} 无法打开会话。请检查其配置后重试。",
+  "cli_agent.turn_failed": "{cli} 在完成任务前停止了。",
+  "chat.agent_created_project_binding_failed": "「{name}」已创建，但未加入项目。你可以在项目的「智能体」列表中添加它。",
+  "chat.agent_created_project_binding_unconfirmed": "「{name}」已创建。暂时无法确认是否已加入项目，请查看项目的「智能体」列表。",
+  "cli_agent.tool_restore_unsupported": "{cli} 不支持在选择模型后恢复工具。请更新 CLI 后重试。",
+  "cli_agent.tool_restore_rejected": "{cli} 在选择模型后拒绝恢复工具。请检查工具配置后重试。",
+  "cli_agent.tool_restore_timeout": "{cli} 在选择模型后恢复工具超时。请重试。"
 }

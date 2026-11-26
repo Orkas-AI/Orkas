@@ -10,7 +10,7 @@ import { writeBytesAtomic } from '../../storage';
 import { appTaskInteractions, takeAppTaskInteraction, clearAppTaskEvents } from '../../util/app-task-events';
 import { createLogger } from '../../logger';
 import { AppError } from './runtime';
-import { AppTaskService, TaskInputError, type TaskInspection } from './tasks';
+import { AppTaskService, TaskInputError, type SettledInspection, type TaskInspection } from './tasks';
 import { getActiveUserId } from '../users';
 import { pendingTask, drainPendingTasks, appTaskHostId } from './task-maintenance';
 import * as deleteConfirmation from '../../model/core-agent/delete-file-confirm';
@@ -27,13 +27,14 @@ async function guard(file: string, root: string) {
         if (path.dirname(p) === p) throw new AppError('E_FILE');
     }
 }
-async function regularFile(file: string, root: string) {
+async function regularFile(file: string, root: string, expected?: TaskFile) {
     await guard(file, root);
     const before = await fs.lstat(file);
     const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     try {
         const st = await handle.stat();
         if (!st.isFile() || st.nlink !== 1 || st.size > MAX_TEXT_FILE_BYTES || st.ino !== before.ino || st.dev !== before.dev) throw new AppError('E_FILE');
+        if (expected && (st.size !== expected.bytes || Math.floor(st.mtimeMs) !== Math.floor(expected.mtime))) throw new AppError('E_FILE');
         const chunks: Buffer[] = []; let count = 0;
         for await (const chunk of handle.createReadStream({ autoClose: false, highWaterMark: 65536 })) {
             count += chunk.length;
@@ -55,31 +56,99 @@ async function ownedRoot(uid: string, cid: string) {
     if (!conv || !['normal', 'app_task'].includes(conv.kind)) throw new AppError('E_TASK');
     return null;
 }
-async function outputs(uid: string, cid: string) {
+/** A receipt carries at most this many files. */
+const MAX_RECEIPT_FILES = 100;
+/** Limit the general artifact scan. Declared deliveries have a separate receipt-sized lookup. */
+const MAX_ARTIFACT_FILES = 1000;
+const MAX_ARTIFACT_DEPTH = 8;
+type TaskFile = { path: string; name: string; bytes: number; mtime: number; relative: string };
+type OutputRoots = { workspace: string; appRoot: string | null };
+type SelectedFile = TaskFile & { published?: boolean };
+// Only archive consumes this selection. Absolute paths never enter the SDK response or durable receipt.
+const outputSelections = new WeakMap<TaskInspection, { files: SelectedFile[]; workspace: string; unavailableDelivery: boolean }>();
+
+function unavailableSource(error: unknown): boolean {
+    if (error instanceof AppError) return ['E_FILE', 'E_LIMIT'].includes(error.code);
+    return ['ENOENT', 'ENOTDIR', 'EISDIR', 'EACCES', 'EPERM', 'ELOOP'].includes((error as NodeJS.ErrnoException)?.code ?? '');
+}
+function relativeInside(root: string, file: string): string | undefined {
+    const relative = path.relative(root, file);
+    if (relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) return relative;
+}
+function declaredOutputRelative(file: string, roots: OutputRoots): string | undefined {
+    const workspace = relativeInside(roots.workspace, file);
+    if (workspace) return workspace.split(path.sep).join('/');
+    if (!roots.appRoot || path.basename(file) === '__orkas-meta.json') return;
+    const artifact = relativeInside(path.join(roots.appRoot, 'artifacts'), file)?.split(path.sep);
+    if (artifact && artifact.length <= MAX_ARTIFACT_DEPTH + 1) return 'artifacts/' + artifact.join('/');
+}
+async function declaredOutput(file: string, relative: string, roots: OutputRoots): Promise<TaskFile> {
+    await guard(file, roots.appRoot || roots.workspace);
+    const st = await fs.lstat(file);
+    if (!st.isFile() || st.nlink !== 1 || st.size > MAX_TEXT_FILE_BYTES) throw new AppError('E_FILE');
+    return { path: file, relative, name: path.basename(file), bytes: st.size, mtime: st.mtimeMs };
+}
+/** General inventory for filling a receipt and resolving live outputs. */
+async function allOutputs(uid: string, cid: string): Promise<OutputRoots & { files: TaskFile[] }> {
     const { listConversationOutputs } = await import('../conversation_outputs');
     const result = await listConversationOutputs(uid, cid);
-    if (result.truncated || result.scanSkipped || result.items.length > 100) throw new AppError('E_LIMIT');
-    const files = result.items.filter(item => item.path && item.origin === 'workspace').map(v => ({ path: v.path!, name: v.name, bytes: v.bytes, mtime: v.mtime, relative: v.relPath }));
+    const files: TaskFile[] = result.items.filter(item => item.path && item.origin === 'workspace').map(v => ({ path: v.path!, name: v.name, bytes: v.bytes, mtime: v.mtime, relative: v.relPath }));
     const appRoot = appConversationRoot(uid, cid);
     if (appRoot) {
         const artifactRoot = path.join(appRoot, 'artifacts');
+        let artifacts = 0;
         const walk = async (dir: string, depth: number) => {
-            if (depth > 8) throw new AppError('E_LIMIT');
+            if (depth > MAX_ARTIFACT_DEPTH) throw new AppError('E_LIMIT');
             for (const entry of await fs.readdir(dir, { withFileTypes: true }).catch(e => { if (e.code === 'ENOENT') return []; throw e; })) {
+                if (artifacts >= MAX_ARTIFACT_FILES) return;
                 if (entry.name === '__orkas-meta.json') continue;
                 const file = path.join(dir, entry.name);
                 await guard(file, appRoot);
                 if (entry.isDirectory()) await walk(file, depth + 1);
                 else {
-                    if (!entry.isFile() || files.length >= 100) throw new AppError('E_LIMIT');
+                    if (!entry.isFile()) throw new AppError('E_LIMIT');
                     const st = await fs.lstat(file);
+                    artifacts++;
                     files.push({ path: file, name: entry.name, bytes: st.size, mtime: st.mtimeMs, relative: 'artifacts/' + path.relative(artifactRoot, file).split(path.sep).join('/') });
                 }
             }
         };
         await walk(artifactRoot, 0);
     }
-    return files;
+    return { files, workspace: result.root, appRoot };
+}
+/** The files a receipt carries. A run that leaves more, such as VideoStudio
+ *  frames and test renders, keeps the files its reply delivered, then the
+ *  newest others. On 2026-11-17 one such run failed every result read with
+ *  E_LIMIT, so the user never saw its reply that the footage had not arrived. */
+function receiptFiles(files: TaskFile[], delivered: readonly string[] | undefined): TaskFile[] {
+    const wanted = new Set((delivered || []).map(file => path.resolve(file)));
+    const isDelivered = (file: TaskFile) => wanted.has(path.resolve(file.path));
+    // An unpublished intermediate that cannot be read by the output API must
+    // not prevent archival of the reply and its explicitly delivered files.
+    const candidates = files.filter(file => file.bytes <= MAX_TEXT_FILE_BYTES || isDelivered(file));
+    if (candidates.length <= MAX_RECEIPT_FILES) return candidates;
+    const others = candidates.filter(file => !isDelivered(file)).sort((a, b) => b.mtime - a.mtime);
+    return [...candidates.filter(isDelivered), ...others].slice(0, MAX_RECEIPT_FILES);
+}
+async function selectOutputs(uid: string, cid: string, delivered: readonly string[] | undefined) {
+    const inventory = await allOutputs(uid, cid);
+    const scanned = new Set(inventory.files.map(file => file.path));
+    let unavailableDelivery = false;
+    // Resolve exact declarations that the general scans could not see.
+    const declarations = new Set(delivered?.slice(0, MAX_RECEIPT_FILES).filter(file => path.isAbsolute(file)).map(file => path.resolve(file)));
+    for (const file of declarations) {
+        if (scanned.has(file)) continue;
+        const relative = declaredOutputRelative(file, inventory);
+        if (!relative) continue;
+        try { inventory.files.push(await declaredOutput(file, relative, inventory)); }
+        catch (error) {
+            if (!unavailableSource(error)) throw error;
+            unavailableDelivery = true;
+        }
+    }
+    const { markPublishedOutputs } = await import('./task-output');
+    return { workspace: inventory.workspace, unavailableDelivery, files: markPublishedOutputs(receiptFiles(inventory.files, delivered), delivered) };
 }
 async function pendingMedia(uid: string, cid: string): Promise<boolean> {
     const root = appConversationRoot(uid, cid);
@@ -132,12 +201,13 @@ async function inspect(uid: string, cid: string, messageId?: string, baseline?: 
     if (['completed', 'failed', 'stopped'].includes(status)) {
         if (!await (await import('../group_chat/bus')).drainConversationWrites(uid, cid)) status = 'running';
     }
-    const { markPublishedOutputs } = await import('./task-output');
-    const files = markPublishedOutputs(['running', 'unknown'].includes(status) ? [] : await outputs(uid, cid), reply?.produced);
-    return { status, text: reply?.text?.slice(0, 40000) || '',
-        files: files.map(file => ({ id: hash(file.path), name: file.name, bytes: file.bytes, ...(file.published !== undefined ? { published: file.published } : {}), version: hash(JSON.stringify([file.bytes, file.mtime])) })),
+    const selection = ['running', 'unknown'].includes(status) ? undefined : await selectOutputs(uid, cid, reply?.produced);
+    const result: TaskInspection = { status, text: reply?.text?.slice(0, 40000) || '',
+        files: (selection?.files ?? []).map(file => ({ id: hash(file.path), name: file.name, bytes: file.bytes, ...(file.published !== undefined ? { published: file.published } : {}), version: hash(JSON.stringify([file.bytes, file.mtime])) })),
         ...(status === 'waiting_input' && reply ? { inputId: reply.id } : {}),
         ...(interactions.length ? { interactions } : {}), ...(form ? { form: { messageId: form.id, ...form.form } } : {}) };
+    if (selection) outputSelections.set(result, selection);
+    return result;
 }
 export const taskService = new AppTaskService({
     activeUser: getActiveUserId,
@@ -228,12 +298,19 @@ export const taskService = new AppTaskService({
         const owner = appConversationOwner(cid);
         if (owner && owner.key !== scope.key) throw new AppError('E_TASK');
         const root = await ownedRoot(uid, cid);
-        const workspace = await (await import('../group_chat/conv_workspace')).getConversationWorkspacePath(uid, cid);
-        const files = await outputs(uid, cid);
+        const selection = outputSelections.get(result);
+        if (!selection && result.files.length) throw new AppError('E_FILE');
+        let unavailableDelivery = selection?.unavailableDelivery ?? false;
         const archived: TaskInspection['files'] = [];
-        for (const file of files) {
+        for (const file of selection?.files ?? []) {
             if (uid !== getActiveUserId()) throw new AppError('E_CLOSED');
-            const bytes = await regularFile(file.path, root || workspace);
+            let bytes: Buffer;
+            try { bytes = await regularFile(file.path, root || selection!.workspace, file); }
+            catch (error) {
+                if (!unavailableSource(error)) throw error;
+                if (file.published) unavailableDelivery = true;
+                continue;
+            }
             const version = hash(bytes), id = hash(file.path);
             const relative = file.relative.startsWith('artifacts/') ? file.relative
                 : `${id.slice(0, 16)}-${version.slice(0, 16)}${path.extname(file.name).slice(0, 16)}`;
@@ -241,8 +318,13 @@ export const taskService = new AppTaskService({
             const destination = path.join(webAppSandboxRoot(uid, scope.key, 'cloud'), 'files', ...appPath.split('/'));
             await guard(destination, userCloudRoot(uid));
             await writeBytesAtomic(destination, bytes, { shouldCommit: () => getActiveUserId() === uid });
-            const published = result.files.find(candidate => candidate.id === id)?.published;
+            const published = file.published;
             archived.push({ id, version, name: file.name, bytes: bytes.length, path: appPath, ...(published !== undefined ? { published } : {}) });
+        }
+        const error = result.error as { code?: string } | undefined;
+        if (unavailableDelivery && (result.status === 'completed' || (result.status === 'failed' && (!error || error.code === 'E_OUTPUT_MISSING')))) {
+            result.status = 'failed';
+            result.error = { code: 'E_OUTPUT_SAVE_FAILED' };
         }
         if (result.status === 'completed' && deliverable && (deliverable !== 'text' || output?.format)) {
             const { isAppDeliverable, isAppTextDeliverable, AppOutputUnverifiedError } = await import('./task-output');
@@ -304,10 +386,17 @@ export const taskService = new AppTaskService({
             if (hash(bytes) !== file.version) throw new AppError('E_FILE');
             return { base64: bytes.toString('base64'), name: file.name };
         }
-        const file = (await outputs(uid, cid)).find(v => hash(v.path) === id);
-        if (!file) throw new AppError('E_FILE');
-        const root = await ownedRoot(uid, cid) || await (await import('../group_chat/conv_workspace')).getConversationWorkspacePath(uid, cid);
-        return { base64: (await regularFile(file.path, root)).toString('base64'), name: file.name };
+        const root = await ownedRoot(uid, cid);
+        const inventory = await allOutputs(uid, cid);
+        const file = inventory.files.find(v => hash(v.path) === id);
+        if (file) return { base64: (await regularFile(file.path, root || inventory.workspace)).toString('base64'), name: file.name };
+        // A live receipt may have found a declared delivery beyond the general scan.
+        const { listProducedPaths } = await import('../chats');
+        const match = (await listProducedPaths(uid, cid, 30)).find(value => path.isAbsolute(value) && hash(path.resolve(value)) === id);
+        const absolute = match && path.resolve(match);
+        const relative = absolute && declaredOutputRelative(absolute, inventory);
+        if (!absolute || !relative) throw new AppError('E_FILE');
+        return { base64: (await regularFile(absolute, root || inventory.workspace)).toString('base64'), name: path.basename(absolute) };
     },
     respond: async (uid, cid, args, request) => {
         if (args.kind === 'text') {
@@ -385,16 +474,17 @@ export const taskService = new AppTaskService({
     watch: async (s, requestId) => { await pendingTask(s.userId, s.key, requestId, true); startAppTaskMaintenance(); },
     unwatch: async (s, requestId) => pendingTask(s.userId, s.key, requestId, false),
 });
-let timer: NodeJS.Timeout | undefined, draining = false, lastWarning = 0;
+let timer: NodeJS.Timeout | undefined, maintenance: Promise<void> | undefined, lastWarning = 0;
 export async function maintainAppTasks(): Promise<void> {
-    if (draining) return;
-    draining = true;
+    if (maintenance) return;
+    const pass = drainPendingTasks(getActiveUserId(), getActiveUserId, async (s, id) => { await taskService.settle(s, id); }, code => {
+        if (Date.now() - lastWarning < 60000) return;
+        lastWarning = Date.now(); log.warn('app task storage pending', { code });
+    });
+    maintenance = pass;
     try {
-        await drainPendingTasks(getActiveUserId(), getActiveUserId, (s, id) => taskService.settle(s, id), code => {
-            if (Date.now() - lastWarning < 60000) return;
-            lastWarning = Date.now(); log.warn('app task storage pending', { code });
-        });
-    } finally { draining = false; }
+        await pass;
+    } finally { maintenance = undefined; }
 }
 export function startAppTaskMaintenance(): void {
     if (timer) return;
@@ -403,7 +493,11 @@ export function startAppTaskMaintenance(): void {
     }); }, 5000);
     timer.unref();
 }
-export function stopAppTaskMaintenance(): void { if (timer) clearInterval(timer); timer = undefined; }
+export function stopAppTaskMaintenance(): Promise<void> | undefined {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    return maintenance;
+}
 export async function appTaskCall(uid: string, key: string, method: string, args: any, signal: AbortSignal) {
     if (uid !== getActiveUserId() || signal.aborted) throw new AppError('E_CLOSED');
     if (method === 'tasks.agents') {
@@ -412,8 +506,9 @@ export async function appTaskCall(uid: string, key: string, method: string, args
     }
     if(method==='tasks.services')return(await import('./media-services')).listAppMediaServices(args.kind,signal,args.refresh===true);
     const scope = { userId: uid, key, signal };
+    let settled: SettledInspection | undefined;
     if (method === 'tasks.get') {
-        try { await taskService.settle(scope, args.requestId); }
+        try { settled = await taskService.settle(scope, args.requestId); }
         catch (cause) {
             if (cause instanceof AppError && ['E_CLOSED', 'E_CANCELLED', 'E_TASK', 'E_INPUT'].includes(cause.code)) throw cause;
             const result = await taskService.call(scope, method, args);
@@ -421,5 +516,5 @@ export async function appTaskCall(uid: string, key: string, method: string, args
             return { ...result, status: 'saving', storageError: true };
         }
     }
-    return taskService.call(scope, method, args);
+    return taskService.call(scope, method, args, settled);
 }

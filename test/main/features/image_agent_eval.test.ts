@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { validateImageStudioManifest } from '../../../src/main/features/image_studio';
+import { createImageStudioTool } from '../../../src/main/model/core-agent/image-studio-tool';
 
 const AGENT_ID = '814b61b027f0';
 const agentDir = path.join(process.cwd(), 'resources', 'builtin', 'marketplace', 'agents', AGENT_ID);
@@ -46,7 +47,7 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(agent.workflow).toContain('GENERATE');
     expect(agent.workflow).toContain('EDIT');
     expect(privateSurface).toContain('image_studio');
-    expect(privateSurface).toContain('workflow.run');
+    expect(privateSurface).not.toMatch(/workflow\.(?:run|capabilities)|ComfyUI|InvokeAI|AUTOMATIC1111|IOPaint|rembg|Real-ESRGAN/i);
     expect(privateSurface).toContain('generation.quote');
     expect(privateSurface).toContain('Never infer a price');
     expect(privateSurface).toContain('checks provider availability again');
@@ -61,18 +62,24 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(router).toMatch(/clear zero-input poster or social graphic[\s\S]*low-risk defaults/i);
     expect(router).toMatch(/routine canvas and export choices are low-risk defaults/i);
     expect(router).toMatch(/choose them without asking and state the chosen defaults in the delivery/i);
-    expect(privateSurface).toMatch(/multiple meaningful regions/i);
-    expect(privateSurface).toMatch(/Skip it for a simple single-region image/i);
-    expect(agent.workflow.indexOf('`image-craft`')).toBeLessThan(agent.workflow.indexOf('`image-canvas`'));
-    expect(privateSurface).toContain('COMPOSE');
-    expect(privateSurface).toContain('image-compose');
-    expect(router).toMatch(/Add `image-canvas` only for multiple meaningful regions/i);
+    // The router selects canvas work from the composition's reading jobs
+    // and other concrete layout constraints.
+    const canvasSelection = router.split('\n').find(line => line.startsWith('- Add `image-canvas`'));
+    expect(canvasSelection).toMatch(/distinct visual regions.*explicit reading order.*exact layout constraints.*region-bound references/i);
+    expect(canvasSelection).toMatch(/main visual.*separate block of facts or supporting copy.*distinct regions.*one artboard/i);
+    expect(router).toMatch(/establish art direction and canvas before authoring/i);
+    expect(router).toMatch(/Add `image-compose` for `COMPOSE`/i);
+    // The review-before-export sequence moved into the production skills, which
+    // are read at the point it applies; standards keep the export contract only.
     const designReview = fs.readFileSync(
       path.join(agentDir, 'skills', 'image-design-review', 'SKILL.md'), 'utf8',
     );
     const compose = fs.readFileSync(path.join(agentDir, 'skills', 'image-compose', 'SKILL.md'), 'utf8');
     expect(designReview).toMatch(/project\.submit_design_review/);
-    expect(compose).toMatch(/first `project\.export` call[\s\S]*workspace-relative `output_path` ending in `\.png`/i);
+    const vectorPdfExport = compose.split('\n').find(line => line.includes('`format:"pdf"`'));
+    expect(vectorPdfExport).toMatch(/SVG[\s\S]*review[\s\S]*project\.export[\s\S]*workspace-relative `\.pdf`/i);
+    expect(compose).toMatch(/PSD preparation[^\n]*workspace-relative `\.png`[^\n]*After PNG export succeeds[^\n]*PSD/i);
+    expect(compose).not.toMatch(/first `project\.export` call[^\n]*`\.png`/i);
     expect(compose).toMatch(/instead of handing a completed direct request back to Commander/i);
     expect(compose).toMatch(/Show only exported final deliverables unless the user asks for review evidence/i);
     expect(compose).toMatch(/before the first preview/i);
@@ -100,6 +107,7 @@ describe('ImageStudio built-in agent evaluation', () => {
     };
     expect(agent.workflow).toContain('Read `image-router` first');
     expect(agent.workflow).toContain('load only the route-specific image Skills');
+    expect(agent.workflow).toMatch(/Read `image-router` first[^\n]*add a vector PDF[^\n]*existing artwork/i);
 
     const router = fs.readFileSync(path.join(agentDir, 'skills', 'image-router', 'SKILL.md'), 'utf8');
     const craft = fs.readFileSync(path.join(agentDir, 'skills', 'image-craft', 'SKILL.md'), 'utf8');
@@ -121,6 +129,8 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(compose).toContain('Do not preload it during routing');
     // Discovery must expose conversion before the production instructions load.
     const composeSelection = router.split('\n').find(line => line.startsWith('- Add `image-compose`'))!;
+    const vectorPdfFollowUp = router.split('\n').find(line => line.startsWith('- For a vector PDF follow-up'));
+    expect(vectorPdfFollowUp).toMatch(/retained (?:HTML or SVG|SVG or HTML).*load `image-compose`/i);
     for (const entry of [composeSelection, compose.split('\n').find(line => line.startsWith('description_en:'))!,
       compose.split('\n').find(line => line.startsWith('Read this skill'))!]) {
       expect(entry).toMatch(/SVG\/HTML conversion/);
@@ -194,7 +204,7 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(compose).toContain('not only a pending label');
     expect(review).toContain('exact evidence path');
     expect(review).toContain('`quality_scores` as one object');
-    expect(review).toContain('`findings:[]`');
+    expect(review).toContain('`review_findings:[]`');
     expect(review).toContain('intent_alignment');
     expect(review).toContain('overall >= 80');
     expect(review).toContain('mandatory dimensions are the comparable baseline, not a closed list');
@@ -289,30 +299,22 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(shared).toContain('reference_intent.minimum_score` to at least 85');
   });
 
-  it('keeps external workflow execution private, host-bound, and budgeted', () => {
+  it('keeps provider generation quoted, budgeted, and inspected', () => {
     const generate = fs.readFileSync(path.join(agentDir, 'skills', 'image-generate', 'SKILL.md'), 'utf8');
-    expect(generate).toContain('workflow.capabilities');
-    expect(generate).toContain('AUTOMATIC1111');
-    expect(generate).toContain('IOPaint');
-    expect(generate).toContain('Real-ESRGAN');
-    expect(generate).toContain('SAM/SAM2');
-    expect(generate).toContain('Never accept, construct, print, or persist');
     expect(generate).toContain('pending_uncertain');
-    expect(generate).toContain('durable generation budget');
-    expect(generate).toContain('scoped to the current user turn');
+    expect(generate).toContain('durable generation transaction');
+    expect(generate).toContain('Respect `generation_budget.max_calls` within the current user turn');
     expect(generate).toContain('fresh call scope');
     expect(generate).toContain('Provider availability and billing disclosure');
     expect(generate).toContain('generation.quote');
     expect(generate).toContain('Never infer a price');
     expect(generate).toContain('checks provider availability again');
-    expect(generate).toContain('does not use in-app billing');
+    expect(generate).toContain('may bill through its own account');
     expect(generate).toContain('project call slots consumed');
-    expect(generate).toContain('request.sd_keep_unmasked_area:true');
-    expect(generate).toContain('concrete, executable fields');
-    expect(generate).toContain('project.submit_design_review');
+    expect(generate).toMatch(/For `is_generation:true`.*returns `project\.export`.*do not load `image-design-review`/i);
     expect(fs.existsSync(path.join(agentDir, 'skills', 'image-compose', 'scripts', 'structured_visual.js'))).toBe(true);
     expect(fs.existsSync(path.join(agentDir, 'skills', 'image-compose', 'scripts', 'image_asset.js'))).toBe(true);
-    expect(fs.existsSync(path.join(agentDir, 'skills', 'image-generate', 'references', 'external-workflows.md'))).toBe(true);
+    expect(fs.existsSync(path.join(agentDir, 'skills', 'image-generate', 'references', 'external-workflows.md'))).toBe(false);
   });
 
   it('continues technical recovery without forms and surfaces the current candidate before stopping', () => {
@@ -329,5 +331,21 @@ describe('ImageStudio built-in agent evaluation', () => {
     expect(generate).toContain('deterministic zero-call repair');
     expect(generate).toContain('Never raise manifest `max_calls` or request a quota-increase form');
     expect(generate).toContain('using normal chat rather than a recovery form');
+  });
+
+  // 2026-11-19: the review Skill told the model to send `findings`, while
+  // project.submit_design_review reads `review_findings`. The tool schema is
+  // the oracle: every review field it accepts is named exactly.
+  it('names the design-review fields the image_studio tool actually reads', () => {
+    const review = fs.readFileSync(path.join(agentDir, 'skills', 'image-design-review', 'SKILL.md'), 'utf8');
+    const properties = Object.keys((createImageStudioTool({ userId: 'review-field-audit', agentId: AGENT_ID })
+      .inputSchema as { properties: Record<string, unknown> }).properties);
+    const reviewFields = properties.filter((name) => name.startsWith('review_'));
+    expect(reviewFields).toEqual(expect.arrayContaining(['review_verdict', 'review_scope', 'review_findings']));
+    for (const field of [...reviewFields, 'evidence_path', 'quality_scores', 'additional_dimensions']) {
+      expect(properties).toContain(field);
+      expect(review).toContain(`\`${field}\``);
+    }
+    expect(review).not.toMatch(/`findings[`:]/);
   });
 });

@@ -148,26 +148,32 @@ describe('add_custom_connector tool', () => {
     }
   });
 
-  it('does not install when the user declines', async () => {
+  it.each(['declined', 'conversation cancelled', 'timed out'])('reports no confirmation without installing (%s)', async mode => {
     mockMcpClient();
     const added: string[] = [];
     const { ic, tool } = await buildTool((connectorId) => added.push(connectorId));
     const pushed: any[] = [];
     ic._setBroadcastForTest((_ch, payload) => pushed.push(payload));
+    if (mode === 'timed out') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
       const exec = tool!.execute(
-        { name: 'Nope', transport: { kind: 'stdio', command: 'evil', args: [] } },
+        { name: 'Fixture connector', transport: { kind: 'stdio', command: 'fixture', args: [] } },
         { state: {} } as never,
       );
       await vi.waitFor(() => expect(pushed).toHaveLength(1));
-      ic.respond(pushed[0].request_id, false);
+      const requestId = pushed[0].request_id;
+      if (mode === 'declined') ic.respond(requestId, false);
+      else if (mode === 'conversation cancelled') ic.cancelForCid('c1');
+      else await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
       const result = await exec;
-      expect(String(result.content)).toContain('declined');
+      expect(String(result.content)).toContain('Installation was not confirmed. The connector was not installed.');
+      expect(ic.respond(requestId, true)).toBe(false);
 
       const registry = await import('../../../../src/main/features/connectors/registry');
       expect(Object.keys(registry.load(TEST_UID).connections)).toHaveLength(0);
       expect(added).toEqual([]);
     } finally {
+      vi.useRealTimers();
       ic._setBroadcastForTest(null);
     }
   });

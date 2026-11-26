@@ -172,7 +172,7 @@ describe('settings sidebar navigation', () => {
 
     expect(header).toContain('id="create-agent-btn"');
     expect(header).toContain('id="agents-connect-cli-btn"');
-    expect(header).toContain('data-i18n="agents.connect_cli_sub"');
+    expect(header).toContain('data-i18n="sidebar.connect_agent_sub"');
     expect(header).toContain('id="agents-more-btn"');
     expect(handlerStart).toBeGreaterThan(-1);
     expect(handler).toContain("initialTab: 'external'");

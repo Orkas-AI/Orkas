@@ -85,7 +85,7 @@ Summarize:
 
 ## References
 
-List every cited source in APA 7 format. Do not include sources that were not actually used unless an appendix explicitly labels them as reviewed but excluded.
+List every cited source in the requested citation style; do not impose APA unless the user or deliverable requires it. Do not include sources that were not actually used unless an appendix explicitly labels them as reviewed but excluded.
 
 ## Appendices
 

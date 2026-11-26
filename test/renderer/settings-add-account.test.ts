@@ -250,7 +250,7 @@ it('adds a Wan tier with its chosen region and workspace and clears the submitte
     context._settingsRenderVideoPicker();
     const picker = vm.runInContext('_settingsState.videoProviderSel', context);
     expect(picker.getOptions()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ value: 'doubao:doubao-seedance-2-5-flash', label: 'Doubao Seedance 2.5 Flash' }),
+      expect.objectContaining({ value: 'doubao:doubao-seedance-2-5-flash', label: 'Seedance 2.5 Flash' }),
       expect.objectContaining({ value: 'aliyun:wan3.0-video-prime' }),
     ]));
     picker.emitChange('aliyun:wan3.0-video-prime');

@@ -69,7 +69,8 @@ export function registerGeneratedMediaUrl(absPath: string, url?: string): void {
   }
   const fileIdentity = localFileIdentity(cleanPath);
   if (!cleanPath || !cleanUrl || !fileIdentity) return;
-  if (generatedMediaUrls.size >= 256) generatedMediaUrls.delete(generatedMediaUrls.keys().next().value);
+  generatedMediaUrls.delete(cleanPath);
+  if (generatedMediaUrls.size >= 256) generatedMediaUrls.delete(generatedMediaUrls.keys().next().value!);
   generatedMediaUrls.set(cleanPath, {
     url: cleanUrl,
     ownerId: currentReferenceOwnerId(),
@@ -169,7 +170,7 @@ export async function loadImageReferenceBuffers(urls: string[] = [], paths: stri
 
 export async function loadImageReferenceBuffersWithProgress(
   urls: string[] = [], paths: string[] = [],
-  opts: { signal?: AbortSignal; onProgress?: GenerationReferenceProgressReporter } = {},
+  opts: { signal?: AbortSignal; onProgress?: GenerationReferenceProgressReporter; assertLocalPath?: (file: string) => void } = {},
 ): Promise<Buffer[]> {
   return withReferencePreparation(opts.signal, signal => loadImageReferenceBuffersWithinBudget(urls, paths, { ...opts, signal }));
 }
@@ -180,6 +181,7 @@ async function loadImageReferenceBuffersWithinBudget(
   opts: {
     signal?: AbortSignal;
     onProgress?: GenerationReferenceProgressReporter;
+    assertLocalPath?: (file: string) => void;
   } = {},
 ): Promise<Buffer[]> {
   const out: Buffer[] = [];
@@ -195,6 +197,7 @@ async function loadImageReferenceBuffersWithinBudget(
       index,
       total,
     });
+    opts.assertLocalPath?.(localPath);
     const buf = await fs.readFile(localPath, { signal: opts.signal });
     throwIfAborted(opts.signal);
     out.push(buf);

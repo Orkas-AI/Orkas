@@ -4,6 +4,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The access setting reads files outside the workspace by; null cannot be read, which keeps
+// reads to the workspace, as for a user who chose that.
+const access = vi.hoisted(() => ({ mode: null as null | 'workspace_approval' | 'all_files_approval' | 'all_files_auto' }));
+vi.mock('../../../../src/main/features/permissions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../../src/main/features/permissions')>()),
+  localAccessAllowsOutsideWorkspace: () => {
+    if (!access.mode) throw new Error('no active user');
+    return access.mode !== 'workspace_approval';
+  },
+  localAccessRequiresSensitiveApproval: () => access.mode !== 'all_files_auto',
+}));
+
 const h = vi.hoisted(() => ({
   engineAvailable: true,
   workspace: '',
@@ -161,6 +173,58 @@ describe('Office built-in tools', () => {
     } }) };
   }
 
+  it.each([
+    { content: { paragraphs: [{ text: 'Keep me' }, { style: 'Heading2' }] }, field: 'paragraphs[1].text' },
+    { content: { paragraphs: [null] }, field: 'paragraphs[0]' },
+    { content: { tables: [{ rows: 'not a grid' }] }, field: 'tables[0].rows' },
+    { content: { tables: [{ rows: [['Keep me'], null] }] }, field: 'tables[0].rows[1]' },
+    { content: { tables: [{ rows: [['Revenue', { value: 42 }]] }] }, field: 'tables[0].rows[0][1]' },
+    { content: { tables: [{ rows: [[['nested']]] }] }, field: 'tables[0].rows[0][0]' },
+    { content: { images: [null] }, field: 'images[0]' },
+    { content: { images: [{ width: '2in' }] }, field: 'images[0].src' },
+    { content: { paragraphs: { text: 'Expected an array' } }, field: 'paragraphs' },
+  ])('rejects a DOCX with malformed $field before creating or reserving it', async ({ content, field }) => {
+    const input = { path: 'correctable.docx', preview: false };
+    const result = await getTool('create_docx').execute({ ...input, ...content }, ctx());
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ code: 'E_BAD_INPUT',
+      issues: expect.arrayContaining([expect.objectContaining({ field })]),
+    });
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpDir, 'office-creation-state'))).toBe(false);
+    expect(fs.readdirSync(h.workspace)).toEqual([]);
+    const corrected = await getTool('create_docx').execute({ ...input, paragraphs: [{ text: 'Restored' }] }, ctx());
+    expect(creationReceipt(corrected)).toMatchObject({ attempt: 1, publication: 'published' });
+  });
+
+  it('creates intentional blank DOCX content and preserves empty cells alongside text', async () => {
+    const blank = await getTool('create_docx').execute({ path: 'blank.docx', preview: false }, ctx());
+    expect(creationReceipt(blank)).toMatchObject({ publication: 'published' });
+    const filled = await getTool('create_docx').execute({ path: 'filled.docx', preview: false,
+      paragraphs: [{ text: '' }, { text: 'Body' }], tables: [{ rows: [[null, ''], [42, 'Cell']] }],
+    }, ctx());
+    expect(creationReceipt(filled)).toMatchObject({ publication: 'published' });
+    const batch = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
+    expect(JSON.parse(batch![1].stdin)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'p', props: { text: '' } }),
+      expect.objectContaining({ type: 'p', props: { text: 'Body' } }),
+      expect.objectContaining({ type: 'table', props: { rows: '2', cols: '2' } }),
+      expect.objectContaining({ path: '/body/table[1]/tr[2]/tc[2]/p[1]', props: { text: 'Cell' } }),
+    ]));
+  });
+
+  it.each([null, ''])('explains how to start an initial creation when retry_of is %j', async retry_of => {
+    const input = { path: 'initial.docx', preview: false, paragraphs: [{ text: 'Report' }] };
+    const blocked = await getTool('create_docx').execute({ ...input, retry_of }, ctx());
+    expect(blocked).toMatchObject({ isError: true, content: expect.stringMatching(/omit.*retry_of/i) });
+    expect(blocked.content).not.toContain('<office-creation>');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(fs.readdirSync(h.workspace)).toEqual([]);
+    const first = await getTool('create_docx').execute(input, ctx());
+    expect(creationReceipt(first)).toMatchObject({ attempt: 1, publication: 'published' });
+  });
+
   // A rejected initial document is recoverable; a deleted delivered document
   // is not. Observe actual final files and native dispatches, not just receipts.
   it.each([
@@ -179,15 +243,36 @@ describe('Office built-in tools', () => {
     const failed = creationReceipt(first);
     expect(failed).toMatchObject({ publication: 'not_published', retry_available: true });
     expect(fs.existsSync(path.join(h.workspace, initial.path))).toBe(false);
+    const beforeCorrection = h.runOfficeCli.mock.calls.length;
+    for (const retry_of of [null, '']) {
+      const omittedId = await getTool(name).execute({ ...initial, retry_of }, ctx());
+      expect(omittedId).toMatchObject({ isError: true, content: expect.stringContaining('E_OFFICE_RETRY_NOT_ALLOWED') });
+      expect(creationReceipt(omittedId)).toMatchObject({ operation_id: failed.operation_id,
+        publication: 'not_published', retry_available: true, attempt: 1 });
+    }
+    expect(h.runOfficeCli.mock.calls).toHaveLength(beforeCorrection);
+    const differentPath = await getTool(name).execute({ ...initial, path: `different.${extension}`, retry_of: null }, ctx());
+    expect(differentPath.isError).toBe(true);
+    expect(differentPath.content).not.toContain(failed.operation_id);
     const corrected = { ...initial, paragraphs: [{ text: 'Corrected' }],
       sheets: [{ name: 'Sheet1', rows: [['Corrected']] }], slides: [{ title: 'Corrected' }],
       retry_of: failed.operation_id };
+    if (name === 'create_docx') {
+      const invalidCorrection = await getTool(name).execute({ ...corrected, paragraphs: [null] }, ctx());
+      expect(invalidCorrection.isError).toBe(true);
+      expect(JSON.parse(invalidCorrection.content)).toMatchObject({ code: 'E_BAD_INPUT' });
+      expect(h.runOfficeCli.mock.calls).toHaveLength(beforeCorrection);
+    }
     const recovered = await getTool(name).execute(corrected, ctx());
     expect(recovered.isError).toBeUndefined();
     expect(creationReceipt(recovered)).toMatchObject({ operation_id: failed.operation_id,
       publication: 'published', retry_available: false, attempt: 2 });
     expect(fs.readFileSync(path.join(h.workspace, initial.path), 'utf8')).toBe('created-office-file');
     const calls = h.runOfficeCli.mock.calls.length;
+    const published = await getTool(name).execute({ ...corrected, retry_of: null }, ctx());
+    expect(published.isError).toBe(true);
+    expect(published.content).not.toContain('"retry_available":true');
+    expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
     fs.unlinkSync(path.join(h.workspace, initial.path));
     const resurrected = await getTool(name).execute(corrected, ctx());
     expect(resurrected.isError).toBe(true);
@@ -380,6 +465,44 @@ describe('Office built-in tools', () => {
     expect((await getTool('create_docx').execute({ ...input, retry_of: first.operation_id }, ctx())).isError).toBe(true);
     expect(h.runOfficeCli.mock.calls).toHaveLength(calls);
     expect(fs.existsSync(path.join(h.workspace, input.path))).toBe(false);
+  });
+
+  it('detects a known image format mismatch before reserving a PowerPoint creation', async () => {
+    // Same generated JPEG bytes in both inputs. Only the filename is wrong.
+    const jpeg = Buffer.from(
+      '/9j/4AAQSkZJRgABAgAAAQABAAD//gAPTGF2YzYwLjMuMTAwAP/bAEMACAQEBAQEBQUFBQUFBgYGBgYGBgYGBgYGBgcHBwgICAcHBwYGBwcICAgICQkJCAgICAkJCgoKDAwLCw4ODhERFP/EAE0AAQEAAAAAAAAAAAAAAAAAAAAHAQEBAQAAAAAAAAAAAAAAAAAABQcQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCABAAEADASIAAhEAAxEA/9oADAMBAAIRAxEAPwCOAN/SwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/2Q==',
+      'base64',
+    );
+    fs.writeFileSync(path.join(h.workspace, 'picture.png'), jpeg);
+    fs.writeFileSync(path.join(h.workspace, 'picture.jpg'), jpeg);
+    const input = (src: string) => ({
+      path: 'draft.pptx', preview: false, slides: [{ title: 'Example', images: [{ src }] }],
+    });
+    const batch = h.runOfficeCli.getMockImplementation()!;
+    h.runOfficeCli.mockImplementation(async (args: string[], options: { stdin: string }) => {
+      if (args[0] === 'batch' && options.stdin.includes('picture.png')) {
+        // The pinned native engine certifies rollback but supplies no row code.
+        const rejection = atomicRejection(options);
+        const payload = JSON.parse(rejection.stdout);
+        delete payload.data.results.at(-1).code;
+        return { ...rejection, stdout: JSON.stringify(payload) };
+      }
+      return batch(args, options);
+    });
+
+    const tool = getTool('create_pptx');
+    const rejected = await tool.execute(input('picture.png'), ctx());
+    expect(rejected.isError).toBe(true);
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(h.workspace, 'draft.pptx'))).toBe(false);
+    const callsAfterRejection = h.runOfficeCli.mock.calls.length;
+    const corrected = await tool.execute(input('picture.jpg'), ctx());
+
+    expect.soft(rejected.content).toContain('E_OFFICE_IMAGE');
+    expect.soft(callsAfterRejection).toBe(0);
+    expect.soft(corrected.isError).toBeUndefined();
+    expect.soft(onFileWritten).toHaveBeenCalledTimes(1);
+    expect.soft(fs.existsSync(path.join(h.workspace, 'draft.pptx'))).toBe(true);
   });
 
   it.each(['untyped', 'not-rolled-back', 'wrong-error', 'incomplete'])('does not infer correction authority from a %s native failure', async shape => {
@@ -802,6 +925,43 @@ describe('Office built-in tools', () => {
     expect(batches).toHaveLength(1);
     expect(JSON.parse(batches[0][1].stdin)).toContainEqual({ command: 'set', path: '/slide[1]/shape[1]',
       props: { size: '28', height: '0.6in', color: '#FFFFFF' } });
+  });
+
+  // 2026-11-23: a file the user names elsewhere on the computer follows the access setting the
+  // file tools follow; what the edit writes goes to the workspace, and the source is untouched.
+  it('reads a file elsewhere on the computer by the access setting, and edits a copy in the workspace', async () => {
+    const elsewhere = path.join(tmpDir, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    const source = path.join(elsewhere, 'deck.pptx');
+    const image = path.join(elsewhere, 'logo.png');
+    fs.writeFileSync(source, 'original-deck');
+    fs.writeFileSync(image, 'png');
+    const edit = () => getTool('edit_office').execute({
+      path: source,
+      operations: [{ action: 'add', parent: '/slide[1]', type: 'picture', props: { src: image } }],
+      preview: false,
+    }, ctx());
+    try {
+      access.mode = 'workspace_approval';
+      const refused = await edit();
+      expect(refused.isError).toBe(true);
+      expect(refused.content).toContain('Ask the user to attach it, or to allow files outside the workspace in Settings.');
+      expect(h.runOfficeCli).not.toHaveBeenCalled();
+      access.mode = 'all_files_approval';
+      const edited = await edit();
+      expect(edited.isError, edited.content).toBeUndefined();
+      expect(fs.readFileSync(source, 'utf8')).toBe('original-deck');
+      expect(fs.readdirSync(elsewhere).sort()).toEqual(['deck.pptx', 'logo.png']);
+      expect(fs.existsSync(path.join(h.workspace, 'deck-edited.pptx'))).toBe(true);
+      const batches = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
+      expect(JSON.parse(batches[0][1].stdin)).toContainEqual(expect.objectContaining({ props: { src: image } }));
+      h.runOfficeCli.mockClear();
+      const read = await getTool('office_read').execute({ path: source }, ctx());
+      expect(read.content).not.toContain('E_PATH_OUT_OF_SCOPE');
+      expect(h.runOfficeCli).toHaveBeenCalled();
+    } finally {
+      access.mode = null;
+    }
   });
 
   it('appends a complete page atomically with sandboxed local assets while preserving the source', async () => {
@@ -1808,11 +1968,11 @@ describe('Office built-in tools', () => {
     }, ctx());
 
     expect(outsideResult).toMatchObject({ isError: true });
-    expect(outsideResult.content).toContain('outside the conversation');
+    expect(outsideResult.content).toContain("is outside this conversation's files");
     expect(remoteResult).toMatchObject({ isError: true });
     expect(remoteResult.content).toContain('does not accept URI');
     expect(nestedOutsideResult).toMatchObject({ isError: true });
-    expect(nestedOutsideResult.content).toContain('outside the conversation');
+    expect(nestedOutsideResult.content).toContain("is outside this conversation's files");
     expect(activeLinkResult).toMatchObject({ isError: true });
     expect(activeLinkResult.content).toContain('unsafe URI scheme');
     expect(h.runOfficeCli).not.toHaveBeenCalled();

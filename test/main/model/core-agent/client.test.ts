@@ -950,3 +950,36 @@ it('does not attribute a previous completed response to a host-interrupted run',
   expect(client.summarizeModelRunForLog(stats).terminal_output)
     .toEqual({ version: 1, output_kind: 'unknown', mapped_text_chars: 0 });
 });
+
+it.each(['tool_loop_limit', 'repetitive_tool_calls'] as const)(
+  'preserves the authoritative %s reason through the actual public terminal producer', async reason => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser('public-terminal-owner');
+    vi.doMock('../../../../src/main/model/core-agent/runner', async importOriginal => ({
+      ...(await importOriginal<object>()),
+      buildRunner: async () => ({
+        providerId: 'custom', modelId: 'terminal-fixture', toolDefs: [], failureTrackingScope: {},
+        skillDisplayNameById: new Map(), skillMetadataByReadRef: new Map(),
+        agentDisplayNameById: new Map(), connectorDisplayNameById: new Map(),
+        runner: { async *runStream() {
+          yield { type: 'done', result: {
+            text: 'Draft retained.', content: [{ type: 'text', text: 'Draft retained.' }],
+            meta: { termination: { status: 'stopped', reason },
+              convergenceSignals: [reason, 'not-a-runtime-signal', reason] },
+          } };
+        } },
+      }),
+    }));
+    try {
+      const { streamChatWithModel } = await import('../../../../src/main/model/core-agent/client');
+      const events: any[] = [];
+      for await (const event of streamChatWithModel({ userId: 'public-terminal-owner',
+        sessionId: `gconv-public-terminal-${reason}`, message: 'Retain the partial draft.' })) events.push(event);
+      expect(events.filter(event => event.type === 'error')).toEqual([]);
+      const terminal = events.filter(event => event.type === 'event' && event.event?.stream === 'agent_run_terminal');
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0].event.data).toMatchObject({ terminal_status: 'stopped', convergence_signals: [reason] });
+      expect(events.at(-1)?.type).toBe('done');
+    } finally { vi.doUnmock('../../../../src/main/model/core-agent/runner'); }
+  },
+);

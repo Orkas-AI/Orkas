@@ -17,6 +17,7 @@ import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { gateOutsideRead } from './outside-read-gate';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { fileEditLock } from '../../util/locks';
 import { createLogger } from '../../logger';
@@ -75,6 +76,9 @@ const PDF_ACTION_FIELDS: Readonly<Record<PdfAction, ReadonlySet<string>>> = {
 export interface PdfToolsOpts {
   userId?: string;
   cid?: string;
+  /** Who is asking, for the approval prompt a read outside the workspace may need. */
+  agentId?: string;
+  agentName?: string;
   projectId?: string;
   extraRoots?: readonly string[];
   onFileWritten?: (absPath: string) => void | Promise<void>;
@@ -122,6 +126,22 @@ function guardPath(opts: PdfToolsOpts, abs: string, action: 'read' | 'write'): s
   return null;
 }
 
+/** A file read elsewhere on the computer follows the user's access setting, as the file
+ *  tools do; outputs keep to the workspace (guardPath 'write'). */
+async function guardRead(opts: PdfToolsOpts, abs: string, operation: string, ctx?: ToolContext): Promise<string | null> {
+  const gate = await gateOutsideRead({
+    userId: opts.userId ?? '',
+    ...(opts.cid ? { cid: opts.cid } : {}),
+    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    ...(opts.agentName ? { agentName: opts.agentName } : {}),
+    roots: allowedRootsFor(opts),
+    abs,
+    operation,
+    ...(ctx ? { ctx } : {}),
+  });
+  return gate.ok === false ? `${gate.code}: ${gate.message}` : null;
+}
+
 function isMineFor(opts: PdfToolsOpts): (abs: string) => boolean {
   return (abs) => !!opts.hasProducedPath?.(abs)
     || (!!opts.extraRoots?.length && isPathAllowed(abs, opts.extraRoots));
@@ -131,9 +151,9 @@ function resolvePath(ctx: ToolContext, raw: unknown): string {
   return path.resolve(ctx.workingDir ?? '.', String(raw ?? '').trim());
 }
 
-function ensurePdfInput(opts: PdfToolsOpts, abs: string): string | null {
+async function ensurePdfInput(opts: PdfToolsOpts, abs: string, operation: string, ctx: ToolContext): Promise<string | null> {
   if (path.extname(abs).toLowerCase() !== '.pdf') return `PDF input must end in .pdf: ${abs}`;
-  const scopeErr = guardPath(opts, abs, 'read');
+  const scopeErr = await guardRead(opts, abs, operation, ctx);
   if (scopeErr) return scopeErr;
   let stat: fs.Stats;
   try { stat = fs.statSync(abs); }
@@ -356,7 +376,7 @@ async function applyPdfAction(
 
   if (action === 'overlay_image') {
     const imagePath = resolvePath(ctx, input.image_path);
-    const imageScopeErr = guardPath(opts, imagePath, 'read');
+    const imageScopeErr = await guardRead(opts, imagePath, 'edit_pdf', ctx);
     if (imageScopeErr) throw new Error(imageScopeErr);
     if (!fs.existsSync(imagePath)) throw new Error(`image not found: ${imagePath}`);
     const ext = path.extname(imagePath).toLowerCase();
@@ -473,7 +493,7 @@ function createEditPdfTool(opts: PdfToolsOpts): AgentTool {
         ? (Array.isArray(input.input_paths) ? input.input_paths : []).map((raw) => resolvePath(ctx, raw))
         : [resolvePath(ctx, input.input_path)];
       for (const inputPath of inputPaths) {
-        const inputErr = ensurePdfInput(opts, inputPath);
+        const inputErr = await ensurePdfInput(opts, inputPath, 'edit_pdf', ctx);
         if (inputErr) return errResult(inputErr.startsWith('E_') ? inputErr.split(':')[0] : 'E_BAD_INPUT', inputErr.replace(/^E_[A-Z_]+:\s*/, ''));
       }
       if (inputPaths.some((inputPath) => path.resolve(inputPath) === path.resolve(outputPath))) {
@@ -550,7 +570,7 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
     },
     async execute(input, ctx) {
       const abs = resolvePath(ctx, input.path);
-      const inputErr = ensurePdfInput(opts, abs);
+      const inputErr = await ensurePdfInput(opts, abs, 'pdf_render', ctx);
       if (inputErr) return errResult(inputErr.startsWith('E_') ? inputErr.split(':')[0] : 'E_BAD_INPUT', inputErr.replace(/^E_[A-Z_]+:\s*/, ''));
       const pageNumber = finiteNumber(input.page, 1, 1, 100_000, 'page');
       if (!Number.isInteger(pageNumber)) return errResult('E_BAD_INPUT', 'page must be an integer');

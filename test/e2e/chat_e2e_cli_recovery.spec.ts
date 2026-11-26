@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -73,6 +74,174 @@ function appendCanonicalMessages(
   );
   appendFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
 }
+
+test('connects Kimi with the standard dialog, runs a task and resumes it with a fresh MCP bridge', async ({ cliOrkas }, testInfo) => {
+  test.setTimeout(120_000);
+  const app = cliOrkas;
+  const page = app.page!;
+  const script = path.join(app.root, 'kimi-fixture.cjs');
+  const log = path.join(app.root, 'kimi-session-starts.jsonl');
+  const releaseReply = path.join(app.root, 'kimi-release-reply');
+  const releaseTerminal = path.join(app.root, 'kimi-release-terminal');
+  const failPrompt = path.join(app.root, 'kimi-fail-prompt');
+  const nativeError = 'The native provider is temporarily unavailable';
+  const fixture = String.raw`
+    const assert = require('node:assert/strict');
+    const readline = require('node:readline');
+    const {spawn} = require('node:child_process');
+    const fs = require('node:fs');
+    if (process.argv.includes('--version')) { console.log('2.7.0'); process.exit(0); }
+    assert.deepEqual(process.argv.slice(2), ['acp']);
+    const send = message => process.stdout.write(JSON.stringify({jsonrpc:'2.0',...message}) + '\n');
+    let resumed = false;
+    readline.createInterface({input:process.stdin}).on('line', line => {
+      const m = JSON.parse(line);
+      if (m.method === 'initialize') send({id:m.id,result:{protocolVersion:1,agentCapabilities:{
+        sessionCapabilities:{resume:{}}}}});
+      if (m.method === 'session/new' || m.method === 'session/resume') {
+        resumed = m.method === 'session/resume';
+        if (resumed) assert.equal(m.params.sessionId,'kimi-e2e-session');
+        const [bridge] = m.params.mcpServers;
+        const env = Object.fromEntries(bridge.env.map(({name,value}) => [name,value]));
+        fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({method:m.method,envFile:env.ORKAS_BRIDGE_ENV_FILE}) + '\n');
+        const connector = spawn(bridge.command,bridge.args,{stdio:['pipe','pipe','ignore'],env:{...process.env,...env}});
+        const mcp = message => connector.stdin.write(JSON.stringify({jsonrpc:'2.0',...message}) + '\n');
+        readline.createInterface({input:connector.stdout}).on('line', line => {
+          const response = JSON.parse(line);
+          if (response.id === 1) {
+            mcp({method:'notifications/initialized'});
+            mcp({id:2,method:'tools/list',params:{}});
+          } else if (response.id === 2) {
+            assert.ok(response.result.tools.some(tool => tool.name === 'orkas_list_skills'));
+            send({id:m.id,result:{sessionId:'kimi-e2e-session'}});
+          }
+        });
+        mcp({id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},
+          clientInfo:{name:'cli-fixture',version:'1.0.0'}}});
+      }
+      if (m.method === 'session/prompt') {
+        if (fs.existsSync(${JSON.stringify(failPrompt)})) {
+          send({id:m.id,error:{code:-32603,message:${JSON.stringify(nativeError)} + '; token=fixture-secret'}});
+          return;
+        }
+        const update = update => send({method:'session/update',params:{sessionId:'kimi-e2e-session',update}});
+        const text = text => update({sessionUpdate:'agent_message_chunk',content:{type:'text',text}});
+        const finish = () => send({id:m.id,result:{stopReason:'end_turn'}});
+        const waitFor = (file, ready) => {
+          const gate = setInterval(() => {
+            if (!fs.existsSync(file)) return;
+            clearInterval(gate);
+            ready();
+          }, 25);
+        };
+        if (resumed) { text('**Scoped continuation ready**'); finish(); return; }
+        for (const [id, narration] of [['read-first','Inspect **the first input**.'], ['read-second','Verify **the second input**.']]) {
+          text(narration);
+          update({sessionUpdate:'tool_call',toolCallId:id,kind:'read',title:id});
+          update({sessionUpdate:'tool_call_update',toolCallId:id,status:'completed',rawOutput:'Read complete'});
+        }
+        waitFor(${JSON.stringify(releaseReply)}, () => {
+          text('**Scoped first run ready**');
+          waitFor(${JSON.stringify(releaseTerminal)}, finish);
+        });
+      }
+    });
+  `;
+  const executable = path.join(app.root, process.platform === 'win32' ? 'kimi-fixture.cmd' : 'kimi-fixture');
+  const node = process.env.ORKAS_TEST_NODE || process.execPath;
+  writeFileSync(script, fixture);
+  writeFileSync(executable, process.platform === 'win32' ? `@echo off\r\n"${node}" "${script}" %*\r\n` : `#!${node}\n${fixture}`);
+  if (process.platform !== 'win32') chmodSync(executable, 0o755);
+  await app.electronApp!.evaluate((_electron, bin) => {
+    process.env.ORKAS_KIMI_PATH = bin;
+  }, executable);
+  await openSidebarEntry(page, '#agents-btn');
+  const cliPicker = page.locator('#agent-modal-ext-cli-select');
+  await page.locator('#agents-connect-cli-btn').click();
+  await expect(cliPicker).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+  await selectAiOption(page, '#agent-modal-ext-cli-select', 'kimi');
+  await expect(cliPicker.locator('.ai-select-label')).toHaveText('Kimi Code (2.7.0)');
+  await expect(page.locator('#agent-ext-name-input')).toHaveValue('Kimi-Code');
+  await expect(page.locator('#agent-modal-ext-cli-status')).toBeHidden();
+  await page.screenshot({ path: testInfo.outputPath('expanded-cli-standard-dialog.png') });
+  await page.locator('#agent-modal .modal-actions .btn').first().click();
+  await page.setViewportSize({ width: 900, height: 650 });
+  await page.evaluate(async () => { await (window as any).setLang('zh'); });
+  await page.locator('#agents-connect-cli-btn').click();
+  await expect(cliPicker).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+  await selectAiOption(page, '#agent-modal-ext-cli-select', 'kimi');
+  await expect(page.locator('#agent-ext-desc-input')).toHaveValue(/理解和维护项目代码/);
+  await expect(page.locator('#agent-modal-ext-cli-status')).toBeHidden();
+  await expect(page.locator('#agent-save-btn')).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('expanded-cli-standard-dialog-zh.png') });
+  await expect(page.locator('#agent-ext-name-input')).toHaveValue('Kimi-Code');
+  await page.locator('#agent-save-btn').click();
+  await expect(page.locator('#agent-modal')).not.toHaveClass(/\bopen\b/);
+  await expect(page.locator('.agents-detail-runtime-select .ai-select-label'))
+    .toHaveText(/^Kimi Code(?: \(.+\))?$/);
+  await page.locator('#agents-back-btn').click();
+  await expect(page.locator('.agent-card').filter({ hasText: 'Kimi-Code' }).locator('.agent-card-chip.is-cli')).toHaveText('Kimi Code');
+  await page.locator('#new-chat-btn').click();
+  const cid = await sendNewChat(page, '@Kimi-Code Run the first check.');
+  const history = page.locator('#chat-history');
+  const assertProcess = async (current: Page) => {
+    const rows = current.locator('#chat-history .stream-process-commentary, #chat-history [data-process-call-id^="cli:read-"]');
+    await expect(rows).toHaveCount(4, { timeout: 30_000 });
+    expect(await rows.evaluateAll(elements => elements.map(element =>
+      element.getAttribute('data-process-call-id') || element.textContent?.trim()))).toEqual([
+      'Inspect the first input.', 'cli:read-first', 'Verify the second input.', 'cli:read-second',
+    ]);
+    await expect(rows.locator('strong')).toHaveText(['the first input', 'the second input']);
+  };
+  const finalBody = (current: Page, text: string) => current.locator(
+    '#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])',
+  ).filter({ hasText: text });
+  await assertProcess(page);
+  await expect(history.locator('[data-role="final"]:visible')).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('expanded-cli-live-process.png') });
+  writeFileSync(releaseReply, 'ready');
+  await expect(finalBody(page, 'Scoped first run ready')).toHaveText('Scoped first run ready', { timeout: 30_000 });
+  await expect(finalBody(page, 'Scoped first run ready').locator('strong')).toHaveText('Scoped first run ready');
+  await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+  const other = await app.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+    title: 'Other task during the CLI reply',
+  });
+  await page.evaluate(async () => (window as any).loadConversations());
+  await page.locator(`#conversation-list .conv-item[data-cid="${other.conversation.conversation_id}"]`).click();
+  await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+  await assertProcess(page);
+  await expect(finalBody(page, 'Scoped first run ready')).toHaveText('Scoped first run ready');
+  await expect(history.locator('.chat-message.assistant')).toHaveAttribute('data-stream-phase', 'pending');
+  writeFileSync(releaseTerminal, 'ready');
+  await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+  await sendFollowUp(page, '@Kimi-Code Continue using the same task.');
+  await expect(finalBody(page, 'Scoped continuation ready')).toHaveText('Scoped continuation ready', { timeout: 30_000 });
+  await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+  const starts = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(starts.map(row => row.method)).toEqual(['session/new', 'session/resume']);
+  expect(new Set(starts.map(row => row.envFile)).size).toBe(2);
+  const restored = await app.relaunch();
+  await restored.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+  const processPanel = restored.locator('#chat-history .stream-process').first();
+  if (!await processPanel.evaluate((element: HTMLDetailsElement) => element.open)) {
+    await processPanel.locator('.stream-process-summary').click();
+  }
+  await assertProcess(restored);
+  await expect(finalBody(restored, 'Scoped first run ready')).toHaveText('Scoped first run ready');
+  await expect(finalBody(restored, 'Scoped continuation ready')).toHaveText('Scoped continuation ready');
+  await restored.screenshot({ path: testInfo.outputPath('expanded-cli-restored-process-and-final.png') });
+  await app.electronApp!.evaluate((_electron, bin) => {
+    process.env.ORKAS_KIMI_PATH = bin;
+  }, executable);
+  writeFileSync(failPrompt, 'fail');
+  await sendFollowUp(restored, '@Kimi-Code Run one more check.');
+  const failure = restored.locator('#chat-history .chat-message.assistant').last();
+  await expect(failure).toContainText(nativeError, { timeout: 30_000 });
+  await expect(failure).not.toContainText('fixture-secret');
+  const saved = await app.invoke<{ history: Array<{ text?: string }> }>('conversations.history', { cid });
+  expect(saved.history.at(-1)?.text).toContain(nativeError);
+  expect(saved.history.at(-1)?.text).not.toContain('fixture-secret');
+});
 
 test.describe('CLI Agent runtime settings', () => {
   test.describe.configure({ timeout: 120_000 });

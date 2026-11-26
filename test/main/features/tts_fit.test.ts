@@ -42,6 +42,27 @@ describe('assessNarrationFit', () => {
     expect(fit!.message).toMatch(/shorter|no narration|add/i);
   });
 
+  it('asks for a longer line to the same file when a narration is short, not an early finish', () => {
+    expect(assessNarrationFit({ measuredSec: 16.25, targetSec: 23.9, wordCount: 41 })!.message).toBe(
+      'Narration is 16.25s, 7.65s shorter than the 23.9s clip — that much of the clip will have no narration. '
+      + 'To fill it, add ~19 words and generate the line once more to the same output_path.',
+    );
+    // 40 characters read in 9.2s fill a 15s clip with about 25 more.
+    expect(assessNarrationFit({ measuredSec: 9.2, targetSec: 15, wordCount: 40, unit: 'characters' })!.message)
+      .toContain('To fill it, add ~25 characters and generate the line once more to the same output_path.');
+  });
+
+  it('stops asking for another take once a short line has been filled twice, and leaves long and fitting lines alone', () => {
+    expect(assessNarrationFit({ measuredSec: 9.2, targetSec: 15, wordCount: 40, unit: 'characters', fillLimitReached: true })!.message).toBe(
+      'Narration is 9.2s, 5.8s shorter than the 15s clip — that much of the clip will have no narration. '
+      + 'This line has already been generated again twice this turn, the limit: keep this audio and let the scene finish early.',
+    );
+    for (const measuredSec of [30, 23.9]) {
+      expect(assessNarrationFit({ measuredSec, targetSec: 23.9, wordCount: 60, fillLimitReached: true })!.message)
+        .toBe(assessNarrationFit({ measuredSec, targetSec: 23.9, wordCount: 60 })!.message);
+    }
+  });
+
   it('flags a narration that overshoots the clip', () => {
     const fit = assessNarrationFit({ measuredSec: 30, targetSec: 23.9, wordCount: 60 });
     expect(fit!.status).toBe('over');
@@ -129,8 +150,9 @@ describe('estimateNarrationDuration', () => {
       numericDigits: 73,
     });
     expect(estimate.estimatedSec).toBeGreaterThan(117 * 1.05);
-    expect(estimate.estimatedSec).toBeGreaterThanOrEqual(138);
-    expect(estimate.estimatedSec).toBeLessThanOrEqual(148);
+    // Within 10% of the measured 140.9s, the error accepted for Chinese (2026-11-15).
+    expect(estimate.estimatedSec / 140.9).toBeGreaterThan(0.9);
+    expect(estimate.estimatedSec / 140.9).toBeLessThan(1.1);
   });
 
   it('accounts for requested speech speed without allowing invalid values', () => {
@@ -289,12 +311,39 @@ describe('estimateNarrationDuration across managed-voice languages', () => {
     })?.status).toBe('fits');
   });
 
-  it('keeps Chinese and English estimates on their existing rates', () => {
+  // Managed Chinese voices measured 2026-11-15: voice, script, seconds.
+  const chinese: Array<[string, string, number]> = [
+    ['zh_female_vv_uranus_bigtts', '调料瓶总是挤成一堆？试试这款旋转调料盒，轻轻一转，常用的那瓶就到手边，做饭再也不用翻来翻去。', 9.07],
+    ['zh_female_vv_uranus_bigtts', '打开设置页面，先点右上角的头像，再选择账号与安全，就能看到修改密码的入口，按提示操作就行。', 9.22],
+    ['zh_female_vv_uranus_bigtts', '那天晚上下着大雨，他一个人站在车站门口，手里攥着那张旧车票，犹豫了很久，始终没有走进去。', 8.66],
+    ['zh_male_jieshuoxiaoming_uranus_bigtts', '很多人以为跑步伤膝盖，其实只要控制好步频和落地方式，适量跑步反而能让关节变得更加灵活。', 8.45],
+    ['zh_male_cixingjieshuonan_uranus_bigtts', '这座大桥全长三十多公里，从开工到通车整整用了九年，它让两座城市之间的车程缩短到半小时。', 11.86],
+    ['zh_male_xuanyijieshuo_uranus_bigtts', '三年后两人在医院重逢，她早已认不出他，而他只是笑了笑，把那封信悄悄放回了外套的口袋里。', 9.05],
+    ['zh_female_liuchangnv_uranus_bigtts', '分格设计容量大，酱油、醋、盐和胡椒都能各归其位，台面一下子清爽了不少，承重也足够稳当。', 8.83],
+    ['zh_female_shuangkuaisisi_uranus_bigtts', '现在下单只要39.9元，还送两个备用调料瓶，库存不多了，喜欢的朋友赶紧点击下方的链接下单吧。', 8.04],
+    ['zh_male_m191_uranus_bigtts', '今天带大家看看这家开了二十年的老面馆，汤底每天凌晨四点开始熬，一碗面只要十五块钱就能吃饱。', 7.63],
+    ['zh_female_kailangjiejie_uranus_bigtts', '周末我们来到海边的小镇，街上到处是卖海鲜的小摊，随便找一家坐下来，就能吃到当天的渔获。', 8.45],
+  ];
+
+  it('stays within 10% of measured managed Chinese voices, and closer for the default voice', () => {
+    const ratios = chinese.map(([, script, seconds]) => estimateNarrationDuration(script).estimatedSec / seconds).sort((a, b) => a - b);
+    const median = (ratios[4] + ratios[5]) / 2;
+    expect(median).toBeGreaterThan(0.9);
+    expect(median).toBeLessThan(1.1);
+    for (const [voice, script, seconds] of chinese.filter(([voice]) => voice === 'zh_female_vv_uranus_bigtts')) {
+      const ratio = estimateNarrationDuration(script).estimatedSec / seconds;
+      expect(ratio, voice).toBeGreaterThan(0.9);
+      expect(ratio, voice).toBeLessThan(1.15);
+    }
+  });
+
+  it('keeps the Chinese and English rates', () => {
+    // 18 Han characters at 4.5 per second, one comma (0.12s) and one full stop (0.28s).
     expect(estimateNarrationDuration('这是一条测试旁白，确认时长估算没有变化。')).toMatchObject({
-      estimatedSec: 4.9,
+      estimatedSec: 4.4,
       unit: 'characters',
       units: 18,
-      unitsPerSec: 4,
+      unitsPerSec: 4.5,
     });
     expect(estimateNarrationDuration('White ceramic, a blue wave, and room for 350 mL of coffee or tea.')).toMatchObject({
       estimatedSec: 6.26,

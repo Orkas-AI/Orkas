@@ -21,6 +21,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { WebContents } from 'electron';
 import {
   detectAll,
   findAllInstalled,
@@ -29,7 +30,6 @@ import {
   LOCAL_CLI_TYPES,
   type LocalCliPermissionPolicy,
   type LocalCliType,
-  type LocalCliEntry,
 } from '../features/local_agents/registry.js';
 import { getCliUpgradeInfo, upgradeLocalCli } from '../features/local_agents/upgrade.js';
 import { getLocalCliRuntimeOptions } from '../features/local_agents/runtime_options.js';
@@ -56,6 +56,7 @@ const log = createLogger('ipc:local_agents');
  * never split UTF-8 characters. Existing head-only callers remain compatible. */
 const READ_TOOL_RESULT_MAX_BYTES = 256 * 1024;
 const TOOL_RESULT_REF_RE = /^[A-Za-z0-9_-]{1,48}\.[a-f0-9]{16,64}$/i;
+const UPGRADE_PROGRESS_ID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 
 function resolveToolResultRef(rootDir: string, ref: string): string | null {
   if (!TOOL_RESULT_REF_RE.test(ref)) return null;
@@ -80,28 +81,6 @@ function isLocalCliType(v: unknown): v is LocalCliType {
 function isActivePermissionOwner(uid: string): boolean {
   try { return getActiveUserId() === uid; }
   catch { return false; }
-}
-
-// Set of CLI types we have a working dispatch backend for. Detection
-// is independent (registry probes PATH + --version regardless), but
-// the create-modal / detail-page selectors shouldn't let users pick a
-// CLI we can't actually dispatch through. As of today every detected
-// CLI has a backend — left as a guard for future additions where the
-// dispatch path lags detection.
-const DISPATCHABLE: ReadonlySet<LocalCliType> = new Set<LocalCliType>(
-  ['claude', 'codex', 'openclaw', 'opencode', 'hermes'],
-);
-
-function maskUnsupported(entries: LocalCliEntry[]): LocalCliEntry[] {
-  return entries.map(e => {
-    if (DISPATCHABLE.has(e.type)) return e;
-    return {
-      ...e,
-      available: false,
-      error: e.error ?? 'version_unknown',
-      errorDetail: 'backend not yet implemented in Orkas',
-    };
-  });
 }
 
 async function upgradeTarget(payload: { type?: unknown; agent_id?: unknown }): Promise<LocalCliType> {
@@ -137,8 +116,20 @@ export const invokeHandlers = {
   },
   'localAgents.upgradeInfo': async (payload: { type?: unknown; agent_id?: unknown }) =>
     getCliUpgradeInfo(await upgradeTarget(payload)),
-  'localAgents.upgrade': async (payload: { type?: unknown; agent_id?: unknown }) =>
-    upgradeLocalCli(await upgradeTarget(payload)),
+  'localAgents.upgrade': async (
+    payload: { type?: unknown; agent_id?: unknown; progress_id?: unknown },
+    ctx?: { sender: Pick<WebContents, 'send' | 'isDestroyed'> },
+  ) => {
+    const type = await upgradeTarget(payload);
+    const { progress_id: progressId } = payload;
+    const sender = ctx?.sender;
+    if (!sender || typeof progressId !== 'string' || !UPGRADE_PROGRESS_ID_RE.test(progressId)) {
+      return upgradeLocalCli(type);
+    }
+    return upgradeLocalCli(type, ({ phase, elapsed_ms }) => {
+      if (!sender.isDestroyed()) sender.send('local-agent:upgrade-progress', { progress_id: progressId, phase, elapsed_ms });
+    });
+  },
 
   /**
    * List all known CLI types. Default runs version validation and uses the
@@ -152,7 +143,7 @@ export const invokeHandlers = {
     const entries = validate === false
       ? await findAllInstalled()
       : await detectAll({ force: !!force });
-    return { entries: maskUnsupported(entries) };
+    return { entries };
   },
 
   /**
@@ -163,7 +154,7 @@ export const invokeHandlers = {
   'localAgents.detect': async ({ type }: { type?: unknown }) => {
     if (!isLocalCliType(type)) throw new Error('invalid CLI type');
     const entry = await resolveCli(type, { force: true });
-    return { entry: maskUnsupported([entry])[0] };
+    return { entry };
   },
 
   /**

@@ -14,8 +14,9 @@ function rejectionHasOutput(value: unknown): boolean {
 
 /** pi-ai flattens SDK errors into display strings. Retain request-local facts
  * before that boundary. Never retain bodies in diagnostics or shared state. */
-export function createProviderErrorCapture(streamProtocol?: 'openai-responses' | 'openai-completions', onStreamError?: (error: object) => void) {
+export function createProviderErrorCapture(streamProtocol?: 'openai-responses' | 'openai-completions' | 'openai-codex-responses', onStreamError?: (error: object) => void) {
   let original: unknown;
+  let readFailureCaptured = false;
   let responseFacts: Error | undefined;
   let rejectedInput: ResponsesRejectedInput | undefined;
   let owner: object;
@@ -30,6 +31,7 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
       return async (input, init) => {
         const requestOwner = owner = {};
         original = undefined;
+        readFailureCaptured = false;
         responseFacts = undefined;
         rejectedInput = undefined;
         try {
@@ -38,7 +40,17 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
             responseFacts = Object.assign(new Error('Provider HTTP error'), { status: response.status, retryAfterMs: providerRetryAfterMs({ headers: response.headers }), providerRequestRejected: true });
             const detail = await readErrorBody(response, init?.signal, input => { rejectedInput = input; });
             if (detail) Object.assign(responseFacts, { error: detail });
-          } else if (streamProtocol && response.body && response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) {
+          } else if (streamProtocol && response.body && (streamProtocol === 'openai-codex-responses'
+            || response.headers.get('content-type')?.toLowerCase().includes('text/event-stream'))) {
+            const retainReadFailure = (error: unknown) => {
+              if (owner === requestOwner && !responseFacts) { original = error; readFailureCaptured = true; }
+            };
+            // Codex already observes native protocol errors through the SDK
+            // hook. Preserve only original read failures here, even when the
+            // endpoint omits Content-Type; do not parse or reclassify envelopes.
+            if (streamProtocol === 'openai-codex-responses') {
+              return observeResponseBody(response, undefined, retainReadFailure);
+            }
             return observeStreamErrors(response, streamProtocol, error => {
               if (owner !== requestOwner) return;
               try { onStreamError?.(error); } catch { /* Diagnostics cannot replace delivery. */ }
@@ -50,7 +62,7 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
             }, error => {
               // Fetch has already resolved here; retain body-read causes before
               // SDK flattening without replacing an earlier protocol rejection.
-              if (owner === requestOwner && !responseFacts) original = error;
+              retainReadFailure(error);
             });
           }
           return response;
@@ -62,7 +74,9 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
     },
     cause(sdkErrorMessage?: string): Error | undefined {
       if (original instanceof Error) return original;
-      if (original && typeof original === 'object') return Object.assign(new Error('Provider transport error'), { cause: original });
+      if (readFailureCaptured || original && typeof original === 'object') {
+        return Object.assign(new Error('Provider transport error'), { cause: original });
+      }
       if (responseFacts) return responseFacts;
       // Legacy adapters without custom fetch expose complete serialized API
       // envelopes only. Decode their machine fields at this adapter boundary;
@@ -128,7 +142,6 @@ async function readErrorBody(response: Response, signal?: AbortSignal | null, ob
  * model output and terminal/cancellation behavior. Oversized frames are unknown. */
 function observeStreamErrors(response: Response, protocol: 'openai-responses' | 'openai-completions', observe: (error: object) => void, observeReadFailure: (error: unknown) => void): Response {
   const limit = 16 * 1024;
-  const reader = response.body!.getReader();
   const frame = new Uint8Array(limit);
   const decoder = new TextDecoder();
   let size = 0, lineHasData = false, dropped = false, afterCR = false, terminal = false;
@@ -177,12 +190,20 @@ function observeStreamErrors(response: Response, protocol: 'openai-responses' | 
       }
     }
   };
+  return observeResponseBody(response, inspect, observeReadFailure);
+}
+
+/** One demand-driven reader. Keep the original exception in memory for the
+ * caller's typed error chain; diagnostics still emit only closed machine fields. */
+function observeResponseBody(response: Response, inspect: ((bytes: Uint8Array) => void) | undefined,
+  observeReadFailure: (error: unknown) => void): Response {
+  const reader = response.body!.getReader();
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const part = await reader.read().catch(error => { observeReadFailure(error); throw error; });
         if (part.done) { controller.close(); reader.releaseLock(); return; }
-        inspect(part.value);
+        inspect?.(part.value);
         controller.enqueue(part.value);
       } catch (error) { controller.error(error); reader.releaseLock(); }
     },

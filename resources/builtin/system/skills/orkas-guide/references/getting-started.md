@@ -8,14 +8,15 @@ Start in **Commander** to describe the outcome, provide context, follow the work
 |---|---|---|
 | **Task / conversation** | Carry out a concrete request and retain its discussion, execution and results; enough for a one-off request. | Follow up in the same task when its context still applies. |
 | **Project** | Group related tasks when they need shared goals, rules, sources or specialist resources over time. | Reuse an existing suitable Project; creating one does not itself start work. |
-| **Goals & rules** | State the intended outcome and requirements that should apply across Project conversations. | A numeric target does not automatically track business progress; temporary directions belong in the current task. |
+| **Goal** | State what the Project should achieve, optionally with success criteria. | The tab is off by default. |
+| **Rules** | State standing requirements and preferred output that apply across Project conversations. | Temporary directions belong in the current task. |
 | **To-do** | Track specific work that needs a status, responsible Agent or member, deadline or materials. | Can link to an execution conversation and run manually or through enabled auto-advance; a deadline is not a scheduled start. |
 | **Auto** | Start a saved instruction at a future time or on a repeating schedule. | Runs continue in the automation's conversation; the assigned device and required access must be available. |
 | **Agent** | Use a specialist from **AI Team** when work benefits from its role, workflow or delivery standards. | Its reusable role can serve different tasks; Orkas-run roles and the task model are separate choices. |
 | **Skill** | Use an established method or deliverable pattern when it fits the task. | Commander or an Agent follows it using that caller's available capabilities. |
 | **Connector** | Read information or perform actions in a supported external service. | Requires a working authorized connection and the applicable operation permissions. |
 | **Library** | Keep source documents, business records and deliverables for later retrieval and reuse. | Use global or Project material as appropriate; a one-task input can remain an attachment. |
-| **Memory** | Retain concise facts and preferences that remain useful across conversations in their scope. | Keep explicit Project requirements in Goals & rules and source documents in Library. |
+| **Memory** | Retain concise facts and preferences that remain useful across conversations in their scope. | Keep standing Project requirements in Rules and source documents in Library. |
 | **App** | Keep an eligible interactive result, such as a calculator or tracker, for repeated use. | Saved code and app-private data have their own lifecycle; a static report can remain a file. |
 | **Model** | Supply the reasoning or generation service that runs the task. | Selected separately from the Agent role and Skill method; external CLI Agents use their CLI's runtime. |
 | **Workspace** | Identify the working folder for task files and permitted file operations. | Separate from Library and attachments; attaching a file does not switch the working folder. |
@@ -56,4 +57,4 @@ The external CLI action is separate from Orkas model selection. Open **AI Team**
 
 When related tasks need shared instructions and reusable material, use a **Project** to keep that context together.
 
-For Project goals, to-dos and scheduled work, see [projects-and-automation.md](projects-and-automation.md). For specialist roles, methods and service access, see [agents-skills-and-connectors.md](agents-skills-and-connectors.md).
+For Project setup, to-dos and scheduled work, see [projects-and-automation.md](projects-and-automation.md). For specialist roles, methods and service access, see [agents-skills-and-connectors.md](agents-skills-and-connectors.md).

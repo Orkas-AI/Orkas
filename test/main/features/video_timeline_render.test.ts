@@ -9,6 +9,7 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  capturedPictureKinds,
   checkVideoTimeline,
   loadVideoProject,
   noteTimelineBeforeChange,
@@ -24,6 +25,7 @@ import { deriveVideoTimeline, timelineAudioTracks } from '../../../src/main/feat
 import { buildVideoTrackRemuxArgs, pruneSegmentCache } from '../../../src/main/features/video_studio';
 import { bundledFfmpegPaths } from '../../../src/main/util/bundled-runtime';
 import type { Issue } from '../../../src/main/features/video_studio_qa';
+import * as studio from '../../../src/main/features/video_studio';
 
 // The window is faked here so the suite runs everywhere; ffmpeg is real, so frame
 // extraction, encoding, joining and mixing are the real thing. Real-window pixels
@@ -50,10 +52,11 @@ const electronFake = vi.hoisted(() => {
     pageSections: string[];
     consoleError: string;
     calls: string[];
+    previewTiles: Buffer[];
     /** What the page reports, scene by scene, as lines of words lying on a marked product. */
     productCover: Record<string, Array<{ text: string; share: number }>>;
     inspectIssues: Issue[];
-  } = { captures: 0, shown: 0, lateCaptures: 0, moving: false, textured: false, failScene: '', currentScene: '', failAtCapture: -1, timelineKeys: [], pageSections: [], consoleError: '', calls: [], productCover: {}, inspectIssues: [] };
+  } = { captures: 0, shown: 0, lateCaptures: 0, moving: false, textured: false, failScene: '', currentScene: '', failAtCapture: -1, timelineKeys: [], pageSections: [], consoleError: '', calls: [], previewTiles: [], productCover: {}, inspectIssues: [] };
   let lateLeft = 0;
   class FakeBrowserWindow {
     private consoleHandler: ((event: { level: string; message: string }) => void) | null = null;
@@ -106,7 +109,11 @@ const electronFake = vi.hoisted(() => {
           // video.check samples a smaller copy to see how empty a frame is.
           resize: ({ width }: { width: number }) => {
             const height = Math.max(1, Math.round((width * 284) / 160));
-            return { getSize: () => ({ width, height }), toBitmap: () => bitmap(width, height) };
+            return {
+              getSize: () => ({ width, height }),
+              toBitmap: () => bitmap(width, height),
+              toPNG: () => state.previewTiles[onSurface - 1] ?? Buffer.alloc(0),
+            };
           },
         };
       },
@@ -218,12 +225,96 @@ afterEach(() => {
   electronFake.state.pageSections = [];
   electronFake.state.consoleError = '';
   electronFake.state.calls = [];
+  electronFake.state.previewTiles = [];
   electronFake.state.productCover = {};
   electronFake.state.inspectIssues = [];
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+it('keeps valid screen and photo capture evidence alongside unreadable entries', async () => {
+  const root = makeRoot();
+  const folder = path.join(root, 'assets', 'product', 'capture-1');
+  fs.mkdirSync(folder, { recursive: true });
+  const pictures = [['screen.png', 'screen bytes'], ['photo.png', 'photo bytes']] as const;
+  for (const [name, bytes] of pictures) fs.writeFileSync(path.join(folder, name), bytes);
+  fs.writeFileSync(path.join(folder, 'capture.json'), JSON.stringify({
+    tiles: [null, { path: 'screen.png' }],
+    images: [null, { path: 'photo.png', content: 'media' }, { path: 'other.png' }],
+  }));
+  const kinds = await capturedPictureKinds(root);
+  const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+  expect(kinds).toEqual(new Map([[digest('screen bytes'), true], [digest('photo bytes'), false]]));
+});
+
 describe('renderVideoTimeline', () => {
+  it.each([
+    ['at the same size', WIDTH, HEIGHT],
+    ['scaled up', WIDTH / 2, HEIGHT / 2],
+    ['scaled down', WIDTH * 2, HEIGHT * 2],
+  ])('cuts eligible clips %s without a page, then reuses the segments for a new mix', async (_label, sourceWidth, sourceHeight) => {
+    const p = setup(makeRoot(), { manifest: timeline() });
+    ffmpeg(['-f', 'lavfi', '-i', `testsrc2=s=${sourceWidth}x${sourceHeight}:r=30:d=2`, '-vf', 'setsar=1',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-color_range', 'tv', '-colorspace', 'bt709',
+      '-color_primaries', 'bt709', '-color_trc', 'bt709', p.clip]);
+    electronFake.state.failScene = 'a';
+    const first = await renderVideoTimeline(p.options());
+    expect(first).toMatchObject({ ok: true, scene_segments: { rendered: 2, reused: 0 } });
+    expect(electronFake.state.captures).toBe(0);
+    expect(probe(p.output).streams).toEqual([expect.objectContaining({
+      codec_type: 'video', nb_read_frames: '30', width: WIDTH, height: HEIGHT,
+    })]);
+
+    const music = path.join(p.production, 'media', 'music.wav');
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=f=440:d=1', music]);
+    const ledger = path.join(p.production, 'assets.json');
+    const { assets } = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+    fs.writeFileSync(ledger, JSON.stringify({ assets: [...assets, {
+      id: 'music', kind: 'audio', label: 'Music', path: 'media/music.wav', origin: 'upload',
+    }] }));
+    p.writeManifest({ ...timeline(), tracks: [{ kind: 'music', asset: 'music', volume: 1 }] });
+    const mixed = await renderVideoTimeline(p.options());
+    expect(mixed).toMatchObject({ ok: true, scene_segments: { rendered: 0, reused: 2 } });
+    expect(electronFake.state.captures).toBe(0);
+    expect(probe(p.output).streams.map((stream) => stream.codec_type)).toEqual(['video', 'audio']);
+  });
+
+  it('keeps the page composition for a clip with a different aspect ratio', async () => {
+    const p = setup(makeRoot());
+    ffmpeg(['-f', 'lavfi', '-i', `testsrc2=s=${WIDTH / 2}x${HEIGHT / 2 + 2}:r=30:d=2`, '-vf', 'setsar=1',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-color_range', 'tv', '-colorspace', 'bt709',
+      '-color_primaries', 'bt709', '-color_trc', 'bt709', p.clip]);
+    const result = await renderVideoTimeline(p.options());
+    expect(result).toMatchObject({ ok: true, scene_segments: { rendered: 2, reused: 0 } });
+    expect(electronFake.state.captures).toBeGreaterThan(0);
+    expect(probe(p.output).streams).toEqual([expect.objectContaining({
+      codec_type: 'video', nb_read_frames: '30', width: WIDTH, height: HEIGHT,
+    })]);
+  });
+
+  it('falls back and caches a complete scene when the selected source frames have uneven timestamps', async () => {
+    const p = setup(makeRoot(), { manifest: timeline([
+      { id: 'a', clips: [{ id: 'c1', asset: 'clip', in: 4, dur: 0.5 }] },
+    ]) });
+    // A few late timestamps move by 1/240s. The early samples and overall
+    // duration still make both ffprobe stream rates appear to be 30 fps.
+    ffmpeg(['-f', 'lavfi', '-i', `testsrc2=s=${WIDTH}x${HEIGHT}:r=30:d=5`,
+      '-vf', "setsar=1,settb=1/15360,setpts='PTS+if(between(N,121,126)*mod(N,2),64,0)'",
+      '-fps_mode', 'passthrough', '-enc_time_base', '1:15360', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', p.clip]);
+    const fallbacks: unknown[] = [];
+    const first = await renderVideoTimeline({ ...p.options(), onProgress: (event) => {
+      if (event.data?.directCutFallback) fallbacks.push(event.data.sceneId);
+    } });
+    expect(first).toMatchObject({ ok: true, scene_segments: { rendered: 1, reused: 0 } });
+    expect(fallbacks).toEqual(['a']);
+    expect(probe(p.output).streams).toEqual([expect.objectContaining({ codec_type: 'video', nb_read_frames: '15' })]);
+    const original = sha(p.output);
+    electronFake.state.failScene = 'a';
+    const second = await renderVideoTimeline(p.options());
+    expect(second).toMatchObject({ ok: true, scene_segments: { rendered: 0, reused: 1 } });
+    expect(sha(p.output)).toBe(original);
+  });
+
   it.each(['manifest.json', 'index.html', 'assets.json', 'product.json'])('does not load an out-of-scope symlink for %s', async name => {
     const p = setup(makeRoot());
     const file = path.join(name === 'manifest.json' || name === 'index.html' ? p.video : p.production, name);
@@ -546,6 +637,65 @@ describe('renderVideoTimeline', () => {
   });
 });
 
+describe('a narrated video that would go silent', () => {
+  // 2026-11-17: explainers made without a requested length voiced their first scenes,
+  // rendered the rest silent and found out only at delivery.
+  function silentAfterTheHook(withMusic: boolean) {
+    const p = setup(makeRoot());
+    const media = path.join(p.production, 'media');
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1', '-c:a', 'aac', path.join(media, 'voice.m4a')]);
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=220:sample_rate=48000:duration=30', '-c:a', 'aac', path.join(media, 'song.m4a')]);
+    fs.writeFileSync(path.join(p.production, 'assets.json'), JSON.stringify({ assets: [
+      { id: 'clip', kind: 'video', label: 'Clip', path: 'media/clip.mp4', origin: 'upload' },
+      { id: 'voice', kind: 'audio', label: 'Voice', path: 'media/voice.m4a', origin: 'generated' },
+      { id: 'song', kind: 'audio', label: 'Song', path: 'media/song.m4a', origin: 'generated' },
+    ] }));
+    p.writeManifest(timeline([
+      { id: 'hook', clips: [{ id: 'c1', asset: 'clip', in: 0, dur: 1 }], narration: { text: 'Hi', asset: 'voice' } },
+      { id: 'pressure', clips: [{ id: 'c2', asset: 'clip', in: 1, dur: 1.5 }] },
+      { id: 'close', clips: [{ id: 'c3', asset: 'clip', in: 1.5, dur: 1.5 }] },
+    ], withMusic ? { tracks: [{ kind: 'music', asset: 'song', volume: 0.3 }] } : {}));
+    return p;
+  }
+
+  it('is named by the check and not rendered until each scene has sound', async () => {
+    const p = silentAfterTheHook(false);
+    const checked = await checkVideoTimeline(p.options()) as { ok: boolean; issues?: Array<{ code: string; message: string }> };
+    const silent = checked.issues?.find((issue) => issue.code === 'TIMELINE_SCENES_SILENT');
+    expect(silent?.message).toBe('Scenes pressure and close (3.0s) have no narration and nothing else plays under them, so they would be silent. Give each a line with generate_speech, or put music under the video, then check again.');
+    const rendered = await renderVideoTimeline({ ...p.options(), requireSound: true });
+    expect(rendered).toMatchObject({ ok: false, errorCode: 'E_VIDEO_CHECK_BLOCKED' });
+    expect((rendered as { issues?: Array<{ code: string }> }).issues?.map((issue) => issue.code)).toContain('TIMELINE_SCENES_SILENT');
+    expect(electronFake.state.shown).toBe(0);
+    expect(fs.existsSync(p.output)).toBe(false);
+  });
+
+  it('still renders a user\'s own canvas edit, which asks for no such check', async () => {
+    const p = silentAfterTheHook(false);
+    expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true });
+  });
+
+  it('is named when its lines were written and never voiced, and not rendered', async () => {
+    const p = silentAfterTheHook(false);
+    p.writeManifest(timeline([
+      { id: 'hook', clips: [{ id: 'c1', asset: 'clip', in: 0, dur: 1.5 }], narration: { text: 'Why do planes fly?' } },
+      { id: 'close', clips: [{ id: 'c2', asset: 'clip', in: 1.5, dur: 1.5 }], narration: { text: 'Wings push air down.' } },
+    ]));
+    const checked = await checkVideoTimeline(p.options()) as { issues?: Array<{ code: string; message: string }> };
+    expect(checked.issues?.find((issue) => issue.code === 'TIMELINE_NARRATION_UNVOICED')?.message)
+      .toMatch(/^Scenes hook and close \(3\.0s\) have narration text but no voice/);
+    expect(await renderVideoTimeline({ ...p.options(), requireSound: true })).toMatchObject({ ok: false, errorCode: 'E_VIDEO_CHECK_BLOCKED' });
+    expect(fs.existsSync(p.output)).toBe(false);
+  });
+
+  it('renders once music plays under it', async () => {
+    const p = silentAfterTheHook(true);
+    const checked = await checkVideoTimeline(p.options()) as { issues?: Array<{ code: string }> };
+    expect((checked.issues ?? []).map((issue) => issue.code)).not.toContain('TIMELINE_SCENES_SILENT');
+    expect(await renderVideoTimeline({ ...p.options(), requireSound: true })).toMatchObject({ ok: true });
+  });
+});
+
 describe('timeline audio mix', () => {
   // Levels are measured from the mixed file, independent of the filter text.
   function rmsAt(file: string, startSec: number, durSec: number): number {
@@ -762,6 +912,94 @@ describe('rendering across volumes', () => {
     expect(fs.existsSync(path.join(cacheDir, '.staging'))).toBe(false);
   });
 
+  // Review 2026-11-16 S4-7: each production's cache is capped on its own, so a render clears
+  // other productions' caches unused for 30 days, and the ones the 2.0.0 flow left under keys
+  // nothing reads; nothing else in the folder.
+  describe('caches of other productions', () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const key = (n: number) => crypto.createHash('sha256').update(`production-${n}`).digest('hex').slice(0, 32);
+    const cache = (cacheRoot: string, name: string, ageDays: number) => {
+      const dir = path.join(cacheRoot, name);
+      fs.mkdirSync(path.join(dir, 'scene'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'scene', 'segment.mp4'), 'cached');
+      const at = new Date(Date.now() - ageDays * DAY_MS);
+      fs.utimesSync(dir, at, at);
+      return dir;
+    };
+
+    it('removes one unused for over 30 days and keeps one used since, an unknown folder and its own', async () => {
+      const root = makeRoot();
+      const p = setup(root);
+      const cacheRoot = path.join(root, 'segment_cache');
+      const idle = cache(cacheRoot, key(1), 31);
+      const recent = cache(cacheRoot, key(2), 29);
+      const unknown = cache(cacheRoot, 'not-a-cache', 400);
+      const interrupted = cache(cacheRoot, '.expired-left-behind', 0);
+      const result = await renderVideoTimeline({ ...p.options(), segmentCacheDirAbs: path.join(cacheRoot, key(0)) });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true, scene_segments: { rendered: 2 } });
+      expect(fs.existsSync(idle)).toBe(false);
+      expect(fs.existsSync(interrupted)).toBe(false);
+      expect(fs.existsSync(recent)).toBe(true);
+      expect(fs.existsSync(unknown)).toBe(true);
+      expect(fs.readdirSync(cacheRoot).sort()).toEqual([key(0), key(2), 'not-a-cache'].sort());
+    });
+
+    it('keeps an old cache in use while another production sweeps unused caches', async () => {
+      const root = makeRoot();
+      const current = setup(root);
+      const cacheRoot = path.join(root, 'segment_cache');
+      const oldCache = path.join(cacheRoot, key(1));
+      const reuseOptions = { ...current.options(), segmentCacheDirAbs: oldCache };
+      expect(await renderVideoTimeline(reuseOptions)).toMatchObject({ ok: true, scene_segments: { rendered: 2 } });
+      const oldDate = new Date(Date.now() - 31 * DAY_MS);
+      fs.utimesSync(oldCache, oldDate, oldDate);
+      const unused = cache(cacheRoot, key(2), 31);
+
+      let entered!: () => void;
+      const inspecting = new Promise<void>(resolve => { entered = resolve; });
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const realStat = fsPromises.stat.bind(fsPromises);
+      const stat = vi.spyOn(fsPromises, 'stat').mockImplementation(async (file, options) => {
+        if (typeof file === 'string' && file.startsWith(oldCache + path.sep) && path.basename(file) === 'segment.mp4') {
+          entered();
+          await held;
+        }
+        return realStat(file, options as never);
+      });
+      syncBuiltinESMExports();
+      const active = renderVideoTimeline({ ...reuseOptions, outputAbsPath: path.join(root, 'active-cache.mp4') });
+      try {
+        await Promise.race([
+          inspecting,
+          active.then(() => { throw new Error('The active render did not reach its cached segment.'); }),
+        ]);
+        const swept = await renderVideoTimeline({ ...current.options(), segmentCacheDirAbs: path.join(cacheRoot, key(0)) });
+        expect(swept).toMatchObject({ ok: true });
+        expect(fs.existsSync(unused)).toBe(false);
+        expect(fs.existsSync(oldCache)).toBe(true);
+        release();
+        expect(await active).toMatchObject({ ok: true, scene_segments: { rendered: 0, reused: 2 } });
+      } finally {
+        release();
+        await Promise.allSettled([active]);
+        stat.mockRestore();
+        syncBuiltinESMExports();
+      }
+    });
+
+    it('removes at most 16 in one render and the rest at the next', async () => {
+      const root = makeRoot();
+      const p = setup(root);
+      const cacheRoot = path.join(root, 'segment_cache');
+      for (let n = 1; n <= 17; n += 1) cache(cacheRoot, key(n), 40);
+      expect(await renderVideoTimeline({ ...p.options(), segmentCacheDirAbs: path.join(cacheRoot, key(0)) })).toMatchObject({ ok: true });
+      expect(fs.readdirSync(cacheRoot).filter((name) => name !== key(0))).toHaveLength(1);
+      expect(await renderVideoTimeline({ ...p.options(), segmentCacheDirAbs: path.join(cacheRoot, key(100)) })).toMatchObject({ ok: true });
+      expect(fs.readdirSync(cacheRoot).sort()).toEqual([key(0), key(100)].sort());
+    });
+  });
+
   it('neither counts nor evicts staging when pruning the cache', async () => {
     const root = makeRoot();
     const sized = (dir: string, bytes: number, mtimeMs: number) => {
@@ -793,6 +1031,196 @@ describe('delivering a file the timeline has moved on from', () => {
   });
   const findings = (result: unknown) => ((result as { issues?: Array<{ code: string }> }).issues ?? []).map((issue) => issue.code);
 
+  const audio = (file: string, hz: number, seconds = 2) => ffmpeg([
+    '-f', 'lavfi', '-i', `sine=frequency=${hz}:sample_rate=48000:duration=${seconds}`, '-c:a', 'pcm_s16le', file,
+  ]);
+
+  function decoded(file: string, args: string[]): Buffer {
+    const run = spawnSync(bundledFfmpegPaths().ffmpeg!, ['-hide_banner', '-loglevel', 'error', '-i', file, ...args, 'pipe:1']);
+    expect(run.status, run.stderr.toString()).toBe(0);
+    return run.stdout;
+  }
+
+  function trackLevels(file: string, rates: number[]): number[] {
+    const pcm = decoded(file, ['-ss', '0.25', '-t', '0.5', '-map', '0:a:0', '-ac', '1', '-ar', '8000', '-f', 's16le']);
+    expect(pcm.length).toBe(8000);
+    return rates.map(hz => {
+      let sine = 0;
+      let cosine = 0;
+      for (let i = 0; i < pcm.length / 2; i += 1) {
+        const frame = pcm.readInt16LE(i * 2);
+        const phase = 2 * Math.PI * hz * i / 8000;
+        sine += frame * Math.sin(phase);
+        cosine += frame * Math.cos(phase);
+      }
+      return Math.hypot(sine, cosine) / (pcm.length / 2);
+    });
+  }
+
+  it('cancels an in-progress asset fingerprint before rendering any frames', async () => {
+    const root = makeRoot();
+    const p = setup(root);
+    const hashing = await import('../../../src/main/util/sha256');
+    const original = hashing.sha256OfFileStream;
+    const controller = new AbortController();
+    let signalled = false;
+    const hash = vi.spyOn(hashing, 'sha256OfFileStream').mockImplementation((file, signal) => {
+      if (file === p.clip) {
+        signalled = signal === controller.signal;
+        controller.abort();
+      }
+      return original(file, signal);
+    });
+    try {
+      const result = await renderVideoTimeline({ ...p.options(), signal: controller.signal });
+      expect({ signalled, result: result.ok ? 'published' : result.errorCode, published: fs.existsSync(p.output) })
+        .toEqual({ signalled: true, result: 'E_RENDER_ABORTED', published: false });
+      expect(electronFake.state.captures).toBe(0);
+    } finally {
+      hash.mockRestore();
+      // Keep cancellation cleanup asynchronous so Windows can finish filesystem work.
+      await fsPromises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  it('requires a new mix after an interrupted same-name music replacement, even when the timeline stayed the same', async () => {
+    const { importProductionAttachments } = await import('../../../src/main/features/video_production_spend');
+    const { videoUpToDate } = await import('../../../src/main/features/video_canvas');
+    const root = makeRoot();
+    const p = setup(root);
+    const initial = path.join(root, 'attachments-original');
+    const later = path.join(root, 'attachments-replacement');
+    fs.mkdirSync(initial);
+    fs.mkdirSync(later);
+    const importMusic = async (attachmentDirAbs: string) => (await importProductionAttachments({
+      productionDirAbs: p.production, attachmentDirAbs, names: ['music.wav'],
+    })).imported[0];
+    audio(path.join(initial, 'music.wav'), 280);
+    audio(path.join(initial, 'voice.wav'), 1000, 1.25);
+    const music = await importMusic(initial);
+    const { imported: [voice] } = await importProductionAttachments({
+      productionDirAbs: p.production, attachmentDirAbs: initial, names: ['voice.wav'],
+    });
+    const original = timeline([{ id: 'a', clips: [{ id: 'c1', asset: 'clip', in: 0, dur: 2 }],
+      narration: { text: 'Keep this original line.', asset: voice.asset_id } }], {
+      tracks: [{ kind: 'music', asset: music.asset_id, volume: 0.5 }],
+    });
+    p.writeManifest(original);
+    expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true });
+    const v1 = await deliver(p, root);
+    expect(v1).toMatchObject({ ok: true, version: { id: 'v1' } });
+    const prior = path.resolve(p.production, (v1.version as { path: string }).path);
+    const priorHash = sha(prior);
+    const versions = path.join(p.production, 'versions.json');
+    const before = fs.readFileSync(versions, 'utf8');
+    const [oldBefore, newBefore, voiceBefore] = trackLevels(prior, [280, 570, 1000]);
+    expect(oldBefore).toBeGreaterThan(newBefore * 20);
+    expect(voiceBefore).toBeGreaterThan(100);
+
+    audio(path.join(later, 'music.wav'), 570);
+    expect((await importMusic(later)).asset_id).toBe(music.asset_id);
+    const controller = new AbortController();
+    const runProcess = studio.runVideoProcessForTest;
+    const stopMix = vi.spyOn(studio, 'runVideoProcessForTest').mockImplementation((cmd, args, opts) => {
+      if (args.some(arg => arg.includes('.assembling-'))) controller.abort();
+      return runProcess(cmd, args, opts);
+    });
+    try {
+      expect(await renderVideoTimeline({ ...p.options(), signal: controller.signal }))
+        .toMatchObject({ ok: false, errorCode: 'E_RENDER_ABORTED' });
+    } finally {
+      stopMix.mockRestore();
+    }
+    expect(sha(p.output)).toBe(priorHash);
+    const upToDate = await videoUpToDate(p.production, 'main');
+    const stale = await deliver(p, root);
+    const afterAttempt = fs.readFileSync(versions, 'utf8');
+
+    expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true, scene_segments: { rendered: 0, reused: 1 } });
+    const fresh = await deliver(p, root);
+    expect(fresh).toMatchObject({ ok: true, version: { id: 'v2' } });
+    const delivered = path.resolve(p.production, (fresh.version as { path: string }).path);
+    const [oldAfter, newAfter, voiceAfter] = trackLevels(delivered, [280, 570, 1000]);
+    expect(newAfter).toBeGreaterThan(oldAfter * 20);
+    expect(voiceAfter).toBeGreaterThan(100);
+    const frameHash = (file: string) => decoded(file, ['-map', '0:v:0', '-f', 'hash', '-hash', 'sha256']).toString();
+    expect(frameHash(delivered)).toBe(frameHash(prior));
+    expect(sha(prior)).toBe(priorHash);
+    expect(JSON.parse(fs.readFileSync(path.join(p.video, 'manifest.json'), 'utf8'))).toEqual(original);
+    expect(await videoUpToDate(p.production, 'main')).toBe(true);
+    expect({ stale: stale.ok, issues: findings(stale), upToDate, versionLedgerUnchanged: before === afterAttempt })
+      .toEqual({ stale: false, issues: ['DELIVERY_TIMELINE_CHANGED'], upToDate: false, versionLedgerUnchanged: true });
+  }, 30_000);
+
+  it('refreshes legacy audio renders once and ignores changes to unused audio thereafter', async () => {
+    const root = makeRoot();
+    const p = setup(root, { assets: [
+      { id: 'clip', kind: 'video', label: 'Clip', path: 'media/clip.mp4', origin: 'upload' },
+      { id: 'active', kind: 'audio', label: 'Active', path: 'media/active.wav', origin: 'upload' },
+      { id: 'unused', kind: 'audio', label: 'Unused', path: 'media/unused.wav', origin: 'upload' },
+    ], manifest: timeline(undefined, { tracks: [{ kind: 'music', asset: 'active', volume: 0.5 }] }) });
+    const active = path.join(p.production, 'media', 'active.wav');
+    const unused = path.join(p.production, 'media', 'unused.wav');
+    audio(active, 280);
+    audio(unused, 570);
+    expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true });
+    const latest = path.join(p.video, '.last-render.json');
+    const { output, source_sha256 } = JSON.parse(fs.readFileSync(latest, 'utf8'));
+    fs.writeFileSync(latest, JSON.stringify({ output, source_sha256 }));
+    expect(await deliver(p, root, { override: { codes: ['DELIVERY_TIMELINE_CHANGED'], reason: 'Keep the timeline edit for later.' } }))
+      .toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+    expect(fs.existsSync(path.join(p.production, 'versions.json'))).toBe(false);
+
+    expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true, scene_segments: { rendered: 0, reused: 2 } });
+    audio(unused, 1000);
+    expect(await deliver(p, root)).toMatchObject({ ok: true, version: { id: 'v1' } });
+    expect(await deliver(p, root)).toMatchObject({ ok: true, version: { id: 'v1' } });
+    fs.rmSync(active);
+    expect(await deliver(p, root)).toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED' });
+  }, 25_000);
+
+  it.each(['rendering', 'finalizing', 'replacing a render'] as const)('publishes only a matching render when an audio source changes while %s', async phase => {
+    const root = makeRoot();
+    const p = setup(root, { assets: [
+      { id: 'clip', kind: 'video', label: 'Clip', path: 'media/clip.mp4', origin: 'upload' },
+      { id: 'music', kind: 'audio', label: 'Music', path: 'media/music.wav', origin: 'upload' },
+    ], manifest: timeline(undefined, { tracks: [{ kind: 'music', asset: 'music', volume: 0.5 }] }) });
+    const music = path.join(p.production, 'media', 'music.wav');
+    audio(music, 280);
+    expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true });
+    const previous = sha(p.output);
+    const lastRender = path.join(p.video, '.last-render.json');
+    const before = fs.readFileSync(lastRender, 'utf8');
+    if (phase === 'rendering') {
+      const runProcess = studio.runVideoProcessForTest;
+      const replaceDuringMix = vi.spyOn(studio, 'runVideoProcessForTest').mockImplementation((cmd, args, opts) => {
+        if (args.some(arg => arg.includes('.assembling-'))) audio(music, 570);
+        return runProcess(cmd, args, opts);
+      });
+      try {
+        expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: false, errorCode: 'E_RENDER_AUDIO_CHANGED' });
+      } finally {
+        replaceDuringMix.mockRestore();
+      }
+    } else {
+      expect(await deliver(p, root, { finalize: async () => {
+        audio(music, 570);
+        if (phase === 'replacing a render') expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true });
+      } }))
+        .toMatchObject({ ok: false, errorCode: 'E_VIDEO_SHIP_BLOCKED', issues: [expect.objectContaining({ code: 'DELIVERY_TIMELINE_CHANGED' })] });
+      expect(fs.readdirSync(path.join(p.production, 'versions'))).toEqual([]);
+    }
+    if (phase === 'replacing a render') {
+      expect(sha(p.output)).not.toBe(previous);
+    } else {
+      expect(sha(p.output)).toBe(previous);
+      expect(fs.readFileSync(lastRender, 'utf8')).toBe(before);
+      expect(await renderVideoTimeline(p.options())).toMatchObject({ ok: true });
+    }
+    expect(fs.existsSync(path.join(p.production, 'versions.json'))).toBe(false);
+    expect(await deliver(p, root)).toMatchObject({ ok: true, version: { id: 'v1' } });
+  }, 25_000);
+
   it('refuses it until it is rendered again, and then delivers the new one', async () => {
     const root = makeRoot();
     const p = setup(root);
@@ -809,6 +1237,23 @@ describe('delivering a file the timeline has moved on from', () => {
     await renderVideoTimeline(p.options());
     // The fake window paints every frame alike, so the file itself comes out the same.
     expect(await deliver(p, root)).toMatchObject({ ok: true });
+  });
+
+  // Review 2026-11-16 S4-8: only development builds from 2026-11-05 to 11-09 hashed the whole
+  // product.json, with no prefix. No release wrote it, so such a record says nothing, and the file
+  // is rendered again before it goes out.
+  it('treats a render recorded in a form no release wrote as rendered before a change', async () => {
+    const root = makeRoot();
+    const p = setup(root);
+    await renderVideoTimeline(p.options());
+    const recordPath = path.join(p.video, '.last-render.json');
+    const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+    const whole = crypto.createHash('sha256');
+    for (const file of [path.join(p.video, 'manifest.json'), path.join(p.video, 'index.html'), path.join(p.production, 'product.json')]) {
+      whole.update(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '').update('\0');
+    }
+    fs.writeFileSync(recordPath, JSON.stringify({ ...record, source_sha256: whole.digest('hex') }));
+    expect(findings(await deliver(p, root))).toEqual(['DELIVERY_TIMELINE_CHANGED']);
   });
 
   // Revised on 2026-11-09: only the facts a scene quotes reach the screen, so a fact noted after
@@ -968,8 +1413,27 @@ describe('words on a marked product', () => {
     const result = await p.check({ wordsOnProductAsked: 3, onWordsOnProductAsked: asked });
     expect(result.ok).toBe(true);
     expect(String(result.message ?? '')).not.toContain('Words cover the product');
-    expect(result.warnings).toContainEqual(expect.objectContaining({ code: 'TEXT_OVER_PRODUCT' }));
+    expect(result.visual_review.findings).toContainEqual(expect.objectContaining({ code: 'TEXT_OVER_PRODUCT' }));
     expect(asked).not.toHaveBeenCalled();
+  });
+
+  // Review 2026-11-16 S4-3: the check commanded a fix on every run while the Skill and
+  // delivery treat these findings as advice.
+  it('points out still scenes as advice, and only on the first check and two more', async () => {
+    const p = marked(makeRoot());
+    const asked = vi.fn();
+    const first = await p.check({ onStillScenesAsked: asked });
+    expect(first.ok).toBe(true);
+    expect(first.message).toContain('look mostly empty or do not move');
+    expect(first.message).toContain('say why you keep the rest');
+    expect(first.message).not.toContain('Before rendering');
+    expect(asked).toHaveBeenCalledTimes(1);
+    const later = vi.fn();
+    const fourth = await p.check({ stillScenesAsked: 3, onStillScenesAsked: later });
+    expect(fourth.ok).toBe(true);
+    expect(String(fourth.message ?? '')).not.toContain('mostly empty');
+    expect(fourth.visual_review.findings.map((issue: { code: string }) => issue.code)).toEqual(expect.arrayContaining([expect.stringMatching(/^SCENE_(MOSTLY_EMPTY|STATIC)$/)]));
+    expect(later).not.toHaveBeenCalled();
   });
 
   it('refuses a marked region that is not four numbers', async () => {
@@ -981,6 +1445,40 @@ describe('words on a marked product', () => {
 });
 
 describe('advisory visual review follows the checked input and delivered version', () => {
+  it('reuses sampled scene endpoints in order, including a one-frame scene', async () => {
+    const { default: sharp } = await import('sharp');
+    const colors = ['#ff0000', '#ffffff', '#00ff00', '#0000ff'];
+    electronFake.state.previewTiles = await Promise.all(colors.map((background) =>
+      sharp({ create: { width: WIDTH, height: HEIGHT, channels: 3, background } }).png().toBuffer()));
+    const p = setup(makeRoot(), { manifest: timeline([
+      { id: 'a', clips: [{ id: 'c1', asset: 'clip', in: 0, dur: 0.5 }] },
+      { id: 'b', clips: [{ id: 'c2', asset: 'clip', in: 1, dur: 1 / 30 }] },
+    ]) });
+    const diagnostics = await checkVideoTimeline(p.options());
+    const captureCount = electronFake.state.captures;
+    expect(electronFake.state.shown).toBe(4);
+    expect(diagnostics).not.toHaveProperty('contact_sheet');
+
+    electronFake.state.shown = 0;
+    const previewOutputDirAbs = fs.mkdtempSync(path.join(p.production, 'preview-'));
+    const preview = await checkVideoTimeline({ ...p.options(), previewOutputDirAbs });
+    expect(preview).toMatchObject(diagnostics);
+    expect(electronFake.state.captures).toBe(2 * captureCount);
+    expect(preview.contact_sheet).toBe(path.join(previewOutputDirAbs, 'contact-sheet.png'));
+    const { data, info } = await sharp(String(preview.contact_sheet)).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const pixels = [0, 1, 2, 3].map((cell) => {
+      const x = Math.round(info.width * (cell + 0.5) / 4);
+      return [...data.subarray((32 * info.width + x) * info.channels, (32 * info.width + x) * info.channels + 3)];
+    });
+    expect(pixels).toEqual([[255, 0, 0], [0, 255, 0], [0, 0, 255], [0, 0, 255]]);
+
+    // A later failure must not attach this earlier preview.
+    electronFake.state.failScene = 'b';
+    const failure = await checkVideoTimeline({ ...p.options(), previewOutputDirAbs });
+    expect(failure).toMatchObject({ ok: false, visual_review: { status: 'unavailable' } });
+    expect(failure).not.toHaveProperty('contact_sheet');
+  });
+
   it('round-trips measured facts while preserving legacy records and discarding untrusted optional evidence', () => {
     const legacy = { code: 'LOW_CONTRAST', count: 1, scenes: ['a'], examples: [{ scene_id: 'a', selector: '.title', message: 'Low contrast' }] };
     expect(parseVisualReview(visualReview('has_findings', [legacy]))).toEqual(visualReview('has_findings', [legacy]));
@@ -1097,7 +1595,9 @@ describe('advisory visual review follows the checked input and delivered version
     const rendered = await renderVideoTimeline(p.options());
     expect(rendered).toMatchObject({ ok: true, visual_review: checked.visual_review });
     const shipped = await shipVideoFile({ productionDirAbs: p.production, videoDirAbs: p.video, allowedRoots: [root], videoPathAbs: p.output });
-    expect(shipped).toMatchObject({ ok: true, visual_review: checked.visual_review, version: { visual_review: checked.visual_review } });
+    // Shown once at the top of the reply; the stored version keeps it.
+    expect(shipped).toMatchObject({ ok: true, visual_review: checked.visual_review });
+    expect((shipped as { version: object }).version).not.toHaveProperty('visual_review');
     expect(JSON.parse(fs.readFileSync(path.join(p.production, 'versions.json'), 'utf8')).versions[0].visual_review).toEqual(checked.visual_review);
   });
 
@@ -1164,7 +1664,9 @@ describe('advisory visual review follows the checked input and delivered version
     sourceClip(other, 1);
     expect(await shipVideoFile({ ...paths, videoPathAbs: other })).toMatchObject({ ok: true, visual_review: { status: 'not_checked' } });
     expect(await shipVideoFile({ ...paths, videoPathAbs: p.output, finalize: async (file) => { fs.appendFileSync(file, 'marked'); } }))
-      .toMatchObject({ ok: true, visual_review: { status: 'stale' }, version: { visual_review: { status: 'stale' } } });
+      .toMatchObject({ ok: true, visual_review: { status: 'stale' } });
+    expect(JSON.parse(fs.readFileSync(path.join(p.production, 'versions.json'), 'utf8')).versions.at(-1).visual_review)
+      .toMatchObject({ status: 'stale' });
   });
 
   it('replaces a prior clear result with unavailable after a failed check', async () => {
@@ -1202,7 +1704,9 @@ describe('pictures a page places by file', () => {
     const result = await checkVideoTimeline(p.options());
 
     expect(result.ok).toBe(true);
-    expect(result.warnings).toContainEqual({
+    // The findings are in visual_review only; the result has no second copy.
+    expect(result.warnings).toBeUndefined();
+    expect(result.visual_review.findings).toContainEqual({
       code: 'PAGE_PICTURE_NOT_A_CLIP',
       count: 1,
       target_count: 1,

@@ -51,14 +51,14 @@ function makeRepo(name: string, files: Record<string, string>): string {
   return repo;
 }
 
-function runPkgWithEnv(extraEnv: Record<string, string>, ...args: string[]) {
+function runPkgWithOptions(args: string[], options: { cwd?: string; env?: Record<string, string> } = {}) {
   const pcRoot = process.cwd();
   const r = spawnSync(TEST_NODE, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
-    cwd: pcRoot,
+    cwd: options.cwd ?? pcRoot,
     encoding: 'utf8',
     env: {
       ...process.env,
-      ...extraEnv,
+      ...options.env,
       ORKAS_WORKSPACE_ROOT: wsRoot,
       ORKAS_UID: TEST_UID,
       ORKAS_PC_DIR: pcRoot,
@@ -76,7 +76,7 @@ function runPkgWithEnv(extraEnv: Record<string, string>, ...args: string[]) {
 }
 
 function runPkg(...args: string[]) {
-  return runPkgWithEnv({}, ...args);
+  return runPkgWithOptions(args);
 }
 
 /** Pause a real CLI at a filesystem boundary; only the schedule is injected. */
@@ -431,6 +431,28 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(reg.packages[0].commit).toMatch(/^[0-9a-f]{40}$/);
   });
 
+  it('reports a missing local source from the working directory and installs after correcting the path', () => {
+    const repo = makeRepo('local skill', { 'SKILL.md': '---\nname: local-skill\ndescription: Example\n---\nBody' });
+    const cwd = path.join(tmpDir, 'task');
+    fs.mkdirSync(cwd);
+    const relativeSource = '.' + path.sep + path.basename(repo);
+    const failure = runPkgWithOptions(['install', relativeSource, '--name', 'local-skill'], { cwd });
+
+    expect(failure.status).toBe(76);
+    expect(failure.json).toMatchObject({
+      ok: false, code: 'local_source_unavailable', error: expect.stringMatching(/working directory.*absolute path/i),
+    });
+    expect(fs.existsSync(path.join(pkgsDir(), '_registry.json'))).toBe(false);
+    expect(fs.existsSync(path.join(pkgsDir(), 'local-skill'))).toBe(false);
+
+    const installed = runPkgWithOptions(['install', repo, '--name', 'local-skill'], { cwd });
+    expect(installed.status).toBe(0);
+    expect(installed.json).toMatchObject({ ok: true, kind: 'skill', skill_roots: ['.'] });
+    expect(readRegistry().packages).toEqual([
+      expect.objectContaining({ name: 'local-skill', kind: 'skill', enabled: true, skill_roots: ['.'] }),
+    ]);
+  });
+
   it('rejects a repo with neither skills nor CLI entry points', () => {
     const repo = makeRepo('agent-only', { 'README.md': 'agent stuff', 'agent.yaml': 'x' });
     const r = runPkg('install', repo);
@@ -541,14 +563,15 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(install.json.deps_pending_consent).toEqual(['npm ci --omit=dev']);
     expect(fs.existsSync(path.join(pkgsDir(), 'npmpkg', 'node_modules'))).toBe(false);
 
-    const consent = runPkgWithEnv({
+    const env = {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
       NPM_ARGS_LOG: argsLog,
       NPM_CACHE_LOG: cacheLog,
       NPM_PREFIX_LOG: prefixLog,
       NPM_CONFIG_CACHE: path.join(tmpDir, 'inherited-global-npm-cache'),
       NPM_CONFIG_PREFIX: path.join(tmpDir, 'inherited-global-npm-prefix'),
-    }, 'consent-deps', 'npmpkg');
+    };
+    const consent = runPkgWithOptions(['consent-deps', 'npmpkg'], { env });
 
     expect(consent.status).toBe(0);
     expect(consent.json.deps_installed).toEqual(['npm ci --omit=dev']);
@@ -648,7 +671,7 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     }
     const env = { ORKAS_UV: fakeUv, ORKAS_PYTHON: fakePython };
 
-    const install = runPkgWithEnv(env, 'install', repo);
+    const install = runPkgWithOptions(['install', repo], { env });
     expect(install.status).toBe(0);
     expect(install.json.deps_pending_consent).toHaveLength(1);
     expect(install.json.deps_pending_consent[0]).toContain(path.join(wsRoot, 'venv', 'python', 'packages', 'pyuv-'));
@@ -656,7 +679,7 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(install.json.deps_pending_consent[0]).not.toContain(' -e ');
     expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(false);
 
-    const consent = runPkgWithEnv(env, 'consent-deps', 'pyuv');
+    const consent = runPkgWithOptions(['consent-deps', 'pyuv'], { env });
     expect(consent.status).toBe(0);
     expect(consent.json.deps_installed).toEqual(['uv pip install .']);
     expect(consent.json.shims).toEqual(['real-entry']);

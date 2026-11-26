@@ -49,6 +49,36 @@ afterEach(() => {
 });
 
 describe('group_chat state › sessionId builders', () => {
+  it('round-trips ordered task requests separately from the latest update and reads old ledgers', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const history = [
+      { source_message_id: 'original-request', text: 'Deliver a report and workbook.' },
+      { source_message_id: 'changed-date', text: 'Use the corrected closing date: June 12.' },
+      { source_message_id: 'progress-question', text: 'Report progress, then continue.' },
+    ];
+    await state.setOrchestrationLedger(TEST_UID, TEST_CID, { owner_agent_id: 'writer',
+      user_goal: history[2].text, resume_instruction: 'Continue the remaining work.', request_history: history } as any);
+    expect((await state.readState(TEST_UID, TEST_CID)).orchestration_ledger).toMatchObject({
+      user_goal: history[2].text, request_history: history,
+    });
+    await state.setOrchestrationLedger(TEST_UID, TEST_CID, { owner_agent_id: 'writer',
+      user_goal: 'A legacy task.', resume_instruction: 'Continue.' });
+    expect((await state.readState(TEST_UID, TEST_CID)).orchestration_ledger).not.toHaveProperty('request_history');
+  });
+
+  it('bounds inline request data while keeping original, latest and explicit retrieval identities', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const rows = Array.from({ length: 20 }, (_, i) => ({ source_message_id: `request-${i}`, text: String(i).padEnd(4000, 'x') }));
+    const result = state.normalizeOrchestrationRequestHistory(rows)!;
+    expect(result.map(r => r.source_message_id)).toEqual(rows.map(r => r.source_message_id));
+    expect(result[0].text).toBe(rows[0].text);
+    expect(result.at(-1)!.text).toBe(rows.at(-1)!.text);
+    expect(result.reduce((n, r) => n + (r.text?.length || 0), 0)).toBeLessThanOrEqual(40_000);
+    expect(result.filter(r => !r.text).every(r => r.text_omitted === true)).toBe(true);
+    expect(state.normalizeOrchestrationRequestHistory([{ source_message_id: '../foreign', text: 'ignore' }, rows[0], rows[0]]))
+      .toEqual([rows[0]]);
+  });
+
   // session_id format is `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id; user
   // scoping comes from the path root `<activeUid>/cloud/sessions/<sid>.jsonl`).
   it('build commander / member session ids with the right kind segment', async () => {

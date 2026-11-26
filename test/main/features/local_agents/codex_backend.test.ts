@@ -176,6 +176,7 @@ if (envTraceFlag >= 0) {
   fs.writeFileSync(process.argv[envTraceFlag + 1], JSON.stringify({
     ORKAS_BRIDGE_ENV_FILE: process.env.ORKAS_BRIDGE_ENV_FILE ?? null,
     ORKAS_PC_DIR: process.env.ORKAS_PC_DIR ?? null,
+    ORKAS_CANVAS_CLIENT: process.env.ORKAS_CANVAS_CLIENT ?? null,
   }));
 }
 const received = [];
@@ -2170,6 +2171,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     const seen = JSON.parse(fs.readFileSync(envTracePath, 'utf8'));
     expect(seen.ORKAS_BRIDGE_ENV_FILE).toBeNull();
     expect(seen.ORKAS_PC_DIR).toBeNull();
+    expect(seen.ORKAS_CANVAS_CLIENT).toBeNull();
   });
 
   it('reports timeout when Codex never emits a terminal event', async () => {

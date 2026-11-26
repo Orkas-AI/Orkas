@@ -967,6 +967,42 @@ describe("Tools", () => {
         }
       });
 
+      it.each([
+        { prefixEnd: 0, gapStart: 0 },
+        { prefixEnd: 4_000, gapStart: 4_000 },
+      ])("recovers unread cached bytes after an offset jump and compaction: $gapStart", async ({ prefixEnd, gapStart }) => {
+        const fetchMock = stubRelease();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const runScopedLedger = new Map<string, unknown>();
+          const before = { state: { runScopedLedger, toolResultReadLedger: { epoch: 0 } } };
+          const after = { state: { runScopedLedger, toolResultReadLedger: { epoch: 1 } } };
+          const url = "https://example.test/release";
+          if (prefixEnd) await webFetch.execute({ url, maxChars: prefixEnd }, before);
+          const late = await webFetch.execute({ url, maxChars: 4_000, offset: 12_000 }, before);
+          expect(windowBody(late.content)).toMatchObject({ start: 12_000, end: 16_000 });
+          expect(late.content).not.toContain(gapStart === 0 ? "Paragraph 0:" : "Paragraph 8:");
+
+          const replay = await webFetch.execute({ url }, after);
+          expect(replay.content).toContain("WEB_FETCH_RUN_CACHE_HIT");
+          expect.soft(replay.content).toContain('"offset": ' + gapStart + '.');
+          const gap = await webFetch.execute({ url, offset: gapStart, maxChars: 4_000 }, after);
+          expect.soft(gap.content).not.toContain("WEB_FETCH_RUN_CACHE_HIT");
+          expect.soft(gap.content).toContain(gapStart === 0 ? "Paragraph 0:" : "Paragraph 8:");
+          for (let next = gapStart + 4_000; next < 12_000; next += 4_000) {
+            const part = await webFetch.execute({ url, offset: next, maxChars: 4_000 }, after);
+            expect(windowBody(part.content).start).toBe(next);
+          }
+          const joined = await webFetch.execute({ url }, after);
+          expect(joined.content).toContain('"offset": 16000.');
+          const repeated = await webFetch.execute({ url, offset: 12_000, maxChars: 4_000 }, after);
+          expect(repeated.content).toContain("WEB_FETCH_RUN_CACHE_HIT");
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
       it("starts a cold fetch at the requested window", async () => {
         const fetchMock = stubRelease();
         try {

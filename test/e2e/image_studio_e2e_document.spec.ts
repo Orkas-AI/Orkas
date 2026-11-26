@@ -94,6 +94,22 @@ test('creates a durable three-page catalogue, modifies one page, reorders and de
   const input = fixture(orkas, 'book-main'), original = readFileSync(path.join(input.root, 'pages/p1.html'));
   expect((await operate(orkas, input.root, 'status')).ready_to_export).toBe(false);
   expect((await operate(orkas, input.root, 'approve')).ready_to_export).toBe(true);
+  const detailPreview = path.join(input.root, 'p2.png');
+  const reviewedPreview = readFileSync(detailPreview);
+  const reviewedStatePath = path.join(input.root, '.state/p2.json');
+  const reviewedState = readFileSync(reviewedStatePath);
+  writeFileSync(detailPreview, readFileSync(path.join(input.root, 'p1.png')));
+  const replacedPreview = await operate(orkas, input.root, 'status');
+  expect(replacedPreview.ready_to_export).toBe(false);
+  expect(replacedPreview.pages[1]).toMatchObject({
+    id: 'p2', ok: true, evidence_current: false, review_current: false, next_operation: 'project.snapshot',
+  });
+  expect(replacedPreview.pages.map((page: any) => page.review_current)).toEqual([true, false, true]);
+  const rejected = await operate(orkas, input.root, 'export', { name: 'changed-preview.pdf' });
+  expect(rejected.error).toContain('E_IMAGE_REVIEW_EVIDENCE_CHANGED');
+  expect(existsSync(path.join(input.root, 'changed-preview.pdf'))).toBe(false);
+  expect(readFileSync(reviewedStatePath)).toEqual(reviewedState);
+  writeFileSync(detailPreview, reviewedPreview);
   const result = await operate(orkas, input.root, 'export'); expect(result.windows).toBe(0); expect(result.result.page_count).toBe(3);
   await verifyPdf(path.join(input.root, 'book.pdf'), input.root, ['p1', 'p2', 'p3'], input.titles);
   const previous = readFileSync(path.join(input.root, 'book.pdf'));

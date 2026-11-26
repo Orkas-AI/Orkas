@@ -67,6 +67,14 @@ export interface RunningConversationRegistry {
   items: RunningConversationEntry[];
 }
 
+export interface OrchestrationRequestEntry {
+  source_message_id: string;
+  text?: string;
+  /** The canonical message remains available through chat_history. */
+  text_omitted?: true;
+  text_truncated?: true;
+}
+
 export interface OrchestrationLedger {
   version: 1;
   id: string;
@@ -78,6 +86,7 @@ export interface OrchestrationLedger {
   owner_agent_name?: string;
   form_id?: string;
   user_goal: string;
+  request_history?: OrchestrationRequestEntry[];
   handoff_message: string;
   resume_instruction: string;
   created_at: string;
@@ -185,6 +194,32 @@ export function boundOrchestrationGoal(value: unknown): string {
   return _cleanLedgerText(value);
 }
 
+/** Keep source identities even when bounded inline data needs on-demand reads.
+ * The original request is pinned; newer updates receive the remaining budget.
+ * This is data, not a host decision about whether an update replaces a goal. */
+export function normalizeOrchestrationRequestHistory(value: unknown): OrchestrationRequestEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const entries: OrchestrationRequestEntry[] = [];
+  for (const row of value) {
+    if (!row || typeof row.source_message_id !== 'string' || !safeId(row.source_message_id)
+      || seen.has(row.source_message_id)) continue;
+    seen.add(row.source_message_id);
+    const text = boundOrchestrationGoal(row.text);
+    entries.push({ source_message_id: row.source_message_id, ...(text ? { text } : { text_omitted: true as const }),
+      ...(row.text_truncated === true || (typeof row.text === 'string' && row.text.length > text.length)
+        ? { text_truncated: true as const } : {}) });
+  }
+  if (!entries.length) return undefined;
+  let remaining = 40_000 - (entries[0].text?.length || 0);
+  for (let index = entries.length - 1; index > 0; index--) {
+    const entry = entries[index];
+    if ((entry.text?.length || 0) <= remaining) remaining -= entry.text?.length || 0;
+    else { delete entry.text; entry.text_omitted = true; }
+  }
+  return entries;
+}
+
 function _sanitizeOrchestrationLedger(v: unknown): OrchestrationLedger | undefined {
   if (!v || typeof v !== 'object') return undefined;
   const row = v as Record<string, unknown>;
@@ -207,6 +242,7 @@ function _sanitizeOrchestrationLedger(v: unknown): OrchestrationLedger | undefin
   const id = typeof row.id === 'string' && /^[A-Za-z0-9_.-]+$/.test(row.id) ? row.id : genId12();
   const now = nowIso();
   const user_goal = _cleanLedgerText(row.user_goal);
+  const requestHistory = normalizeOrchestrationRequestHistory(row.request_history);
   const handoff_message = _cleanLedgerText(row.handoff_message);
   const resume_instruction = _cleanLedgerText(row.resume_instruction);
   if (!resume_instruction) return undefined;
@@ -223,6 +259,7 @@ function _sanitizeOrchestrationLedger(v: unknown): OrchestrationLedger | undefin
       ? { owner_agent_name: _cleanLedgerText(row.owner_agent_name, 200) }
       : {}),
     user_goal,
+    ...(requestHistory ? { request_history: requestHistory } : {}),
     handoff_message,
     resume_instruction,
     created_at: typeof row.created_at === 'string' && row.created_at ? row.created_at : now,
@@ -785,6 +822,7 @@ export async function setOrchestrationLedger(
 type OrchestrationLedgerInput = Parameters<typeof setOrchestrationLedger>[2];
 
 function _buildOrchestrationLedger(ledger: OrchestrationLedgerInput, now: string): OrchestrationLedger {
+  const requestHistory = normalizeOrchestrationRequestHistory(ledger.request_history);
   return {
     version: 1,
     id: ledger.id || genId12(),
@@ -796,6 +834,7 @@ function _buildOrchestrationLedger(ledger: OrchestrationLedgerInput, now: string
     ...(ledger.form_id ? { form_id: ledger.form_id } : {}),
     ...(ledger.owner_agent_name ? { owner_agent_name: ledger.owner_agent_name } : {}),
     user_goal: _cleanLedgerText(ledger.user_goal),
+    ...(requestHistory ? { request_history: requestHistory } : {}),
     handoff_message: _cleanLedgerText(ledger.handoff_message),
     resume_instruction: _cleanLedgerText(ledger.resume_instruction),
     created_at: ledger.created_at || now,
@@ -899,6 +938,7 @@ export async function beginAgentHandoff(
     claimFloor: boolean;
     expectedChoiceRevision?: number;
     userGoal: string;
+    requestHistory?: OrchestrationRequestEntry[];
     handoffMessage: string;
     resumeInstruction?: string;
   },
@@ -949,6 +989,8 @@ export async function beginAgentHandoff(
         owner_agent_id: params.ownerAgentId,
         ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
         user_goal: _cleanLedgerText(params.userGoal),
+        ...(normalizeOrchestrationRequestHistory(params.requestHistory)
+          ? { request_history: normalizeOrchestrationRequestHistory(params.requestHistory) } : {}),
         handoff_message: _cleanLedgerText(params.handoffMessage),
         resume_instruction: resumeInstruction,
         created_at: now,

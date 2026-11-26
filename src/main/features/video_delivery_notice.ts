@@ -83,7 +83,8 @@ export async function interruptedVideoDeliveryNotice(input: {
         if (recordRaw) {
           const record = JSON.parse(recordRaw) as { delivered_version_id?: string; delivered_source_sha256?: string };
           const hash = record.delivered_source_sha256;
-          if (record.delivered_version_id === version.id && typeof hash === 'string' && /^(parsed:|facts:)?[a-f0-9]{64}$/.test(hash)) {
+          // Deliveries record this form only; another says nothing about later edits.
+          if (record.delivered_version_id === version.id && typeof hash === 'string' && /^parsed:[a-f0-9]{64}$/.test(hash)) {
             const manifest = await read(path.join(video, 'manifest.json'), production);
             if (!manifest || JSON.parse(manifest)?.id !== version.video_id) throw new Error('invalid manifest');
             const page = await read(path.join(video, 'index.html'), production) ?? '';
@@ -91,8 +92,7 @@ export async function interruptedVideoDeliveryNotice(input: {
             if (product) JSON.parse(product);
             const { videoTimelineSourceHash } = await import('./video_timeline_render');
             check();
-            const form = hash.startsWith('parsed:') ? 'parsed' : hash.startsWith('facts:') ? 'facts' : 'whole';
-            if (videoTimelineSourceHash({ manifest, page, product }, form) !== hash) {
+            if (videoTimelineSourceHash({ manifest, page, product }, 'parsed') !== hash) {
               retained += ` ${t('video.delivery_later_edits', undefined, input.lang)}`;
             }
           }

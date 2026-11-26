@@ -54,6 +54,7 @@ describe('application shutdown durability and latency', () => {
       './util/boot_init': { stopBootWork: mark('boot-work') },
       './features/library_corpus': { closeAllLibraryCorpora: mark('library-owners') },
       './features/local_agents/runner.js': { stopBackgroundRuns: mark('background-cli') },
+      './features/video_canvas_jobs': { stopVideoCanvasJobsForQuit: mark('canvas-jobs') },
       '../core-agent/src/tools/process-session': { stopAllProcessSessions: mark('process-sessions') },
       './features/kb_vector': { closeAllKb: mark('kb-database') },
       './features/kb_embed': { closeEmbedder: mark('embed-worker') },
@@ -91,7 +92,7 @@ describe('application shutdown durability and latency', () => {
     const pending = shutdown.prepare(mode);
     expect(shutdown.prepare(mode)).toBe(pending);
     await vi.waitFor(() => expect(events).toContain('process-sessions'));
-    expect(events).toEqual(mode === 'quit' ? ['capture', 'app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions'] : ['app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions']);
+    expect(events).toEqual(mode === 'quit' ? ['capture', 'app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'canvas-jobs', 'process-sessions'] : ['app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'canvas-jobs', 'process-sessions']);
     archived.release();
     await vi.waitFor(() => expect(events).toContain('browser-save'));
     expect(events).toContain('history-workers');
@@ -121,7 +122,7 @@ describe('application shutdown durability and latency', () => {
       exited.release();
     }
     await pending;
-    const owners = ['app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'history-workers', 'office-extract', 'office', 'browser-save', 'open-lifecycle', 'app-close', 'app-databases'];
+    const owners = ['app-maintenance-stop', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'canvas-jobs', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'history-workers', 'office-extract', 'office', 'browser-save', 'open-lifecycle', 'app-close', 'app-databases'];
     expect([...events].sort()).toEqual([...owners, ...(mode === 'quit' ? ['capture', 'terminate', 'dispose'] : [])].sort());
     expect(shutdown.complete).toBe(true);
   });
@@ -144,6 +145,7 @@ describe('application shutdown durability and latency', () => {
       './util/boot_init': { stopBootWork: vi.fn(), resumeBootAdmission: mark('boot') },
       './features/library_corpus': { closeAllLibraryCorpora: vi.fn(), resumeLibraryAdmission: async () => { events.push('library'); } },
       './features/local_agents/runner.js': { stopBackgroundRuns: vi.fn() },
+      './features/video_canvas_jobs': { stopVideoCanvasJobsForQuit: vi.fn() },
       '../core-agent/src/tools/process-session': { stopAllProcessSessions: overrides.stopAllProcessSessions || vi.fn() },
       './features/kb_vector': { closeAllKb: vi.fn() },
       './features/kb_embed': { closeEmbedder: vi.fn() },

@@ -2,9 +2,12 @@
 import * as path from 'node:path';
 import { nowIso } from '../storage';
 import { taskContent } from '../util/project-task-content';
-import type { ProjectTask, TaskStatus } from './project_tasks';
+import { taskNoteLimitEnd } from '../../core-agent/src/shared/task-note-limit';
+import type { ProjectTask, TaskNoteKind, TaskStatus } from './project_tasks';
 
 export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
+export const TASK_NOTE_KINDS: readonly TaskNoteKind[] = ['result', 'blocker'];
+
 /** Cleanup deletes the version the user reviewed, never a later edit. */
 export type TaskDeleteExpectation = Pick<ProjectTask, 'content' | 'status' | 'created_at' | 'updated_at'>;
 export function matchesTaskDeleteExpectation(task: ProjectTask | null | undefined, expected: TaskDeleteExpectation): boolean {
@@ -93,6 +96,16 @@ export function normaliseTask(raw: any): ProjectTask | null {
   }
   if (status === 'done' && typeof raw.done_at === 'string' && raw.done_at) t.done_at = raw.done_at;
   if (isDueDate(raw.due_at)) t.due_at = raw.due_at;
+  if (typeof raw.status_changed_at === 'string' && raw.status_changed_at) t.status_changed_at = raw.status_changed_at;
+  if (raw.status_changed_by === 'user') t.status_changed_by = 'user';
+  if (typeof raw.last_change_cid === 'string' && raw.last_change_cid) t.last_change_cid = raw.last_change_cid;
+  // A synced or hand-edited note past the bound is clipped, never dropped.
+  const rawNote = typeof raw.note === 'string' ? raw.note.trim() : '';
+  const note = rawNote.slice(0, taskNoteLimitEnd(rawNote));
+  if (note) {
+    t.note = note;
+    t.note_kind = TASK_NOTE_KINDS.includes(raw.note_kind) ? raw.note_kind : 'result';
+  }
   return t;
 }
 

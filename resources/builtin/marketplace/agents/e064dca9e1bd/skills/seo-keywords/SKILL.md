@@ -16,7 +16,7 @@ Deterministic and stdlib-only: it does not fetch, call models, or persist.
 
 ## The split, and why the agent has to do the harvesting
 
-A Python skill cannot reach the network. So the AGENT harvests and this skill
+This skill does not fetch, so the AGENT harvests and this skill
 processes. That division is the whole design — do not ask this skill for data it
 cannot get, and do not skip the processing because the raw lists "look fine": a
 pool of near-duplicate strings across three surfaces is not research.

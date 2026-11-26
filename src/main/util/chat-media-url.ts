@@ -271,14 +271,24 @@ function _normalizeWorkspaceDocumentLinks(text: string, baseDirAbs: string, toke
  * a media destination written relative to it resolves to the file it names.
  * Explicit document links are also resolved when the file exists inside that
  * directory; source locations remain URL fragments, separate from path bytes.
+ * Callers may override the media base independently or pass an empty media
+ * base to refresh canonical URLs without resolving any relative media again.
  */
-export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): string {
+export function versionChatMediaLocalUrlsInText(
+  text: string, baseDirAbs = '', allowLocalPath?: (file: string) => boolean,
+  relativeMediaBaseDir = baseDirAbs,
+): string {
   // Invocation-local metadata only: repeated references share I/O, while the
   // next render observes file creation, deletion, replacement, and new bytes.
   const tokens = new Map<string, string>();
   const normalized = _normalizeLocalMediaAliasesInMarkdown(
-    _normalizeWorkspaceDocumentLinks(String(text || ''), baseDirAbs, tokens), baseDirAbs,
+    _normalizeWorkspaceDocumentLinks(String(text || ''), baseDirAbs, tokens), relativeMediaBaseDir,
   );
+  const blocked = (url: string): boolean => {
+    if (!allowLocalPath) return false;
+    const file = chatMediaLocalPathFromUrl(url);
+    return !!file && !allowLocalPath(file);
+  };
   const versionBareUrls = (segment: string): string => segment.replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
     let candidate = raw;
     let suffix = '';
@@ -305,6 +315,7 @@ export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): 
       suffix = last + suffix;
       versioned = _versionLocalUrlCandidate(candidate, tokens);
     }
+    if (blocked(candidate)) return suffix;
     return versioned ? versioned + suffix : raw;
   });
 
@@ -317,8 +328,10 @@ export function versionChatMediaLocalUrlsInText(text: string, baseDirAbs = ''): 
     const index = match.index!;
     parts.push(versionBareUrls(normalized.slice(cursor, index)));
     const [full, prefix, destination, suffix] = match;
-    const versioned = destination && _versionLocalUrlCandidate(destination, tokens);
-    parts.push(versioned ? `${prefix}${versioned}${suffix}` : versionBareUrls(full));
+    if (!destination || !blocked(destination)) {
+      const versioned = destination && _versionLocalUrlCandidate(destination, tokens);
+      parts.push(versioned ? `${prefix}${versioned}${suffix}` : versionBareUrls(full));
+    }
     cursor = index + full.length;
   }
   parts.push(versionBareUrls(normalized.slice(cursor)));

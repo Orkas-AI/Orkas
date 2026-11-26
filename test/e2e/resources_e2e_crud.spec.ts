@@ -238,7 +238,10 @@ test.describe('agents and skills', () => {
     expect(before).toMatchObject({ name: seed.name, workflow: seed.workflow });
 
     const request = 'Add a rollback note to the release notes workflow.';
-    app.setModelMode('truncated');
+    app.setModelRequestScript(() => ({
+      text: 'I started revising the workflow.\n\n<agent><workflow>Unfinished workflow.</workflow>',
+      truncated: true,
+    }));
     let page = app.page!;
     const openEditor = async () => {
       await openSidebarEntry(page, '#agents-btn');
@@ -262,7 +265,7 @@ test.describe('agents and skills', () => {
     expect(await readAgent()).toEqual(before);
 
     const recoveredWorkflow = `${seed.workflow} End with a rollback note.`;
-    app.setModelMode('success');
+    app.setModelRequestScript(null);
     app.setModelTextReplies([`Rollback note added.\n\n<agent><workflow>${recoveredWorkflow}</workflow></agent>`]);
     const requestsBeforeRetry = app.modelRequests.length;
     await failed.hover();
@@ -355,6 +358,64 @@ test.describe('agents and skills', () => {
       ]),
     }));
     expect(orkas.modelRequests).toHaveLength(1);
+  });
+
+  for (const exit of ['Done', 'sidebar'] as const) {
+    test(`recycles an empty URL import draft on ${exit}`, async ({ orkas }) => {
+      if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+      const page = orkas.page;
+      const id = 'e2e-import-placeholder';
+      await openSidebarEntry(page, '#skills-btn');
+      const created = await orkas.invoke<{ skill: SkillSummary }>('skills.createFromUrl', {
+        name: id, description: 'Import placeholder for the desktop lifecycle test.', url: 'https://example.com/skills',
+      });
+      expect(created.skill?.id).toBe(id);
+      await page.evaluate((skillId) => (window as any).openSkillDetail('custom', skillId), id);
+      await expect(page.locator('#skills-detail-name')).toHaveText(id);
+      if (exit === 'Done') {
+        await page.locator('#skill-edit-btn').click();
+        await expect(page.locator('#skill-edit-btn')).toHaveText('Done');
+        await page.locator('#skill-edit-btn').click();
+        await expect(page.locator('#skills-grid-view')).toBeVisible();
+      } else {
+        await openSidebarEntry(page, '#agents-btn');
+        await expect(page.locator('#panel-agents')).toHaveClass(/\bactive\b/);
+        await openSidebarEntry(page, '#skills-btn');
+      }
+      await expect.poll(async () => {
+        const recycle = await orkas.invoke<{ batches: RecycleBatch[] }>('recycle.list');
+        return recycle.batches.some(batch => batch.kind === 'skill'
+          && batch.display_items?.some(item => item.category === 'skill' && item.id === id));
+      }).toBe(true);
+      await expect(page.locator(`.skill-card[data-id="${id}"]`)).toHaveCount(0);
+      await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
+    });
+  }
+
+  test('keeps an import draft when the user types and leaves before autosave', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const id = 'e2e-import-edited';
+    await openSidebarEntry(page, '#skills-btn');
+    await orkas.invoke('skills.createFromUrl', {
+      name: id, description: 'Import placeholder for the desktop lifecycle test.', url: 'https://example.com/skills',
+    });
+    await page.evaluate((skillId) => (window as any).openSkillDetail('custom', skillId), id);
+    await page.locator('#skill-edit-btn').click();
+    const editor = page.locator('.skill-file-editor');
+    await expect(editor).toBeVisible();
+    await editor.evaluate((textarea) => {
+      const field = textarea as HTMLTextAreaElement;
+      field.value += '\n# Instructions\nKeep the user draft.';
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('skills-back-btn')?.click();
+    });
+    await expect(page.locator(`.skill-card[data-id="${id}"]`)).toBeVisible();
+    await expect.poll(async () => (
+      await orkas.invoke<{ content: string }>('skills.read', { source: 'custom', id })
+    ).content).toContain('Keep the user draft.');
+    const recycle = await orkas.invoke<{ batches: RecycleBatch[] }>('recycle.list');
+    expect(recycle.batches.some(batch => batch.display_items?.some(item => item.id === id))).toBe(false);
   });
 
   test('creates a skill, persists its enabled state, and deletes it', async ({ modelOrkas: orkas }) => {

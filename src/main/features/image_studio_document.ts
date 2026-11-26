@@ -82,14 +82,18 @@ export async function readImageStudioDocument(projectDir: string): Promise<Image
 export async function inspectImageStudioDocument(projectDir: string, statePath: (id: string) => string) {
   const document = await readImageStudioDocument(projectDir);
   if (!document) fail('E_IMAGE_DOCUMENT_MANIFEST', 'a version 2 document is required');
-  const { inspectImageStudioProject, readImageStudioEvidenceState, assertCurrentEvidence } = await import('./image_studio');
+  const { inspectImageStudioProject, readImageStudioEvidenceState, imageStudioEvidencePixelsMatch } = await import('./image_studio');
   const pages = [];
   for (const page of document.pages) {
     const inspection = await inspectImageStudioProject(projectDir, undefined, page.id);
     const state = await readImageStudioEvidenceState(statePath(page.id));
     let current = false;
-    if (state && path.resolve(state.project_dir) === path.resolve(projectDir) && state.page_id === page.id
-      && state.signature === inspection.signature) try { await assertCurrentEvidence(statePath(page.id)); current = true; } catch { /* preserve stale work for repair */ }
+    if (inspection.ok && inspection.signature && state && path.resolve(state.project_dir) === path.resolve(projectDir)
+      && state.page_id === page.id && state.signature === inspection.signature) {
+      try {
+        current = await imageStudioEvidencePixelsMatch(state);
+      } catch { /* preserve stale work for repair */ }
+    }
     const approved = current && state?.review?.verdict === 'passed' && state.review.signature === inspection.signature;
     pages.push({ id: page.id, index: pages.length, entry: page.entry, ok: inspection.ok,
       blockers: inspection.blockers, current_signature: inspection.signature || null,

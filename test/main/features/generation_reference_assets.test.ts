@@ -143,6 +143,25 @@ describe('generation reference assets', () => {
     expect(fetchMock).toHaveBeenCalledTimes(failure === 'download' ? 1 : 0);
   });
 
+  it('checks the scoped local reference before reading it or requesting a remote image', async () => {
+    const { loadImageReferenceBuffersWithProgress } = await import('../../../src/main/features/generation_reference_assets');
+    const local = path.join(tmpDir, 'local-reference.png');
+    await fs.writeFile(local, Buffer.from('local reference bytes'));
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const assertLocalPath = vi.fn((file: string) => {
+      expect(file).toBe(local);
+      throw new Error('Reference scope changed');
+    });
+    await expect(loadImageReferenceBuffersWithProgress(['https://images.example.test/allowed.png'], [local],
+      { assertLocalPath })).rejects.toThrow('Reference scope changed');
+    expect(assertLocalPath).toHaveBeenCalledOnce();
+    expect(fetch).not.toHaveBeenCalled();
+    assertLocalPath.mockImplementation(() => {});
+    await expect(loadImageReferenceBuffersWithProgress([], [local], { assertLocalPath }))
+      .resolves.toEqual([Buffer.from('local reference bytes')]);
+  });
+
   it('retries a transient reference-image GET without replaying any generation request', async () => {
     const png = Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
@@ -207,6 +226,7 @@ describe('generation reference assets', () => {
       'https://[::ffff:169.254.169.254]/reference.png',
       'https://[::ffff:10.0.0.1]/reference.png',
       'https://[::ffff:192.168.1.1]/reference.png',
+      'https://100.64.0.1/reference.png',
       'asset:not-a-provider-asset',
       'not a URL',
     ]) {

@@ -1,6 +1,5 @@
 import { mapCoreAgentEvents } from '../../../../src/main/model/core-agent/event-mapper';
-import { t } from '../../../../src/main/i18n';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { classifyRetryableError, classifyTransientNetworkError } from '../../../../src/core-agent/src/shared/errors';
 import {
@@ -17,6 +16,7 @@ import { createPiProvider, AgentRunner, createConfig, defineTool, ContextOverflo
 import { _clearAll, getCooldown } from '../../../../src/main/model/core-agent/profile-cooldown';
 
 import { normalizeElectronNetFetchError } from '../../../../src/main/util/proxy-dispatcher';
+import { getCurrentLang, setCurrentLang, t } from '../../../../src/main/i18n';
 
 // ── Fake LLMProvider factory ────────────────────────────────────────────
 
@@ -73,6 +73,59 @@ const PARAMS: CompletionParams = {
   model: 'test-model',
   messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
 };
+
+describe('Anthropic API-key cache retention', () => {
+  it.each((['complete', 'stream'] as const).flatMap(method =>
+    (['long', 'short', 'none'] as const).map(retention => [method, retention] as const),
+  ))('preserves the requested %s fallback cache policy (%s) for API keys and subscriptions', async (method, retention) => {
+    _clearAll();
+    const authError = Object.assign(new Error('invalid API key'), { status: 401 });
+    const answer: CompletionResult = {
+      content: [{ type: 'text', text: 'Recovered' }], stopReason: 'end_turn', model: 'claude-fixture',
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    };
+    const requests: Array<[string, CompletionParams['cacheRetention']]> = [];
+    const record = (entry: RotatingCandidate): RotatingCandidate => ({
+      ...entry,
+      async build() {
+        const provider = await entry.build();
+        return {
+          ...provider,
+          stream(params) {
+            requests.push([entry.profileId, params.cacheRetention]);
+            return provider.stream(params);
+          },
+          complete(params) {
+            requests.push([entry.profileId, params.cacheRetention]);
+            return provider.complete(params);
+          },
+        };
+      },
+    });
+    const rejected = { completeError: authError, throwBefore: authError };
+    const provider = createRotatingProvider({ providerId: 'openai', candidates: [
+      record(candidate('openai-key', rejected, 'openai')),
+      record(candidate('claude-key', rejected, 'anthropic')),
+      record({
+        ...candidate('claude-subscription', {
+          completeResult: answer, streamEvents: [{ type: 'text_delta', text: 'Recovered' }],
+        }, 'anthropic', answer.model),
+        refreshCredential: async () => false,
+      }),
+    ] });
+    try {
+      const params = { ...PARAMS, cacheRetention: retention };
+      if (method === 'complete') {
+        await expect(provider.complete(params)).resolves.toEqual(answer);
+      } else {
+        expect(await collect(provider.stream(params))).toContainEqual({ type: 'text_delta', text: 'Recovered' });
+      }
+      expect(requests).toEqual([
+        ['openai-key', retention], ['claude-key', retention], ['claude-subscription', retention],
+      ]);
+    } finally { _clearAll(); }
+  });
+});
 
 describe('recovery of actual upstream rejections', () => {
   it.each(['openai-completions', 'openai-responses'] as const)
@@ -2716,7 +2769,7 @@ describe('committed stream resource ownership', () => {
 // refusal, to hear that retrying as is will not help.
 describe('rejected requests after the candidate chain ends', () => {
   const REASON = 'Unknown parameter: stream_options';
-  async function refusedRun(names: string[], failureTrackingScope: object) {
+  async function refusedRun(names: string[], failureTrackingScope: object, message = 'Continue') {
     const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       requests.push(new URL(String(input)).hostname.split('.')[0]);
@@ -2739,7 +2792,7 @@ describe('rejected requests after the candidate chain ends', () => {
       providers: registry, tools: [],
     });
     const events: any[] = [];
-    for await (const event of mapCoreAgentEvents(runner.runStream({ message: 'Continue' }), { failureTrackingScope })) events.push(event);
+    for await (const event of mapCoreAgentEvents(runner.runStream({ message }), { failureTrackingScope })) events.push(event);
     return { requests, error: events.find(event => event.type === 'error') };
   }
 
@@ -2764,6 +2817,29 @@ describe('rejected requests after the candidate chain ends', () => {
       expect(second.error.detail).toBe(t('errors.provider_reply_detail', { detail: REASON }));
       for (const id of names) expect(getCooldown(id)).toBeUndefined();
     } finally { vi.unstubAllGlobals(); warning.mockRestore(); _clearAll(); }
+  });
+
+  it('describes consecutive rejections across distinct text requests', async () => {
+    _clearAll();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const language = getCurrentLang();
+    try {
+      setCurrentLang('en');
+      const scope = {};
+      const first = await refusedRun(['primary'], scope, 'Summarize the first draft');
+      const second = await refusedRun(['primary'], scope, 'List the open decisions');
+      expect(first.requests).toEqual(['primary']);
+      expect(second.requests).toEqual(['primary']);
+      expect(second.error.text).toContain('The model service rejected several requests in a row.');
+      expect(second.error.text).not.toContain('will not change the result');
+      expect(second.error.text).not.toContain('remove images or attachments');
+      expect(second.error.detail).toBe(t('errors.provider_reply_detail', { detail: REASON }));
+    } finally {
+      setCurrentLang(language);
+      vi.unstubAllGlobals();
+      warning.mockRestore();
+      _clearAll();
+    }
   });
 });
 
@@ -3553,5 +3629,263 @@ describe('user-owned provider balance isolation', () => {
     const events = await collect(p.stream(PARAMS));
     expect(events.some((event: any) => event.type === 'provider_fallback')).toBe(false);
     expect((events.at(-1) as any).text).toBe('ok');
+
+  });
+});
+describe('rotating-provider › failures that a same-candidate retry cannot help', () => {
+  // The managed Server's in-band startup failure after it has tried its own routes.
+  const managedStartupFailure = () => Object.assign(new Error('Provider stream error'), {
+    status: 503, cause: { code: 'upstream_error', cause: {} }, providerRequestRejected: true,
+  });
+  // A configured model the provider does not have.
+  const modelNotFound = () => Object.assign(new Error('404 The model does not exist'), {
+    status: 404, code: 'model_not_found', providerRequestRejected: true,
+  });
+  const invalidRequest = () => Object.assign(new Error('400 Invalid request'), {
+    status: 400, code: 'invalid_request_error', providerRequestRejected: true,
+  });
+
+  /** A candidate that fails before any output after `waitMs`, or serves when `fail` is absent. */
+  function timedCandidate(id: string, sends: string[], behavior: { fail?: () => unknown; waitMs?: number },
+    providerId = 'openai'): RotatingCandidate {
+    return {
+      profileId: id, cooldownId: id, providerId, modelId: id,
+      build: async () => ({
+        ...fakeProvider(id, {}),
+        async *stream() {
+          sends.push(id);
+          yield { type: 'message_start' } as StreamEvent;
+          if (behavior.waitMs) vi.advanceTimersByTime(behavior.waitMs);
+          if (behavior.fail) { yield { type: 'error', error: behavior.fail() } as unknown as StreamEvent; return; }
+          yield { type: 'text_delta', text: 'ok' } as StreamEvent;
+        },
+        async complete() {
+          sends.push(id);
+          if (behavior.waitMs) vi.advanceTimersByTime(behavior.waitMs);
+          if (behavior.fail) throw behavior.fail();
+          return { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } } as unknown as CompletionResult;
+        },
+      }),
+    };
+  }
+  const call = (provider: LLMProvider, method: 'stream' | 'complete') => (method === 'stream'
+    ? collect(provider.stream(PARAMS)) : provider.complete(PARAMS)).then(() => 'ok', (error) => String(error?.code || error?.message));
+
+  beforeEach(() => { _clearAll(); vi.useFakeTimers({ toFake: ['performance'] }); });
+  afterEach(() => { vi.useRealTimers(); _clearAll(); });
+
+  it.each(['stream', 'complete'] as const)('sends an configured candidate once when it failed only after a long wait (%s)', async (method) => {
+    const sends: string[] = [];
+    const provider = createRotatingProvider({ providerId: 'openai', networkRetryDelayMs: () => 0,
+      candidates: [timedCandidate('configured-first', sends, { fail: managedStartupFailure, waitMs: 280_000 })] });
+    expect(await call(provider, method)).toBe('PROVIDER_NETWORK_EXHAUSTED');
+    expect(sends).toEqual(['configured-first']);
+  });
+
+  it.each(['stream', 'complete'] as const)('moves on to the next candidate after a slow failure, without retrying in place (%s)', async (method) => {
+    const sends: string[] = [];
+    const provider = createRotatingProvider({ providerId: 'openai', networkRetryDelayMs: () => 0,
+      candidates: [
+        timedCandidate('configured-first', sends, { fail: managedStartupFailure, waitMs: 30_000 }),
+        timedCandidate('configured-next', sends, {}),
+      ] });
+    expect(await call(provider, method)).toBe('ok');
+    expect(sends).toEqual(['configured-first', 'configured-next']);
+  });
+
+  it.each(['stream', 'complete'] as const)('still retries a quick failure in place three times (%s)', async (method) => {
+    const sends: string[] = [];
+    const provider = createRotatingProvider({ providerId: 'openai', networkRetryDelayMs: () => 0,
+      candidates: [timedCandidate('configured-first', sends, { fail: managedStartupFailure, waitMs: 29_999 })] });
+    expect(await call(provider, method)).toBe('PROVIDER_NETWORK_EXHAUSTED');
+    expect(sends).toEqual(['configured-first', 'configured-first', 'configured-first', 'configured-first']);
+  });
+
+  it.each(['stream', 'complete'] as const)('stops trying a model the provider does not have for the rest of the run (%s)', async (method) => {
+    for (const providerId of ['openai', 'deepseek']) {
+      const sends: string[] = [];
+      const provider = createRotatingProvider({ providerId, networkRetryDelayMs: () => 0,
+        candidates: [
+          timedCandidate('missing-model', sends, { fail: modelNotFound }, providerId),
+          timedCandidate('working-model', sends, {}, 'openai'),
+        ] });
+      for (let round = 0; round < 4; round++) expect(await call(provider, method)).toBe('ok');
+      expect(sends).toEqual(['missing-model', 'working-model', 'working-model', 'working-model', 'working-model']);
+      // A new run starts from the whole configured list again, with no stored cooldown.
+      const nextRun: string[] = [];
+      const next = createRotatingProvider({ providerId, networkRetryDelayMs: () => 0,
+        candidates: [
+          timedCandidate('missing-model', nextRun, { fail: modelNotFound }, providerId),
+          timedCandidate('working-model', nextRun, {}, 'openai'),
+        ] });
+      expect(await call(next, method)).toBe('ok');
+      expect(nextRun).toEqual(['missing-model', 'working-model']);
+      expect(getCooldown('missing-model')).toBeUndefined();
+    }
+  });
+
+  it.each(['stream', 'complete'] as const)('keeps a candidate that refused one request for the next one (%s)', async (method) => {
+    const sends: string[] = [];
+    const provider = createRotatingProvider({ providerId: 'openai', networkRetryDelayMs: () => 0,
+      candidates: [
+        timedCandidate('picky-model', sends, { fail: invalidRequest }, 'openai'),
+        timedCandidate('working-model', sends, {}, 'openai'),
+      ] });
+    expect(await call(provider, method)).toBe('ok');
+    expect(await call(provider, method)).toBe('ok');
+    expect(sends).toEqual(['picky-model', 'working-model', 'picky-model', 'working-model']);
+  });
+
+  // 2026-11-02 review S1-7: a candidate that keeps answering 5xx at once was paid
+  // four times (three in-place retries) at the start of every model call of the
+  // run, while a later candidate did the work, and it still set the compaction budget.
+  /** Fails quickly before output while `down()` is true, otherwise serves. */
+  function flakyCandidate(id: string, sends: string[], down: () => boolean, providerId: string,
+    contextWindow: number): RotatingCandidate {
+    return {
+      profileId: id, cooldownId: id, providerId, modelId: id, contextWindow, maxTokens: 8_000,
+      build: async () => ({
+        ...fakeProvider(id, {}),
+        async *stream() {
+          sends.push(id);
+          yield { type: 'message_start' } as StreamEvent;
+          if (down()) { yield { type: 'error', error: managedStartupFailure() } as unknown as StreamEvent; return; }
+          yield { type: 'text_delta', text: 'ok' } as StreamEvent;
+        },
+        async complete() {
+          sends.push(id);
+          if (down()) throw managedStartupFailure();
+          return { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } } as unknown as CompletionResult;
+        },
+      }),
+    };
+  }
+
+  it.each(['stream', 'complete'] as const)('sends a candidate another one outlived once per later call, and only for this run (%s)', async (method) => {
+    const sends: string[] = [];
+    const make = (log: string[]) => createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [
+        flakyCandidate('own-model', log, () => true, 'custom', 131_072),
+        flakyCandidate('fallback-model', log, () => false, 'custom', 272_000),
+      ] });
+    const provider = make(sends);
+    for (let round = 0; round < 3; round++) expect(await call(provider, method)).toBe('ok');
+    expect(sends).toEqual([
+      'own-model', 'own-model', 'own-model', 'own-model', 'fallback-model',
+      'own-model', 'fallback-model',
+      'own-model', 'fallback-model',
+    ]);
+    // A new run gives the user's model its in-place retries again; nothing is stored.
+    const nextRun: string[] = [];
+    expect(await call(make(nextRun), method)).toBe('ok');
+    expect(nextRun).toEqual(['own-model', 'own-model', 'own-model', 'own-model', 'fallback-model']);
+    expect(getCooldown('own-model')).toBeUndefined();
+  });
+
+  it.each(['stream', 'complete'] as const)('gives a recovered candidate its in-place retries back (%s)', async (method) => {
+    const sends: string[] = [];
+    let ownDown = true;
+    let blip = false;
+    const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [
+        flakyCandidate('own-model', sends, () => {
+          if (blip) { blip = false; return true; }
+          return ownDown;
+        }, 'custom', 131_072),
+        flakyCandidate('fallback-model', sends, () => false, 'custom', 272_000),
+      ] });
+    expect(await call(provider, method)).toBe('ok');
+    ownDown = false;
+    expect(await call(provider, method)).toBe('ok');
+    // One quick failure after it served again is retried in place, as before.
+    blip = true;
+    expect(await call(provider, method)).toBe('ok');
+    expect(sends).toEqual([
+      'own-model', 'own-model', 'own-model', 'own-model', 'fallback-model',
+      'own-model',
+      'own-model', 'own-model',
+    ]);
+  });
+
+  it.each(['stream', 'complete'] as const)('keeps every in-place retry when no candidate got through (%s)', async (method) => {
+    const sends: string[] = [];
+    const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [
+        flakyCandidate('own-model', sends, () => true, 'custom', 131_072),
+        flakyCandidate('fallback-model', sends, () => true, 'custom', 272_000),
+      ] });
+    expect(await call(provider, method)).toBe('PROVIDER_NETWORK_EXHAUSTED');
+    expect(await call(provider, method)).toBe('PROVIDER_NETWORK_EXHAUSTED');
+    const once = ['own-model', 'own-model', 'own-model', 'own-model',
+      'fallback-model', 'fallback-model', 'fallback-model', 'fallback-model'];
+    expect(sends).toEqual([...once, ...once]);
+  });
+
+  it('prices compaction for the candidate that is serving, not one it outlived', async () => {
+    const sends: string[] = [];
+    let ownDown = true;
+    const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [
+        flakyCandidate('own-model', sends, () => ownDown, 'custom', 131_072),
+        flakyCandidate('fallback-model', sends, () => false, 'custom', 272_000),
+      ] });
+    expect(provider.contextBudgetModel?.()).toBe('own-model');
+    expect(await call(provider, 'stream')).toBe('ok');
+    expect(provider.contextBudgetModel?.()).toBe('fallback-model');
+    expect(provider.contextBudget?.('next')).toMatchObject({ model: 'fallback-model', contextWindow: 272_000 });
+    // Still failing on its one try: the budget stays with the serving model.
+    expect(await call(provider, 'stream')).toBe('ok');
+    expect(provider.contextBudgetModel?.()).toBe('fallback-model');
+    // Once the user's model serves again, compaction is priced for it again.
+    ownDown = false;
+    expect(await call(provider, 'stream')).toBe('ok');
+    expect(provider.contextBudgetModel?.()).toBe('own-model');
+  });
+
+  it('keeps the budget on a model that only missed a summary\'s shorter start deadline', async () => {
+    const sends: string[] = [];
+    const silent = flakyCandidate('own-model', sends, () => false, 'custom', 131_072);
+    const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [
+        { ...silent, build: async () => ({
+          ...(await silent.build()),
+          async *stream(params: CompletionParams) {
+            sends.push('own-model');
+            yield { type: 'message_start' } as StreamEvent;
+            await new Promise<void>((resolve) => params.signal?.addEventListener('abort', () => resolve(), { once: true }));
+          },
+        }) },
+        flakyCandidate('fallback-model', sends, () => false, 'custom', 272_000),
+      ] });
+    const summary = await collect(provider.stream({ ...PARAMS, firstEventTimeoutMs: 5,
+      requestMetadata: { outputLimitSource: 'provider_default' } }));
+    expect(summary.some(event => event.type === 'text_delta')).toBe(true);
+    expect(sends).toEqual(['own-model', 'fallback-model']);
+    expect(provider.contextBudgetModel?.()).toBe('own-model');
+  });
+
+  it('prices for an outlived candidate when it is the only one left', async () => {
+    const sends: string[] = [];
+    let fallbackRateLimited = false;
+    const fallback = flakyCandidate('fallback-model', sends, () => false, 'custom', 272_000);
+    const provider = createRotatingProvider({ providerId: 'custom', networkRetryDelayMs: () => 0,
+      candidates: [
+        flakyCandidate('own-model', sends, () => true, 'custom', 131_072),
+        { ...fallback, build: async () => ({
+          ...(await fallback.build()),
+          async *stream() {
+            sends.push('fallback-model');
+            if (fallbackRateLimited) throw Object.assign(new Error('Too Many Requests'), { status: 429 });
+            yield { type: 'text_delta', text: 'ok' } as StreamEvent;
+          },
+        }) },
+      ] });
+    expect(await call(provider, 'stream')).toBe('ok');
+    expect(provider.contextBudgetModel?.()).toBe('fallback-model');
+    fallbackRateLimited = true;
+    expect(await call(provider, 'stream')).not.toBe('ok');
+    expect(sends.slice(-2)).toEqual(['own-model', 'fallback-model']);
+    // The fallback models are out for this run; the user's model is what is left.
+    expect(provider.contextBudgetModel?.()).toBe('own-model');
   });
 });

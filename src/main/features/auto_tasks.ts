@@ -669,11 +669,9 @@ async function _validateProjectScope(
   // orphan directory that no real Project view can surface.
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return 'invalid_project';
   if (!recipient || recipient.kind !== 'agent') return null;
-  // Match the project picker and execution scope, including member-private
-  // choices and shared packages that do not live in bindings.json.
+  // Match the project picker and execution scope for built-ins and added Agents.
   const projects = await import('./projects');
-  const bindings = await projects.getBindings(uid, projectId);
-  return bindings.agents.includes(recipient.id) ? null : 'invalid_recipient';
+  return await projects.isAgentAvailableInProject(uid, projectId, recipient.id) ? null : 'invalid_recipient';
 }
 
 export async function listTasks(uid: string, opts?: { projectId?: string | null }): Promise<AutoTask[]> {
@@ -939,7 +937,7 @@ export interface AutoTaskMutationOptions {
   sourceAttachmentCid?: string;
   /** Host-bound scope: null is global, undefined preserves Commander selection. */
   projectId?: string | null;
-  /** Scope observed by an unbound caller and verified again under the storage lock. */
+  /** Source scope verified by an unbound caller; the storage lock rechecks it. */
   expectedSourceProjectId?: string | null;
   /** Conversation the mutation was made in. A created task runs there;
    *  an update leaves the run conversation unchanged. */
@@ -1130,10 +1128,23 @@ const _activeRuns: Map<string, ActiveRun> = ((globalThis as Record<symbol, unkno
 
 function _activeRunKey(uid: string, cid: string): string { return `${uid}\u0000${cid}`; }
 
+type AutoRunEndListener = (event: { userId: string; cid: string; taskId: string }) => void;
+const _runEndListeners = new Set<AutoRunEndListener>();
+
+export function subscribeRunEnds(listener: AutoRunEndListener): () => void {
+  _runEndListeners.add(listener);
+  return () => { _runEndListeners.delete(listener); };
+}
+
 function _endActiveRun(uid: string, cid: string, taskId: string, startedAt: string): void {
   const key = _activeRunKey(uid, cid);
   const active = _activeRuns.get(key);
-  if (active?.taskId === taskId && active.startedAt === startedAt) _activeRuns.delete(key);
+  if (active?.taskId !== taskId || active.startedAt !== startedAt) return;
+  _activeRuns.delete(key);
+  for (const listener of _runEndListeners) {
+    try { listener({ userId: uid, cid, taskId }); }
+    catch (_) { log.warn('automation run end listener failed'); }
+  }
 }
 
 /** The task whose run is in progress in this conversation, or ''. */
@@ -2491,6 +2502,16 @@ export function resumeSchedulerForTest(uid: string): Promise<void> {
   return _resumeScheduler(uid);
 }
 
+// Both ordinary and late-loaded clients share the live scheduler owner.
+const SCHEDULER_SWITCH_OWNER = Symbol.for('orkas.auto-tasks.scheduler-switch-owner');
+const schedulerSwitchState = globalThis as typeof globalThis & {
+  [SCHEDULER_SWITCH_OWNER]?: (previousUid: string, nextUid: string) => void;
+};
+
+function dispatchSchedulerUserSwitch(previousUid: string, nextUid: string): void {
+  (schedulerSwitchState[SCHEDULER_SWITCH_OWNER] ?? handleSchedulerUserSwitch)(previousUid, nextUid);
+}
+
 /** Initial bootstrap — list every task and register a timer for each
  *  enabled / own-device one, catching up an occurrence missed while Orkas was
  *  closed. Called once on startup; deferred via the deferred boot phase
@@ -2498,6 +2519,8 @@ export function resumeSchedulerForTest(uid: string): Promise<void> {
 export function startScheduler(): void {
   if (_started) return;
   _started = true;
+  schedulerSwitchState[SCHEDULER_SWITCH_OWNER] = handleSchedulerUserSwitch;
+  registerUserSwitchHook('auto-tasks-scheduler', dispatchSchedulerUserSwitch);
   _schedulerSuspended = false;
   _startClockMonitor();
   void _attachSchedulerPowerMonitor();
@@ -2528,10 +2551,13 @@ export function stopScheduler(): void {
   _detachSchedulerPowerMonitor();
   _schedulerSuspended = false;
   _started = false;
+  if (schedulerSwitchState[SCHEDULER_SWITCH_OWNER] === handleSchedulerUserSwitch) {
+    delete schedulerSwitchState[SCHEDULER_SWITCH_OWNER];
+  }
   log.info('scheduler stopped');
 }
 
-registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
+function handleSchedulerUserSwitch(_previousUid: string, nextUid: string): void {
   // Invalidate callbacks before users.activateUser swaps filesystem and
   // credential roots. clearTimeout alone is insufficient when a callback has
   // already left the timer queue and is awaiting disk or sleep-state IO.
@@ -2544,4 +2570,6 @@ registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
     _rescheduleAll(nextUid, 'restore', switchEpoch)
       .catch((err) => log.warn(`account-switch reschedule failed uid=${maskId(nextUid)}`, logErrorSummary(err)));
   });
-});
+}
+
+registerUserSwitchHook('auto-tasks-scheduler', dispatchSchedulerUserSwitch);

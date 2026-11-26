@@ -1,4 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
@@ -34,9 +36,7 @@ for (const broken of [false, true]) {
 }
 
 for (const label of ['Resume', 'Continue', 'Download resume']) {
-  test(`distinguishes a state action from a promised download: ${label}`, async ({ sdkOrkas: orkas }, info) => {
-    // H158: retain the intended outcome while the heuristic change awaits approval.
-    test.fail(label === 'Resume', 'H158: a paused-state Resume action is mistaken for a download');
+  test(`observes the same state change regardless of the button label: ${label}`, async ({ sdkOrkas: orkas }, info) => {
     const entry = orkas.createWorkspaceFile('state-action/index.html', `<!doctype html>
       <style>button:focus-visible{outline:2px solid blue}</style>
       <button onclick="document.querySelector('output').textContent='Running'">${label}</button><output>Paused</output>`);
@@ -45,11 +45,33 @@ for (const label of ['Resume', 'Continue', 'Download resume']) {
       return (await renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }])).evidence;
     }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
     writeFileSync(info.outputPath('state-action.json'), JSON.stringify({ ...evidence, entryPath: undefined }, null, 2));
-    if (label === 'Continue') expect(evidence.interactions.stateChangesObserved).toBeGreaterThan(0);
-    expect(evidence.interactions.downloads).toEqual([]);
-    expect(evidence.ok).toBe(label !== 'Download resume');
+    expect(evidence.interactions).toMatchObject({
+      stateControlsExercised: 1,
+      stateTransitionsObserved: 1,
+      stateTransitionControls: [label],
+      downloadCandidates: [],
+      downloads: [],
+    });
+    expect(evidence.ok).toBe(true);
   });
 }
+
+test('reports a declared download link and the absence of a browser download as observations', async ({ sdkOrkas: orkas }) => {
+  const entry = orkas.createWorkspaceFile('declared-download/index.html', `<!doctype html>
+    <style>a:focus-visible{outline:2px solid blue}</style>
+    <a download="report.txt" href="data:text/plain,Report" onclick="event.preventDefault()">Export report</a>`);
+  const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+    const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+    return (await renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }])).evidence;
+  }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+  expect(evidence.screenshotCaptures).toMatchObject([{ captured: true }]);
+  expect(evidence.interactions).toMatchObject({
+    controlsExercised: 1,
+    downloadCandidates: ['report.txt'],
+    downloads: [],
+  });
+  expect(evidence.blockers).toEqual([]);
+});
 
 test('submits bounded native temporal fields without reporting a false form failure', async ({ sdkOrkas: orkas }, info) => {
   const entry = orkas.createWorkspaceFile('temporal-form/index.html', `<!doctype html>
@@ -144,8 +166,9 @@ test('exercises SVG diagram controls and downloads without losing native control
     expect(evidence.ok).toBe(true);
     expect(evidence.blockers).toEqual([]);
     expect(evidence.viewports.every(view => view.consoleErrors.length === 0)).toBe(true);
-    expect(evidence.interactions).toMatchObject({ controlsExercised: 4, stateControlsExercised: 3,
-      stateTransitionsObserved: 2, failures: [], warnings: ['enabled control produced no observable outcome: Unwired detail'] });
+    expect(evidence.interactions).toMatchObject({ controlsExercised: 4, stateControlsExercised: 4,
+      stateTransitionsObserved: 2, failures: [], downloadCandidates: [] });
+    expect(evidence.interactions.warnings).toContain('enabled control produced no observable outcome: Unwired detail');
     expect(evidence.interactions.downloads).toEqual([{
       filename: 'diagram.txt', mimeType: 'text/plain', totalBytes: 7, urlKind: 'data',
     }]);
@@ -377,4 +400,120 @@ test('distinguishes ignored inline transforms from transformable and hidden boxe
     expect(evidence.ok).toBe(!broken);
     expect(evidence.viewports[0].ineffectiveTransforms).toEqual(broken ? ['#target'] : []);
   }
+});
+
+for (const destination of ['anchor', 'missing-anchor', 'selector-sensitive-anchor', 'route'] as const) {
+  test(`audits a browser-verified link destination: ${destination}`, async ({ sdkOrkas: orkas }, info) => {
+    const routed = destination === 'route';
+    const target = routed ? '/details' : destination === 'selector-sensitive-anchor' ? 'chapter:one' : 'details';
+    const entry = orkas.createWorkspaceFile('link-destination/index.html', `<!doctype html>
+      <style>a:focus-visible{outline:2px solid blue}</style>
+      <a href="#${target}">Open details</a>
+      ${routed ? '<output>Home</output>' : destination === 'missing-anchor' ? '' : `<section id="${target}">Details</section>`}
+      <button onclick="document.getElementById('action').textContent='Updated'">Refresh detail</button><p id="action">Idle</p>
+      ${routed ? `<script>addEventListener('hashchange',()=>{
+        document.querySelector('output').textContent=location.hash==='#/details'?'Details':'Home';
+      });</script>` : ''}`);
+    const browser = await orkas.electronApp!.evaluate(async ({ BrowserWindow }, args) => {
+      const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      try {
+        await win.loadFile(args.entry);
+        await win.webContents.executeJavaScript("document.querySelector('a').click()");
+        await new Promise(resolve => setTimeout(resolve, 100));
+        return await win.webContents.executeJavaScript(`({ hash: location.hash,
+          reached: ${args.routed ? "document.querySelector('output').textContent==='Details'" : 'Boolean(document.getElementById(decodeURIComponent(location.hash.slice(1))))'} })`);
+      } finally { win.destroy(); }
+    }, { entry, routed });
+    expect(browser).toEqual({ hash: '#' + target, reached: destination !== 'missing-anchor' });
+    for (const artifact of [false, true]) {
+      const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+        const preview = (process as any).mainModule.require(args.modulePath);
+        return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+          : preview.renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }], {}, { fileViewer: true }))).evidence;
+      }, { entry, artifact, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+      const receipt = JSON.stringify({ browser, evidence: { ...evidence, entryPath: undefined } }, null, 2);
+      writeFileSync(info.outputPath(`link-${artifact}.json`), receipt);
+      await info.attach(`link-${artifact}`, { body: Buffer.from(receipt), contentType: 'application/json' });
+      expect(evidence.viewports.every(view => view.consoleErrors.length === 0)).toBe(true);
+      expect(evidence.interactions.stateTransitionsObserved).toBeGreaterThan(0);
+      expect.soft(evidence.interactions.hashLinksChecked).toBe(destination === 'missing-anchor' ? 0 : 1);
+      expect(evidence.interactions.hashRoutesUnverified).toBeUndefined();
+      expect.soft(evidence.ok, `${artifact ? 'artifact' : 'responsive'} preview must agree with the browser destination`).toBe(browser.reached);
+    }
+  });
+}
+test('keeps routes with only progress feedback or external data unverified without sending the request', async ({ sdkOrkas: orkas }, info) => {
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { 'Access-Control-Allow-Origin': '*' }).end('Details');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/details`;
+    const entry = orkas.createWorkspaceFile('route-inconclusive/index.html', `<!doctype html>
+      <style>a:focus-visible{outline:2px solid blue}</style>
+      <a href="#/external" role="button">Open remote details</a>
+      <a href="#!/wait">Wait for details</a>
+      <main><h1>Home</h1><p role="status"></p></main>
+      <script>addEventListener('hashchange', async () => {
+        document.querySelector('[role=status]').textContent='Loading details';
+        if (location.hash === '#/external') {
+          const result = await fetch(${JSON.stringify(url)}).catch(() => null);
+          if (result?.ok) document.querySelector('h1').textContent=await result.text();
+        } else {
+          setTimeout(() => { document.querySelector('h1').textContent='Delayed details'; }, 5000);
+        }
+      });</script>`);
+    const checkpoint = orkas.rendererDiagnosticCheckpoint();
+    for (const artifact of [false, true]) {
+      const actual = await orkas.electronApp!.evaluate(async (_, args) => {
+        const preview = (process as any).mainModule.require(args.modulePath);
+        return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+          : preview.renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }], {}, { fileViewer: true }))).evidence;
+      }, { entry, artifact, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+      await info.attach(`unverified-routes-${artifact}`, {
+        body: JSON.stringify({ ...actual, entryPath: undefined }), contentType: 'application/json',
+      });
+      expect(requests).toBe(0);
+      expect(actual.ok).toBe(true);
+      expect(actual.interactions.hashLinksChecked).toBe(0);
+      expect(actual.interactions.controlsExercised).toBe(0);
+      expect(actual.interactions.hashRoutesUnverified).toBe(2);
+      expect(actual.warnings).toContain('2 same-document hash routes could not be verified in the offline preview.');
+    }
+    // Each isolated browser reports its policy denial. Retain both diagnostics
+    // per entry point after checking that the server received no request.
+    for (const detail of [
+      `Connecting to '${url}' violates the following Content Security Policy directive: "connect-src chat-media://local". The action has been blocked.`,
+      `Fetch API cannot load ${url}. Refused to connect because it violates the document's Content Security Policy.`,
+    ]) {
+      await orkas.acknowledgeRendererFailure({ after: checkpoint, detail, count: 2 });
+    }
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('bounds the number of isolated hash routes that can be verified', async ({ sdkOrkas: orkas }) => {
+  const links = Array.from({ length: 5 }, (_, index) => `<a href="#/details-${index}">Details ${index}</a>`).join('');
+  const entry = orkas.createWorkspaceFile('route-budget/index.html', `<!doctype html>
+    <style>a:focus-visible{outline:2px solid blue}</style>
+    <nav>${links}</nav><main><h1>Home</h1></main>
+    <script>addEventListener('hashchange', () => {
+      document.querySelector('h1').textContent = 'Opened ' + location.hash;
+    });</script>`);
+  const actual = await orkas.electronApp!.evaluate(async (_, args) => {
+    const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+    return (await renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }],
+      {}, { fileViewer: true })).evidence;
+  }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+  const verified = actual.interactions.hashLinksChecked;
+  expect(actual.ok).toBe(true);
+  expect(verified).toBeGreaterThan(0);
+  expect(verified).toBeLessThanOrEqual(3);
+  expect(actual.interactions.hashRoutesUnverified).toBe(5 - verified);
 });

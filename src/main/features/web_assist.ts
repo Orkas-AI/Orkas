@@ -12,6 +12,7 @@ import { armWebAssistMediaCapture } from './web_assist_media_capture';
  */
 
 import { displayBrowserUrl } from './web_assist_url';
+import { createHash } from 'node:crypto';
 import { webAssistVisualStampScript, buildWebAssistPointScript, type WebAssistVisualStamp } from './web_assist_visual';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -575,6 +576,8 @@ function configureSession(userId: string, ses: Session): ReturnType<typeof prepa
   configureWebAssistFilePickers();
   ses.registerPreloadScript({ id: 'orkas-browser-file-pickers', type: 'frame',
     filePath: path.join(__dirname, 'web_assist_file_picker_preload.js') });
+  ses.registerPreloadScript({ id: 'orkas-browser-directory-transfer', type: 'frame',
+    filePath: path.join(__dirname, 'web_assist_directory_preload.js') });
   if (process.platform === 'darwin') {
     ses.registerPreloadScript({ id: 'orkas-browser-phone-passkey', type: 'frame',
       filePath: path.join(__dirname, 'web_assist_passkey_preload.js') });
@@ -1658,6 +1661,9 @@ function mountTab(
       ...options.webPreferences,
       session: ses,
       devTools: false,
+      // Electron needs this flag to run sandboxed preloads in child frames.
+      // hardenedWebPreferences still disables page Node and isolates every world.
+      nodeIntegrationInSubFrames: true,
       spellcheck: true,
       // A task tab is routinely off screen: another conversation is in front,
       // Task Details is closed, or an unattended run made a minimised window.
@@ -2312,11 +2318,14 @@ function observeWebAssistInteraction(tab: WebAssistTabRecord, scope: 'full' | 'm
     || observeWebAssistFileChooser(tab, scope);
 }
 
+type BrowserSnapshotObserver = (snapshot: { target: string; fingerprint: string }) => void;
+
 async function observeWebAssistTab(
   record: WebAssistRecord,
   tab: WebAssistTabRecord,
   scope: 'full' | 'meta' = 'full',
   window: WebAssistObserveWindow = {},
+  onCompleteSnapshot?: BrowserSnapshotObserver,
 ): Promise<Record<string, unknown>> {
   if (!ensureTabLoaded(record, tab)) return { ok: false, code: 'page_loading', error: 'The page is being restored; wait before observing it.' };
   const contents = tab.view.webContents;
@@ -2389,10 +2398,21 @@ async function observeWebAssistTab(
       };
     }
     Object.assign(sanitized.publicSnapshot, webAssistFrameInventory(frames, frame.id));
-    return fitWebAssistObservation(
+    const result = fitWebAssistObservation(
       { ok: true, tab_id: tab.id, ...sanitized.publicSnapshot, ...webAssistDialogs(contents)?.notices(), ...takeWebAssistFilePickerNotice(contents) },
       window.tokenBudget ?? DEFAULT_INLINE_RESULT_TOKENS,
     );
+    if (onCompleteSnapshot && !frame.parentId && !tab.loading && !contents.isLoading() && !tab.userControlled
+      && !result.text_offset && !result.element_offset && !result.text_truncated && !result.elements_truncated
+      && result.text_next_offset == null && result.element_next_offset == null
+      && typeof result.text === 'string' && Array.isArray(result.elements)) {
+      const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+      onCompleteSnapshot({
+        target: digest([tab.id, currentUrl, controlRevision]),
+        fingerprint: digest([result.title, result.text, result.elements.map(({ ref: _ref, ...element }) => element)]),
+      });
+    }
+    return result;
   } catch (error) {
     if (error instanceof WebAssistDialogOpenedError) {
       const dialog = observeWebAssistInteraction(tab, scope, window);
@@ -2603,6 +2623,14 @@ async function actOnWebAssistTab(
   const revision = tab.controlRevision || 0;
   let pointerDispatched = false;
   let uploadFiles: import('./web_assist_upload').WebAssistUploadFile[] | undefined;
+  const backgroundDirectory = {
+    enabled: () => uploadFiles?.length === 1 && uploadFiles[0].directory && !tabOnScreen(record, tab),
+    signal: lifetime.signal,
+    verifyFiles: async (directory: string, files: string[], signal: AbortSignal) => {
+      const { verifyWebAssistDirectoryFiles } = await import('./web_assist_upload');
+      await verifyWebAssistDirectoryFiles(record.ownerUserId, tab.conversationId, directory, files, signal);
+    },
+  };
   const context = tab.controlContext;
   const validate = (): Record<string, unknown> | null => {
     if (tab.userControlled) return userControlResult();
@@ -2646,7 +2674,7 @@ async function actOnWebAssistTab(
         return { ok: true, outcome: 'acted', action: checked.action };
       }
       if (checked.action !== 'upload' || input.elementRef !== 'e1') return { ok: false, code: 'invalid_action', error: 'File selection accepts upload with authorized file_paths, or Escape to cancel.' };
-      const count = await setWebAssistInputFiles(checked.contents, chooser, uploadFiles!.map(file => file.path), undefined, validate);
+      const count = await setWebAssistInputFiles(checked.contents, chooser, uploadFiles!.map(file => file.path), undefined, validate, backgroundDirectory);
       clearWebAssistFileChooser(checked.contents);
       return { ok: true, outcome: 'acted', action: 'upload', file_count: count };
     }
@@ -2679,7 +2707,7 @@ async function actOnWebAssistTab(
     const result = await withAssistantAction(record, tab, 'acting', async () => {
       if (checked.action === 'upload') {
         const invalid = validate(); if (invalid) return invalid;
-        const fileCount = await setWebAssistInputFiles(checked.contents, buildWebAssistActionScript({ action: 'upload', ref: checked.ref }, tab.controlContext?.scope), uploadFiles!.map(file => file.path), tab.observation?.frameId, validate);
+        const fileCount = await setWebAssistInputFiles(checked.contents, buildWebAssistActionScript({ action: 'upload', ref: checked.ref }, tab.controlContext?.scope), uploadFiles!.map(file => file.path), tab.observation?.frameId, validate, backgroundDirectory);
         return { ok: true, outcome: 'acted', action: 'upload', file_count: fileCount };
       }
       if (checked.action === 'press') {
@@ -3020,13 +3048,14 @@ export async function observeModelWebAssist(
   tabId?: unknown,
   scope?: 'full' | 'meta',
   window?: WebAssistObserveWindow,
+  onCompleteSnapshot?: BrowserSnapshotObserver,
 ): Promise<Record<string, unknown>> {
   const resolved = taskTab(userId, conversationId, tabId);
   if (!resolved.ok) return resolved;
   const exposed = exposeTaskTabToModel(resolved);
   if (!exposed.ok) return exposed;
   return observeWebAssistTab(
-    resolved.record, resolved.tab, scope === 'meta' ? 'meta' : 'full', window || {},
+    resolved.record, resolved.tab, scope === 'meta' ? 'meta' : 'full', window || {}, onCompleteSnapshot,
   );
 }
 
@@ -3067,6 +3096,7 @@ export async function waitForModelWebAssist(
   conversationId: string,
   input: { tabId?: unknown; condition?: unknown; text?: unknown; timeoutMs?: unknown },
   lifetime: WebAssistActionLifetime = {},
+  onWaitBoundary?: () => void,
 ): Promise<Record<string, unknown>> {
   const ended = () => lifetime.signal?.aborted || lifetime.isActive?.() === false;
   const endedResult = { ok: false, code: 'task_run_ended', error: 'This browser task turn has ended.' };
@@ -3096,7 +3126,10 @@ export async function waitForModelWebAssist(
       const loadFailure = pageLoadWaitFailure(current.tab);
       if (loadFailure) return loadFailure;
       const dialog = observeWebAssistInteraction(current.tab);
-      if (dialog) return { ...dialog, condition, condition_matched: false };
+      if (dialog) {
+        onWaitBoundary?.();
+        return { ...dialog, condition, condition_matched: false };
+      }
       const contents = current.tab.view.webContents;
       const navigationRevision = current.tab.navigationRevision || 0;
       const controlRevision = current.tab.controlRevision || 0;
@@ -3117,13 +3150,17 @@ export async function waitForModelWebAssist(
       const lateLoadFailure = pageLoadWaitFailure(latest.tab);
       if (lateLoadFailure) return lateLoadFailure;
       const interaction = observeWebAssistInteraction(latest.tab);
-      if (interaction) return { ...interaction, condition, condition_matched: false };
+      if (interaction) {
+        onWaitBoundary?.();
+        return { ...interaction, condition, condition_matched: false };
+      }
       if (matched && Date.now() - started < timeoutMs
         && latest.tab === current.tab && waitPageIsCurrent(latest.tab, contents, navigationRevision, controlRevision)) {
         return { ok: true, tab_id: current.tab.id, condition, elapsed_ms: Math.max(0, Date.now() - started) };
       }
       const remaining = started + timeoutMs - Date.now();
       if (remaining <= 0) break;
+      onWaitBoundary?.();
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(200, remaining)));
     }
     if (ended()) return endedResult;

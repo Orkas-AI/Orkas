@@ -889,6 +889,12 @@ function _processToolPresentation(name, data, input) {
     return { actionKey: 'chat.process.action_generate_image', target };
   }
   if (key === 'generate_speech') {
+    if (data?.execution_state === 'proposed' || !input || typeof input !== 'object' || Array.isArray(input)) {
+      return { actionKey: 'chat.process.action_execute', target: '', awaitingSpeechArguments: true };
+    }
+    if (Object.hasOwn(input, 'action') && input.action === 'preflight') {
+      return { actionKey: 'chat.process.action_check_narration_timing', target: '' };
+    }
     return { actionKey: 'chat.process.action_generate_audio', target };
   }
   if (_isProcessPlanToolName(key)) {
@@ -1210,7 +1216,12 @@ function _processToolResultFailed(data) {
 function _formatKnownToolProcessLine(name, data, input, phase, displayContext, scope = 'tool') {
   const callId = String(data?.callId || data?.call_id || data?.id || '').trim();
   const displayId = callId ? `${scope}:${callId}` : '';
-  let presentation = _processToolPresentation(name, data, input);
+  const cached = displayId ? displayContext?.tools?.get(displayId) : null;
+  // A replayed progress event can carry an empty argument envelope for a
+  // call whose actual speech action has already been identified.
+  const emptySpeechUpdate = cached && _processToolKey(name) === 'generate_speech'
+    && input && typeof input === 'object' && Object.keys(input).length === 0;
+  let presentation = _processToolPresentation(name, data, emptySpeechUpdate ? undefined : input);
   const terminal = phase === 'end' || phase === 'result';
   const hadPlan = Boolean(displayContext?.planCreated);
   const planResult = terminal ? _processPlanResult(data, displayContext) : null;
@@ -1240,9 +1251,11 @@ function _formatKnownToolProcessLine(name, data, input, phase, displayContext, s
   }
 
   if ((phase === 'result' || phase === 'end') && displayId && displayContext?.tools) {
-    presentation = displayContext.tools.get(displayId) || presentation;
+    presentation = cached?.awaitingSpeechArguments
+      ? _processBestToolPresentation(cached, presentation)
+      : cached || presentation;
   } else if (phase === 'progress' && displayId && displayContext?.tools) {
-    presentation = _processBestToolPresentation(displayContext.tools.get(displayId), presentation);
+    presentation = _processBestToolPresentation(cached, presentation);
     const elapsedSeconds = Number(data?.elapsedSeconds);
     if (presentation && Number.isFinite(elapsedSeconds) && elapsedSeconds > 0) {
       presentation = {
@@ -1255,6 +1268,9 @@ function _formatKnownToolProcessLine(name, data, input, phase, displayContext, s
     }
     if (presentation) displayContext.tools.set(displayId, presentation);
   } else if ((phase === 'use' || phase === 'start') && displayId && presentation && displayContext?.tools) {
+    if (presentation.awaitingSpeechArguments) {
+      presentation = cached || presentation;
+    }
     displayContext.tools.set(displayId, presentation);
   }
 
@@ -1317,7 +1333,9 @@ function _formatKnownToolProcessLine(name, data, input, phase, displayContext, s
     const failure = _processFailureSummary(data);
     return failure ? `${detailedLine} · ${failure}` : detailedLine;
   }
-  const actionLine = _processActionLine(presentation.actionKey, presentation.target, statusKey);
+  const actionLine = statusKey === 'chat.process.status_done' && _processToolKey(name) === 'publish_outputs'
+    ? t('chat.process.publish_call_ended')
+    : _processActionLine(presentation.actionKey, presentation.target, statusKey);
   const line = !terminal && scope === 'tool'
     ? t(data?.execution_state === 'proposed' ? 'chat.process.preparing_action' : 'chat.process.started_action', { label: actionLine })
     : actionLine;
@@ -1980,6 +1998,16 @@ function _projectIdForConversation(cid) {
  *  left cannot clear the chip of the one they are on. */
 const _composerAgentScopes = new Map();
 
+/** Agents usable in a project, from a `projects.bindings.list` answer: its
+ *  added Agents plus every built-in (`availableAgents`). An answer without
+ *  that field falls back to the added Agents alone. */
+function projectAvailableAgentIds(res) {
+  if (res && Array.isArray(res.availableAgents)) {
+    return res.availableAgents.map((agent) => agent && agent.agent_id).filter(Boolean);
+  }
+  return (res && res.bindings && res.bindings.agents) || [];
+}
+
 async function validateRecipientAgainstProject(target, pid, boundAgentIds) {
   if (!pid) { _composerAgentScopes.delete(target); return; }
   const pendingScope = { pid, ids: new Set() };
@@ -1989,7 +2017,7 @@ async function validateRecipientAgainstProject(target, pid, boundAgentIds) {
     if (!bound) {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
       if (!res || !res.ok) return;
-      bound = new Set((res.bindings && res.bindings.agents) || []);
+      bound = new Set(projectAvailableAgentIds(res));
     }
     if (_composerAgentScopes.get(target) !== pendingScope) return;
     pendingScope.ids = bound;
@@ -2713,7 +2741,8 @@ function _refreshChatHeader() {
   if (actionsEl) actionsEl.hidden = !cid;
   const editingTitle = !!(cid && _conversationHeaderRenameCid === cid);
   if (titleEl) {
-    titleEl.textContent = (conv && conv.title) || t('chat.new_conv_title');
+    const title = (conv && conv.title) || t('chat.new_conv_title');
+    if (titleEl.textContent !== title) titleEl.textContent = title;
     titleEl.hidden = editingTitle;
   }
   if (titleInput) {
@@ -2785,7 +2814,11 @@ function _refreshChatHeader() {
         parts.push(`<span class="chat-header-meta-text">${escapeHtml(countLabel)}</span>`);
       }
     }
-    metaEl.innerHTML = parts.join('');
+    const markup = parts.join('');
+    if (metaEl._chatHeaderMarkup !== markup) {
+      metaEl.innerHTML = markup;
+      metaEl._chatHeaderMarkup = markup;
+    }
   }
   const taskLinksEl = document.getElementById('chat-header-task-links');
   if (taskLinksEl) {
@@ -3318,6 +3351,7 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   const hasLiveController = !!state.controller && !!activeController
     && activeController !== _groupObserverReservations.get(cid);
   if (hasLiveController && !allowController) return false;
+  const busyRevision = groupBusyConvs.get(cid);
   const loadingEl = state.loadingEl;
   let data = null;
   try {
@@ -3338,6 +3372,8 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     try { window.ConversationInfo.refreshFiles(cid, { silent: true }); } catch (_) {}
   }
   if (!processing) {
+    if (hasLiveController && (_convChatCtrls.get(cid) !== activeController
+        || groupBusyConvs.get(cid) !== busyRevision)) return false;
     // Runtime can be idle while a recovery stream still buffers the terminal
     // reply. Read canonical history before cancelling that stream; otherwise
     // an empty placeholder makes cleanup discard the only delivery path.
@@ -3347,6 +3383,12 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     }
     _stopGroupEventObserver(cid);
     if (hasLiveController) {
+      // A terminal host run can stop contributing to sidebar activity while
+      // its controller is still delivering the reply and owns stream cleanup.
+      if (state.controller === activeController && data.processing === false
+          && state.acceptedRunId && state.acceptedRunId === data.settled_run_id) {
+        state.sidebarRunSettled = true;
+      }
       _latestInFlight.set(cid, []);
       _latestActiveTurns.set(cid, []);
       setGroupConversationBusy(cid, false);
@@ -4239,7 +4281,7 @@ let _chatAttachmentSelectionSequence = 0;
 // deletion is still in flight.
 const _chatAttachmentOperations = new Map(); // cid → active mutation count
 const _chatAttachmentRevisions = new Map();  // cid → monotonically increasing state revision
-const _chatAttachmentSendLocks = new Set();  // cid values currently being prepared for send
+const _chatAttachmentSendLocks = new Map();  // cid → release function for this send
 
 // Draft cid used by the commander (new-chat) tab — files land in a local-only
 // draft pool until the user hits send, at which point the backend adopts that
@@ -4403,16 +4445,22 @@ function _chatAttachIsSending(cid) {
 
 function _chatAttachTryBeginSend(cid) {
   if (!cid || _chatAttachmentSendLocks.has(cid) || _chatAttachHasPendingWork(cid)) return null;
-  _chatAttachmentSendLocks.add(cid);
+  const release = () => {
+    if (_chatAttachmentSendLocks.get(cid) === release) _chatAttachmentSendLocks.delete(cid);
+  };
+  _chatAttachmentSendLocks.set(cid, release);
   // Invalidate refreshes that started before the send snapshot. They must not
   // repaint an older attachment list while the draft is being adopted/sent.
   _chatAttachMarkMutation(cid);
-  let finished = false;
-  return () => {
-    if (finished) return;
-    finished = true;
-    _chatAttachmentSendLocks.delete(cid);
-  };
+  return release;
+}
+
+function _cancelChatSendPreflight(cid) {
+  const release = _chatAttachmentSendLocks.get(cid);
+  if (!release || release.dispatched) return;
+  release.cancelled = true;
+  _chatAttachMarkMutation(cid);
+  release();
 }
 
 function _chatAttachItemsFromServer(cid, infos) {
@@ -5848,6 +5896,27 @@ function _scheduleConversationTaskLinksRefresh() {
   }, 150);
 }
 
+async function _onConversationAutomationRunEnded(payload) {
+  const cid = payload?.cid;
+  const taskId = payload?.taskId;
+  if (!cid || !taskId) return;
+  const uid = currentUserId;
+  if (_loadConversationsInFlight) await _loadConversationsInFlight;
+  if (uid !== currentUserId) return;
+  const row = conversations.find(item => item?.conversation_id === cid);
+  if (!row || row.origin_auto_task_id === taskId
+      || !row.task_links?.some(link => link.kind === 'automation' && link.task_id === taskId)) return;
+  try {
+    const response = await window.orkas.invoke('conversations.get', { cid });
+    if (uid !== currentUserId || !conversations.includes(row) || response?.ok === false) return;
+    const links = response?.conversation?.task_links;
+    if (!Array.isArray(links) || JSON.stringify(links) === JSON.stringify(row.task_links)) return;
+    row.task_links = links;
+    renderConversationList();
+    if (cid === currentCid && currentView === 'conversation') _refreshChatHeader();
+  } catch (_) { /* The next navigation refresh reconciles an unavailable link lookup. */ }
+}
+
 let _conversationRemovalRevision = 0;
 let _conversationRemovalRenderPending = false;
 const _loadedConversationProjectIds = new Set();
@@ -6194,13 +6263,15 @@ function _renderConversationTimeBucketList(items, itemOpts = {}) {
 // failure/blocked state. Extension point: once the backend surfaces a
 // per-conversation status (or the linked task's status), populate `c.status`
 // and the abnormal label lights up automatically. Live streaming/queued state
-// stays owned by `_updateConvSidebarBadge`.
+// stays owned by `_updateConvSidebarBadge`; live CLI questions add the existing
+// trailing attention label without hiding a still-active run's pulse.
 const _CONV_ROW_STATUSES = ['failed', 'in_progress', 'in_review', 'blocked', 'done', 'cancelled'];
 // Only "attention" states get a text label; normal states stay unadorned so the
 // list reads clean and troubled entries stand out (screenshot spec).
-const _CONV_ROW_LABEL_STATUSES = new Set(['waiting', 'failed', 'blocked']);
+const _CONV_ROW_LABEL_STATUSES = new Set(['waiting', 'approval', 'failed', 'blocked']);
 function _convRowStatus(c) {
   const cid = c && c.conversation_id;
+  if (cid && typeof _hasPendingBashApproval === 'function' && _hasPendingBashApproval(cid)) return 'approval';
   if (cid && window.CliAsyncInput?.waitingCount(cid) > 0) return 'waiting';
   // A live reply, canonical terminal, or reopened persisted history describes
   // a newer user journey than the optional index status. Keep its neutral
@@ -6217,6 +6288,7 @@ function _convRowStatus(c) {
 }
 function _convRowStatusKey(status) {
   if (status === 'waiting') return 'sidebar.conv_waiting_answer';
+  if (status === 'approval') return 'sidebar.conv_pending_confirmation';
   // `failed` is a conversation-level state with its own copy; the task-vocab
   // states reuse the To-do status strings.
   return status === 'failed' ? 'chat.status.failed_short' : `project.todo.status_${status}`;
@@ -6229,7 +6301,7 @@ function _convRowStatusLabel(status) {
 function _convRowStatusHtml(c) {
   const status = _convRowStatus(c);
   const label = _CONV_ROW_LABEL_STATUSES.has(status)
-    ? `<span class="conv-item-status-label is-${status}" data-i18n="${escapeHtml(_convRowStatusKey(status))}">${escapeHtml(_convRowStatusLabel(status))}</span>`
+    ? `<span class="conv-item-status-label is-${status === 'approval' ? 'waiting' : status}" data-i18n="${escapeHtml(_convRowStatusKey(status))}">${escapeHtml(_convRowStatusLabel(status))}</span>`
     : '';
   return { dot: '', label };
 }
@@ -6261,7 +6333,7 @@ function _repaintConvRowStatus(cid, snapshot) {
         if (title && title.nextSibling) row.insertBefore(label, title.nextSibling);
         else row.appendChild(label);
       }
-      label.className = `conv-item-status-label is-${status}`;
+      label.className = `conv-item-status-label is-${status === 'approval' ? 'waiting' : status}`;
       label.dataset.i18n = _convRowStatusKey(status);
       label.textContent = _convRowStatusLabel(status);
     } else if (label) {
@@ -6836,20 +6908,9 @@ function _bindConversationSidebarItems(container, opts = {}) {
   });
 }
 
-function renderConversationList() {
-  _conversationBucketDateKey = _conversationLocalDateKey();
+function _renderUnprojectedConversationList() {
   const container = document.getElementById('conversation-list');
-  _sortConversationCacheForSidebar();
-  if (_conversationInlineRenameBlocksRender(container)) {
-    // Other sidebar/task surfaces may still refresh. Only the list that owns
-    // the live editor is frozen until its submit/cancel path renders again.
-    if (typeof renderTodayTasksSection === 'function') renderTodayTasksSection();
-    if (typeof renderProjectsSection === 'function') renderProjectsSection();
-    if (typeof _renderProjectAllTasks === 'function') _renderProjectAllTasks();
-    if (typeof _refreshAutoExpandedTaskConvs === 'function') _refreshAutoExpandedTaskConvs();
-    _refreshAllConvBadges();
-    return;
-  }
+  if (!container || _conversationInlineRenameBlocksRender(container)) return;
   // Conversations with a project_id are rendered nested under their project
   // by `projects.js::renderProjectsSection`. The "Conversations" section
   // here only shows the unprojected ones — same data model as the user's
@@ -6858,15 +6919,6 @@ function renderConversationList() {
   const unprojected = (conversations || []).filter((c) => !c || !c.project_id);
   if (!unprojected.length) {
     container.innerHTML = `<div class="conv-empty" data-i18n="sidebar.conv_empty">${escapeHtml(t('sidebar.conv_empty'))}</div>`;
-    // Still re-render the Today and Projects sections (the calls are cheap
-    // when the cache is already loaded), then paint badges once: the Today
-    // mirror can hold projected rows even when the Projects section renders
-    // nothing, so the trailing pass belongs here rather than inside the lists.
-    if (typeof renderTodayTasksSection === 'function') renderTodayTasksSection();
-    if (typeof renderProjectsSection === 'function') renderProjectsSection();
-    if (typeof _renderProjectAllTasks === 'function') _renderProjectAllTasks();
-    if (typeof _refreshAutoExpandedTaskConvs === 'function') _refreshAutoExpandedTaskConvs();
-    _refreshAllConvBadges();
     return;
   }
   container.innerHTML = _renderConversationTimeBucketList(unprojected, { listId: 'conversation-list' });
@@ -6892,17 +6944,22 @@ function renderConversationList() {
       }
     }
   });
+}
 
-  // Re-render the Today aggregate and the projects section (both consume the
-  // same `conversations` global; Today filters by activity date, Projects
-  // groups projected items by project).
+function renderConversationList() {
+  _conversationBucketDateKey = _conversationLocalDateKey();
+  _sortConversationCacheForSidebar();
+  _renderUnprojectedConversationList();
   if (typeof renderTodayTasksSection === 'function') renderTodayTasksSection();
   if (typeof renderProjectsSection === 'function') renderProjectsSection();
 
-  // Re-render mirror surfaces that consume the same `conversations` cache:
-  // project-detail tasks and expanded automation run lists.
-  if (typeof _renderProjectAllTasks === 'function') _renderProjectAllTasks();
-  if (typeof _refreshAutoExpandedTaskConvs === 'function') _refreshAutoExpandedTaskConvs();
+  // Page mirrors revalidate on navigation. Only their active views need the
+  // new list order immediately when a background conversation gains activity.
+  const view = typeof currentView === 'string' ? currentView : '';
+  if (view === 'project' && typeof _renderProjectAllTasks === 'function') _renderProjectAllTasks();
+  if ((view === 'auto' || view === 'project') && typeof _refreshAutoExpandedTaskConvs === 'function') {
+    _refreshAutoExpandedTaskConvs();
+  }
 
   // Reapply pending / queued status badges after the DOM was re-rendered
   // (covers both the unprojected list and the projects section's nested
@@ -7653,7 +7710,7 @@ function _restoreLiveDisplaySnapshot(cid, snapshot) {
       _absorbSegmentRecord(cid, record, row, { replayProcess: true });
     }
     _replayPersistedProcessItems(row, current.process);
-    if (current.text) _streamingAppendFinalDelta(row, current.text);
+    if (current.text) _streamingAppendFinalDelta(row, current.text, current.display_phase === 'pending' ? 'pending' : undefined);
     _restoreStreamingMessageActivityPosition(row, turn.activity_after_message_id);
     const details = row.querySelector?.('.stream-process');
     if (details && typeof wasOpen === 'boolean') details.open = wasOpen;
@@ -7877,6 +7934,7 @@ async function loadConversationHistory(cid, opts = {}) {
       window.CliAsyncInput?.observe(cid, message);
     }
     for (const message of indexedHistory) {
+      _clearUnconfirmedConversationSend(cid, message);
       if (message?.turn_id && _isTerminalGroupHistoryRecord(message)) load.endedTurnIds.add(message.turn_id);
     }
     // The transcript is rebuilt below, so the rows now in the DOM are not the
@@ -7948,6 +8006,12 @@ async function loadConversationHistory(cid, opts = {}) {
         _stampTurnEndRow(row, { turn_id: msg._turn_id }, msg._turn_end === true || load.endedTurnIds.has(msg._turn_id));
       });
       container.appendChild(historyFragment);
+    }
+    for (const entry of _unconfirmedConversationSends.values()) {
+      if (entry.cid !== cid || entry.row.parentElement === container) continue;
+      container.querySelector('.empty')?.remove();
+      _showConversationSendStatus(entry.row, 'chat.send_unconfirmed');
+      _appendBeforeSpacer(container, entry.row);
     }
     load.painted = true;
     load.collecting = false;
@@ -8297,6 +8361,7 @@ function _claimPersistedUserMessage(cid, gm) {
 }
 
 function _renderOrClaimPersistedUserMessage(cid, gm, opts = {}) {
+  _clearUnconfirmedConversationSend(cid, gm);
   if (!cid || cid !== currentCid || !gm || gm.from !== 'user') return false;
   _rememberHistoryLoadMessage(cid, gm);
   if (_claimPersistedUserMessage(cid, gm)) return true;
@@ -9239,6 +9304,9 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     if (typeof message.model_text === 'string' && message.model_text) {
       msgDiv.dataset.retryModelText = message.model_text;
     }
+    if (opts.skillImportMetadata && typeof message.import_metadata_id === 'string') {
+      msgDiv.dataset.retryImportMetadataId = message.import_metadata_id;
+    }
   }
   if (opts.messageActions === 'errors-only') msgDiv.dataset.messageActions = 'errors-only';
   if (typeof opts.failedRetryHandler === 'function') msgDiv._failedRetryHandler = opts.failedRetryHandler;
@@ -9894,7 +9962,7 @@ function _mountAppNavRequests(host, message) {
       const targetKey = surface.configureTargetKey || 'chat.app_nav_configure_target';
       const targetLabel = targetName ? t(targetKey, { target: targetName }) : '';
       if (!targetLabel || targetLabel === targetKey) return false;
-      _paintAppNavButton(btn, targetLabel, target.iconSvg || '');
+      _paintAppNavButton(btn, targetLabel, target.iconHtml || target.iconSvg || '');
       return true;
     };
     const target = action === 'configure' ? _appNavConfigureTarget(surfaceId, targetId) : null;
@@ -9918,7 +9986,7 @@ function _mountAppNavRequests(host, message) {
 }
 
 // Several configure cards can arrive in one reply, so connector and project cards name their
-// exact target. Returns `{ name, iconSvg? }`, a Promise of it, or null (keep the page label).
+// exact target. Built-in resolvers supply a local icon or sanitized SVG.
 const _appNavProjectRefreshes = new Set();
 
 function _appNavConfigureTarget(surfaceId, targetId) {
@@ -9952,17 +10020,17 @@ function _appNavConfigureTarget(surfaceId, targetId) {
   return Promise.resolve(loadProjects(true)).then(named).catch(() => null);
 }
 
-function _paintAppNavButton(btn, label, iconSvg) {
+function _paintAppNavButton(btn, label, iconHtml) {
   btn.textContent = '';
   btn.title = label;
   const text = document.createElement('span');
   text.className = 'chat-msg-created-agent-label';
   text.textContent = label;
   btn.appendChild(text);
-  if (!iconSvg && typeof window.uiIconHtml !== 'function') return;
+  if (!iconHtml && typeof window.uiIconHtml !== 'function') return;
   const pageIcon = document.createElement('span');
-  pageIcon.className = iconSvg ? 'chat-app-nav-btn-page-icon is-brand' : 'chat-app-nav-btn-page-icon';
-  pageIcon.innerHTML = iconSvg || window.uiIconHtml('panel-list', 'ui-icon chat-app-nav-btn-page-icon-svg');
+  pageIcon.className = iconHtml ? 'chat-app-nav-btn-page-icon is-brand' : 'chat-app-nav-btn-page-icon';
+  pageIcon.innerHTML = iconHtml || window.uiIconHtml('panel-list', 'ui-icon chat-app-nav-btn-page-icon-svg');
   btn.appendChild(pageIcon);
 }
 
@@ -11585,6 +11653,7 @@ async function handleChatSubmit() {
     await _finishQueueItemEdit(currentCid);
     return;
   }
+  if (pendingConvs.get(currentCid)?.confirmingSend) return;
   const input = document.getElementById('chat-input');
   const submittedDraft = composerSnapshot(input);
   const authoredText = submittedDraft.text();
@@ -11637,6 +11706,7 @@ async function handleChatSubmit() {
       else if (typeof _discardSubmittedDraft === 'function') _discardSubmittedDraft(cid, submittedDraft);
     };
     const attachmentSnapshot = await _chatAttachSnapshotForSend(cid);
+    if (releaseAttachmentSend.cancelled) return;
     if (!attachmentSnapshot.ok) {
       releaseAttachmentSend();
 
@@ -11657,17 +11727,19 @@ async function handleChatSubmit() {
     // stored (order preserved: while any remain, new sends line up behind
     // them). A newly queued task can still be folded into the active turn with
     // its task-board row's explicit "Send now" action.
-    _takeRecipientSnapshotForSend('conversation', recipientSnapshot, cid);
     const pendingFloorSync = _floorSyncByCid.get(cid);
     if (pendingFloorSync) {
       await Promise.race([pendingFloorSync, new Promise((r) => setTimeout(r, 1500))]);
     }
+    if (releaseAttachmentSend.cancelled) return;
+    _takeRecipientSnapshotForSend('conversation', recipientSnapshot, cid);
     if (isConvPending(cid)) {
       // Lightweight direct send while busy (same transport the queue rows'
       // "Send now" used): plain /send, no local controller — the already-open
       // event stream renders the bubble and the board row. Composer sends
       // always queue; only an existing task-board row offers "Send now".
       try {
+        releaseAttachmentSend.dispatched = true;
         const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/send`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -11770,6 +11842,65 @@ async function handleChatSubmit() {
 // own AbortController. Entries are dropped on done via the hooks below.
 const _convChatCtrls = new Map();  // cid → controller
 
+const _unconfirmedConversationSends = new Map(); // client message id → visible status and observed receipt
+
+function _clearUnconfirmedConversationSend(cid, message) {
+  const entry = message?.from === 'user' && _unconfirmedConversationSends.get(message.client_msg_id);
+  if (!entry || entry.cid !== cid) return;
+  entry.observed = true;
+  entry.row.remove();
+  _unconfirmedConversationSends.delete(message.client_msg_id);
+}
+
+async function _confirmConversationSend(cid, clientMsgId) {
+  const url = `${_historyRequestUrl(cid)}&receipt_client_msg_id=${encodeURIComponent(clientMsgId)}`;
+  let timer;
+  let expired = false;
+  const lookup = async () => {
+    for (let attempt = 0; attempt < 2 && !expired; attempt++) {
+      try {
+        const response = await apiFetch(url);
+        const data = await response.json();
+        if (!data?.ok) break;
+        const message = data.history?.find((item) => item?.from === 'user' && item.client_msg_id === clientMsgId);
+        if (message || data.send_receipt === 'accepted') return { status: 'accepted', message };
+        if (data.send_receipt === 'rejected') return { status: 'rejected' };
+      } catch (_) { break; }
+      if (attempt === 0 && !expired) await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+    return { status: 'unconfirmed' };
+  };
+  try {
+    return await Promise.race([
+      lookup(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => {
+          expired = true;
+          resolve({ status: 'unconfirmed' });
+        }, 1800);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function _showConversationSendStatus(row, key) {
+  const body = row?.querySelector('[data-role="final"]');
+  if (!body) return;
+  delete row.dataset.identityPending;
+  row.style.display = '';
+  _hideThinking(row);
+  const process = row.querySelector('[data-role="process-container"]');
+  if (process) process.hidden = true;
+  row.dataset.activityDone = '1';
+  body.style.display = '';
+  body.style.color = key === 'chat.send_unconfirmed' ? 'var(--text-2)' : 'var(--danger)';
+  body.setAttribute('role', 'status');
+  body.setAttribute('data-i18n', key);
+  body.textContent = t(key);
+}
+
 function _observerShouldDeferCleanup(cid, allowWithController) {
   return !!allowWithController && _convChatCtrls.has(cid);
 }
@@ -11839,8 +11970,54 @@ function _makeConvChatController(cid, options = {}) {
       optimisticUserBubble: false,
     },
     hooks: {
+      onRequestDispatched: options.onRequestDispatched,
+      ...(options.restoreComposerOnFailure ? {
+        async confirmSend(msgEl, id, clientMsgId) {
+          const state = pendingConvs.get(id);
+          if (state?.controller !== self || _convChatCtrls.get(id) !== self) return 'unconfirmed';
+          state.confirmingSend = true;
+          _updateConvSendUI(id);
+          let row = msgEl;
+          if (msgEl.dataset.fromActor || msgEl.dataset.msgId) {
+            if (msgEl.parentElement) row = _createStreamingAssistantMessage(msgEl.parentElement);
+            else row = null;
+          } else {
+            // The recovery stream may still receive actor events while this
+            // request is being checked. Keep this status out of its live row.
+            state.loadingEl = null;
+          }
+          const entry = row ? { cid: id, row, observed: false } : null;
+          if (entry) {
+            _showConversationSendStatus(row, 'chat.send_unconfirmed');
+            _unconfirmedConversationSends.set(clientMsgId, entry);
+            if (_unconfirmedConversationSends.size > 32) {
+              const oldest = _unconfirmedConversationSends.keys().next().value;
+              _unconfirmedConversationSends.get(oldest)?.row.remove();
+              _unconfirmedConversationSends.delete(oldest);
+            }
+          }
+          const receipt = await _confirmConversationSend(id, clientMsgId);
+          if (entry?.observed) receipt.status = 'accepted';
+          if (receipt.status === 'unconfirmed') return receipt.status;
+          _unconfirmedConversationSends.delete(clientMsgId);
+          if (receipt.status === 'rejected') {
+            _showConversationSendStatus(row, 'chat.send_not_delivered');
+            return receipt.status;
+          }
+          row?.remove();
+          if (typeof options.onAccepted === 'function') options.onAccepted();
+          if (receipt.message?.id && !receipt.message.deleted_at && _isVisibleGroupHistoryRecord(receipt.message)) {
+            _renderOrClaimPersistedUserMessage(id, receipt.message, { autoScroll: false });
+          }
+          return receipt.status;
+        },
+      } : {}),
       onStreamEvent(event) {
-        if (event.type === 'send_accepted' && typeof options.onAccepted === 'function') options.onAccepted();
+        if (event.type !== 'send_accepted') return;
+        const state = pendingConvs.get(cid);
+        if (state && state.controller === self && _convChatCtrls.get(cid) === self
+            && typeof event.run_id === 'string') state.acceptedRunId = event.run_id;
+        if (typeof options.onAccepted === 'function') options.onAccepted();
       },
       onUserAppended(userMsgEl, content, id) {
         // Remember the pair so server timestamp reconciliation can keep the
@@ -11904,7 +12081,8 @@ function _makeConvChatController(cid, options = {}) {
       },
       onDone(msgEl, id, result = {}) {
         // Restore a rejected send before settlement clears its snapshot.
-        if (_convChatCtrls.get(id) === self && options.restoreComposerOnFailure && result.accepted === false && result.errored && !result.aborted
+        const needsRestore = result.sendStatus === 'not_dispatched' || result.sendStatus === 'rejected';
+        if (_convChatCtrls.get(id) === self && options.restoreComposerOnFailure && needsRestore && !result.aborted
             && typeof _restoreSentComposerSnapshot === 'function') _restoreSentComposerSnapshot(id);
         // Final cleanup is owned by the controller that still represents this
         // conversation's active send. We must NOT release the pin again after
@@ -11929,6 +12107,13 @@ function _makeConvChatController(cid, options = {}) {
           // `_finishStreamingMsg` can synchronously start the next queued
           // controller. Delete only if the map still belongs to this send.
           if (_convChatCtrls.get(id) === self) _convChatCtrls.delete(id);
+          if (result.recoveredReceipt && !_convChatCtrls.has(id)) {
+            try {
+              _observeConversationRunFromPlanAction(id, { attachExisting: true });
+            } catch (_) {
+              _convLog.warn('post-send visibility repair failed', { failure_stage: 'visibility_repair' });
+            }
+          }
         }
         if (typeof options.onDone === 'function') {
           try { options.onDone(result); } catch (_) {}
@@ -11946,6 +12131,7 @@ async function sendInConversation(cid, content, extra, options = {}) {
   const agentId = String(sendOptions.agent_id || '');
   let doneResult = null;
   let taskStarted = false;
+  let requestDispatched = false;
   let accepted = false;
   const notifyAccepted = () => {
     if (accepted) return;
@@ -12011,6 +12197,7 @@ async function sendInConversation(cid, content, extra, options = {}) {
   const ctrl = _makeConvChatController(cid, {
     background: sendOptions.background === true,
     onAccepted: notifyAccepted,
+    onRequestDispatched() { requestDispatched = true; },
     restoreComposerOnFailure: sendOptions.restoreComposerOnFailure,
     onStarted() {
       taskStarted = true;
@@ -12034,14 +12221,17 @@ async function sendInConversation(cid, content, extra, options = {}) {
       errored: true,
       reason: 'unknown',
     };
-    const started = terminal.started !== false && taskStarted;
+    const started = terminal.started !== false && taskStarted && terminal.sendStatus !== 'not_dispatched';
     const aborted = !!terminal.aborted;
     const errored = !!terminal.errored || !started;
-    const result = aborted ? 'cancelled' : (errored ? 'failure' : 'success');
+    const result = aborted ? 'cancelled'
+      : terminal.sendStatus === 'unconfirmed' ? 'unconfirmed'
+      : errored ? 'failure' : 'success';
     if (agentId) {
       _notifyAgentRunFinished(agentId);
     }
-    if (sendOptions.restoreComposerOnFailure && (!started || controllerResult?.accepted === false) && errored && !aborted
+    if (sendOptions.restoreComposerOnFailure && !started && !terminal.sendStatus && errored && !aborted
+        && _convChatCtrls.get(cid) === ctrl
         && typeof _restoreSentComposerSnapshot === 'function') {
       _restoreSentComposerSnapshot(cid);
     }
@@ -12049,7 +12239,7 @@ async function sendInConversation(cid, content, extra, options = {}) {
     // snapshot must not survive to be handed back on some later turn's stop.
     // The queued-return path above exits earlier and keeps the running turn's
     // snapshot intact.
-    if (!started && typeof _clearSentComposerSnapshot === 'function') {
+    if (!started && _convChatCtrls.get(cid) === ctrl && typeof _clearSentComposerSnapshot === 'function') {
       _clearSentComposerSnapshot(cid);
     }
     if (!started && _convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
@@ -12062,12 +12252,11 @@ async function sendInConversation(cid, content, extra, options = {}) {
       cid,
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
     });
-    if (!taskStarted && sendOptions.restoreComposerOnFailure && typeof _restoreSentComposerSnapshot === 'function') _restoreSentComposerSnapshot(cid);
-    if (!taskStarted && typeof _clearSentComposerSnapshot === 'function') {
-      _clearSentComposerSnapshot(cid);
-    }
-    if (taskStarted && _convChatCtrls.get(cid) === ctrl) {
-      _finishStreamingMsg(cid);
+    if (_convChatCtrls.get(cid) === ctrl) {
+      if (!requestDispatched && sendOptions.restoreComposerOnFailure
+          && typeof _restoreSentComposerSnapshot === 'function') _restoreSentComposerSnapshot(cid);
+      if (pendingConvs.get(cid)?.controller === ctrl) _finishStreamingMsg(cid);
+      else if (typeof _clearSentComposerSnapshot === 'function') _clearSentComposerSnapshot(cid);
     }
     if (_convChatCtrls.get(cid) === ctrl) {
       if (!taskStarted) _clearSentComposerSnapshot(cid);
@@ -14052,6 +14241,7 @@ function _pinMessageToTopWithDynamicSpacer(msgEl, container) {
 //
 // Returns { loadHistory, send, abort, clear, isBusy }
 function createChatController(config) {
+  const skillEdit = config.queue?.keyPrefix === 'skill';
   const features = {
     archive: false,
     scrollPin: true,
@@ -14121,6 +14311,7 @@ function createChatController(config) {
     if (!extraBody || typeof extraBody !== 'object') return undefined;
     const body = { ...extraBody };
     delete body.model_text;
+    if (skillEdit) delete body.import_metadata_id;
     return Object.keys(body).length ? body : undefined;
   }
   function enqueue(content, meta = {}) {
@@ -14289,7 +14480,8 @@ function createChatController(config) {
       : '';
     if (shouldCommit) {
       item.content = nextContent;
-      if (item.meta?.extraBody && Object.prototype.hasOwnProperty.call(item.meta.extraBody, 'model_text')) {
+      if (item.meta?.extraBody && (Object.prototype.hasOwnProperty.call(item.meta.extraBody, 'model_text')
+        || (skillEdit && Object.prototype.hasOwnProperty.call(item.meta.extraBody, 'import_metadata_id')))) {
         item.meta = {
           ...item.meta,
           extraBody: _extraBodyWithoutModelText(item.meta.extraBody) || {},
@@ -14317,6 +14509,9 @@ function createChatController(config) {
     if (!payload) {
       await uiAlert(t('chat.retry_no_source'));
       return;
+    }
+    if (skillEdit && userMsgEl.dataset.retryImportMetadataId) {
+      payload.extra = { ...payload.extra, import_metadata_id: userMsgEl.dataset.retryImportMetadataId };
     }
     const hasQueue = features.queue && _qGet(config.getCurrentId()).length > 0;
     if ((pending || hasQueue) && features.queue) {
@@ -14372,6 +14567,7 @@ function createChatController(config) {
       archive: features.archive,
       cid: cid || config.getCurrentId(),
       messageActions: features.messageActions,
+      skillImportMetadata: skillEdit,
       ...(features.messageActions === 'errors-only'
         ? { failedRetryHandler: _retryFailedEditMessage, feedbackConversationId: '' }
         : {}),
@@ -14460,6 +14656,7 @@ function createChatController(config) {
           ...(attachmentCidForBubble ? { attachment_cid: attachmentCidForBubble } : {}),
           ...(referencesForBubble ? { references: referencesForBubble } : {}),
           ...(modelTextForBubble ? { model_text: modelTextForBubble } : {}),
+          ...(skillEdit && extraBody?.import_metadata_id ? { import_metadata_id: extraBody.import_metadata_id } : {}),
         },
         false,
         id,
@@ -14476,8 +14673,6 @@ function createChatController(config) {
         ? { failedRetryHandler: _retryFailedEditMessage, feedbackConversationId: '' }
         : {}),
     });
-    if (hooks.onAssistantStart) hooks.onAssistantStart(msgEl, id);
-
     // On send, pin the user's message to the top while the dynamic spacer
     // can absorb reply growth. Once the spacer is consumed, live output
     // follows downward again unless the user has manually scrolled away.
@@ -14489,11 +14684,6 @@ function createChatController(config) {
     // pin once; without this the historic bubbles get pushed out of view
     // by the spacer and the user sees a "messages disappeared" flash.
     const suppressPin = historyEl.dataset.suppressScrollPin === '1';
-    if (suppressPin) delete historyEl.dataset.suppressScrollPin;
-    if (features.scrollPin && !suppressPin && userMsgEl) {
-      _pinMessageToTopWithDynamicSpacer(userMsgEl, historyEl);
-    }
-
     const controller = new AbortController();
     pending = {
       controller,
@@ -14509,16 +14699,26 @@ function createChatController(config) {
     if (!features.actorIdentity && typeof msgEl?.querySelector === 'function') {
       _streamingUpdateActivity(msgEl, t('chat.activity_working'));
     }
-    _updateSendUI();
-
     let terminalResult = { started: true, aborted: false, errored: false };
+    let requestDispatched = false;
     try {
-      const res = await apiFetch(config.streamEndpoint(id), {
+      if (hooks.onAssistantStart) hooks.onAssistantStart(msgEl, id);
+      if (suppressPin) delete historyEl.dataset.suppressScrollPin;
+      if (features.scrollPin && !suppressPin && userMsgEl) {
+        _pinMessageToTopWithDynamicSpacer(userMsgEl, historyEl);
+      }
+      _updateSendUI();
+      const endpoint = config.streamEndpoint(id);
+      const body = JSON.stringify({ content, ...(extraBody || {}), client_msg_id: clientMsgId });
+      requestDispatched = true;
+      hooks.onRequestDispatched?.();
+      const res = await apiFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content, client_msg_id: clientMsgId, ...(extraBody || {}) }),
+        body,
         signal: controller.signal,
       });
+      if (res.streamNotDispatched === true) requestDispatched = false;
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
       const reader = res.body.getReader();
@@ -14543,6 +14743,10 @@ function createChatController(config) {
           try {
             const ev = JSON.parse(dataLines.join('\n'));
             if (ev.type === 'send_accepted' && pending) pending.accepted = true;
+            if (hooks.confirmSend && !pending.accepted && ev.type === 'error' && !ev.aborted) {
+              if (ev.admission_rejected === true) pending.admissionRejected = true;
+              continue; // Wait for definite rejection or a read-only receipt before painting an error.
+            }
             // Post-abort events can still arrive while main's for-await drains
             // its buffer — drop them so the bubble stays frozen at the "stopped" state
             // instead of accumulating more deltas / a final reply behind it.
@@ -14615,18 +14819,46 @@ function createChatController(config) {
         }
       }
     } catch (err) {
-      if (err?.name === 'AbortError' || pending?.aborted) {
+      if (pending?.aborted || (err?.name === 'AbortError' && (!hooks.confirmSend || controller.signal.aborted))) {
         _streamingMarkAborted(msgEl);
         if (hooks.onAbort) hooks.onAbort(msgEl, id);
+      } else if (hooks.confirmSend && !pending.accepted) {
+        // Transport failure before receipt is not evidence of model failure.
+        if (!requestDispatched) _convLog.warn('chat send stopped before dispatch', { failure_stage: 'preflight' });
       } else {
         _streamingSetError(msgEl, err.message || String(err));
         pending.errored = true;
         if (hooks.onError) hooks.onError(err.message || String(err), msgEl, id);
       }
     } finally {
+      let sendStatus;
+      let recoveredReceipt = false;
+      if (hooks.confirmSend && !pending.accepted && !pending.aborted) {
+        if (!requestDispatched) sendStatus = 'not_dispatched';
+        else if (pending.admissionRejected) sendStatus = 'rejected';
+        else {
+          try {
+            sendStatus = await hooks.confirmSend(msgEl, id, clientMsgId);
+          } catch (_) {
+            sendStatus = 'unconfirmed';
+            _convLog.warn('chat send receipt check unavailable', { failure_stage: 'stream' });
+          }
+          recoveredReceipt = sendStatus === 'accepted';
+          pending.accepted = recoveredReceipt;
+        }
+        if (sendStatus === 'not_dispatched' || sendStatus === 'rejected') {
+          pending.errored = true;
+          if (!requestDispatched || pending.admissionRejected) {
+            _showConversationSendStatus(msgEl, 'chat.send_not_delivered');
+          }
+        }
+      }
       const wasAborted = pending?.aborted;
       const wasErrored = pending?.errored;
-      terminalResult = { started: true, aborted: !!wasAborted, errored: !!wasErrored, accepted: !!pending?.accepted };
+      terminalResult = {
+        started: true, aborted: !!wasAborted, errored: !!wasErrored, accepted: !!pending?.accepted,
+        ...(sendStatus ? { sendStatus, recoveredReceipt } : {}),
+      };
       _clearOffViewGroupProcessEvents(id);
       pending = null;
       _updateSendUI();
@@ -17469,6 +17701,12 @@ function _updateConvSendUI(cid) {
     }
     return;
   }
+  if (pendingConvs.get(cid)?.confirmingSend) {
+    sendBtn.classList.remove('streaming', 'aborting');
+    sendBtn.disabled = true;
+    sendBtn.title = t('chat.send_unconfirmed');
+    return;
+  }
   const pending = isConvPending(cid);
   _ensureConvCreateAgentInline();
   // While `.aborting` is set, pin the button as send-style + disabled. The
@@ -17570,7 +17808,7 @@ function _refreshTaskSurfacesAfterAbort(cid, owner) {
   try {
     if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid, { silent: true });
   } catch (_) {}
-  // Stop detaches streams before task settlement. Keep the immediate refresh
+  // Conversation teardown can detach streams before task settlement. Keep the immediate refresh
   // and one refresh after the latest settlement window, owned by this abort.
   try {
     if (window.TaskBoard && typeof window.TaskBoard.resync === 'function') {
@@ -17609,9 +17847,28 @@ function abortConvStream(cid, options = {}) {
   const taskSurfaceOwner = _beginTaskSurfaceAbortRefresh(cid);
   const state = pendingConvs.get(cid);
   if (options && options.userInitiated) {
+    if (state?.confirmingSend) return;
+    _cancelChatSendPreflight(cid);
     // A user stop is normally followed by an edit and resend. Restore the
     // authored composer snapshot without affecting cleanup/recovery aborts.
     if (typeof _restoreSentComposerSnapshot === 'function') _restoreSentComposerSnapshot(cid);
+    // Keep listening as the active tasks settle and a queued successor starts.
+    try {
+      const request = apiFetch(`/api/conversations/${encodeURIComponent(cid)}/abort`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keep_queue: true }),
+      }).catch(() => {}).finally(() => {
+        taskSurfaceOwner.settled = true;
+        _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
+      });
+      _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
+      return request;
+    } catch (_) {
+      taskSurfaceOwner.settled = true;
+      _refreshTaskSurfacesAfterAbort(cid, taskSurfaceOwner);
+      return;
+    }
   }
   _stopRuntimeActorRecovery(cid);
   _stopGroupEventObserver(cid);
@@ -17684,6 +17941,10 @@ function abortConvStream(cid, options = {}) {
 // row/metadata snapshot. Queued work lives on the task board
 // (server-side); a conversation with queued rows is running, so the
 // streaming badge already covers it.
+function _isConvRunningInSidebar(cid, state = pendingConvs.get(cid)) {
+  return !state?.aborted && (groupBusyConvs.has(cid) || (!!state && !state.sidebarRunSettled));
+}
+
 function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
   const menu = document.getElementById('conversation-action-menu');
   if (menu && menu.dataset.cid === cid) {
@@ -17696,10 +17957,6 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
   }
 
   if (!deferRunningChips) _refreshSidebarRunningChips();
-  // Chat header's status pill follows the same per-conversation signal.
-  if (cid === currentCid) {
-    try { _refreshChatHeader(); } catch (_) { /* not yet bound */ }
-  }
   // A task can be mounted in several sidebar copies at once (the Today
   // aggregate plus its Project or the Tasks list); every copy shows the same
   // live state, so paint all of them rather than the first match.
@@ -17708,23 +17965,23 @@ function _updateConvSidebarBadge(cid, _unused, deferRunningChips, snapshot) {
   // Treat aborted-but-still-draining as not streaming. `pendingConvs` only
   // clears when main emits `done`, which can trail the stop click; until then
   // the bubble already shows the "stopped" state so the streaming badge would lie.
-  const state = pendingConvs.get(cid);
-  const pending = isConvPending(cid) && !(state && state.aborted);
+  const pending = _isConvRunningInSidebar(cid);
   const conv = snapshot ? snapshot.conversation : conversations.find(c => c.conversation_id === cid);
   const status = _convRowStatus(conv || { conversation_id: cid });
-  if (!pending) {
-    // Settled work has no live pulse.
+  if (!pending || status === 'failed') {
+    // Settled or failed work has no live pulse.
     // The failed mark is maintained by the structured hooks
     // (`_finalizeActorPlaceholder`, history sync, onDone) — nothing to derive here.
     items.forEach((item) => item.querySelector('.conv-status-badge')?.remove());
     _repaintConvRowStatus(cid, snapshot);
     return;
   }
-  // A question can leave its turn running. Keep the leading live pulse and
-  // trailing attention label until the user answers or the turn ends.
-  if (status === 'waiting') _repaintConvRowStatus(cid, snapshot);
+  // A question can leave its turn running. Keep both the leading live pulse
+  // and the trailing attention label until the user answers or the turn ends.
+  const awaitingUser = status === 'waiting' || status === 'approval';
+  if (awaitingUser) _repaintConvRowStatus(cid, snapshot);
   items.forEach((item) => {
-    if (status !== 'waiting') item.querySelector('.conv-item-status-label')?.remove();
+    if (!awaitingUser) item.querySelector('.conv-item-status-label')?.remove();
     const existing = item.querySelector('.conv-status-badge');
     // Preserve an unchanged running indicator and its breathing animation.
     if (existing?.classList.contains('is-streaming')) return;
@@ -17767,14 +18024,13 @@ window.addEventListener('i18n-change', _refreshAllConvBadges);
 function _sidebarRunningConversationIds() {
   const ids = new Set();
   pendingConvs.forEach((state, cid) => {
-    if (!(state && state.aborted) && !(window.CliAsyncInput?.waitingCount(cid) > 0)) ids.add(cid);
+    if (_isConvRunningInSidebar(cid, state) && !(window.CliAsyncInput?.waitingCount(cid) > 0)) ids.add(cid);
   });
   // Group runtime activity can become visible just before a request-backed
   // pending entry is attached (for example during recovery). Include it so
   // project and Commander counts do not briefly disappear in that window.
   groupBusyConvs.forEach((_busy, cid) => {
-    const state = pendingConvs.get(cid);
-    if (!(state && state.aborted) && !(window.CliAsyncInput?.waitingCount(cid) > 0)) ids.add(cid);
+    if (_isConvRunningInSidebar(cid) && !(window.CliAsyncInput?.waitingCount(cid) > 0)) ids.add(cid);
   });
   return ids;
 }
@@ -17933,10 +18189,8 @@ function _logConversationManageResult(action, startedAt, result, errorCode = '',
 try {
   if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     window.orkas.onPushEvent('conversation:media_materialized', _conversationMediaHandleMaterialized);
-    window.orkas.onPushEvent('conversation:task_terminal', (payload) => {
-      _taskTerminalHandlePresentation(payload);
-      _scheduleConversationTaskLinksRefresh();
-    });
+    window.orkas.onPushEvent('conversation:task_terminal', _taskTerminalHandlePresentation);
+    window.orkas.onPushEvent('conversations:automation_run_ended', _onConversationAutomationRunEnded);
     window.orkas.onPushEvent('projects:tasks-changed', _scheduleConversationTaskLinksRefresh);
   }
 } catch (_) {}

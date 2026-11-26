@@ -1,10 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as vm from 'node:vm';
 
 import { describe, expect, it } from 'vitest';
 
-import { buildTimelineAdapterScript } from '../../../src/main/features/video_studio';
-import type { CompositionMeta } from '../../../src/main/features/video_studio_qa';
 import { buildVideoTimelineAdapterScript } from '../../../src/main/features/video_timeline';
 
 // Why this file exists: for three days every composed opening captured blank
@@ -131,21 +130,24 @@ describe('frame-zero seek against the bundled GSAP', () => {
     expect(script).toContain('tl.render(t, false, true)');
     expect(script).toMatch(/Math\.abs\(before - t\) < 1e-6/);
   });
-  it('also keeps the normal seek and forced-render guard in the native composition adapter', () => {
-    const meta = {
-      htmlPath: '/ws/index.html',
-      html: '',
-      rootAttrs: {},
-      id: 'main',
-      width: 1920,
-      height: 1080,
-      durationSec: 50.875,
-      audioTracks: [],
-    } as CompositionMeta;
-    const script = buildTimelineAdapterScript(meta);
-    expect(script).toContain('tl.render(t, false, true)');
-    expect(script).toMatch(/Math\.abs\(before - t\) < 1e-6/);
-    // The forced render must not replace the ordinary seek path.
-    expect(script).toContain('tl.seek(t, false)');
+  it('renders the first and later frames through the adapter every native scene uses', async () => {
+    const { gsap, el } = loadBundledGsap();
+    const section: any = el;
+    section.getAttribute = (name: string) => name === 'data-scene-id' ? 'main' : null;
+    section.querySelectorAll = () => [];
+    section.querySelector = () => null;
+    section.removeAttribute = () => {};
+    const window: any = { __timelines: { main: sceneRevealTimeline(gsap, el) } };
+    vm.runInNewContext(buildVideoTimelineAdapterScript(), {
+      window,
+      document: { querySelectorAll: () => [section], getAnimations: () => [] },
+      getComputedStyle: () => ({ backgroundImage: 'none', display: 'block' }),
+    });
+    await window.__ORKAS_VIDEO__.renderFrame('main', 0, {}, '');
+    expect(el.style.opacity).toBe(1);
+    expect(el.style.visibility).toBe('inherit');
+    await window.__ORKAS_VIDEO__.renderFrame('main', 5.875, {}, '');
+    expect(el.style.opacity).toBe(0);
+    expect(el.style.visibility).toBe('hidden');
   });
 });

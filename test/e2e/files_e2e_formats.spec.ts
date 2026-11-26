@@ -1,10 +1,116 @@
 import { pathToFileURL } from 'node:url';
-import { appendFileSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, mkdtempSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 import { makeMinimalDocx } from '../fixtures/make-minimal-docx';
 import { makeMinimalPdf } from '../fixtures/make-minimal-pdf';
+
+test('a local HTML preview opens a linked Markdown file in the same window', async ({ orkas }, info) => {
+  const project = path.join(orkas.workspaceRoot, 'coding-project');
+  mkdirSync(path.join(project, 'design'), { recursive: true });
+  mkdirSync(path.join(project, 'plans'));
+  const note = '# 项目自治方案\n\n**交付流程**\n';
+  const markdown = path.join(project, 'plans', '完整方案 100%.MD');
+  writeFileSync(markdown, note);
+  writeFileSync(path.join(orkas.workspaceRoot, 'outside.md'), '# Outside the coding project');
+  const html = path.join(project, 'design', 'architecture.html');
+  writeFileSync(html, `<!doctype html>
+    <meta charset="utf-8">
+    <ul>
+      <li><a href="../plans/${encodeURIComponent('完整方案 100%.MD')}">查看完整方案</a></li>
+      <li><a href="missing.md">Missing document</a></li>
+      <li><a href="../../outside.md">Outside document</a></li>
+    </ul>`);
+  const created: any = await orkas.invoke('conversations.create', { title: 'Read the architecture' });
+  const cid = created.conversation.conversation_id;
+  await orkas.electronApp!.evaluate(async (_, { main, cid, project }) => {
+    const req = (process as any).mainModule.require.bind((process as any).mainModule);
+    const uid = req(`${main}/features/users.ts`).getActiveUserId();
+    await req(`${main}/features/group_chat/state.ts`).setCodingProjectDir(uid, cid, project, { explicit: true });
+  }, { main: path.resolve(__dirname, '../../src/main'), cid, project });
+  appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`), JSON.stringify({
+    id: 'architecture-file', from: 'commander', to: ['user'], ts: new Date().toISOString(),
+    text: `[architecture.html](${pathToFileURL(html).href})`,
+  }) + '\n');
+  const page = orkas.page!;
+  await page.evaluate(async cid => {
+    await (window as any).loadConversations();
+    await (window as any).setView('conversation', cid);
+  }, cid);
+  const chip = page.getByRole('button', { name: 'architecture.html', exact: true });
+  const preview = await orkas.openPreview(() => chip.click());
+  const frame = preview.frameLocator('.chat-file-viewer-html');
+  await frame.getByRole('link', { name: '查看完整方案' }).click();
+  await expect(preview.getByRole('heading', { name: '项目自治方案' })).toBeVisible();
+  await expect(preview.locator('strong', { hasText: '交付流程' })).toBeVisible();
+  await expect(preview).toHaveTitle('完整方案 100%.MD');
+  await expect(preview.locator('.chat-file-viewer-html, [data-mve-action="edit"]')).toHaveCount(0);
+  await preview.screenshot({ path: info.outputPath('linked-markdown.png') });
+  await preview.setViewportSize({ width: 480, height: 320 });
+  await expect(preview.getByRole('heading', { name: '项目自治方案' })).toBeInViewport();
+  await preview.screenshot({ path: info.outputPath('linked-markdown-narrow.png') });
+
+  await chip.click();
+  await frame.getByRole('link', { name: 'Outside document' }).click();
+  await expect(frame.getByRole('link', { name: '查看完整方案' })).toBeVisible();
+  await frame.getByRole('link', { name: 'Missing document' }).press('Enter');
+  await expect(frame.getByRole('link', { name: '查看完整方案' })).toBeVisible();
+  await frame.getByRole('link', { name: '查看完整方案' }).press('Enter');
+  await expect(preview.getByRole('heading', { name: '项目自治方案' })).toBeVisible();
+  expect(readFileSync(markdown, 'utf8')).toBe(note);
+});
+
+test('reopening a bubble file shows the latest disk content in the existing preview', async ({ orkas }, info) => {
+  const page = orkas.page!;
+  const note = orkas.createWorkspaceFile('report.md', '# Version one\n');
+  const html = orkas.createWorkspaceFile('report.html', '<!doctype html><h1>Build one</h1>');
+  const timestamp = new Date('2026-01-01T00:00:00Z');
+  for (const file of [note, html]) utimesSync(file, timestamp, timestamp);
+  const created: any = await orkas.invoke('conversations.create', { title: 'Reopen updated files' });
+  const cid = created.conversation.conversation_id;
+  appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`), JSON.stringify({
+    id: 'updated-files', from: 'commander', to: ['user'], ts: new Date().toISOString(),
+    text: `[report.md](${pathToFileURL(note).href})\n\n[report.html](${pathToFileURL(html).href})`,
+  }) + '\n');
+  await page.evaluate(async cid => {
+    await (window as any).loadConversations();
+    await (window as any).setView('conversation', cid);
+  }, cid);
+
+  const noteChip = page.getByRole('button', { name: 'report.md', exact: true });
+  const preview = await orkas.openPreview(() => noteChip.click());
+  await expect(preview.getByRole('heading', { name: 'Version one' })).toBeVisible();
+  await preview.locator('[data-mve-action="edit"]').click();
+  const draft = preview.locator('[data-mve-textarea]');
+  await draft.fill('# Unsaved draft');
+  await noteChip.click();
+  const dialog = preview.locator('.ui-dialog-overlay:visible');
+  await expect(dialog).toHaveCount(0);
+  await expect(draft).toHaveValue('# Unsaved draft');
+
+  writeFileSync(note, '# Version two\n');
+  utimesSync(note, timestamp, timestamp);
+  await noteChip.click();
+  await expect(dialog).toBeVisible();
+  await dialog.locator('[data-act="cancel"]').click();
+  await expect(draft).toHaveValue('# Unsaved draft');
+  await noteChip.click();
+  await dialog.locator('[data-act="ok"]').click();
+  await expect(preview.getByRole('heading', { name: 'Version two' })).toBeVisible();
+  expect(readFileSync(note, 'utf8')).toBe('# Version two\n');
+  await preview.screenshot({ path: info.outputPath('refreshed-markdown.png') });
+
+  const htmlChip = page.getByRole('button', { name: 'report.html', exact: true });
+  await htmlChip.click();
+  const heading = preview.frameLocator('.chat-file-viewer-html').getByRole('heading');
+  await expect(heading).toHaveText('Build one');
+  writeFileSync(html, '<!doctype html><h1>Build two</h1>');
+  utimesSync(html, timestamp, timestamp);
+  await htmlChip.click();
+  await expect(heading).toHaveText('Build two');
+  await preview.screenshot({ path: info.outputPath('refreshed-html.png') });
+});
 
 test('a descriptive file-link label does not hide the CSV format', async ({ orkas }) => {
   const file = orkas.createWorkspaceFile('report.csv', 'name,value\nOrkas,12\n');
@@ -230,7 +336,8 @@ test('unregistered external bubble files preview read-only with existing unsuppo
   const files = [
     ['交接 100% #1.md', `# ${marker}\n\n- [ ] Preserve this checkbox\n`],
     ['report.csv', `name,value\n${marker},12\n`],
-    ['page.html', `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="style.css"><p>${marker}</p>`],
+    ['page.html', `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="style.css"><p>${marker}</p>
+      <a href="${encodeURIComponent('交接 100% #1.md')}">Open the handover</a>`],
     ['brief.docx', makeMinimalDocx({ paragraphs: [marker] })],
     ['document.pdf', makeMinimalPdf(['External PDF preview'])],
     ['archive.zip', 'unsupported'],
@@ -258,6 +365,9 @@ test('unregistered external bubble files preview read-only with existing unsuppo
       if (ext === '.html') {
         await expect(preview.frameLocator('.chat-file-viewer-html').locator('p')).toHaveText(marker);
         await expect(preview.frameLocator('.chat-file-viewer-html').locator('p')).toHaveCSS('color', 'rgb(12, 34, 56)');
+        await preview.frameLocator('.chat-file-viewer-html').getByRole('link', { name: 'Open the handover' }).click();
+        await expect(preview.getByRole('heading', { name: marker })).toBeVisible();
+        await expect(preview.locator('[data-mve-action="edit"]')).toHaveCount(0);
       } else if (ext === '.docx') {
         await expect(preview.frameLocator('.chat-file-viewer-office').locator('body')).toContainText(marker);
       } else if (ext === '.pdf') {

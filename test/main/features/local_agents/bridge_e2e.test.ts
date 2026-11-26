@@ -660,7 +660,7 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
       expect(browserHost.openModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid, { url: 'https://example.com/settings' });
       expect((await call({ operation: 'wait', timeout_ms: 60000 })).isError).toBeFalsy();
       expect(browserHost.waitForModelWebAssist).toHaveBeenLastCalledWith(TEST_UID, cid, { condition: 'loaded' },
-        expect.objectContaining({ signal: expect.anything(), isActive: expect.any(Function) }));
+        expect.objectContaining({ signal: expect.anything(), isActive: expect.any(Function) }), expect.any(Function));
       const waitLifetime = (browserHost.waitForModelWebAssist.mock.lastCall as any)[3];
       expect(waitLifetime.signal.aborted).toBe(false);
       expect(waitLifetime.isActive()).toBe(true);
@@ -875,7 +875,7 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         expect(tool.inputSchema.properties.action.enum).not.toContain('list_members');
         expect(tool.inputSchema.properties).not.toHaveProperty('assignee_uid');
         expect(native.inputSchema.properties).not.toHaveProperty('result_ref');
-        for (const field of ['offset', 'limit', 'status', 'task_id', 'content', 'due_at']) {
+        for (const field of ['offset', 'limit', 'status', 'task_id', 'content', 'due_at', 'note', 'note_kind']) {
           expect(tool.inputSchema.properties[field]).toEqual((native.inputSchema as any).properties[field]);
         }
         const autoTasks = await import('../../../../src/main/features/auto_tasks');
@@ -988,7 +988,7 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         const task = (await tasks.listTasks(TEST_UID, scope))[0];
         expect(task.status).toBe('todo');
         expect(task).not.toHaveProperty('assignee_uid');
-        expect(task.origin_cid).toBe(`c-tasks-${bound}`);
+        expect(task).not.toHaveProperty('origin_cid');
         const { chatAttachmentDirForConversation } = await import('../../../../src/main/util/project-layout');
         const sourceDir = chatAttachmentDirForConversation(TEST_UID, `c-tasks-${bound}`);
         fs.mkdirSync(sourceDir, { recursive: true });
@@ -1024,20 +1024,18 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
         expect(JSON.parse(update.result.content[0].text)).toMatchObject({ ok: true });
         expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', content: 'Edited through MCP\nRetained requirement', owner_agent: 'Commander', owner_agent_id: 'commander' });
         expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('assignee_uid');
-        const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'retired-library-pointer' } });
+        const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'retired-library-pointer', note: 'Report sent to the team' } });
         expect(complete.result.isError).toBeFalsy();
-        expect(JSON.parse(complete.result.content[0].text)).toMatchObject({ ok: true });
+        expect(JSON.parse(complete.result.content[0].text)).toMatchObject({ ok: true, task: { note: 'Report sent to the team', note_kind: 'result' } });
         expect(JSON.parse(complete.result.content[1].text)).toEqual({ ignored_fields: ['result_ref'] });
-        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'done' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'done', note: 'Report sent to the team', note_kind: 'result' });
         expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('result_ref');
-        // Completion never changes the link: the to-do keeps the
-        // conversation it was saved from.
-        expect(await tasks.getTask(TEST_UID, scope, task.id)).toHaveProperty('origin_cid', `c-tasks-${bound}`);
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('origin_cid');
         const reopened = await createProjectTasksHandler(TEST_UID, scope, 'new-native-chat', new Map()).update(task.id, { status: 'todo' });
         expect(reopened.task).toMatchObject({ status: 'todo' });
         expect(reopened.task).not.toHaveProperty('result_ref');
         // Reopening from another conversation does not relink it either.
-        expect(reopened.task).toHaveProperty('origin_cid', `c-tasks-${bound}`);
+        expect(reopened.task).not.toHaveProperty('origin_cid');
         const reread = await client.request(28, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(reread.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ id: task.id, status: 'todo' }));
         const queryTodo = { action: 'list', offset: 0, limit: 500, status: 'todo', task_id: 'x' };
@@ -1150,6 +1148,12 @@ describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio 
       );
       expect(library.inputSchema.properties.action.enum).toEqual(['list', 'search', 'read']);
       expect(chatHistory.inputSchema.properties.action.enum).toEqual(['search', 'read', 'read_process', 'read_output']);
+      expect(chatHistory.inputSchema.properties).not.toHaveProperty('cursor');
+      expect(chatHistory.inputSchema.properties).not.toHaveProperty('max_tokens');
+      for (const group of ['read', 'process', 'output']) {
+        expect(chatHistory.inputSchema.properties[group].properties.cursor.type).toBe('integer');
+        expect(chatHistory.inputSchema.properties[group].properties.max_tokens.type).toBe('integer');
+      }
       expect(chatHistory.inputSchema.properties.read.properties.page.properties.mode.enum)
         .toEqual(['latest', 'around', 'before', 'from']);
       expect(readSkill.description).toContain('available Orkas Skill');
@@ -1923,11 +1927,12 @@ describe.each(['legacy', 'modern'] as const)('CLI history process discovery on %
         const retired = await client.request(102, 'tools/call', { name: 'chat_history', arguments: { action: 'search', scope: 'current', ...selectors } });
         expect(retired.result.isError).toBe(true);
         expect(retired.result.content[0].text).toContain('unsupported_fields');
+        expect(retired.result.content[0].text).toContain('"expected_path":"search.k"');
         expect(retired.result.content[0].text).not.toContain('Cedar 导出验收：通过');
       }
       const search = await client.request(2, 'tools/call', { name: 'chat_history', arguments: { action: 'search', scope: 'current', search: { query: 'Cedar 通过 失败', k: 100 } } });
       const locator = JSON.parse(/^    read: (.+)$/m.exec(search.result.content[0].text)![1]);
-      let args = { ...locator, max_tokens: 800 };
+      let args = { ...locator, read: { ...locator.read, max_tokens: 800 } };
       let recovered = '', continued = false;
       for (let i = 0; i < 10; i++) {
         const read = await client.request(3 + i, 'tools/call', { name: 'chat_history', arguments: args });
@@ -1945,8 +1950,8 @@ describe.each(['legacy', 'modern'] as const)('CLI history process discovery on %
       expect(recovered).not.toMatch(/PRIVATE_REASONING|PRIVATE_VIDEO_BYTES|CURRENT_TRIGGER|LATER_CONCURRENT/);
       const focused = JSON.parse(/^    process_read: (.+)$/m.exec(search.result.content[0].text)![1]);
       expect(focused).toMatchObject({ action: 'read_process', scope: 'current', process: { record_id: 'earlier', process_index: 0 } });
-      let focusedArgs = { ...focused, max_tokens: 800 }, focusedText = '', focusedDone = false, focusedPages = 0;
-      let outputReadLocator: Record<string, unknown> | undefined;
+      let focusedArgs = { ...focused, process: { ...focused.process, max_tokens: 800 } }, focusedText = '', focusedDone = false, focusedPages = 0;
+      let outputReadLocator: { output: Record<string, unknown> } | undefined;
       for (; focusedPages < 10; focusedPages++) {
         const read = await client.request(50 + focusedPages, 'tools/call', { name: 'chat_history', arguments: focusedArgs });
         expect(read.result.isError).not.toBe(true);
@@ -1964,12 +1969,17 @@ describe.each(['legacy', 'modern'] as const)('CLI history process discovery on %
       expect(focusedPages).toBeGreaterThan(0);
       expect(focusedText).toContain('END_REPORT');
       expect(outputReadLocator).toMatchObject({ action: 'read_output', output: { record_id: 'earlier', tool_call_id: 'report' } });
-      let outputArgs = { ...outputReadLocator, max_tokens: 800 };
+      const { cursor, max_tokens, ...output } = outputReadLocator!.output;
+      const legacyOutput = { ...outputReadLocator, output, cursor, max_tokens };
+      const legacyReceipt = await client.request(999, 'tools/call', { name: 'chat_history', arguments: legacyOutput });
+      expect(legacyReceipt.result.isError).not.toBe(true);
+      let outputArgs = outputReadLocator!;
       let fullOutput = '', outputDone = false;
       for (let page = 0; page < 20; page++) {
         const receipt = await client.request(1000 + page, 'tools/call', { name: 'chat_history', arguments: outputArgs });
         expect(receipt.result.isError).not.toBe(true);
         const text = receipt.result.content[0].text;
+        if (page === 0) expect(text).toBe(legacyReceipt.result.content[0].text);
         expect(estimateTextTokens(text)).toBeLessThanOrEqual(800);
         expect(text).not.toContain('ref=');
         const part = /covered="(\d+)-(\d+)" next_cursor="[^"]+">\n([\s\S]*?)\n<\/history-tool-output>/.exec(text)!;

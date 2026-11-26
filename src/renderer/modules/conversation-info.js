@@ -22,6 +22,7 @@ const ConversationInfo = (() => {
   let _panelResize = null;
   let _seq = 0;
   let _fileSeq = 0;
+  const _fileSnapshotReads = new Map();
   let _attachmentSeq = 0;
   let _appliedAttachmentSeq = 0;
   let _attachmentInventoryConfirmed = false;
@@ -281,7 +282,21 @@ const ConversationInfo = (() => {
     };
   }
 
-  async function _loadFileSnapshot(cid) {
+  function _loadFileSnapshot(cid) {
+    const running = _fileSnapshotReads.get(cid);
+    if (running) {
+      // Keep one follow-up so a change during the current scan is picked up.
+      running.queued ??= running.active.then(() => (
+        _open && _cid === cid ? _loadFileSnapshot(cid) : null
+      ));
+      return running.queued;
+    }
+    const active = _fetchFileSnapshot(cid).finally(() => _fileSnapshotReads.delete(cid));
+    _fileSnapshotReads.set(cid, { active, queued: null });
+    return active;
+  }
+
+  async function _fetchFileSnapshot(cid) {
     const enc = encodeURIComponent(cid);
     const filesData = await _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
       _infoLog.warn('file list load failed', { cid, error: err && err.message });
@@ -769,7 +784,7 @@ const ConversationInfo = (() => {
     }
     try {
       const partial = await _loadFileSnapshot(target);
-      if (seq !== _fileSeq || target !== _cid) return;
+      if (!partial || seq !== _fileSeq || target !== _cid) return;
       _snapshot = { ..._snapshot, ...partial };
       _error = '';
       if (_activeTab === 'files') _renderBody();

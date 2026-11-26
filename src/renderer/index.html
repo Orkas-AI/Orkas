@@ -517,7 +517,7 @@
                 <span data-ui-icon="terminal" data-ui-icon-class="header-entry-icon"></span>
                 <span class="header-entry-copy">
                   <span data-i18n="agents.connect_cli_btn">Connect an agent</span>
-                  <small data-i18n="agents.connect_cli_sub">Claude Code / Codex CLIs</small>
+                  <small data-i18n="sidebar.connect_agent_sub">Claude Code · Codex &amp; more</small>
                 </span>
               </button>
               <button class="btn header-entry-btn header-entry-btn-market" id="agents-more-btn">
@@ -699,7 +699,7 @@
                   <button class="btn btn-sm" type="button" data-todo-group="status" aria-pressed="false" data-i18n="todo.by_status">By status</button>
                 </div>
                 <button class="btn btn-sm" id="todos-add-btn" type="button" data-i18n="todo.add_short">+ Create</button>
-                <button type="button" class="btn btn-sm" id="todos-cleanup-btn" data-i18n="settings.cleanup.clean">Clean up</button>
+                <button class="btn btn-sm" id="todos-cleanup-btn" type="button" data-i18n="settings.cleanup.clean">Clean up</button>
                 <button class="btn btn-sm" type="button" data-task-return-view="todos" data-i18n="common.back" hidden>Back</button>
               </div>
             </header>
@@ -773,6 +773,12 @@
                 <section class="project-workbench">
                   <div class="project-detail-tabs">
                     <div class="project-detail-tab-group" role="tablist">
+                      <!-- What changed since this device last showed the user;
+                           present only while there is something new. -->
+                      <button type="button" class="project-detail-tab" data-project-tab="recap" id="project-recap-tab" hidden>
+                        <span data-i18n="project.recap.tab">What's new</span>
+                        <span class="project-detail-tab-count" id="project-recap-count"></span>
+                      </button>
                       <button type="button" class="project-detail-tab is-active" data-project-tab="tasks">
                         <span data-i18n="project.tab_tasks">Tasks</span>
                         <span class="project-detail-tab-count" id="project-tasks-count">0</span>
@@ -805,6 +811,9 @@
                 <button type="button" class="btn btn-sm" id="project-todo-cleanup-btn" data-i18n="settings.cleanup.clean">Clean up</button>
                     </div>
                   </div>
+                  <div class="project-detail-tab-panel" data-project-panel="recap" hidden>
+                    <div class="home-list project-recap-list" id="project-recap-list"></div>
+                  </div>
                   <div class="project-detail-tab-panel" data-project-panel="tasks">
                     <div class="project-tasks-list" id="project-tasks-list"></div>
                     <div class="project-tasks-empty empty muted" id="project-tasks-empty" data-i18n="project.tasks_empty">No tasks yet</div>
@@ -833,14 +842,44 @@
                       <span class="project-side-card-scope" data-i18n="project.context.scope">Shared by every conversation</span>
                     </div>
                     <div class="project-side-tabs" role="tablist" data-project-side-tabs="context">
+                      <!-- Hidden for shared projects, which keep no goal yet. -->
+                      <button type="button" class="project-side-tab" data-project-side-tab="goal" id="project-goal-tab" hidden>
+                        <span data-i18n="project.context.goal_tab">Goal</span>
+                      </button>
                       <button type="button" class="project-side-tab is-active" data-project-side-tab="instructions">
-                        <span data-i18n="project.context.instructions_tab">Goals &amp; rules</span>
+                        <span data-i18n="project.context.instructions_tab">Rules</span>
                       </button>
                       <button type="button" class="project-side-tab" data-project-side-tab="memory">
                         <span data-i18n="project.context.memory_tab">Memory</span>
                         <span class="project-side-tab-count" id="project-memory-count"></span>
                       </button>
                     </div>
+                  </div>
+                  <!-- The project's goal. It is optional, so its absence stays quiet. -->
+                  <div class="project-side-panel project-side-goal-panel" data-project-side-panel="goal" hidden>
+                    <div class="project-context-section-head" id="project-goal-head" hidden>
+                      <span class="project-goal-status" id="project-goal-status"></span>
+                      <span class="project-goal-head-actions">
+                        <button type="button" class="btn btn-sm project-context-action" id="project-goal-edit-btn"
+                                data-i18n="common.edit">Edit</button>
+                        <button type="button" class="project-side-icon-btn" id="project-goal-menu-btn" aria-haspopup="menu"
+                                data-i18n-title="project.menu.more_actions" title="More actions"
+                                data-i18n-aria-label="project.menu.more_actions" aria-label="More actions">
+                          <span data-ui-icon="more-horizontal" data-ui-icon-class="project-side-add-icon"></span>
+                        </button>
+                      </span>
+                    </div>
+                    <div class="project-goal-scroll">
+                      <div class="project-goal-body" id="project-goal-body" hidden>
+                        <p class="project-goal-text" id="project-goal-text"></p>
+                        <ol class="project-goal-criteria" id="project-goal-criteria" hidden></ol>
+                      </div>
+                      <div class="project-goal-empty" id="project-goal-empty" hidden>
+                        <button type="button" class="btn btn-sm" id="project-goal-setup-btn"
+                                data-i18n="project.goal.setup">Set a goal</button>
+                      </div>
+                    </div>
+                    <div class="project-context-status" id="project-goal-feedback" role="status"></div>
                   </div>
                   <!-- Instructions read first, edit on demand: the saved rules
                        are what every conversation actually gets, so the panel
@@ -854,9 +893,9 @@
                     </div>
                     <div class="project-instructions-read" id="project-instructions-read"></div>
                     <div class="project-instructions-empty" id="project-instructions-empty" hidden>
-                      <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                      <p class="project-context-help" data-i18n="project.instructions.subtitle">Set the project's priorities and rules. The AI follows them in every conversation.</p>
                       <button type="button" class="btn btn-sm" id="project-instructions-setup-btn"
-                              data-i18n="project.instructions.setup">Set goals and rules</button>
+                              data-i18n="project.instructions.setup">Set rules</button>
                     </div>
                     <div class="project-context-status" id="project-instructions-status" role="status"></div>
                   </div>
@@ -925,8 +964,8 @@
                     </div>
                   </div>
                   <div class="project-side-panel project-side-agents-panel" data-project-side-panel="agents">
+                    <p class="project-agents-builtin-note" id="project-agents-builtin-note" data-i18n="project.bindings.builtin_available">Built-in agents are ready. Add others as needed.</p>
                     <div class="project-side-card-list project-agent-rail-list" id="project-agents-list"></div>
-                    <div class="empty muted" id="project-agents-empty" data-i18n="project.bindings.empty_agents_short">No agents yet</div>
                   </div>
                   <div class="project-side-panel project-side-files-panel" data-project-side-panel="files" hidden>
                     <div class="project-files-status muted" id="project-files-status"></div>
@@ -939,13 +978,45 @@
               </aside>
             </div>
 
-            <!-- Goals & rules editor. The rail shows saved rules; writing
+            <!-- Goal editor (P18). The goal is optional: saving it empty
+                 clears it, and success criteria may be left out. -->
+            <div class="modal-overlay ui-dialog-overlay project-goal-modal" id="project-goal-modal" aria-hidden="true">
+              <div class="modal modal-standard project-goal-dialog" role="dialog" aria-modal="true" aria-labelledby="project-goal-dialog-title">
+                <div class="modal-header">
+                  <h2 class="modal-title" id="project-goal-dialog-title" data-i18n="project.goal.edit_title">Project goal</h2>
+                </div>
+                <div class="project-goal-form">
+                  <label class="todo-editor-field project-goal-field" for="project-goal-input">
+                    <span data-i18n="project.goal.goal_label">Goal</span>
+                  </label>
+                  <textarea class="project-instructions-input project-goal-input" id="project-goal-input" rows="3"
+                            data-i18n-placeholder="project.goal.goal_placeholder"
+                            placeholder="What this project is for, in a sentence or two"></textarea>
+                  <span class="project-instructions-counter muted project-goal-counter" id="project-goal-counter"></span>
+                  <div class="todo-editor-field project-goal-field" id="project-goal-criteria-label">
+                    <span data-i18n="project.goal.criteria_label">How you'll know it's reached (optional)</span>
+                  </div>
+                  <div class="project-goal-criteria-editor" id="project-goal-criteria-editor" role="group"
+                       aria-labelledby="project-goal-criteria-label"></div>
+                  <button type="button" class="btn btn-sm project-goal-criteria-add" id="project-goal-criteria-add">
+                    <span data-ui-icon="plus" data-ui-icon-class="project-goal-criteria-add-icon"></span>
+                    <span data-i18n="project.goal.criteria_add">Add</span>
+                  </button>
+                </div>
+                <div class="modal-actions">
+                  <button type="button" class="btn" id="project-goal-cancel-btn" data-i18n="common.cancel">Cancel</button>
+                  <button type="button" class="btn btn-primary" id="project-goal-save-btn" data-i18n="common.save" disabled>Save</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Rules editor. The rail shows saved rules; writing
                  them happens here so the draft has room and never looks like
                  the live value. Save path is unchanged. -->
             <div class="modal-overlay project-instructions-modal" id="project-instructions-modal" aria-hidden="true">
               <div class="modal project-instructions-dialog" role="dialog" aria-modal="true" aria-labelledby="project-instructions-dialog-title">
                 <div class="modal-header">
-                  <h3 class="modal-title" id="project-instructions-dialog-title" data-i18n="project.instructions.edit_title">Goals and rules</h3>
+                  <h3 class="modal-title" id="project-instructions-dialog-title" data-i18n="project.instructions.edit_title">Rules</h3>
                   <button type="button" class="modal-close-btn" id="project-instructions-close-btn"
                           data-i18n-title="common.close" title="Close"
                           data-i18n-aria-label="common.close" aria-label="Close">
@@ -953,7 +1024,7 @@
                   </button>
                 </div>
                 <div class="modal-body">
-                  <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                  <p class="project-context-help" data-i18n="project.instructions.subtitle">Set the project's priorities and rules. The AI follows them in every conversation.</p>
                   <textarea class="project-instructions-input" id="project-instructions-input" rows="12"
                             data-i18n-placeholder="project.instructions.placeholder"
                             placeholder="Rules and context every conversation in this project should follow"></textarea>
@@ -1558,7 +1629,7 @@
            project-directory setting on the detail page after creation. -->
       <div class="skill-modal-panel" data-agent-panel="external">
         <div class="agent-cli-prerequisite" role="note">
-          <span data-i18n="agent_modal.ext_cli_prerequisite_body">Supports Claude Code, Codex, OpenClaw, OpenCode, and Hermes. Install and configure one to connect.</span>
+          <span data-i18n="agent_modal.ext_cli_prerequisite_body">Install and set up the CLI before connecting it.</span>
         </div>
         <div class="form-row">
           <label>
@@ -1582,7 +1653,7 @@
         </div>
         <div class="form-row">
           <label data-i18n="agent_modal.ext_name">Name</label>
-          <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="e.g. ClaudeCode" />
+          <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="e.g. Claude-Code" />
         </div>
         <div class="form-row">
           <label data-i18n="agent_modal.ext_desc">Summary</label>
@@ -1674,7 +1745,7 @@
         <span data-ui-icon="terminal" data-ui-icon-class="skill-picker-cli-icon"></span>
         <span class="skill-picker-cli-copy">
           <span data-i18n="agents.connect_cli_btn">Connect an agent</span>
-          <small data-i18n="agents.connect_cli_sub">Claude Code / Codex CLIs</small>
+          <small data-i18n="sidebar.connect_agent_sub">Claude Code · Codex &amp; more</small>
         </span>
         <span data-ui-icon="chevron-right" data-ui-icon-class="skill-picker-cli-arrow"></span>
       </button>

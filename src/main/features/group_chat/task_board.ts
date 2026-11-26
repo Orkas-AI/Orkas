@@ -46,6 +46,7 @@ import {
   recordSyncRev,
 } from '../../util/record_sync_fields';
 import { getDeviceId } from '../machine_device_id';
+import { normalizeOrchestrationRequestHistory, type OrchestrationRequestEntry } from './state';
 
 const log = createLogger('group_chat.task_board');
 
@@ -92,6 +93,7 @@ export interface TaskResume {
   source_tool?: string;
   resume_instruction?: string;
   user_goal?: string;
+  request_history?: OrchestrationRequestEntry[];
   handoff_message?: string;
 }
 
@@ -113,6 +115,8 @@ export interface ConversationTask {
   created_by: ConversationTaskCreatedBy;
   /** P3: commander sub-tasks point at their orchestration turn's task. */
   parent_task_id?: string;
+  /** Original delegated assignment for a manual retry, independent of scheduling. */
+  retry_of_task_id?: string;
   /** Structured backlog associations, independent of business status. */
   backlog_tasks?: Array<{ project_id: string; task_id: string }>;
   /** Dependencies (D29): start only after EVERY listed task reaches done;
@@ -260,6 +264,9 @@ function normalizeTask(raw: any, cid: string): ConversationTask | null {
     if (atts.length) t.attachments = atts;
   }
   if (typeof raw.parent_task_id === 'string' && raw.parent_task_id) t.parent_task_id = raw.parent_task_id;
+  if (typeof raw.retry_of_task_id === 'string' && raw.retry_of_task_id && raw.retry_of_task_id !== taskId) {
+    t.retry_of_task_id = raw.retry_of_task_id;
+  }
   if (Array.isArray(raw.backlog_tasks)) {
     const links = raw.backlog_tasks.filter((link: any) => link
       && typeof link.project_id === 'string' && typeof link.task_id === 'string'
@@ -294,6 +301,8 @@ function normalizeTask(raw: any, cid: string): ConversationTask | null {
     for (const key of ['form_id', 'source_tool', 'resume_instruction', 'user_goal', 'handoff_message'] as const) {
       if (typeof raw.resume[key] === 'string' && raw.resume[key]) resume[key] = raw.resume[key];
     }
+    const history = normalizeOrchestrationRequestHistory(raw.resume.request_history);
+    if (history) resume.request_history = history;
     if (Object.keys(resume).length) t.resume = resume;
   }
   return t;
@@ -369,21 +378,44 @@ function pruneLocked(b: BoardState): void {
   });
 }
 
-async function persistLocked(b: BoardState): Promise<void> {
+async function persistLocked(b: BoardState): Promise<boolean> {
   const generation = b.generation;
   b.writing = true;
   try {
     await writeJson(tasksFile(b.uid, b.cid), b.tasks, {
       shouldCommit: () => _boards.get(boardKey(b.uid, b.cid)) === b && b.generation === generation,
     });
+    return _boards.get(boardKey(b.uid, b.cid)) === b && b.generation === generation;
   } catch (err) {
     log.warn('tasks.json write failed', {
       cid: maskId(b.cid),
       error: logErrorSummary(err),
     });
+    return false;
   } finally {
     b.writing = false;
   }
+}
+
+/** A claimed turn has a durable source message. A waiting turn has only its
+ * board row, so flush that conversation's accepted queue before confirming it
+ * to the host. Pending admission and never-started terminal rows cannot link. */
+export async function confirmTodoExecutionAdmission(
+  uid: string, cid: string, messageId: string,
+): Promise<'accepted' | 'rejected' | 'unverified'> {
+  return await withBoard(uid, cid, async (b) => {
+    const matching = b.tasks.filter((task) => task.source_msg_id === messageId);
+    if (matching.some((task) => task.started_at)) return 'accepted';
+    // Dispatch can continue even when creating a board row fails. With no
+    // matching row, the caller must preserve the conversation and skip linking.
+    if (!matching.length) return 'unverified';
+    if (!matching.some((task) => task.status === 'queued' && !task.admission_pending)) return 'rejected';
+    if (await persistLocked(b)) {
+      b.dirty = false;
+      return 'accepted';
+    }
+    return 'unverified';
+  }, { readonly: true });
 }
 
 async function flushLocked(b: BoardState): Promise<void> {
@@ -480,6 +512,7 @@ export interface CreateTaskInput {
   turnId?: string;
   /** P3: commander sub-tasks point at their orchestration turn's task. */
   parentTaskId?: string;
+  retryOfTaskId?: string;
   backlogTask?: { project_id: string; task_id: string };
   /** Dependencies set at creation time (D29): "start after every listed task
    * reaches done". Pointers are built strictly over tasks created earlier in
@@ -512,6 +545,7 @@ function newTask(cid: string, input: CreateTaskInput): ConversationTask {
     ...(input.sourceMsgId ? { source_msg_id: input.sourceMsgId } : {}),
     ...(input.turnId ? { turn_id: input.turnId } : {}),
     ...(input.parentTaskId ? { parent_task_id: input.parentTaskId } : {}),
+    ...(input.retryOfTaskId ? { retry_of_task_id: input.retryOfTaskId } : {}),
     ...(input.backlogTask ? { backlog_tasks: [{ ...input.backlogTask }] } : {}),
     ...(normalizeTaskAfter(input.after).length ? { after: normalizeTaskAfter(input.after) } : {}),
     ...(input.assignmentContext ? { assignment_context: input.assignmentContext } : {}),
@@ -641,6 +675,7 @@ export function setTaskResume(
     const t = b.tasks.find((x) => x.task_id === taskId);
     if (!t) return null;
     t.resume = { ...t.resume, ...meta };
+    if (t.resume.request_history) t.resume.request_history = normalizeOrchestrationRequestHistory(t.resume.request_history);
     return { ...t };
   });
 }
@@ -665,6 +700,7 @@ export function finishTask(
     if (terminal !== 'waiting_input') t.ended_at = nowIso();
     if (opts?.resultMsgId) t.result_msg_id = opts.resultMsgId;
     if (opts?.resume) t.resume = { ...t.resume, ...opts.resume };
+    if (t.resume?.request_history) t.resume.request_history = normalizeOrchestrationRequestHistory(t.resume.request_history);
     return { ...t };
   });
 }
@@ -823,6 +859,7 @@ export function reassignQueued(
     if (!assignee || typeof assignee !== 'string') return { task: null, error: 'invalid_assignee' };
     if (t.assignee === assignee) return { task: { ...t } };
     t.assignee = assignee;
+    delete t.retry_of_task_id;
     return { task: { ...t } };
   });
 }
@@ -847,6 +884,7 @@ export function editQueued(
     const result = applyRuntime();
     if (result.error) return { task: null, error: result.error };
     task.instruction = instruction;
+    delete task.retry_of_task_id;
     task.instruction_revision = (task.instruction_revision || 0) + 1;
     if (result.sourceMsgId) task.source_msg_id = result.sourceMsgId;
     if (result.attachments) task.attachments = result.attachments.slice();

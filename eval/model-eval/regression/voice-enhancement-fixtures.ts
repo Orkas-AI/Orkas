@@ -54,6 +54,8 @@ export function enhancementMeasures(b: Buffer) {
     sibilance: energy(b, 1.8, 8000) / energy(b, 1.8, 440),
     detail: energy(b, 5.3, 8000) / energy(b, 5.3, 440),
     dynamics: energy(b, 4.3, 440) / energy(b, 3.3, 440),
+    quietVoice: energy(b, 3.3, 440),
+    loudVoice: energy(b, 4.3, 440),
     voiced: Math.min(...[.8, 1.8, 3.3, 4.3, 5.3].map(t => energy(b, t, 440))),
     silence: Math.max(...[.1, 2.5, 5.7].map(t => energy(b, t))) };
 }
@@ -74,7 +76,7 @@ export function inspectEnhancement(id: string, root: string): VoiceEvidence {
   // Ratios need their source baseline and units. An absolute .0667 ratio is
   // not evidence of 93% loss: the supplied quiet detail starts at .0667 too.
   try { e.enhancementSource = enhancementMeasures(decodeEnhancement(path.join(base, 'sources/recording.wav'))); } catch {}
-  e.enhancementUnits = 'duration: seconds; rumble: 40/440 Hz amplitude ratio at 0.8 s; sibilance: 8000/440 Hz ratio at 1.8 s; detail: 8000/440 Hz ratio at 5.3 s; dynamics: loud/quiet 440 Hz amplitude ratio; voiced: minimum voiced amplitude; silence: maximum pause RMS. Compare enhancement output against enhancementSource input, not against 1.';
+  e.enhancementUnits = 'duration: seconds; rumble: 40/440 Hz amplitude ratio at 0.8 s; sibilance: 8000/440 Hz ratio at 1.8 s; detail: 8000/440 Hz ratio at 5.3 s; dynamics: loud/quiet 440 Hz amplitude ratio; quietVoice/loudVoice: absolute 440 Hz amplitudes at 3.3/4.3 s; voiced: minimum voiced amplitude; silence: maximum pause RMS. Compare enhancement output against enhancementSource input, not against 1.';
   // write_file can preserve an existing project by allocating a suffixed name.
   // Judge a saved revision's data, not whether it overwrote one exact filename.
   const projects = fs.existsSync(base) ? fs.readdirSync(base, { withFileTypes: true }).filter(f => f.isFile() && f.name.endsWith('.json')).slice(0, 32) : [];
@@ -102,7 +104,15 @@ export function inspectEnhancement(id: string, root: string): VoiceEvidence {
   for (const file of files) {
     try {
       const b = decodeEnhancement(file); e.decoded = true; e.duration = b.length / 4 / 48000;
-      e.enhancement = enhancementMeasures(b); e.contentMatched ||= enhancementMatches(id, b);
+      e.enhancement = enhancementMeasures(b);
+      // These authored windows contain only low-frequency voice, outside the
+      // requested sibilant attenuation. Allow four PCM16 quantization steps,
+      // but do not let unchanged spectral ratios hide an unrelated global gain.
+      const levelsMatch = id !== 'voice-deess' || !!e.enhancementSource
+        && (['quietVoice', 'loudVoice'] as const).every(key => Math.abs(
+          e.enhancement![key] - e.enhancementSource![key],
+        ) <= 4 / 32768);
+      e.contentMatched ||= enhancementMatches(id, b) && levelsMatch;
     } catch {}
   }
   return e;

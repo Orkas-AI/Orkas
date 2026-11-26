@@ -93,6 +93,17 @@ function alignedNoiseCorrelation(clean: Float32Array, output: Float32Array) {
 }
 export function recordedMeasures(kind: RecordedKind, language: RecordedLanguage, pcm: Buffer) {
   const output = floats(pcm), fixture = recordedAudio(kind, language);
+  // Compare against the quantized PCM16 actually supplied to the actor, not
+  // the clean reference or pre-encoding floats. Include quiet/silent regions.
+  let maxSampleError: number | undefined;
+  if (kind === 'preserve') {
+    const frames = (fixture.wav.length - 44) / 2;
+    maxSampleError = output.length === frames ? 0 : Infinity;
+    for (let i = 0; i < Math.min(output.length, frames); i++) {
+      const error = Math.abs(output[i] - fixture.wav.readInt16LE(44 + i * 2) / 32768);
+      maxSampleError = Number.isFinite(error) ? Math.max(maxSampleError, error) : Infinity;
+    }
+  }
   const cleanBand = voiceBand(fixture.clean), outputBand = voiceBand(output);
   const noiseAlignment = kind === 'noise' ? alignedNoiseCorrelation(cleanBand, outputBand) : undefined;
   const measure = (b: ArrayLike<number>) => ({ duration_sec: b.length / rate,
@@ -105,11 +116,12 @@ export function recordedMeasures(kind: RecordedKind, language: RecordedLanguage,
     speech_correlation: noiseAlignment?.correlation ?? (kind === 'dynamics' ? Math.min(correlation(cleanBand, outputBand, 1.2, 1.5), correlation(cleanBand, outputBand, 4.2, 1.5)) : correlation(cleanBand, outputBand)),
     unchanged_correlation: correlation(fixture.input, output),
     local_unchanged_correlation: Math.min(...Array.from({ length: 11 }, (_, i) => correlation(fixture.input, output, 1.2 + i * .5, .25))),
+    max_sample_error: maxSampleError,
     analysis_delay_sec: noiseAlignment?.delay_sec ?? 0,
     speech_reference: kind === 'preserve'
       ? 'speech_correlation compares the clean speech without the deliberately injected 40 Hz rumble. Low correlation with that reference is expected when preserving the supplied noisy recording; preservation is measured by local_unchanged_correlation against the actual input and its unchanged rumble_to_speech ratio.'
       : 'speech_correlation compares against clean speech before the controlled degradation, using the independently measured fixed delay only for denoising.',
-    units: 'Ratios are dimensionless amplitude or RMS ratios. Speech correlation uses an independent voice-band FIR; denoising alignment permits at most 50 ms fixed analysis delay. Preservation compares local waveform shape because the existing export always normalizes loudness. Source/output ratios are independently measured; no perceptual listening claim.' };
+    units: 'Ratios are dimensionless amplitude or RMS ratios. Speech correlation uses an independent voice-band FIR; denoising alignment permits at most 50 ms fixed analysis delay. Preservation additionally compares every decoded sample against the supplied PCM16 input, with at most one PCM16 quantization step of full-scale amplitude error. No perceptual listening claim.' };
 }
 export type RecordedMeasures = ReturnType<typeof recordedMeasures>;
 export function recordedMatches(kind: RecordedKind, m: RecordedMeasures) {
@@ -118,7 +130,8 @@ export function recordedMatches(kind: RecordedKind, m: RecordedMeasures) {
   if (kind === 'rumble') return m.output.rumble_to_speech < m.source.rumble_to_speech * .5;
   if (kind === 'dynamics') return Math.max(m.output.loud_to_quiet, 1 / m.output.loud_to_quiet) < 8;
   if (kind === 'deess') return m.output.sibilance_to_speech < m.source.sibilance_to_speech * .75 && m.output.detail_to_speech > m.source.detail_to_speech * .75;
-  return m.local_unchanged_correlation > .99 && Math.abs(m.output.rumble_to_speech / m.source.rumble_to_speech - 1) < .05;
+  return m.local_unchanged_correlation > .99 && Math.abs(m.output.rumble_to_speech / m.source.rumble_to_speech - 1) < .05
+    && m.max_sample_error !== undefined && m.max_sample_error <= 1 / 32768;
 }
 function config(id: string): { kind: RecordedKind; language: RecordedLanguage } {
   return { kind: id === recordedCases[0] ? 'noise' : id === recordedCases[2] ? 'dynamics' : id === recordedCases[3] || id.endsWith('-undo') ? 'preserve' : 'rumble', language: id === recordedCases[0] || id === recordedCases[2] ? 'en' : 'zh' };
@@ -135,16 +148,25 @@ export function inspectRecorded(id: string, root: string, published?: readonly s
   const expected = kind === 'noise' ? 'denoise' : kind === 'rumble' ? 'highpass' : kind === 'dynamics' ? 'compressor' : undefined;
   const projects: string[] = [];
   try {
-    for (const name of fs.readdirSync(base).filter(n => n.endsWith('.json')).slice(0, 32)) try {
-      const file = path.join(base, name); if (!fs.lstatSync(file).isFile() || fs.lstatSync(file).isSymbolicLink() || fs.statSync(file).size > 4 * 1024 * 1024) continue;
+    const scope = fs.realpathSync(base);
+    const candidates = published === undefined
+      ? fs.readdirSync(base).filter(n => n.endsWith('.json')).slice(0, 32).map(name => path.join(base, name))
+      : [...new Set(published.filter(file => path.isAbsolute(file) && file.endsWith('.json')))].slice(0, 32);
+    for (const candidate of candidates) try {
+      const file = fs.realpathSync(candidate);
+      if (!file.startsWith(scope + path.sep) || !fs.lstatSync(candidate).isFile() || fs.statSync(file).size > 4 * 1024 * 1024) continue;
       const p = JSON.parse(fs.readFileSync(file, 'utf8'));
       const valid = [1, 2, 3].includes(p.schema_version) && p.segments?.length === 1 && p.segments[0].path === 'sources/recording.wav'
         && !p.music && !p.segments[0].denoise && (expected ? p.schema_version === 2 && p.processing?.length === 1 && p.processing[0].type === expected
           && (expected !== 'denoise' || (p.processing[0].strength ?? 'standard') === 'standard')
           && (expected !== 'highpass' || (p.processing[0].frequency_hz ?? 80) === 80) : !p.processing?.length);
-      if (valid) { e.projectValid = true; projects.push(file); }
+      if (valid) projects.push(file);
     } catch { /* Unrelated malformed JSON cannot hide a valid saved project. */ }
   } catch {}
+  // Production passes delivered attachments and resolved file links. Unshared drafts remain
+  // diagnostic candidates only when no delivery selection was requested.
+  const deliveredProjects = publishedVoiceCandidates(projects, published);
+  e.projectValid = deliveredProjects.length > 0;
   const exports: string[] = [];
   function visit(dir: string, depth = 0) {
     if (depth > 6 || !fs.existsSync(dir)) return;
@@ -162,7 +184,7 @@ export function inspectRecorded(id: string, root: string, published?: readonly s
     if (id.endsWith('-undo')) priorRumble ||= recordedMatches('rumble', recordedMeasures('rumble', language, pcm));
   } catch {}
   if (id.endsWith('-undo')) e.contentMatched &&= priorRumble;
-  if (e.contentMatched && matchedFile) e.projectReplay = inspectProjectReplay(base, projects, matchedFile);
+  if (e.contentMatched && matchedFile) e.projectReplay = inspectProjectReplay(base, deliveredProjects, matchedFile);
   return e;
 }
 export function recordedChecks(id: string, t: ProductionRegressionTrace) {

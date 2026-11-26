@@ -82,6 +82,7 @@ import {
   listTasks,
   listTaskSearchRows,
   recordRunTerminal,
+  subscribeRunEnds,
   nextDueAfterRestoreForTest,
   nextDueAtForTest,
   pruneFireBoundaryClaimsForTest,
@@ -120,6 +121,8 @@ const autoRuntime = vi.hoisted(() => ({
   runSeq: 0,
   send: vi.fn(),
   getAgent: vi.fn(),
+  /** The account's Agent catalog; built-ins in it are available in every project. */
+  listAgentSummaries: vi.fn(async () => [] as Array<Record<string, unknown>>),
   terminalListeners: new Set<(event: Record<string, unknown>) => void>(),
 }));
 
@@ -158,6 +161,9 @@ vi.mock('../../../src/main/features/group_chat', () => ({
 
 vi.mock('../../../src/main/features/agents', () => ({
   getAgent: autoRuntime.getAgent,
+  listAgentSummaries: autoRuntime.listAgentSummaries,
+  agentPrioritySource: (agent: { source?: string; seed_source?: string }) => agent.source === 'custom'
+    ? 'custom' : agent.seed_source === 'builtin' ? 'builtin' : 'platform',
 }));
 
 const TEST_UID = 'auto-unit-user';
@@ -609,6 +615,32 @@ describe('task CRUD normalization', () => {
       recipient: { kind: 'agent', id: 'agent_denied', name: 'Denied' },
     });
     expect(updated).toEqual({ ok: false, error: 'invalid_recipient' });
+  });
+
+  it('accepts a built-in Agent recipient in a project that never added it, leaving project bindings unchanged', async () => {
+    writeProject(TEST_UID, 'p_auto_builtin', []);
+    autoRuntime.listAgentSummaries.mockResolvedValue([
+      { agent_id: 'c0ffee000003', name: 'BuiltinStudio', source: 'marketplace', seed_source: 'builtin', enabled: true },
+      { agent_id: 'agent_unbound', name: 'Unbound', source: 'custom', enabled: true },
+    ]);
+    try {
+      const created = await createTask(TEST_UID, {
+        id: 'at_48484848',
+        content: 'weekly talking-head cut',
+        project_id: 'p_auto_builtin',
+        recipient: { kind: 'agent', id: 'c0ffee000003', name: 'BuiltinStudio' },
+        schedule: { type: 'weekly', weekday: 3, hour: 15, minute: 0 },
+      });
+      expect(created.ok).toBe(true);
+      expect(JSON.parse(fs.readFileSync(projectBindingsFile(TEST_UID, 'p_auto_builtin'), 'utf8')).agents).toEqual([]);
+
+      const denied = await updateTask(TEST_UID, 'at_48484848', {
+        recipient: { kind: 'agent', id: 'agent_unbound', name: 'Unbound' },
+      });
+      expect(denied).toEqual({ ok: false, error: 'invalid_recipient' });
+    } finally {
+      autoRuntime.listAgentSummaries.mockResolvedValue([]);
+    }
   });
 
   
@@ -1354,15 +1386,24 @@ describe('run conversation', () => {
 
   it('marks a run as in progress in its conversation from its start until its own end', async () => {
     const taskId = await createdFrom('cid_source');
-    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
-    await recordRunStart(TEST_UID, taskId, 'cid_source', '2026-05-22T09:00:00.000Z');
-    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
-    expect(activeRunTaskId('another-account', 'cid_source')).toBe('');
-    // Another run's end leaves it in progress; its own end clears it.
-    await recordRunTerminal(TEST_UID, taskId, 'cid_source', 'completed', '2026-05-22T09:01:00.000Z', '2026-05-21T09:00:00.000Z');
-    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
-    await recordRunTerminal(TEST_UID, taskId, 'cid_source', 'completed', '2026-05-22T09:02:00.000Z', '2026-05-22T09:00:00.000Z');
-    expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+    const ended = vi.fn(() => activeRunTaskId(TEST_UID, 'cid_source'));
+    const unsubscribe = subscribeRunEnds(ended);
+    try {
+      expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+      await recordRunStart(TEST_UID, taskId, 'cid_source', '2026-05-22T09:00:00.000Z');
+      expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
+      expect(activeRunTaskId('another-account', 'cid_source')).toBe('');
+      // Only the recorded run can end the navigation association.
+      await recordRunTerminal(TEST_UID, taskId, 'cid_source', 'completed', '2026-05-22T09:01:00.000Z', '2026-05-21T09:00:00.000Z');
+      expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe(taskId);
+      expect(ended).not.toHaveBeenCalled();
+      await recordRunTerminal(TEST_UID, taskId, 'cid_source', 'completed', '2026-05-22T09:02:00.000Z', '2026-05-22T09:00:00.000Z');
+      expect(activeRunTaskId(TEST_UID, 'cid_source')).toBe('');
+      expect(ended).toHaveBeenCalledExactlyOnceWith({ userId: TEST_UID, cid: 'cid_source', taskId });
+      expect(ended).toHaveReturnedWith('');
+    } finally {
+      unsubscribe();
+    }
   });
 });
 

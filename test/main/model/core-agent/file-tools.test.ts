@@ -865,6 +865,22 @@ describe('file-tools › reference media reads', () => {
 });
 
 describe('file-tools › read_file (image)', () => {
+  it('reports the source canvas alongside the resized image returned to the model', async () => {
+    const { tools, wsDir } = await buildTools();
+    const file = path.join(wsDir, 'portrait.png');
+    const { default: sharp } = await import('../../../helpers/fixture-sharp');
+    const original = await sharp({ create: { width: 1200, height: 1500, channels: 3, background: '#324c69' } })
+      .png().toBuffer();
+    fs.writeFileSync(file, original);
+    const result = await run(getTool(tools, 'read_files'), { paths: [{ path: file }] });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('source_dimensions="1200x1500"');
+    expect(result.content).toContain('preview_dimensions="819x1024"');
+    expect(result.images).toHaveLength(1);
+    expect(await sharp(Buffer.from(result.images[0].data, 'base64')).metadata()).toMatchObject({ width: 819, height: 1024 });
+    expect(fs.readFileSync(file)).toEqual(original);
+  });
+
   it('preserves reference colors in the model-facing image bytes', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'chart.png');

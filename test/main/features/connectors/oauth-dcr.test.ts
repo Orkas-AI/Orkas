@@ -991,6 +991,77 @@ describe('features/connectors/oauth-dcr', () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://auth.notion.example/token')).toBe(false);
   });
 
+  it.each(['connected', 'issuer mismatch'] as const)('finalizes OpenSEO authorization with outcome %s', async outcome => {
+    const issuer = 'https://app.openseo.so';
+    const resource = `${issuer}/mcp`;
+    const register = `${issuer}/api/auth/oauth2/register`;
+    const token = `${issuer}/api/auth/oauth2/token`;
+    let state = '';
+    const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url === `${resource}/.well-known/oauth-protected-resource`) return jsonResponse({}, false, 404);
+      if (url === `${issuer}/.well-known/oauth-protected-resource/mcp`) {
+        return jsonResponse({ resource, authorization_servers: [issuer], scopes_supported: ['mcp'] });
+      }
+      if (url === `${issuer}/.well-known/oauth-authorization-server`) {
+        return jsonResponse({
+          issuer, authorization_endpoint: `${issuer}/api/auth/oauth2/authorize`, token_endpoint: token,
+          registration_endpoint: register, authorization_response_iss_parameter_supported: true,
+          token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+        });
+      }
+      if (url === register) {
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          redirect_uris: ['https://account.example/api/connectors/oauth/dcr-callback'],
+          grant_types: ['authorization_code', 'refresh_token'],
+          token_endpoint_auth_method: 'client_secret_post',
+        });
+        return jsonResponse({ client_id: 'fixture-client', client_secret: 'fixture-client-secret' });
+      }
+      if (url.endsWith('/oauth/dcr-exchange')) {
+        return jsonResponse({
+          code: 0, oauth_code: 'fixture-code', oauth_state: state,
+          oauth_issuer: outcome === 'issuer mismatch' ? 'https://other.example' : issuer,
+        });
+      }
+      if (url === token) {
+        const params = new URLSearchParams(String(init?.body));
+        expect(params.get('resource')).toBe(resource);
+        expect(params.get('code_verifier')).toBeTruthy();
+        expect(params.get('code')).toBe('fixture-code');
+        return jsonResponse({ access_token: 'fixture-access', refresh_token: 'fixture-refresh', expires_in: 3600, scope: 'offline_access mcp' });
+      }
+      throw new Error('Unexpected OpenSEO OAuth request');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { findCatalogEntry } = await import('../../../../src/main/features/connectors/catalog');
+    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const entry = findCatalogEntry('openseo');
+    expect(entry).not.toBeNull();
+    const pending = startMcpDcrOAuth('uid-1', entry!);
+    const settled = pending.then(grant => ({ grant }), (error: Error & { code?: string }) => ({ error: error.message, code: error.code }));
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    const authorization = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(authorization.origin + authorization.pathname).toBe(`${issuer}/api/auth/oauth2/authorize`);
+    expect(authorization.searchParams.get('resource')).toBe(resource);
+    expect(authorization.searchParams.get('scope')?.split(' ').sort()).toEqual(['mcp', 'offline_access'].sort());
+    expect(authorization.searchParams.get('code_challenge_method')).toBe('S256');
+    state = authorization.searchParams.get('state') || '';
+    expect(state).toBeTruthy();
+
+    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=fixture-exchange');
+    if (outcome === 'connected') {
+      await expect(settled).resolves.toMatchObject({ grant: { grant: {
+        access_token: 'fixture-access', refresh_token: 'fixture-refresh', scopes: ['offline_access', 'mcp'],
+      } } });
+    } else {
+      await expect(settled).resolves.toMatchObject({ error: expect.stringContaining('issuer mismatch') });
+      expect(fetchMock.mock.calls.map(([url]) => url)).not.toContain(token);
+    }
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/oauth/dcr-store'))).toBe(false);
+  });
+
   it('keeps a completed DCR grant and client credentials local', async () => {
     let openedState = '';
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {

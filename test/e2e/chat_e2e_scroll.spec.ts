@@ -82,6 +82,8 @@ test.describe('conversation message-list scrolling', () => {
       await expect.poll(() => historyScrollState(page)).toMatchObject({ pinActive: true, spacerCount: 1 });
       const before = await bubble.boundingBox();
       expect(before).toBeTruthy();
+      const headerMember = await page.locator('#chat-header-meta .chat-header-meta-member').first().elementHandle();
+      const messageRow = await bubble.locator('..').elementHandle();
       await page.screenshot({ path: testInfo.outputPath('before-background-unread.png') });
 
       finishBackground();
@@ -91,6 +93,8 @@ test.describe('conversation message-list scrolling', () => {
       // Sample after its send controller has also completed cleanup.
       await expect.poll(() => page.evaluate(cid => isConvPending(cid), backgroundCid)).toBe(false);
       await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+      expect(await headerMember.evaluate(node => node.isConnected)).toBe(true);
+      expect(await messageRow.evaluate(node => node.isConnected)).toBe(true);
       const after = await bubble.boundingBox();
       expect(after).toBeTruthy();
       await page.screenshot({ path: testInfo.outputPath('after-background-unread.png') });

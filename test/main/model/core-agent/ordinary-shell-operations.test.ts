@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ordinaryBashReasons } from '../../../../src/main/model/core-agent/ordinary-shell-operations';
-import { TaskFileOwnership, CreationSnapshot } from '../../../../src/main/model/core-agent/task-file-ownership';
+import { TaskFileOwnership } from '../../../../src/main/model/core-agent/task-file-ownership';
 
 let root: string;
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ordinary-')); });
@@ -116,15 +116,13 @@ describe('task-created tree cleanup', () => {
       expect(ownership.canRemoveTree(path.dirname(file))).toBe(false);
     },
   );
-  it('neither a modified old file nor an incomplete scan proves new ownership', () => {
+  it('does not acquire ownership by writing an existing user file', () => {
     const ownership = new TaskFileOwnership();
     const file = path.join(root, 'user.txt'); fs.writeFileSync(file, 'old');
     const before = ownership.beforeWrite(file);
     fs.writeFileSync(file, 'modified'); ownership.afterWrite(file, before);
     expect(ownership.canRemoveTree(file)).toBe(false);
-    const partial = new CreationSnapshot(); const after = new CreationSnapshot();
-    after.node(file, fs.lstatSync(file)); ownership.observe(partial, after);
-    expect(ownership.canRemoveTree(file)).toBe(false);
+    expect(ownership.ownsFile(file)).toBe(false);
     expect(ownership.canRemoveTree(root)).toBe(false);
   });
 });

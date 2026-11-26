@@ -848,7 +848,10 @@ function createReadFileTool(
 
         if (kind === 'image') {
           const img = await readImageAsJpeg(opts.userId, abs);
-          const header = `<file path="${displayPath}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} color JPEG q=70"/>`;
+          const previewDimensions = `${img.width}x${img.height}`;
+          const header = `<file path="${displayPath}" kind="image" bytes="${img.bytes}" `
+            + `source_dimensions="${img.sourceWidth}x${img.sourceHeight}" preview_dimensions="${previewDimensions}" `
+            + `compressed="${previewDimensions} color JPEG q=70"/>`;
           log.info('read_files image loaded', {
             user_id: maskId(opts.userId),
             path: logPathRef(abs),
@@ -1431,7 +1434,7 @@ function searchCompletion(reasons: Set<SearchIncompleteReason>): string {
 async function visitFiles(
   root: string,
   visit: (file: string) => boolean | Promise<boolean>,
-  opts: { includeIgnored?: boolean; signal: AbortSignal },
+  opts: { includeIgnored?: boolean; signal: AbortSignal; matchesName?: (name: string) => boolean },
 ): Promise<{ backend: 'rg' | 'walk'; capped: boolean; skippedReason?: string; error?: string; interrupted?: boolean }> {
   if (opts.signal.aborted) return { backend: 'walk', capped: false, interrupted: true };
   const protectedRoot = macosTccSensitivePath(path.resolve(root), { recursive: true });
@@ -1448,26 +1451,74 @@ async function visitFiles(
   let capped = false;
   let failed = false;
   let visited = 0;
-  const walk = async (dir: string, inherited: readonly IgnoreScope[]): Promise<void> => {
-    if (capped || opts.signal.aborted) return;
-    const local = honourIgnores ? readIgnoreScope(dir) : null;
-    const scopes = local ? [...inherited, local] : inherited;
-    const isIgnored = createDirectoryIgnoreMatcher(dir, scopes);
+  type WalkEntry = { file: string; directory: boolean; scopes: readonly IgnoreScope[] };
+  const readDirectory = async function* (dir: string, inherited: readonly IgnoreScope[]): AsyncGenerator<WalkEntry, void> {
+    if (opts.signal.aborted) return;
+    let scopes = inherited;
+    let isIgnored: ReturnType<typeof createDirectoryIgnoreMatcher> | undefined;
     try {
       const entries = await fileSystemForPath(dir).promises.opendir(dir);
       for await (const entry of entries) {
-        if (capped || opts.signal.aborted) break;
+        if (opts.signal.aborted) break;
         if (++visited % GREP_YIELD_EVERY === 0) await new Promise<void>(resolve => setImmediate(resolve));
         if (opts.signal.aborted) break;
-        if (entry.name === '.git' || (entry.isDirectory() && fallbackDirectoryExcluded(entry.name))) continue;
-        const file = path.join(dir, entry.name);
-        if (honourIgnores && isIgnored(entry.name, entry.isDirectory())) continue;
-        if (entry.isDirectory()) await walk(file, scopes);
-        else if (entry.isFile() && !fallbackFileExcluded(entry.name)) capped = await visit(file);
+        const directory = entry.isDirectory();
+        if (entry.name === '.git') continue;
+        if (directory ? fallbackDirectoryExcluded(entry.name)
+          : !entry.isFile() || fallbackFileExcluded(entry.name) || opts.matchesName?.(entry.name) === false) continue;
+        if (honourIgnores) {
+          if (!isIgnored) {
+            const local = readIgnoreScope(dir);
+            if (local) scopes = [...inherited, local];
+            isIgnored = createDirectoryIgnoreMatcher(dir, scopes);
+          }
+          if (isIgnored(entry.name, directory)) continue;
+        }
+        yield { file: path.join(dir, entry.name), directory, scopes };
       }
     } catch { failed = true; }
   };
-  await walk(root, []);
+  const walk = async function* (dir: string, inherited: readonly IgnoreScope[]): AsyncGenerator<string, void> {
+    for await (const { file, directory, scopes } of readDirectory(dir, inherited)) {
+      if (directory) yield* walk(file, scopes);
+      else yield file;
+    }
+  };
+  const walkBatch = async function* (batch: WalkEntry[]): AsyncGenerator<string, void> {
+    // Start one candidate per sibling in parallel. Drain in traversal order
+    // so equal-time results and the visitor's stop behavior stay stable.
+    const pending = batch.map(({ file, directory, scopes }) => {
+      const files = directory ? walk(file, scopes) : undefined;
+      return { file, files, first: files?.next() };
+    });
+    try {
+      for (const { file, files, first } of pending) {
+        if (opts.signal.aborted) break;
+        if (!files) { yield file; continue; }
+        const candidate = await first!;
+        if (typeof candidate.value === 'string') yield candidate.value;
+        yield* files;
+      }
+    } finally {
+      await Promise.all(pending.map(({ files }) => files?.return(undefined)));
+    }
+  };
+  const walkNameSearch = async function* (): AsyncGenerator<string, void> {
+    let batch: WalkEntry[] = [];
+    for await (const entry of readDirectory(root, [])) {
+      batch.push(entry);
+      if (batch.length < 8) continue;
+      yield* walkBatch(batch);
+      batch = [];
+    }
+    if (batch.length) yield* walkBatch(batch);
+  };
+  try {
+    for await (const file of opts.matchesName ? walkNameSearch() : walk(root, [])) {
+      if (opts.signal.aborted) break;
+      if (await visit(file)) { capped = true; break; }
+    }
+  } catch { failed = true; }
   return { backend: 'walk', capped,
     ...(opts.signal.aborted ? { interrupted: true } : {}),
     ...(failed && !opts.signal.aborted ? { error: 'directory scan was incomplete' } : {}) };
@@ -1493,6 +1544,9 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
     async execute(input, ctx) {
       const query = String(input.query ?? '');
       const matcher = compileMatcher(query);
+      const bareName = query.trim().toLowerCase();
+      const matchesName = bareName && !/[/\\*?\[]/.test(bareName)
+        ? (name: string) => name.toLowerCase().includes(bareName) : undefined;
       const roots = allowedRoots(opts);
       if (!roots.length) {
         return { content: errText('E_NO_SCOPE', 'no visible roots for this conversation'), isError: true };
@@ -1597,7 +1651,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
               if (hits.length > maxResults) hits.pop();
             }
             return false;
-          }, { includeIgnored, signal: budget.signal });
+          }, { includeIgnored, signal: budget.signal, matchesName });
           backends.add(scan.backend);
           if (scan.skippedReason) reasons.add('protected_scope');
           if (scan.error) reasons.add('io_error');

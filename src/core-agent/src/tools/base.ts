@@ -96,6 +96,8 @@ export type CommandExecutionObservation = {
 };
 
 export type ToolObservations = {
+  /** Opaque browser snapshot comparison for the reminder only. */
+  browserObservation?: { target: string; fingerprint: string } | 'reset';
   /** Complete durable-state mutation receipt from its owning executor. Scope
    * and version are opaque host-only identities, never model text or logs.
    * changed=false certifies the entire operation had no state effect; version

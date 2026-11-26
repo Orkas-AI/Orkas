@@ -845,6 +845,8 @@ test('embedded pages, forms, downloads, external links and workers keep the app 
 });
 
 test('new ordinary apps isolate browser data across objects and accounts while reopen and legacy data survive', async ({ modelOrkas: orkas }) => {
+  // Two account switches each close and cold-launch Electron again.
+  test.setTimeout(180_000);
   const entry = orkas.createWorkspaceFile('browser-data/index.html', '<!doctype html><h1>Browser data</h1><script src="__orkas/bridge.js"></script>');
   const saved: any[] = [];
   for (const title of ['First', 'Second', 'Legacy']) {

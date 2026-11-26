@@ -69,6 +69,18 @@ it('keeps a retained session bound to its admitted media service and rejects a c
  await expect(service.call(scope(),'tasks.start',{...input,requestId:'omitted',keepSession:true,sessionId:first.sessionId})).rejects.toMatchObject({code:'E_CONFLICT'});expect(deps.send).toHaveBeenCalledOnce();
  await service.call(scope(),'tasks.start',{...input,requestId:'same',keepSession:true,sessionId:first.sessionId,media});expect(deps.send).toHaveBeenCalledTimes(2);
 });
+// Review 2026-11-16 S9-7: a status poll inspects an unfinished task once, never with a stale cancel state.
+it('reuses the inspection settle made for an unfinished task, and inspects again after a cancel between them', async () => {
+ deps.inspect.mockResolvedValue({status:'running',text:'',files:[]});
+ await service.call(scope(),'tasks.start',input); deps.inspect.mockClear();
+ const settled=await service.settle(scope(),input.requestId);
+ expect(await service.call(scope(),'tasks.get',{requestId:input.requestId},settled)).toMatchObject({status:'running',saved:false});
+ expect(deps.inspect).toHaveBeenCalledOnce();
+ const before=await service.settle(scope(),input.requestId);
+ await service.call(scope(),'tasks.cancel',{requestId:input.requestId}); deps.inspect.mockClear();
+ await service.call(scope(),'tasks.get',{requestId:input.requestId},before);
+ expect(deps.inspect).toHaveBeenCalledOnce(); expect(deps.inspect.mock.calls[0][4]).toBe(true);
+});
 it('keeps one durable task after reopening and rejects changed retry inputs',async()=>{const first=await service.call(scope(),'tasks.start',input);expect(first.requestId).toBe(input.requestId);expect(await service.call(scope(),'tasks.start',input)).toEqual(first);expect(deps.send).toHaveBeenCalledOnce();expect(await service.call(scope(),'tasks.get',{requestId:input.requestId})).toMatchObject({status:'completed',text:'Draft result'});await expect(service.call(scope(),'tasks.start',{...input,prompt:'Different request'})).rejects.toMatchObject({code:'E_CONFLICT'});expect(deps.send).toHaveBeenCalledOnce();});
 it('does not replay a dispatch with an uncertain result, and still reconnects to its task',async()=>{deps.send.mockRejectedValueOnce(new Error('connection ended'));await expect(service.call(scope(),'tasks.start',input)).rejects.toMatchObject({code:'E_TASK_UNCERTAIN'});expect(await service.call(scope(),'tasks.get',{requestId:input.requestId})).toMatchObject({status:'completed'});await service.call(scope(),'tasks.start',input);expect(deps.send).toHaveBeenCalledOnce();});
 it('denies another app, an inactive account and cancelled admission without execution',async()=>{await service.call(scope(),'tasks.start',input);await expect(service.call({...scope(),key:'b'.repeat(64)},'tasks.get',{requestId:input.requestId})).rejects.toMatchObject({code:'E_TASK'});uid='user-b';await expect(service.call({...scope(),userId:'user-a'},'tasks.get',{requestId:input.requestId})).rejects.toMatchObject({code:'E_CLOSED'});const controller=new AbortController();controller.abort();await expect(service.call({...scope(),signal:controller.signal},'tasks.start',{...input,requestId:'new'})).rejects.toMatchObject({code:'E_CANCELLED'});expect(deps.send).toHaveBeenCalledOnce();});
@@ -116,6 +128,50 @@ it('denies another app output access and discards an in-flight file response aft
  await reading;uid='user-b';release();await denied;
  uid='user-a';expect(await service.call(scope(),'tasks.output',args)).toEqual({base64:'cHJpdmF0ZQ==',name:'image.png'});
  expect(deps.send).toHaveBeenCalledOnce();
+});
+
+it('uses the durable output if a read starts while its app task is archiving', async () => {
+ const outputId = 'b'.repeat(64);
+ const receipt = { status: 'completed', text: 'Ready', files: [{ id: outputId, name: 'final.txt', bytes: 5 }] };
+ let archiveEntered!: () => void;
+ let releaseArchive!: () => void;
+ let initialRead!: () => void;
+ let resumeRead!: () => void;
+ const entered = new Promise<void>(resolve => { archiveEntered = resolve; });
+ const allowArchive = new Promise<void>(resolve => { releaseArchive = resolve; });
+ const snapshotRead = new Promise<void>(resolve => { initialRead = resolve; });
+ const cleaned = new Promise<void>(resolve => { resumeRead = resolve; });
+ let live = true;
+ deps.assertOwner = vi.fn(async (_user: string, _cid: string, _scope: unknown, archived: boolean) => {
+   if (!archived && !live) throw new Error('The legacy conversation has already been removed');
+ });
+ deps.archive = vi.fn(async () => {
+   archiveEntered();
+   await allowArchive;
+   return receipt;
+ });
+ deps.cleanup = vi.fn(async () => { live = false; });
+ deps.output = vi.fn(async (_uid: string, _cid: string, _id: string, result?: typeof receipt) => ({ name: result?.files[0]?.name }));
+ await service.call(scope(), 'tasks.start', input);
+ const settling = service.settle(scope(), input.requestId);
+ await entered;
+ const originalRead = service.read.bind(service);
+ vi.spyOn(service, 'read').mockImplementationOnce(async (...args) => {
+   const snapshot = await originalRead(...args);
+   initialRead();
+   await cleaned;
+   return snapshot;
+ });
+ const output = service.call(scope(), 'tasks.output', { requestId: input.requestId, outputId });
+ try {
+   await snapshotRead;
+   releaseArchive();
+   await settling;
+ } finally {
+   releaseArchive();
+   resumeRead();
+ }
+ expect(await output).toEqual({ name: 'final.txt' });
 });
 
 it('archives before cleanup without a page and reads the durable result after reopening',async()=>{

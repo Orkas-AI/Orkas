@@ -541,6 +541,8 @@ function windowsHostEnv(env: NodeJS.ProcessEnv): Record<string, string> {
     "COMSPEC",
     "ComSpec",
     "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_ARCHITEW6432",
     "TEMP",
     "TMP",
     "USERPROFILE",

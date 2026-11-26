@@ -56,6 +56,7 @@ type OrkasOptions = {
   voiceStub?: boolean;
   metacognitionEnabled?: boolean;
   enableSystemProxy?: boolean;
+  projectRecapTabEnabled?: boolean;
   /** Language persisted before launch. `null` deliberately leaves the
    * preference absent so boot must detect Electron's system locale. */
   seedLanguage?: 'en' | 'zh' | 'ja' | 'pt' | null;
@@ -95,6 +96,8 @@ type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'mode
 export type ScriptedModelReply = {
   calls?: Array<{ callId: string; name: string; args: Record<string, unknown> }>;
   text?: string;
+  /** Close after the text chunk without sending a terminal event. */
+  truncated?: boolean;
   /** Test-owned arrival barrier; cancelled sockets must never receive a late reply. */
   waitFor?: Promise<void>;
 };
@@ -207,6 +210,7 @@ type ModelToolScenario =
     task: string;
     agentFinalText: string;
     synthesis: string;
+    synthesisUnavailable?: boolean;
   }
   | {
     kind: 'project-history';
@@ -244,7 +248,7 @@ function writeJson(filePath: string, value: unknown): void {
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
-function writeNodeExecutable(directory: string, name: string, source: string, versionInScript = false): string {
+export function writeNodeExecutable(directory: string, name: string, source: string, versionInScript = false): string {
   mkdirSync(directory, { recursive: true });
   const scriptName = `${name}.js`;
   writeFileSync(path.join(directory, scriptName), source, 'utf8');
@@ -448,8 +452,10 @@ const writeState = state => {
 };
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 let sessionId = '';
+let initializationFailed = false;
 const input = readline.createInterface({ input: process.stdin });
 input.on('line', line => {
+  if (initializationFailed) return;
   let message;
   try { message = JSON.parse(line); } catch { return; }
   if (message.id === 1) {
@@ -457,8 +463,7 @@ input.on('line', line => {
     state.hermesInitializations = (state.hermesInitializations || 0) + 1;
     writeState(state);
     if (state.hermesFault === 'initialize_exit') {
-      // Fatal initialization is terminal even if the host already pipelined input.
-      input.removeAllListeners('line');
+      initializationFailed = true;
       // A real CLI says why it cannot start; wait for the write before exiting.
       process.stderr.write('Error: no inference provider configured. Run hermes setup, then try again.\n', () => process.exit(1));
       return;
@@ -969,6 +974,7 @@ export class OrkasTestApp {
   private readonly browserDenials = new Map<number, string>();
   private readonly tracePaths: string[] = [];
   private traceNumber = 0;
+  private traceStopTimeoutMs?: number;
   private readonly appClosePromises = new WeakMap<ElectronApplication, Promise<void>>();
   private readonly appTraceStops = new WeakMap<ElectronApplication, Promise<void>>();
   private readonly nativeShutdownProcesses = new WeakMap<ElectronApplication, ChildProcess>();
@@ -1088,6 +1094,8 @@ export class OrkasTestApp {
       no_proxy: 'localhost,127.0.0.1,::1',
       TZ: 'UTC',
     };
+    if (this.options.projectRecapTabEnabled) environment.ORKAS_PROJECT_RECAP_TAB_ENABLED = '1';
+    else delete environment.ORKAS_PROJECT_RECAP_TAB_ENABLED;
     if (this.appLocale) environment.ORKAS_E2E_SYSTEM_LOCALE = this.appLocale;
     else delete environment.ORKAS_E2E_SYSTEM_LOCALE;
     // Automation shells can use Electron as their Node runtime and leak this
@@ -1839,13 +1847,33 @@ export class OrkasTestApp {
     task: string;
     agentFinalText: string;
     synthesis: string;
-  }): void {
+  }, options: { synthesisUnavailable?: boolean } = {}): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     if (Object.values(input).some((value) => !value.trim())) {
       throw new Error('The commander-segment scenario requires narration, target, task, reply, and synthesis');
     }
     this.modelToolScenarioRequestStart = this.modelRequests.length;
-    this.modelToolScenario = { kind: 'commander-segments', ...input };
+    this.modelToolScenario = { kind: 'commander-segments', ...input, ...options };
+  }
+
+  restoreCommanderSynthesis(): void {
+    if (this.modelToolScenario?.kind !== 'commander-segments') {
+      throw new Error('No Commander segment scenario is active');
+    }
+    this.modelToolScenario.synthesisUnavailable = false;
+  }
+
+  async selectLocalResponsesModel(): Promise<void> {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    const entry = await this.invoke<{ ok: boolean; entryId: string }>('auth.addCustomModelEntry', {
+      label: 'Local Responses fixture',
+      protocol: 'responses',
+      baseUrl: `${this.apiBaseUrl}/v1`,
+      model: 'e2e-responses',
+      apiKey: 'local-e2e-unused-key',
+    });
+    expect(entry.ok).toBe(true);
+    expect(await this.invoke('auth.selectEntry', { entryId: entry.entryId })).toMatchObject({ ok: true });
   }
 
   /** Exercise the Chat adapter itself, without the managed Responses bridge. */
@@ -2253,6 +2281,7 @@ export class OrkasTestApp {
           close: () => child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : requestElectronQuit(app),
         }, '', {
           phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
+          traceTimeoutMs: this.traceStopTimeoutMs,
         });
       } finally {
         if (this.electronApp === app) {
@@ -2263,6 +2292,10 @@ export class OrkasTestApp {
     });
     this.appClosePromises.set(app, closing);
     return closing;
+  }
+
+  setTraceStopTimeout(timeoutMs: number): void {
+    this.traceStopTimeoutMs = timeoutMs;
   }
 
   /** Export while the browser context exists, before a case confirms native exit. */
@@ -2527,6 +2560,9 @@ export class OrkasTestApp {
         const shouldFailAgentAttempt = scenario?.kind === 'agent-handoff-retry'
           && requestNumber >= 2
           && !scenario.recoveryEnabled;
+        const shouldFailCommanderSynthesis = scenario?.kind === 'commander-segments'
+          && requestNumber >= 3
+          && scenario.synthesisUnavailable;
         if (mode === 'auth-error') {
           response.writeHead(401, { 'Content-Type': 'application/json' });
           response.end(JSON.stringify({
@@ -2538,7 +2574,7 @@ export class OrkasTestApp {
           }));
           return;
         }
-        if (mode === 'http-error' || shouldFailAgentAttempt) {
+        if (mode === 'http-error' || shouldFailAgentAttempt || shouldFailCommanderSynthesis) {
           response.writeHead(500, { 'Content-Type': 'application/json' });
           response.end(JSON.stringify({
             error: { type: 'server_error', code: 'e2e_model_failure', message: 'deterministic E2E failure' },
@@ -3017,9 +3053,15 @@ export class OrkasTestApp {
         if (scripted) {
           const reply = () => {
             if (response.destroyed || response.writableEnded) return;
-            finishImmediately(scripted.calls
+            const replyEvents = scripted.calls
               ? toolCallsEvents(scripted.calls)
-              : finalTextEvents(scripted.text || ''));
+              : finalTextEvents(scripted.text || '');
+            if (scripted.truncated) {
+              writeEvent(replyEvents[0]);
+              response.end();
+            } else {
+              finishImmediately(replyEvents);
+            }
           };
           if (scripted.waitFor) {
             void scripted.waitFor.then(reply, () => response.destroy());
@@ -3715,6 +3757,7 @@ export async function openSidebarEntry(page: Page, selector: string): Promise<vo
 }
 
 type OrkasFixtures = {
+  projectRecapTabEnabled: boolean;
   orkas: OrkasTestApp;
   appPage: Page;
   modelOrkas: OrkasTestApp;
@@ -3727,8 +3770,9 @@ type OrkasFixtures = {
 };
 
 export const test = base.extend<OrkasFixtures>({
-  orkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo);
+  projectRecapTabEnabled: [false, { option: true }],
+  orkas: async ({ projectRecapTabEnabled }, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { projectRecapTabEnabled });
     try {
       await app.launch();
       await use(app);

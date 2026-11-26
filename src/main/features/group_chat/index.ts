@@ -35,7 +35,8 @@ import { isPlaceholderTitle } from './conv_title';
 import type { CommanderMentionDisplay } from './message-display';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot, liveDisplaySnapshot,
-  FAILED_TURN_RETRY_ACTOR_UNAVAILABLE, type GroupEvent,
+  FAILED_TURN_RETRY_ACTOR_UNAVAILABLE,
+  type GroupEvent,
   cancelConversationTask as busCancelConversationTask,
   sendConversationTaskNow as busSendConversationTaskNow,
   editConversationTask as busEditConversationTask,
@@ -43,6 +44,8 @@ import {
   cancelConversationTaskEdit as busCancelConversationTaskEdit,
   listConversationTasks as busListConversationTasks,
   listPlanningDispatches as busListPlanningDispatches,
+  taskDependencyResultContext,
+  assertCliFormTaskSource,
   setConversationTaskAfter as busSetConversationTaskAfter,
   resumeBlockedTask as busResumeBlockedTask,
   reorderConversationTask as busReorderConversationTask,
@@ -90,7 +93,7 @@ export async function runtimeStatus(
   userId: string,
   cid: string,
   projectIdHint?: string | null,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; steerable: boolean; started_at_ms: number }>; active_recipient?: string; active_recipients?: string[]; active_recipient_revision?: number }> {
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; steerable: boolean; started_at_ms: number }>; active_recipient?: string; active_recipients?: string[]; active_recipient_revision?: number; settled_run_id?: string }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
     let state = await readState(userId, cid, projectIdHint);
@@ -124,6 +127,7 @@ export async function runtimeStatus(
       processing_since: processing ? (state.last_active_at || null) : null,
       in_flight: inFlight,
       active_turns: runtime.activeTurns,
+      ...(!processing && !recoveryPending && runtime.settledRunId ? { settled_run_id: runtime.settledRunId } : {}),
       ...floor,
     };
   } catch {
@@ -168,6 +172,12 @@ export interface SendInput {
   /** Host-owned delivery decision for the explicit queue "Send now" action.
    * Analytics attribution must never imply this execution control. */
   steerActiveTurn?: boolean;
+  /** Host-only: the host sends this to run a to-do (auto-advance or "run
+   *  now"). The turn learns its reply may have no reader; attribution is
+   *  unchanged. Never set from the renderer. */
+  host_todo_run?: boolean;
+  /** Require proof of admission before establishing a first to-do backlink. */
+  confirm_todo_admission?: boolean;
   /** Renderer-generated id for the optimistic user bubble, echoed back on the
    * persisted record so the renderer can claim that exact bubble instead of
    * guessing by sender+timestamp+text. Two sends can legitimately share those
@@ -308,18 +318,18 @@ async function _resolveMessageReferences(
 
 export async function send(
   input: SendInput,
-): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
+): Promise<{ ok: boolean; msg?: GroupMessage; error?: string; admission_rejected?: true; todo_admission_unverified?: boolean }> {
   const {
     userId, cid, text, title_text, model_text, attachments, use_selections, references,
     steerActiveTurn, commander_mention_display,
     client_msg_id,
   } = input;
-  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
-  if (!text || !text.trim()) return { ok: false, error: 'empty message' };
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid', admission_rejected: true };
+  if (!text || !text.trim()) return { ok: false, error: 'empty message', admission_rejected: true };
   const hasTitleText = typeof title_text === 'string';
   const titleText = hasTitleText ? title_text.trim() : '';
-  await seedReservedActors(userId, cid);
   try {
+    await seedReservedActors(userId, cid);
     const resolvedReferences = await _resolveMessageReferences(userId, references);
     const msg = await enqueue({
       uid: userId, cid,
@@ -331,6 +341,8 @@ export async function send(
       ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
         ? { commander_mention_display } : {}),
       ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
+      ...(input.host_todo_run === true ? { hostTodoRun: true } : {}),
+      ...(input.confirm_todo_admission === true ? { confirmTodoAdmission: true } : {}),
       ...(typeof client_msg_id === 'string' && client_msg_id.trim()
         ? { client_msg_id: client_msg_id.trim() }
         : {}),
@@ -339,6 +351,19 @@ export async function send(
       ...(use_selections && use_selections.length ? { use_selections } : {}),
       ...(resolvedReferences.length ? { references: resolvedReferences } : {}),
     });
+    let todoAdmissionUnverified = false;
+    if (input.confirm_todo_admission) {
+      try {
+        const { confirmTodoExecutionAdmission } = await import('./task_board');
+        const admission = await confirmTodoExecutionAdmission(userId, cid, msg.id);
+        if (admission === 'rejected') return { ok: false, error: 'todo_execution_not_admitted' };
+        todoAdmissionUnverified = admission === 'unverified';
+      } catch {
+        // A failed read cannot justify retrying work that may already be live.
+        log.warn('to-do execution admission verification failed');
+        todoAdmissionUnverified = true;
+      }
+    }
     // Auto-title: the first real user message in a fresh / unnamed
     // conversation overwrites the placeholder title so the sidebar item
     // becomes scannable. Lazy-imported to avoid a chats↔group_chat circular.
@@ -355,13 +380,19 @@ export async function send(
         );
       }
     } catch (err) {
-      log.warn(`auto-title failed user=${userId} cid=${cid}: ${(err as Error).message}`);
+      log.warn('auto-title failed', { error: logErrorSummary(err, { closed: true }) });
     }
-    return { ok: true, msg };
+    return { ok: true, msg, ...(todoAdmissionUnverified ? { todo_admission_unverified: true } : {}) };
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'E_EMPTY_MESSAGE') return { ok: false, error: 'empty message' };
-    log.error(`send failed user=${userId} cid=${cid}: ${(err as Error).message}`);
-    return { ok: false, error: (err as Error).message };
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    // These guards run before either the message or a queue row is written.
+    if (code === 'E_EMPTY_MESSAGE') return { ok: false, error: 'empty message', admission_rejected: true };
+    if (code === 'E_APP_SHUTTING_DOWN' || code === 'E_CONVERSATION_TERMINATING') {
+      return { ok: false, error: (err as Error).message, admission_rejected: true };
+    }
+    if (code === FAILED_TURN_RETRY_ACTOR_UNAVAILABLE) return { ok: false, error: t('errors.task_restore_unavailable') };
+    log.error('send failed', { error: logErrorSummary(err, { closed: true }) });
+    return { ok: false, error: 'send failed' };
   }
 }
 
@@ -378,6 +409,7 @@ export interface RetryFailedTurnInput {
    * bubble exactly like a normal send, so it must echo an identity back or the
    * renderer cannot tell that bubble is this record. */
   client_msg_id?: string;
+  beforeDispatch?: SendInput['beforeDispatch'];
 }
 
 export interface ResolvedFailedTurnRetry {
@@ -671,7 +703,28 @@ export async function resolveFailedTurnRetry(
     failed_before_execution: failedBeforeExecution,
     interrupted,
   });
-  const originalModelText = String(source.model_text || source.text || '');
+  let originalModelText = String(source.model_text || source.text || '');
+  let restoredTask: import('./task_board').ConversationTask | undefined;
+  if (failed.task_id) {
+    const tasks = await busListConversationTasks(userId, cid);
+    restoredTask = tasks.find(task => task.task_id === failed.task_id);
+    if (restoredTask && (restoredTask.assignee !== actor.id || restoredTask.source_msg_id !== source.id)) {
+      return { ok: false, error: t('errors.task_restore_unavailable') };
+    }
+    if (!restoredTask && source.to.length > 1) {
+      return { ok: false, error: t('errors.task_restore_unavailable') };
+    }
+    if (restoredTask?.instruction.trim() && (restoredTask.assignment_context || restoredTask.instruction !== source.text)) {
+      originalModelText = restoredTask.instruction;
+    }
+  }
+  if (!restoredTask && source.to.length > 1) {
+    return { ok: false, error: t('errors.task_restore_unavailable') };
+  }
+  const retryOfTaskId = restoredTask?.retry_of_task_id
+    || (restoredTask?.parent_task_id ? restoredTask.task_id : undefined);
+  const predecessorContext = restoredTask?.after?.length
+    ? await taskDependencyResultContext(userId, cid, restoredTask.after, [], rows) : '';
   const retryGoal = typeof failed.orchestration_goal === 'string'
     ? failed.orchestration_goal : source.orchestration_goal;
   const commanderRetry = source.commander_retry?.source_tool === 'dispatch_to'
@@ -721,9 +774,18 @@ export async function resolveFailedTurnRetry(
         forceTo: [actor.id],
         failedTurnRetryMode: mode,
         retrySourceMessageId: source.id,
+        ...(retryOfTaskId ? { retryOfTaskId } : {}),
+        ...(source.image_studio_native_png ? { imageStudioNativePng: true as const } : {}),
         retryUncertainOperationCount: recovery.uncertain_operation_count,
+        ...(restoredTask ? { taskInstruction: restoredTask.instruction,
+          ...(!source.dispatch && restoredTask.assignment_context ? { assignmentContext: restoredTask.assignment_context } : {}),
+          ...(restoredTask.after?.length ? { completedPredecessorTaskIds: restoredTask.after.slice() } : {}),
+        } : {}),
+        ...(predecessorContext ? { predecessorContext } : {}),
         ...(typeof retryGoal === 'string'
           ? { orchestrationGoal: boundOrchestrationGoal(retryGoal) } : {}),
+        ...((failed.orchestration_request_history || source.orchestration_request_history)
+          ? { orchestrationRequestHistory: failed.orchestration_request_history || source.orchestration_request_history } : {}),
         ...(commanderRetryContinuation ? {
           source_message_id: commanderGoal!.id,
           commanderRetryContinuation,
@@ -805,7 +867,7 @@ export async function retryFailedTurn(
     }
     const resolved = await resolveFailedTurnRetry(input);
     if (!resolved.ok) return resolved;
-    const msg = await enqueue(resolved.value.enqueue);
+    const msg = await enqueue({ ...resolved.value.enqueue, beforeDispatch: input.beforeDispatch });
     _acceptedRetries.set(key, msg.id);
     return { ok: true, mode: resolved.value.mode, msg };
   } catch (err) {
@@ -820,8 +882,8 @@ export async function retryFailedTurn(
 
 // ── Abort + drop ─────────────────────────────────────────────────────────
 
-export async function abort(userId: string, cid: string): Promise<{ ok: boolean }> {
-  await busAbort(userId, cid);
+export async function abort(userId: string, cid: string, options?: { keepQueue?: boolean }): Promise<{ ok: boolean }> {
+  await busAbort(userId, cid, options);
   return { ok: true };
 }
 
@@ -932,23 +994,32 @@ export async function reassignTask(
 /** D9 UI half: the composer chip's explicit selection sets the floor
  * directly instead of synthesizing a hidden `@name` prefix into the next
  * message. 'commander' resets the floor; an agent id must be a real,
- * enabled agent (deterministic validation — no silent redirects). */
+ * enabled Agent available in the conversation scope (no silent redirects). */
 export async function setFloor(userId: string, cid: string, actorId: string | string[]) {
   if (!safeId(cid)) return { ok: false as const, error: 'invalid cid' };
   const ids = [...new Set((Array.isArray(actorId) ? actorId : [actorId])
     .map((id) => String(id || '').trim()))];
   if (!ids.length) ids.push(COMMANDER_ID);
-  for (const id of ids) {
-    if (id !== COMMANDER_ID) {
-      if (!safeId(id)) return { ok: false as const, error: 'invalid actor' };
-      try {
-        const agentsFeat = await import('../agents');
-        const agent = await agentsFeat.getAgent(id);
-        if (!agent) return { ok: false as const, error: 'unknown agent' };
-
-      } catch {
-        return { ok: false as const, error: 'unknown agent' };
+  const recipients = ids.filter(id => id !== COMMANDER_ID);
+  if (recipients.some(id => !safeId(id))) return { ok: false as const, error: 'invalid actor' };
+  if (recipients.length) {
+    try {
+      const agentsFeat = await import('../agents');
+      const { getConversation } = await import('../chats');
+      const projects = await import('../projects');
+      const projectId = (await getConversation(userId, cid))?.project_id;
+      if (projectId) {
+        const scope = await projects.resolveProjectScope(userId, projectId);
+        if (scope && recipients.some(id => !scope.agents.includes(id))) {
+          return { ok: false as const, error: 'unknown agent' };
+        }
       }
+      for (const id of recipients) {
+        const agent = await agentsFeat.getAgent(id);
+        if (!agent || agent.enabled === false) return { ok: false as const, error: 'unknown agent' };
+      }
+    } catch {
+      return { ok: false as const, error: 'unknown agent' };
     }
   }
   await seedReservedActors(userId, cid);
@@ -1212,6 +1283,24 @@ export async function markFormSubmittedAndDispatch(
         return { ok: false, error: 'form already submitted with different values' };
       }
       return _buildFormSubmissionResult(target, storedValues);
+    }
+
+    if (target.task_id && target.form.agent_id !== USER_ID) {
+      const task = (await busListConversationTasks(userId, cid)).find(row => row.task_id === target.task_id);
+      if (!task || task.assignee !== target.form.agent_id || !['waiting_input', 'running'].includes(task.status)
+        || (task.resume?.form_id && task.resume.form_id !== formId)) {
+        return { ok: false, error: t('errors.task_restore_unavailable') };
+      }
+    }
+    if (target.form.agent_id !== USER_ID) {
+      const agent = await (await import('../agents')).getAgent(target.form.agent_id);
+      if (agent?.runtime?.kind === 'cli') {
+        try { await assertCliFormTaskSource(userId, cid, agent, target.form, all); }
+        catch (error) {
+          if ((error as { code?: string })?.code !== 'E_FORM_TASK_UNAVAILABLE') throw error;
+          return { ok: false, error: t('errors.task_restore_unavailable') };
+        }
+      }
     }
 
     // Validate host-affecting form values before touching state or history.

@@ -74,10 +74,20 @@ export { ALL_CONFIGURED_RATE_LIMITED_MESSAGE } from './rate-limit-messages';
 const log = createLogger('rotating-provider');
 
 const NETWORK_RETRY_ATTEMPTS = 3;
+/** A failure before output that took at least this long is not retried on the same
+ *  candidate: another attempt would most likely wait as long again, and an official
+ *  candidate's Server has already tried its own routes within its startup budget.
+ *  Quicker failures keep the bounded same-candidate retries. */
+const SLOW_FAILURE_NO_RETRY_MS = 30_000;
+/** Machine codes saying the configured model itself cannot serve, whatever the request. */
+const MODEL_UNAVAILABLE_CODES = new Set(['model_not_found']);
+/** Temporary service and transport failures the same candidate is retried in place for. */
+const TEMPORARY_FAILURE_KINDS = new Set<string>(['service_unavailable', 'server_error', 'timeout', 'connection_dropped']);
 const NETWORK_RETRY_BASE_DELAY_MS = 500;
 const NETWORK_RETRY_MAX_DELAY_MS = 2_000;
 const PROVIDER_FIRST_EVENT_TIMEOUT_MS = 180_000;
 const NORMAL_EMPTY_RETRY_ATTEMPTS = 1;
+const OPENAI_SOL_DEFAULT_CACHE_MODELS = new Set(['gpt-5.6-sol', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol']);
 export const PROVIDER_NO_FIRST_EVENT_TIMEOUT_CODE = 'PROVIDER_NO_FIRST_EVENT_TIMEOUT';
 /** Legacy code retained for older persisted errors and compatibility tests. */
 export const PROVIDER_EMPTY_RESPONSE_CODE = 'PROVIDER_EMPTY_RESPONSE';
@@ -166,7 +176,7 @@ export interface RotatingCandidate {
   /** Factory is deferred-async because external providers need core-agent
    *  loaded lazily. It may be rebuilt for a bounded retry or after an OAuth
    *  credential refresh; if rotation happens, we build the next candidate. */
-  build(): Promise<LLMProvider>;
+  build(observeUsage?: (usage: Partial<Usage>) => void): Promise<LLMProvider>;
   /** OAuth-only recovery hook. On an authentication failure before any
    * visible content, refresh the credential and make the next build use it.
    * Returns false when refresh is unavailable or failed. */
@@ -227,9 +237,16 @@ function messageImageCount(message: Message): number {
     + (item.type === 'image' ? 1 : item.type === 'tool_result' ? item.images?.length ?? 0 : 0), 0);
 }
 
+export type RequestUsageObserver = (usage: Partial<Usage>, position: {
+  requestRound: number;
+  candidateIndex: number;
+  attempt: number;
+}) => void;
+
 export interface CreateRotatingProviderConfig {
   /** Request diagnostics bypass pre-commit buffering and do not commit a stream. */
   onRequestFailure?: CompletionParams['onRequestFailure'];
+  onRequestUsage?: RequestUsageObserver;
   /** Ordered list of candidates. First entry is the primary (matches
    *  `pickChatEntryGroup()[0]`). Further entries are fallbacks. */
   candidates: RotatingCandidate[];
@@ -292,6 +309,12 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   // Throttling can be model-specific even when models share one credential.
   // Skip only that candidate for this task; a new user request starts fresh.
   const rateLimitedCandidates = new Set<string>();
+  // A candidate whose temporary failure (5xx, timeout, dropped connection) a
+  // later candidate outlived in the same call: proof the failure was its own.
+  // It stays eligible, but each later call tries it once without retrying in
+  // place, and it does not price compaction while another candidate does the
+  // work. Serving a call clears it. Run-local, like the sets above.
+  const outlivedCandidates = new Set<string>();
   let exhaustedRateLimitError: Error | undefined;
   // W4-2: stream() runs once per tool-loop round with the full history, so
   // without this run-local latch the same "images omitted" notice repeats on
@@ -302,7 +325,8 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     candidate.cooldownId || candidate.profileId
   );
 
-  const rateLimitIdFor = (candidate: RotatingCandidate): string => (
+  /** One configured model of one credential: throttling and service failures can be model-specific. */
+  const modelKeyFor = (candidate: RotatingCandidate): string => (
     JSON.stringify([candidate.profileId, candidate.providerId, candidate.modelId])
   );
   const lacksRequiredImages = (candidate: RotatingCandidate): boolean => (
@@ -312,13 +336,23 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   const isUnavailable = (candidate: RotatingCandidate): boolean => (
     lacksRequiredImages(candidate)
     || unavailableProfiles.has(cooldownIdFor(candidate))
-    || rateLimitedCandidates.has(rateLimitIdFor(candidate))
+    || rateLimitedCandidates.has(modelKeyFor(candidate))
   );
   // Pin a committed model through its bounded recovery.
+  // Prefer a currently serving candidate when pricing the next request.
   let recoveryCandidate: RotatingCandidate | undefined;
   const budgetCandidate = (): RotatingCandidate | undefined => {
-    const first = recoveryCandidate ?? candidates.find(candidate => !isUnavailable(candidate));
+    const canPrepare = (candidate: RotatingCandidate) => !isUnavailable(candidate)
+      && !modelContextWindowBelowMinimum(candidate.contextWindow);
+    const first = recoveryCandidate
+      ?? candidates.find(candidate => canPrepare(candidate) && !outlivedCandidates.has(modelKeyFor(candidate)))
+      ?? candidates.find(canPrepare);
     return typeof first?.contextWindow === 'number' ? first : undefined;
+  };
+  /** `served` served a call in which the `failed` candidates had a temporary failure. */
+  const recordOutlived = (failed: ReadonlySet<string>, served: RotatingCandidate): void => {
+    for (const key of failed) outlivedCandidates.add(key);
+    outlivedCandidates.delete(modelKeyFor(served));
   };
   let servedCandidate: RotatingCandidate | undefined;
   const candidateBudgets = new WeakMap<RotatingCandidate, ProviderContextBudget>();
@@ -341,10 +375,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     return budget;
   };
   const allConfiguredRateLimited = (): boolean => candidates.length > 0 && candidates.every(isUnavailable)
-    && candidates.every(candidate => rateLimitedCandidates.has(rateLimitIdFor(candidate)));
+    && candidates.every(candidate => rateLimitedCandidates.has(modelKeyFor(candidate)));
   const markUnavailable = (candidate: RotatingCandidate, kind: KeyFailureKind, reason: string): void => {
     if (kind === 'rate_limit') {
-      rateLimitedCandidates.add(rateLimitIdFor(candidate));
+      rateLimitedCandidates.add(modelKeyFor(candidate));
     } else {
       markCooldown(cooldownIdFor(candidate), kind, reason);
       unavailableProfiles.add(cooldownIdFor(candidate));
@@ -412,9 +446,16 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
    *  across fallback. */
   function paramsFor(cand: RotatingCandidate, params: CompletionParams, observeImages = true): CompletionParams {
     if (lacksRequiredImages(cand)) throw new ProviderCandidatesUnavailableError(config.requireImageInput);
-    const next = { ...params, model: cand.modelId,
+    const { recoverCandidateContext: _recover, ...outbound } = params;
+    const next = { ...outbound, model: cand.modelId,
       ...(config.onRequestFailure ? { onRequestFailure: config.onRequestFailure } : {}),
     };
+    // On OpenAI Sol, short mode omits the redundant 30-minute TTL and keeps
+    // prompt cache keys enabled. OpenAI applies the same lifetime by default.
+    if (cand.providerId === 'openai' && OPENAI_SOL_DEFAULT_CACHE_MODELS.has(cand.modelId)
+      && next.cacheRetention === 'long') {
+      next.cacheRetention = 'short';
+    }
     const imageLimit = cand.imageSupport?.unsupported ? 0 : cand.maxInputImages;
     if (typeof imageLimit === 'number' && Number.isFinite(imageLimit)) {
       next.messages = boundMessagesForImageLimit(params.messages, imageLimit);
@@ -451,17 +492,28 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     return next;
   }
 
+  let requestRounds = 0;
+  function usageObserver(requestRound: number, candidateIndex: number, attempt: number) {
+    const observe = config.onRequestUsage;
+    return observe && ((usage: Partial<Usage>) => observe(usage, { requestRound, candidateIndex, attempt }));
+  }
+
   /** Read-only, request-local admission. Never compact, cool down a profile,
    * or issue a provider call to discover whether a candidate can fit. */
-  async function admitCandidates(params: CompletionParams): Promise<{
+  async function admitCandidates(params: CompletionParams, requestRound: number): Promise<{
     admitted: Map<RotatingCandidate, CompletionParams>;
     skipped: Set<RotatingCandidate>;
+    recoverable: Map<RotatingCandidate, { main: number; summary: number; diagnostics: Record<string, number | string> }>;
+    maxSummary: number;
+    capacityError?: Error;
   }> {
     if (config.requireImageInput && !params.messages.some(message => messageImageCount(message) > 0)) {
       throw new ProviderCandidatesUnavailableError(config.requireImageInput);
     }
     const admitted = new Map<RotatingCandidate, CompletionParams>();
     const skipped = new Set<RotatingCandidate>();
+    const recoverable = new Map<RotatingCandidate, { main: number; summary: number; diagnostics: Record<string, number | string> }>();
+    let maxSummary = 0;
     const inputEstimates = new Map<Message[], number>();
     let capacityError: Error | undefined;
     const oldBudget = params.requestMetadata?.contextBudgetDiagnostics as Record<string, unknown> | undefined;
@@ -524,22 +576,31 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         budget.emergency_result = emergencyResult;
       }
       next.requestMetadata = { ...next.requestMetadata, contextBudgetDiagnostics: budget };
-      if (Number.isSafeInteger(window) && window >= MIN_NATIVE_MODEL_CONTEXT_WINDOW && Number.isSafeInteger(output) && output > 0 && output < window && input <= ceiling) {
-        admitted.set(cand, next);
-        continue;
+      if (Number.isSafeInteger(window) && window >= MIN_NATIVE_MODEL_CONTEXT_WINDOW
+        && Number.isSafeInteger(output) && output > 0 && output < window) {
+        if (input <= ceiling) {
+          admitted.set(cand, next);
+          continue;
+        }
+        const summaryOutput = cand.maxTokens ?? 8_192;
+        if (params.recoverCandidateContext && !config.requireImageInput
+          && Number.isSafeInteger(summaryOutput) && summaryOutput > 0 && summaryOutput < window) {
+          const summary = Math.floor((window - summaryOutput) * mod.CONTEXT_COMPACTION_TRIGGER_RATIO);
+          maxSummary = Math.max(maxSummary, summary);
+          recoverable.set(cand, { main: ceiling, summary, diagnostics: budget });
+        }
       }
       skipped.add(cand);
       capacityError = new mod.ContextOverflowError(modelContextWindowBelowMinimum(window)
         ? t('errors.model_context_too_small', { minimum: MIN_NATIVE_MODEL_CONTEXT_WINDOW })
         : 'The configured models cannot fit this request. Choose a model with a larger context window or reduce the input.', undefined, true);
       const observer = config.onRequestFailure ?? params.onRequestFailure;
-      try { observer?.({ phase: 'before_request', source: 'payload', code: 'context_capacity_insufficient',
+      try { observer?.({ phase: 'before_request', source: 'payload', code: 'context_capacity_insufficient', requestRound,
         elapsedMs: 0, aborted: false, lastEvent: 'none', contextWindow: window,
         outputLimit: output, budgetObserved: false, contextBudget: budget }); } catch { /* Best-effort diagnostics. */ }
       throwIfAborted(params.signal);
     }
-    if (capacityError && admitted.size === 0) throw capacityError;
-    return { admitted, skipped };
+    return { admitted, skipped, recoverable, maxSummary, capacityError };
   }
 
   /** A shorter deadline set by this call itself (context summaries), if any. */
@@ -646,9 +707,23 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     return null;
   }
 
-  function shouldRetryCurrentCandidate(failure: PreCommitFailure): boolean {
-    if (failure.retryCurrent === false) return false;
+  function shouldRetryCurrentCandidate(failure: PreCommitFailure, attemptMs: number): boolean {
+    if (failure.retryCurrent === false || attemptMs >= SLOW_FAILURE_NO_RETRY_MS) return false;
     return failure.cooldownKind === null || failure.kind === 'network';
+  }
+
+  /** A temporary failure that another candidate outliving it makes this candidate's own
+   *  (see outlivedCandidates). A summary missing its own shorter first-event deadline
+   *  says nothing about the candidate, so it is not one. */
+  function temporaryCandidateFailure(err: unknown, failure: PreCommitFailure): boolean {
+    return TEMPORARY_FAILURE_KINDS.has(failure.kind) && !isProviderNoFirstEventTimeout(err);
+  }
+
+  /** The provider refused the model, not this request: later requests of the run would
+   *  be refused too, so the candidate is skipped for the rest of the run. */
+  function candidateModelUnavailable(err: unknown, failure: PreCommitFailure): boolean {
+    return failure.kind === 'request_rejected'
+      && providerErrorFacts(err, false).codes.some((code) => MODEL_UNAVAILABLE_CODES.has(code.toLowerCase()));
   }
 
   async function tryRefreshAuthentication(
@@ -725,7 +800,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     usage?: Partial<Usage>;
   };
 
-  async function streamOne(cand: RotatingCandidate, params: CompletionParams): Promise<{
+  async function streamOne(cand: RotatingCandidate, params: CompletionParams, observeUsage?: (usage: Partial<Usage>) => void): Promise<{
     iterator: AsyncIterator<StreamEvent>;
     buffered: StreamEvent[];
     cleanup: () => void;
@@ -739,7 +814,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
 
     let provider: LLMProvider;
     try {
-      provider = await cand.build();
+      provider = await cand.build(observeUsage);
     } catch (err) {
       if (parentSignal?.aborted) {
         return { rotatable: false, err: abortError(parentSignal) };
@@ -918,6 +993,33 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
     }
   }
 
+  async function* streamCandidateSummary(cand: RotatingCandidate, index: number, params: CompletionParams): AsyncIterable<StreamEvent> {
+    const attempt = await streamOne(cand, params, usageObserver(++requestRounds, index + 1, 1));
+    if ('rotatable' in attempt) {
+      if (attempt.empty?.usage) {
+        yield { type: 'provider_empty', kind: attempt.empty.kind, providerId: cand.providerId,
+          candidateIndex: index + 1, candidateCount: candidates.length, terminalEventSeen: attempt.empty.terminalEventSeen,
+          usage: attempt.empty.usage };
+      }
+      throw attempt.err;
+    }
+    let finished = false;
+    try {
+      yield* attempt.buffered;
+      while (true) {
+        const next = await attempt.iterator.next();
+        if (next.done) {
+          finished = true;
+          return;
+        }
+        yield next.value;
+      }
+    } finally {
+      if (finished) attempt.cleanup();
+      else attempt.dispose();
+    }
+  }
+
   return {
     id: providerId,
     name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
@@ -942,24 +1044,31 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // Deferred network latch — same contract as stream(); see the comment
       // there for why promotion only happens after a later candidate succeeds.
       const networkFailedThisCall = new Set<string>();
+      // Candidates with a temporary failure in this call; see outlivedCandidates.
+      const failedThisCall = new Set<string>();
       const authRefreshAttempted = new Set<string>();
       reportCandidates();
       throwIfAborted(params.signal);
       if (exhaustedRateLimitError) throw exhaustedRateLimitError;
-      const { admitted } = await admitCandidates(params);
+      const requestRound = ++requestRounds;
+      let requestAttempt = 0;
+      const { admitted, capacityError } = await admitCandidates(params, requestRound);
+      if (capacityError && admitted.size === 0) throw capacityError;
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
         if ((recoveryCandidate && cand !== recoveryCandidate) || isUnavailable(cand) || !admitted.has(cand)) continue;
         lastCand = cand;
+        const candidateRetries = outlivedCandidates.has(modelKeyFor(cand)) ? 0 : retryAttempts;
 
         let networkRetry = 0;
         while (true) {
           if (params.signal?.aborted) {
             throw abortError(params.signal);
           }
+          const attemptStartedAt = performance.now();
           try {
             throwIfAborted((params as { signal?: AbortSignal }).signal);
-            const provider = await cand.build();
+            const provider = await cand.build(usageObserver(requestRound, i + 1, ++requestAttempt));
             throwIfAborted((params as { signal?: AbortSignal }).signal);
             const result = await provider.complete(paramsFor(cand, { ...params,
               requestMetadata: admitted.get(cand)!.requestMetadata }));
@@ -980,6 +1089,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             servedCandidate = cand;
             config.onSuccess?.(cand.profileId, cand);
             for (const id of networkFailedThisCall) unavailableProfiles.add(id);
+            recordOutlived(failedThisCall, cand);
             return result;
           } catch (err) {
             const signal = (params as { signal?: AbortSignal }).signal;
@@ -1003,13 +1113,14 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               continue;
             }
 
-            if (shouldRetryCurrentCandidate(failure) && networkRetry < retryAttempts) {
+            const attemptMs = performance.now() - attemptStartedAt;
+            if (shouldRetryCurrentCandidate(failure, attemptMs) && networkRetry < candidateRetries) {
               networkRetry += 1;
               log.warn('complete retrying current candidate', {
                 profile_id: maskId(cand.profileId),
                 kind: failure.kind,
                 attempt: networkRetry,
-                max_attempts: retryAttempts,
+                max_attempts: candidateRetries,
               });
               await sleep(networkRetryDelayMs(networkRetry), (params as { signal?: AbortSignal }).signal);
               continue;
@@ -1020,11 +1131,16 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
               markUnavailable(cand, failure.cooldownKind, reason);
             } else if (failure.kind === 'network') {
               networkFailedThisCall.add(cooldownIdFor(cand));
+            } else if (candidateModelUnavailable(err, failure)) {
+              unavailableProfiles.add(cooldownIdFor(cand));
             }
+            if (temporaryCandidateFailure(err, failure)) failedThisCall.add(modelKeyFor(cand));
             exhaustedNetwork = !failure.cooldownKind || failure.kind === 'network';
             log.warn('complete trying next candidate', {
               profile_id: maskId(cand.profileId),
               kind: failure.kind,
+              ...(attemptMs >= SLOW_FAILURE_NO_RETRY_MS ? { slow_failure: true } : {}),
+              ...(candidateRetries < retryAttempts ? { tried_once: true } : {}),
               candidate_index: i + 1,
               candidate_count: candidates.length,
             });
@@ -1062,24 +1178,51 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
       // swallows the terminal error, so a full-network blip must leave the
       // next call free to retry every candidate.
       const networkFailedThisCall = new Set<string>();
+      // Candidates with a temporary failure in this call; see outlivedCandidates.
+      const failedThisCall = new Set<string>();
       const authRefreshAttempted = new Set<string>();
       reportCandidates();
       throwIfAborted(params.signal);
       if (exhaustedRateLimitError) throw exhaustedRateLimitError;
-      const { admitted } = await admitCandidates(params);
+      const requestRound = ++requestRounds;
+      let requestAttempt = 0;
+      const { admitted, capacityError, recoverable, maxSummary } = await admitCandidates(params, requestRound);
+      if (capacityError && admitted.size === 0) lastErr = capacityError;
 
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        if ((recoveryCandidate && cand !== recoveryCandidate) || isUnavailable(cand) || !admitted.has(cand)) continue;
+        if ((recoveryCandidate && cand !== recoveryCandidate) || isUnavailable(cand)) continue;
+        const capacity = recoverable.get(cand);
+        const draft = capacity && !recoveryCandidate && params.recoverCandidateContext
+          ? yield* params.recoverCandidateContext({ main: capacity.main, summary: capacity.summary, maxSummary }, {
+              stream: summaryParams => streamCandidateSummary(cand, i, summaryParams),
+            }) : undefined;
+        throwIfAborted(params.signal);
+        const original = admitted.get(cand);
+        let selected: CompletionParams | undefined = original && { ...params, requestMetadata: original.requestMetadata };
+        if (draft && capacity && !isUnavailable(cand)) {
+          const reduced = { ...params, messages: draft.messages, requestTokenEstimate: undefined };
+          const projected = paramsFor(cand, reduced, false);
+          const input = projected.messages === reduced.messages ? draft.inputTokens
+            : (await import('#core-agent')).estimateCompletionRequestInputTokens(projected);
+          if (input <= capacity.main) {
+            selected = { ...reduced, requestMetadata: { ...params.requestMetadata,
+              contextBudgetDiagnostics: { ...capacity.diagnostics, estimated_input_tokens: input, estimate_source: 'estimated' } } };
+          }
+        }
+        if (!selected || isUnavailable(cand)) continue;
         lastCand = cand;
+        const candidateRetries = outlivedCandidates.has(modelKeyFor(cand)) ? 0 : retryAttempts;
         let attempt: Awaited<ReturnType<typeof streamOne>> | null = null;
         let networkRetry = 0;
         let normalEmptyRetry = 0;
         let normalEmptyRecoveryActive = false;
 
+        let attemptMs = 0;
         while (true) {
-          attempt = await streamOne(cand, { ...params,
-            requestMetadata: admitted.get(cand)!.requestMetadata });
+          const attemptStartedAt = performance.now();
+          attempt = await streamOne(cand, selected, usageObserver(requestRound, i + 1, ++requestAttempt));
+          attemptMs = performance.now() - attemptStartedAt;
 
           if (!('rotatable' in attempt)) break;
           if (recoveryCandidate === cand) {
@@ -1149,14 +1292,14 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           if (await tryRefreshAuthentication(cand, failure, authRefreshAttempted)) {
             continue;
           }
-          if (shouldRetryCurrentCandidate(failure) && networkRetry < retryAttempts) {
+          if (shouldRetryCurrentCandidate(failure, attemptMs) && networkRetry < candidateRetries) {
             networkRetry += 1;
             const reason = formatKeyFailure(attempt.err);
             log.warn('stream retrying current candidate', {
               profile_id: maskId(cand.profileId),
               kind: failure.kind,
               attempt: networkRetry,
-              max_attempts: retryAttempts,
+              max_attempts: candidateRetries,
             });
             yield { type: 'retry', attempt: networkRetry, reason };
             await sleep(networkRetryDelayMs(networkRetry), (params as { signal?: AbortSignal }).signal);
@@ -1208,11 +1351,16 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
             if (perCallFirstEventTimeoutMs(params) === undefined) unavailableProfiles.add(cooldownIdFor(cand));
           } else if (failure.kind === 'network') {
             networkFailedThisCall.add(cooldownIdFor(cand));
+          } else if (candidateModelUnavailable(attempt.err, failure)) {
+            unavailableProfiles.add(cooldownIdFor(cand));
           }
+          if (temporaryCandidateFailure(attempt.err, failure)) failedThisCall.add(modelKeyFor(cand));
           exhaustedNetwork = !failure.cooldownKind || failure.kind === 'network';
           log.warn('stream trying next candidate', {
             profile_id: maskId(cand.profileId),
             kind: failure.kind,
+            ...(attemptMs >= SLOW_FAILURE_NO_RETRY_MS ? { slow_failure: true } : {}),
+            ...(candidateRetries < retryAttempts ? { tried_once: true } : {}),
             candidate_index: i + 1,
             candidate_count: candidates.length,
           });
@@ -1225,6 +1373,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         const { iterator, buffered, cleanup, dispose } = attempt;
         let streamFinished = false;
         try {
+          if (draft && selected.messages === draft.messages) yield await draft.commit();
           config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
           servedCandidate = cand;
           config.onSuccess?.(cand.profileId, cand);
@@ -1233,6 +1382,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
           // model rounds of this run. Deliberately no markCooldown — the next
           // run starts from the full candidate list again.
           for (const id of networkFailedThisCall) unavailableProfiles.add(id);
+          recordOutlived(failedThisCall, cand);
 
           // W4-2: the committed candidate is text-only, so paramsFor stripped
           // every attached image. Say so — the visible alternative is the model

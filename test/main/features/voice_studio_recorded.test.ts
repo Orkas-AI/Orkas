@@ -10,7 +10,9 @@ import { decodeEnhancement } from '../../../eval/model-eval/regression/voice-enh
 const require = createRequire(import.meta.url);
 const audio = require('../../../resources/builtin/marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/audio.js');
 let root: string, project: string, prior: NodeJS.ProcessEnv;
-const steps: Record<RecordedKind, object[]> = { noise: [{ type: 'denoise', strength: 'standard' }], rumble: [{ type: 'highpass', frequency_hz: 80 }], dynamics: [{ type: 'compressor' }], deess: [{ type: 'deesser', strength: 'standard' }], preserve: [] };
+// The recorded speech has sparse peaks. Use a threshold that compresses the
+// loud phrase without relying on another treatment in the final export.
+const steps: Record<RecordedKind, object[]> = { noise: [{ type: 'denoise', strength: 'standard' }], rumble: [{ type: 'highpass', frequency_hz: 80 }], dynamics: [{ type: 'compressor', threshold_db: -26 }], deess: [{ type: 'deesser', strength: 'standard' }], preserve: [] };
 beforeEach(async () => { prior = { ...process.env }; Object.assign(process.env, bundledRuntimeEnv()); root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'voice-recorded-'))); project = path.join(root, 'voice-project.json'); });
 afterEach(async () => { process.env = prior; await fs.rm(root, { force: true, recursive: true }); });
 async function save(processing: object[], input = 'source.wav', extra = {}) { await fs.writeFile(project, JSON.stringify({ schema_version: 2, roles: {}, segments: [{ id: 'recording', path: input }], processing, ...extra })); }
@@ -20,10 +22,23 @@ async function render(format = 'wav') {
   return { result, file: path.join(root, result.files[0]), receipt };
 }
 const portfolio = (['en', 'zh'] as RecordedLanguage[]).flatMap(language => (['noise', 'rumble', 'dynamics', 'deess', 'preserve'] as RecordedKind[]).map(kind => ({ language, kind })));
+it.each((['en', 'zh'] as RecordedLanguage[]).flatMap(language => ['half-level', 'double-level', 'missing-quiet-sample'].map(mutation => ({ language, mutation }))))(
+  'rejects $mutation in an otherwise unchanged $language PCM conversion', async ({ language, mutation }) => {
+    const fixture = recordedAudio('preserve', language);
+    const source = path.join(root, 'source.wav'); await fs.writeFile(source, fixture.wav);
+    const original = decodeEnhancement(source), changed = Buffer.from(original);
+    expect(recordedMatches('preserve', recordedMeasures('preserve', language, original))).toBe(true);
+    if (mutation === 'missing-quiet-sample') changed.writeFloatLE(.01, 400 * 4);
+    else for (let i = 0; i < changed.length; i += 4) changed.writeFloatLE(changed.readFloatLE(i) * (mutation === 'half-level' ? .5 : 2), i);
+    expect(recordedMatches('preserve', recordedMeasures('preserve', language, changed)), 'Original levels and every retained sample are part of a no-treatment conversion.').toBe(false);
+    expect((await fs.readFile(source)).equals(fixture.wav)).toBe(true);
+  });
 it.each(portfolio)('processes real $language speech with controlled $kind degradation and preserves content/timing', async ({ language, kind }) => {
-  const fixture = recordedAudio(kind, language); await fs.writeFile(path.join(root, 'source.wav'), fixture.wav); await save(steps[kind]);
-  const { result, file } = await render(), m = recordedMeasures(kind, language, decodeEnhancement(file));
+  const fixture = recordedAudio(kind, language); await fs.writeFile(path.join(root, 'source.wav'), fixture.wav);
+  await save(steps[kind], 'source.wav', kind === 'preserve' ? { export: { format: 'wav', channels: 1, normalize_loudness: false } } : {});
+  const { result, file, receipt } = await render(), m = recordedMeasures(kind, language, decodeEnhancement(file));
   expect(recordedMatches(kind, m), JSON.stringify(m)).toBe(true); expect(result.duration_sec).toBe(8);
+  expect(receipt.export.normalize_loudness).toBe(false);
   expect((await fs.readFile(path.join(root, 'source.wav'))).equals(fixture.wav)).toBe(true);
   const noOp = recordedMeasures(kind, language, decodeEnhancement(path.join(root, 'source.wav')));
   expect(recordedMatches(kind, noOp)).toBe(kind === 'preserve');

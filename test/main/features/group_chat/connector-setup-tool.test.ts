@@ -212,6 +212,23 @@ describe('connector_setup', () => {
     expect(stageConfigure).not.toHaveBeenCalled();
   });
 
+  it('returns mailbox capabilities before staging cards for the reproduced onboarding query', async () => {
+    const { search, stageConfigure } = builtInSearchTool();
+    const candidates = await search('email inbox Gmail Outlook email reading and management');
+    expect(candidates.slice(0, 3)).toEqual([
+      expect.objectContaining({ connector_id: 'gmail', description: '读 / 发邮件、整理收件箱。' }),
+      expect.objectContaining({ connector_id: 'm365-mail', description: '搜索、读取、撰写和发送 Microsoft 365 邮件。' }),
+      expect.objectContaining({
+        connector_id: 'outlook',
+        name: 'Outlook 联系人与任务',
+        description: '读取 Outlook 个人资料、联系人、邮箱设置和任务。 Cannot read email messages.',
+        matched_terms: ['outlook', 'and'],
+      }),
+    ]);
+    expect(candidates.length).toBeLessThanOrEqual(8);
+    expect(stageConfigure).not.toHaveBeenCalled();
+  });
+
   it('names the non-mail Outlook entry by its scope so it is not taken for mail access', async () => {
     for (const [language, expected] of [['zh', 'Outlook 联系人与任务'], ['en', 'Outlook Contacts & Tasks'], ['ja', 'Outlook Contacts & Tasks']] as const) {
       const tool = buildConnectorSetupTool({

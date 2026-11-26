@@ -430,6 +430,68 @@ describe('group_chat bus › drainSteerInto (interrupt-steer)', () => {
     expect(runtimeGrantedToolGroups).toEqual(['connectors']);
   });
 
+  it('advertises a newly selected Connector at the accepted steer and executes it once', async () => {
+    const w = fakeW([]);
+    const runtimeGrantedToolGroups: string[] = [];
+    const requests: CompletionParams[] = [];
+    const receipt = 'synthetic connector result';
+    const execute = vi.fn(async () => ({ content: receipt }));
+    const connector = defineTool({
+      name: 'call_connector_tool', description: 'Call a scoped connector',
+      inputSchema: { type: 'object', properties: {} }, execute,
+    });
+    const staleTool = defineTool({
+      name: 'old_step', description: 'Continue the original request',
+      inputSchema: { type: 'object', properties: {} },
+      execute: vi.fn(async () => ({ content: 'obsolete result' })),
+    });
+    const provider: LLMProvider = {
+      id: 'fixture', name: 'Fixture',
+      async complete(): Promise<CompletionResult> { throw new Error('unused'); },
+      async *stream(params) {
+        requests.push(params);
+        yield { type: 'message_start' };
+        const round = requests.length;
+        if (round === 1) w.queue.push(item({
+          actor: agentX, fromActorId: 'user', llmPayload: 'Use the selected connector',
+          useSelections: [{ kind: 'connector', id: 'notion', name: 'Notion' }],
+        }));
+        const content: Message['content'] = round < 3
+          ? [{ type: 'tool_use', name: round === 1 ? staleTool.name : connector.name,
+            id: round === 1 ? 'stale-call' : 'connector-call', input: {} }]
+          : [{ type: 'text', text: 'Finished with the result' }];
+        yield { type: 'message_end', stopReason: round < 3 ? 'tool_use' : 'end_turn',
+          content, usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, model: 'fixture' };
+      },
+      async validateAuth() { return true; },
+    };
+    const providers = new ProviderRegistry();
+    providers.registerFactory('fixture', () => provider);
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: 'fixture', defaultModel: 'fixture' } }),
+      providers, tools: [staleTool, connector], isToolActive: (name) =>
+        name !== connector.name || runtimeGrantedToolGroups.includes('connectors'),
+    });
+    const result = await runner.run({
+      message: 'Start', drainSteer: () => drainSteerInto(w, agentX, { runtimeGrantedToolGroups }),
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[0].tools?.map((tool) => tool.name)).not.toContain(connector.name);
+    expect(requests[1].tools?.map((tool) => tool.name)).toContain(connector.name);
+    expect(requests[1].messages).toContainEqual(expect.objectContaining({
+      role: 'user',
+      content: expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining('Use the selected connector') })]),
+      toolsAddedAfter: [connector.name],
+    }));
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(staleTool.execute).not.toHaveBeenCalled();
+    expect(requests[2].messages.flatMap((message) => message.content)).toContainEqual(expect.objectContaining({
+      type: 'tool_result', toolUseId: 'connector-call', content: receipt,
+    }));
+    expect(result.text).toContain('Finished with the result');
+    expect(w.queue).toEqual([]);
+  });
+
   it('returns [] and leaves the queue intact when nothing matches the running actor', async () => {
     const w = fakeW([
       item({ actor: agentX, fromActorId: 'commander', llmPayload: 'DISPATCH' }),

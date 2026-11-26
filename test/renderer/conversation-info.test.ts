@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -197,6 +197,49 @@ describe('ConversationInfo files tab', () => {
     });
   });
 
+  it.each(['attachment-only', 'full-panel'] as const)('shows a saved attachment when a later %s refresh fails', async refreshKind => {
+    await renderFilesResult({ activeTab: 'attachments', history: [], files: { items: [] } }, async context => {
+      const info = context.window.ConversationInfo;
+      const originalFetch = context.apiFetch;
+      let deliverInventory!: (response: unknown) => void;
+      context.apiFetch = (url: string) => url.includes('/attachments')
+        ? new Promise(resolve => { deliverInventory = resolve; }) : originalFetch(url);
+      const panelLoad = info.refresh('c1', { silent: true });
+      context.apiFetch = (url: string) => url.includes('/attachments')
+        ? Promise.resolve({ json: async () => ({ ok: false, error: 'Temporarily unavailable' }) }) : originalFetch(url);
+      if (refreshKind === 'attachment-only') await info.refreshAttachments('c1');
+      else await info.refresh('c1', { silent: true });
+      deliverInventory({ json: async () => ({ ok: true, items: [{ name: 'saved-roster.csv', bytes: 120 }] }) });
+      await panelLoad;
+      expect(context.document.getElementById('conversation-info-body').innerHTML).toContain('saved-roster.csv');
+      expect(context.document.getElementById('conversation-info-tab-count-attachments').textContent).toBe('1');
+      await info.refresh('c1', { silent: true });
+      expect(context.document.getElementById('conversation-info-body').innerHTML).toContain('saved-roster.csv');
+    });
+  });
+
+  it.each([
+    { items: [{ name: 'saved-roster.csv', bytes: 120 }], expected: 'saved-roster.csv', count: '1' },
+    { items: [], expected: 'No attachments', count: '' },
+  ])('shows the confirmed attachment inventory with $count visible files when history fails', async ({ items, expected, count }) => {
+    await renderFilesResult({
+      history: [], files: { items: [] }, attachments: items, activeTab: 'attachments',
+      historyError: 'History unavailable',
+    }, async context => {
+      const body = context.document.getElementById('conversation-info-body');
+      const info = context.window.ConversationInfo;
+      expect(body.innerHTML).toContain(expected);
+      expect(body.innerHTML).not.toContain('is-error');
+      expect(context.document.getElementById('conversation-info-tab-count-attachments').textContent).toBe(count);
+      await info.refreshAttachments('c1');
+      expect(body.innerHTML).toContain(expected);
+
+      context.document.querySelectorAll('.conversation-info-tab')[0].onclick();
+      await info.refresh('c1');
+      expect(body.innerHTML).toContain('is-error');
+    });
+  });
+
   it.each(['files', 'attachments'] as const)('keeps the newer %s refresh when an older full panel load finishes last', async resource => {
     await renderFilesResult({ history: [], files: { items: [] }, activeTab: resource }, async context => {
       const info = context.window.ConversationInfo;
@@ -279,6 +322,29 @@ describe('ConversationInfo files tab', () => {
       expect(body.innerHTML).toContain('latest.txt');
       expect(body.innerHTML).not.toContain('obsolete.txt');
       expect(context.document.getElementById('conversation-info-tab-count-' + resource).textContent).toBe('1');
+    });
+  });
+
+  it('refreshes once more after overlapping file updates without starting parallel reads', async () => {
+    await renderFilesResult({ history: [], files: { items: [] } }, async context => {
+      const info = context.window.ConversationInfo;
+      const originalFetch = context.apiFetch;
+      const pending: Array<(name: string) => void> = [];
+      context.apiFetch = (url: string) => url.endsWith('/files')
+        ? new Promise(resolve => pending.push(name => resolve({ json: async () => ({ ok: true, count: 1,
+          items: [{ name, relPath: name, path: `/tmp/workspace/${name}`, bytes: 4 }] }) })))
+        : originalFetch(url);
+
+      const updates = Array.from({ length: 8 }, () => info.refreshFiles('c1', { silent: true }));
+      expect(pending).toHaveLength(1);
+      pending[0]('previous.txt');
+      await vi.waitFor(() => expect(pending).toHaveLength(2));
+      pending[1]('latest.txt');
+      await Promise.all(updates);
+
+      const body = context.document.getElementById('conversation-info-body');
+      expect(body.innerHTML).toContain('latest.txt');
+      expect(body.innerHTML).not.toContain('previous.txt');
     });
   });
 

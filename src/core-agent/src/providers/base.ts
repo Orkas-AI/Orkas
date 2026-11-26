@@ -13,6 +13,7 @@ import type {
 export type { Model, PiContext, PiAssistantMessage, PiStreamEvent, PiTool };
 
 import type { Message, StreamEvent, StopReason, Usage } from "../shared/types.js";
+import type { AgentRunEvent } from "../agent/types.js";
 
 /** Tool definition for LLM function calling. */
 export type ToolDefinition = {
@@ -32,8 +33,22 @@ export type ProviderContextBudget = Readonly<{
   maxOutputTokens: number;
 }>;
 
+/** In-process recovery for one native main request. The provider owns candidate
+ * capacity and transport; the runner owns the checkpoint and its commit. */
+export type CandidateContextDraft = {
+  messages: Message[];
+  inputTokens: number;
+  commit(): Promise<Extract<AgentRunEvent, { type: "compaction" }>>;
+};
+export type CandidateContextRecovery = (
+  limits: { main: number; summary: number; maxSummary: number },
+  provider: Pick<LLMProvider, "stream">,
+) => AsyncGenerator<Extract<AgentRunEvent, { type: "context_status" }>, CandidateContextDraft | undefined>;
+
 /** Parameters for an LLM completion request. */
 export type CompletionParams = {
+  /** Host-private, consumed only by the native rotating stream. */
+  recoverCandidateContext?: CandidateContextRecovery;
   /** Request-local measurement from core preparation. `model` is the configured
    * model preparation priced for; input references identify the unchanged
    * request view. Transformed inputs and other candidates must estimate afresh.

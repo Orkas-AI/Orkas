@@ -374,3 +374,51 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
     expect(fs.existsSync(path.join(tmpDir, 'caps_plan.json'))).toBe(false);
   });
 });
+
+it('executes the packaged research script through a freshly seeded native read binding', async () => {
+  const previousRoot = process.env.ORKAS_WORKSPACE_ROOT, previousBuiltin = process.env.ORKAS_BUILTIN_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = path.join(tmpDir, 'runtime');
+  process.env.ORKAS_BUILTIN_ROOT = path.join(PC_ROOT, 'resources/builtin');
+  vi.resetModules();
+  try {
+    const uid = 'research-script-binding-fixture';
+    (await import('../../../src/main/features/users')).activateUser(uid);
+    await (await import('../../../src/main/features/builtin_marketplace')).seedBuiltinMarketplaceForUser(uid);
+    (await import('../../../src/main/features/permissions')).setLocalExecMode('all_files_auto');
+    const bindings = new Map();
+    await (await import('../../../src/main/model/core-agent/skill-registry')).getSystemPromptBlock({
+      agentId: '78900d8758bc', allowlist: ['ee99fbb42964'], runtimeBindings: bindings,
+    });
+    const [ref, binding] = [...bindings.entries()].find(([, value]) => value.id === 'ee99fbb42964')!;
+    expect(binding).toBeTruthy();
+    const script = path.join(binding.root, 'scripts/caps.py');
+    expect(fs.readFileSync(script)).toEqual(fs.readFileSync(path.join(SKILL_DIR, 'scripts/caps.py')));
+    const context = { workingDir: tmpDir, state: { sandboxEnv: {
+      ORKAS_NODE: process.env.ORKAS_TEST_NODE!, ORKAS_PC_DIR: PC_ROOT, ORKAS_UID: uid,
+      ORKAS_WORKSPACE_ROOT: process.env.ORKAS_WORKSPACE_ROOT!, ORKAS_PYTHON: process.env.ORKAS_TEST_PYTHON || path.resolve(PC_ROOT, '../venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+    } } } as any;
+    const reader = (await import('../../../src/main/model/core-agent/file-tools')).createFileTools({userId:uid, skillRuntimeBindings:bindings})
+      .find(tool => tool.name === 'read_files')!;
+    const read = await reader.execute({paths:[{path:'@skill/'+ref}]},context);
+    expect(read.isError).toBeFalsy();
+    const template = read.content.match(/```(?:sh|powershell)\n([^\n]+)\n```/)?.[1];
+    expect(template).toBeTruthy();
+    const bash = (await import('../../../src/main/model/core-agent/local-tools')).createLocalTools({userId:uid, skillRuntimeBindings:bindings})
+      .find(tool => tool.name === 'bash')!;
+    const result = await bash.execute({command:template!.replace('<script-basename> -- <args...>','caps -- --help'),timeoutMs:10000},context);
+    expect(result.isError, result.content).toBeFalsy();
+    expect(result.content).toContain('deep-research/caps');
+    const originalScript = fs.readFileSync(script);
+    expect(originalScript).toEqual(fs.readFileSync(path.join(SKILL_DIR, 'scripts/caps.py')));
+    fs.unlinkSync(script);
+    const missing = await bash.execute({command:template!.replace('<script-basename> -- <args...>','caps -- --help'),timeoutMs:10000},context);
+    expect(missing.isError).toBe(true);
+    expect(missing.content).toContain('skill script not found');
+    expect(fs.readFileSync(path.join(SKILL_DIR, 'scripts/caps.py'))).toEqual(originalScript);
+    fs.writeFileSync(script, originalScript);
+  } finally {
+    if (previousRoot === undefined) delete process.env.ORKAS_WORKSPACE_ROOT; else process.env.ORKAS_WORKSPACE_ROOT = previousRoot;
+    if (previousBuiltin === undefined) delete process.env.ORKAS_BUILTIN_ROOT; else process.env.ORKAS_BUILTIN_ROOT = previousBuiltin;
+    vi.resetModules();
+  }
+}, 30000);

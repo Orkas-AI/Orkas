@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { Reporter, FullConfig, Suite, TestCase, TestResult, FullResult, TestError } from '@playwright/test/reporter';
 import { analyzeWebAppLogs } from '../test/e2e/fixtures/web-app-log-analysis';
 import { sanitizeLogTextForUpload } from '../src/main/util/log-sanitize';
+import { summarizeAttempts } from './e2e-attempt-reporter';
 
 /** Structured outcomes, not console text, determine completion. */
 export default class CheckpointReporter implements Reporter {
@@ -18,8 +19,10 @@ export default class CheckpointReporter implements Reporter {
   private appAnalyses: Array<ReturnType<typeof analyzeWebAppLogs> & { case: string }> = [];
   private artifacts: string[] = [];
   private outputDir = '';
+  private suite: Suite;
 
   onBegin(config: FullConfig, suite: Suite) {
+    this.suite = suite;
     this.outputDir = config.projects[0].outputDir;
     this.inventory = suite.allTests().map(test => test.id);
     this.testFiles = [...new Set(suite.allTests().map(test => test.location.file))].sort();
@@ -75,6 +78,7 @@ export default class CheckpointReporter implements Reporter {
       batchUnits: this.testFiles.length, testFiles: this.testFiles, unhandledErrors: this.errors,
       runnerErrors: this.runnerErrors, omittedRunnerErrors: this.omittedRunnerErrors,
       inventory: this.inventory, files: this.files, appAnalyses: this.appAnalyses,
+      attemptSummary: this.suite ? summarizeAttempts(this.suite, result) : null,
       artifactPaths: this.artifacts, outputDir: this.outputDir }), { mode: 0o600 });
   }
 }

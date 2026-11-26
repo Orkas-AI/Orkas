@@ -52,6 +52,9 @@ main{max-width:960px;min-width:0;margin:auto;padding:20px 32px 32px}.page-head{p
 @media(prefers-reduced-motion:reduce){button,button.btn,button.modal-close-btn,.brief-panel{transition:none}}
 
 .record-failure-summary,.record-error{color:var(--danger);font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 0}.record-failure-summary{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.record-error{max-height:240px;overflow:auto}
+.record-failure-summary.is-agent-reply{color:var(--text-2)}
+#record-reply{margin:10px 0 2px}
+#record-reply-text{margin-top:3px;font-size:13px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;text-wrap:pretty;max-height:240px;overflow:auto}
 
 #service-field .section-head{gap:8px;flex-wrap:nowrap}#service-field .text-button{font-size:11px;padding:0}#service-state{margin:0}#service-state.error{color:var(--danger)}
 

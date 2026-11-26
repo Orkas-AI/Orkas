@@ -65,6 +65,7 @@ import {
   writeProjectInstructionsIfUnchanged,
 } from '../../features/projects';
 import * as projectTasks from '../../features/project_tasks';
+import { formatProjectGoalForSystemPrompt } from '../../features/project_goal';
 import * as conversationTaskBoard from '../../features/group_chat/task_board';
 import * as metacognition from '../../features/metacognition';
 import { appendAgentSkill, listAgentSummaries } from '../../features/agents';
@@ -90,6 +91,8 @@ import {
   getToolCatalogEntry,
   getLoadableToolGroupsSystemPromptBlock,
   isToolVisibleToAgent,
+  isModelToolName,
+  toolNamesForAgentGroups,
   toolNamesForGroups,
 } from './tool-catalog';
 import { createToolLoadTool, createToolSurfaceController } from './tool-surface';
@@ -126,7 +129,7 @@ import {
   omitReservedOutputLimitForProvider,
 } from './external-providers';
 import { withTaskBudget } from './task-budget-provider';
-import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
+import { createRotatingProvider, type RequestUsageObserver, type RotatingCandidate } from './rotating-provider';
 import { clearCooldown } from './profile-cooldown';
 import {
   isExternalApiProvider,
@@ -288,6 +291,9 @@ export interface BuildRunnerParams {
   historyBoundaryMessageId?: string;
   /** Host-owned final delivery versus intermediate work for Commander. */
   outputDelivery?: 'final' | 'process';
+  /** The host started this turn to run a to-do (auto-advance or "run now");
+   *  its reply may have no reader. Never changes task attribution. */
+  hostTodoRun?: boolean;
   /** Host-side post-success hook for a user-confirmed custom Connector. */
   onCustomConnectorAdded?: (connectorId: string) => void;
   /** Current real user text, used by tools that must bind an approval action
@@ -381,8 +387,10 @@ export interface BuildRunnerParams {
    * `create_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
+  onShellFileObserved?: (absPath: string, version: string) => void | Promise<void>;
   /** Turn owner resource-display filter for the `publish_outputs` tool. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  imageStudioNativePngDelivery?: import('../../features/image_studio_delivery').ImageStudioNativePngDelivery;
   /** A saved automation, so the host can offer the user a route to it. */
   onAutoTaskSaved?: (taskId: string, title: string) => void;
   onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
@@ -418,6 +426,7 @@ export interface BuildRunnerParams {
    * when the call succeeds on the first candidate. */
   onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void;
   onRequestFailure?: (failure: ProviderRequestFailure) => void;
+  onRequestUsage?: RequestUsageObserver;
 }
 
 export interface NativeSearchInjectedInfo {
@@ -589,6 +598,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? params.runtimeSkillBindings
     : new Map<string, SkillRuntimeBinding>();
   const systemSkillsVisible = systemSkillsExposureFromSessionId(params.sessionId);
+  // A named Agent lists the app SDK guide only when its declared capabilities
+  // include app authoring; others hand app requests back to Commander, which
+  // keeps the guide. A legacy Agent without a tool list keeps it.
+  const namedAgentAuthorsApps = params.toolList === undefined
+    || toolNamesForAgentGroups(params.toolList).includes('create_artifact');
   const skillSearchVisible = skillSearchExposureFromSessionId(params.sessionId);
   const skillBlocksPromise: Promise<[string, string]> = isReflectionSession
     ? Promise.resolve(['', ''])
@@ -600,7 +614,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
             earlyUid || undefined,
             skillRuntimeBindings,
             /^gmember-/.test(params.sessionId)
-              ? APP_AUTHORING_SYSTEM_SKILLS.filter(id => params.systemSkillList === undefined || params.systemSkillList.includes(id))
+              ? (namedAgentAuthorsApps ? APP_AUTHORING_SYSTEM_SKILLS : [])
+                .filter(id => params.systemSkillList === undefined || params.systemSkillList.includes(id))
               : params.systemSkillList,
           )
         : '';
@@ -739,6 +754,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       includeProjectTier: !!projectScopeId,
       projectTierReadOnly: !!projectScopeId && !isCommander && !isGroupAgent,
       globalTiersReadOnly: !isCommander,
+      supportsCapabilityHandback: isGroupAgent,
     }));
   }
 
@@ -892,7 +908,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(analysisInputsDir ? { analysisInputRoots: [analysisInputsDir] } : {}),
     skillRuntimeBindings,
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+    ...(params.onShellFileObserved ? { onShellFileObserved: params.onShellFileObserved } : {}),
     ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+    ...(params.imageStudioNativePngDelivery ? { imageStudioNativePngDelivery: params.imageStudioNativePngDelivery } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
     ...(onArtifactCreatedForHistory ? { onArtifactCreated: onArtifactCreatedForHistory } : {}),
   });
@@ -1051,6 +1069,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
         ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+        ...(params.imageStudioNativePngDelivery ? { imageStudioNativePngDelivery: params.imageStudioNativePngDelivery } : {}),
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
     : [];
@@ -1069,6 +1088,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         userId: uid,
         creationStateDir: path.join(params.cid ? conversationLayout(uid, params.cid, params.projectId).groupDir : toolResultsDir, 'office-creation'),
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
@@ -1082,6 +1103,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? createPdfTools({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
@@ -1193,19 +1216,22 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // produced it. Unknown caller tools remain visible in legacy mode; scoped
   // mode rejects them below so a registration cannot silently become
   // permanently inactive.
-  const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
-  const evolutionToolNames = agentId && earlyUid ? ['skill_manage'] : [];
-  const isNamedAgentRuntime = sessionKind === 'gmember';
   const programmaticToolPolicy = programmaticExecutionExposureFromSessionId(params.sessionId)
     ? createProgrammaticToolPolicy({ ...(uid ? { userId: uid } : {}) })
     : undefined;
+  const visibleTools = allTools.filter((tool) => (
+    isToolVisibleToAgent(tool.name, agentId)
+    && (isModelToolName(tool.name) || programmaticToolPolicy?.isEligible(tool.name))
+  ));
+  const evolutionToolNames = agentId && earlyUid ? ['skill_manage'] : [];
+  const isNamedAgentRuntime = sessionKind === 'gmember';
   const dynamicToolLoading = isCommander || isNamedAgentRuntime;
   const dynamicLoadPolicy = isNamedAgentRuntime
     ? 'agent-dependency' as const
     : 'loadable' as const;
   const availableToolNames = Array.from(new Set([
     ...builtinTools.map((tool) => tool.name),
-    ...visibleTools.map((tool) => tool.name),
+    ...visibleTools.map((tool) => tool.name).filter(isModelToolName),
     ...(EXPOSE_EXECUTION_PLAN_TOOL ? ['manage_execution_plan'] : []),
     ...evolutionToolNames,
     ...(dynamicToolLoading ? ['tool_load'] : []),
@@ -1286,7 +1312,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Resolve trusted entry context once for both initial tools and turn guidance.
   const conversationAssistance = (uid && params.cid && (isCommander || (isGroupAgent && agentId)))
     ? await (await import('../../features/conversation_assistance_context')).resolveConversationAssistanceForTurn(uid, params.cid, {
-        ...(isGroupAgent ? { agentId } : {}), outputDelivery: params.outputDelivery,
+        ...(isGroupAgent ? { agentId } : {}),
+        outputDelivery: params.outputDelivery,
+        ...(params.hostTodoRun ? { hostTodoRun: true } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
       })
     : { kind: undefined, guidance: '' };
   const toolSurface = createToolSurfaceController({
@@ -1447,6 +1476,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? formatProjectInstructionsForSystemPrompt(uid, params.projectId)
     : '';
   if (projectInstructionsBlock) parts.push(projectInstructionsBlock);
+  // The user-set project goal, beside the instructions for the same cache
+  // reason. Commander also gets how to use it; named Agents get the facts.
+  const projectGoalBlock = (uid && memoryAgentScope && params.projectId)
+    ? formatProjectGoalForSystemPrompt(uid, params.projectId, { usage: isCommander })
+    : '';
+  if (projectGoalBlock) parts.push(projectGoalBlock);
   if (runtimeInjectionBlock) parts.push(runtimeInjectionBlock);
   // Cross-session memory (read side): the user's stored profile + notes as
   // background context. It is more turn-volatile than resource indexes, so
@@ -1504,6 +1539,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   ]
     .filter((b) => b && b.trim())
     .join('\n\n');
+  // This turn tells the user the project's news; the host records it as seen
+  // once the run delivers its reply.
+  if ('recap' in conversationAssistance && conversationAssistance.recap && uid && params.cid) {
+    (await import('../../features/project_recap')).noteRecapShown(uid, params.cid, conversationAssistance.recap, params.turnId);
+  }
 
   // Evolution (the self-evolving skill store) is per-agent: when an
   // agentId is present we write into that agent's private directory
@@ -1605,6 +1645,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       params.cid,
       params.requireImageInput,
       params.onRequestFailure,
+      params.onRequestUsage,
     );
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
@@ -1657,7 +1698,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
               }
             : {}),
         }
-      : {}),
+      : { isToolActive: isModelToolName }),
     // The core package still ships read_file for standalone callers. Orkas
     // owns a consolidated read_files contract, so retire the builtin executor
     // in every surface mode (including reflection and legacy rollback). Fixed
@@ -1845,6 +1886,7 @@ async function buildRotatingProvider(
   cid?: string,
   requireImageInput = false,
   onRequestFailure?: (failure: ProviderRequestFailure) => void,
+  onRequestUsage?: RequestUsageObserver,
 ): Promise<LLMProvider> {
   const userCacheKey = providerUserCacheKey(userId);
   const candidates: RotatingCandidate[] = group.map((choice) => {
@@ -1882,9 +1924,9 @@ async function buildRotatingProvider(
         currentApiKey = refreshed;
         return true;
       } } : {}),
-      build: async () => {
+      build: async (observeUsage) => {
         if (isExternal) {
-          return withTaskBudget(await buildExternalProvider({ ...choice, apiKey: currentApiKey }, usageContext, userCacheKey), cid);
+          return withTaskBudget(await buildExternalProvider({ ...choice, apiKey: currentApiKey }, usageContext, userCacheKey), cid, observeUsage);
         }
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {
@@ -1904,7 +1946,7 @@ async function buildRotatingProvider(
             buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
           ),
           googleNativeSearch: shouldUseGoogleNativeSearch,
-        }), cid);
+        }), cid, observeUsage);
       },
     };
   });
@@ -1914,6 +1956,7 @@ async function buildRotatingProvider(
     candidates,
     requireImageInput,
     ...retryLimits,
+    ...(onRequestUsage ? { onRequestUsage } : {}),
     ...(process.env.ORKAS_MODEL_EVAL_PINNED_ROUTE === '1'
       && providerId === 'custom'
       && candidates.length === 1

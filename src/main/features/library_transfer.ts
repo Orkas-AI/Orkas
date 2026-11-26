@@ -10,9 +10,10 @@
  */
 
 import * as path from 'node:path';
+import { t } from '../i18n';
 import {
   captureLocalEntryRevision, captureLocalEntryRevisionSync, localEntryRevisionMatches,
-  type LocalEntryRevision,
+  prepareLocalEntryDelete, type BeforeLocalEntryDelete, type LocalEntryRevision,
 } from '../util/file-import';
 
 import * as contexts from './contexts';
@@ -39,6 +40,7 @@ export interface TransferItemResult {
   destination: string;
   ok: boolean;
   error?: string;
+  message?: string;
   fileCount?: number;
   bytes?: number;
 }
@@ -55,6 +57,8 @@ export type TransferResult =
   };
 
 const MAX_BATCH_ENTRIES = 100;
+const SYNC_REVISION_BYTES = 16 * 1024 * 1024;
+const SYNC_REVISION_ENTRIES = 256;
 
 function isActiveAccount(userId: string): boolean {
   try {
@@ -142,7 +146,7 @@ async function copyInto(
 }
 
 async function deleteFrom(
-  userId: string, ref: LibraryRef, rel: string, beforeDelete?: () => boolean,
+  userId: string, ref: LibraryRef, rel: string, beforeDelete: BeforeLocalEntryDelete,
 ): Promise<{ ok: boolean; error?: string }> {
   if (ref.scope === 'global') return contexts.deleteContextTarget(rel, userId, beforeDelete);
   return projectFiles.deleteProjectEntry(userId, ref.projectId!, rel, beforeDelete);
@@ -161,6 +165,7 @@ async function moveWithin(
 function normalizeError(error: string | undefined): string {
   if (!error) return 'transfer_failed';
   if (error === 'account_changed') return 'account_changed';
+  if (error === 'invalid_source_encoding') return error;
   if (error === 'destination already exists' || error === 'target_exists') return 'target_exists';
   if (error === 'unsupported_destination' || error.includes('unsupported')) return 'unsupported_destination';
   if (error === 'not_found') return 'not_found';
@@ -238,27 +243,29 @@ export async function transferLibraryEntries(
     }
     let destinationRevision: LocalEntryRevision | undefined;
     const copied = await copyInto(userId, destination, resolved.absPath, targetRel,
-      mode === 'move' ? absolute => { destinationRevision = captureLocalEntryRevisionSync(absolute); } : undefined);
+      mode === 'move' ? absolute => { destinationRevision = captureLocalEntryRevisionSync(absolute, revision); } : undefined);
     if (copied.ok === false) {
-      results.push({ ...resultBase, ok: false, error: normalizeError(copied.error) });
+      const error = normalizeError(copied.error);
+      results.push({ ...resultBase, ok: false, error,
+        ...(error === 'invalid_source_encoding' ? { message: t('errors.not_utf8') } : {}) });
       continue;
     }
     if (mode === 'move') {
-      // Both sides must still be the revisions this operation owns. Share one
-      // verification budget and repeat at the synchronous removal boundary.
-      const revisionsMatch = () => {
+      const large = copied.bytes > SYNC_REVISION_BYTES || (revision?.entries.length ?? 0) > SYNC_REVISION_ENTRIES;
+      const beforeRemove = (deletingSource: boolean): BeforeLocalEntryDelete => () => {
+        const allowed = () => !deletingSource || isActiveAccount(userId);
+        if (!allowed()) return false;
+        // Read the side about to be removed last, sharing a deadline with
+        // the evidence that the other side still holds the copied bytes.
+        const revisions = deletingSource ? [destinationRevision, revision] : [revision, destinationRevision];
+        if (large) return prepareLocalEntryDelete(revisions).then(confirm => () => allowed() && confirm());
         const deadline = performance.now() + 100;
-        return localEntryRevisionMatches(revision, deadline)
-          && localEntryRevisionMatches(destinationRevision, deadline);
+        return revisions.every(evidence => localEntryRevisionMatches(evidence, deadline));
       };
       if (!isActiveAccount(userId)) {
-        if (!revisionsMatch()) {
-          results.push({ ...resultBase, ok: false, error: 'rollback_failed' });
-          continue;
-        }
         let rollback: { ok: boolean; error?: string };
         try {
-          rollback = await deleteFrom(userId, destination, targetRel, revisionsMatch);
+          rollback = await deleteFrom(userId, destination, targetRel, beforeRemove(false));
         } catch {
           rollback = { ok: false, error: 'rollback_failed' };
         }
@@ -271,18 +278,14 @@ export async function transferLibraryEntries(
       }
       let removed: { ok: boolean; error?: string };
       try {
-        removed = await deleteFrom(userId, source, sourceRel, revisionsMatch);
+        removed = await deleteFrom(userId, source, sourceRel, beforeRemove(true));
       } catch {
         removed = { ok: false, error: 'source_delete_failed' };
       }
       if (!removed.ok) {
-        if (!revisionsMatch()) {
-          results.push({ ...resultBase, ok: false, error: 'rollback_failed' });
-          continue;
-        }
         let rollback: { ok: boolean; error?: string };
         try {
-          rollback = await deleteFrom(userId, destination, targetRel, revisionsMatch);
+          rollback = await deleteFrom(userId, destination, targetRel, beforeRemove(false));
         } catch {
           rollback = { ok: false, error: 'rollback_failed' };
         }

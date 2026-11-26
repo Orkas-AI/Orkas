@@ -1035,6 +1035,7 @@ const MAX_TOOL_TIMELINE_LOG_ENTRIES = 80;
 const MAX_RUN_TIMELINE_LOG_ENTRIES = 120;
 const MAX_PROVIDER_ROUND_EVIDENCE = 64;
 const MAX_PROVIDER_ROUND_TOOL_NAMES = 16;
+const MAX_CACHE_WRITE_REQUESTS = 3;
 
 function safeToolNameForLog(rawName: unknown): string {
   return String(rawName || 'unknown').slice(0, 80) || 'unknown';
@@ -1545,6 +1546,7 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     // The shared logger bounds object keys/nodes. Preserve the last-response
     // evidence before optional activity counters consume that budget.
     terminal_output: terminalOutputSnapshot(stats.terminalOutput),
+    usage: stats.usage,
     stopReason: stats.stopReason,
     errorKind: stats.errorKind,
     doneRawEventMs: stats.doneRawEventMs,
@@ -1606,7 +1608,6 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     providerDurationMs: stats.providerDurationMs,
     provider: stats.provider,
     model: stats.model,
-    usage: stats.usage,
     toolLoops: stats.toolLoops,
     skillsLoadedCount: stats.skillsLoadedCount,
     transientToolErrors: stats.transientToolErrors,
@@ -1645,6 +1646,7 @@ function agentRunResultEvent(input: {
   failureCode?: string;
   failureRawCode?: string;
   failurePhase?: StreamEvent['failurePhase'];
+  convergenceSignals?: readonly AgentRunConvergenceSignal[];
 }): StreamEvent {
   const result = input.status === 'completed' || input.status === 'waiting_input'
     ? 'success'
@@ -1661,6 +1663,10 @@ function agentRunResultEvent(input: {
   if (Number.isFinite(input.streamIdleTimeoutSec)) data.stream_idle_timeout_sec = Math.max(0, Math.round(input.streamIdleTimeoutSec || 0));
   if (Number.isFinite(input.idleWindowSec)) data.idle_window_sec = Math.max(0, Math.round(input.idleWindowSec || 0));
   if (input.failurePhase) data.failure_phase = input.failurePhase;
+  const convergenceSignals = Array.from(new Set(
+    Array.isArray(input.convergenceSignals) ? input.convergenceSignals : [],
+  )).filter((value): value is AgentRunConvergenceSignal => /^(tool_loop_limit_nudge|elapsed_convergence_nudge|spin_convergence_nudge|no_progress_nudge|discovery_stall_nudge|tool_loop_limit|repetitive_tool_calls|repeated_tool_failure_nudge|repeated_tool_failure_block|no_progress_stop|discovery_stall_stop|output_limit_continuation|output_limit_unrecovered)$/.test(value));
+  if (convergenceSignals.length) data.convergence_signals = convergenceSignals;
   if (input.timings) {
     data.provider_ms = Math.max(0, Math.round(input.timings.providerMs));
     data.tool_ms = Math.max(0, Math.round(input.timings.toolMs));
@@ -1826,9 +1832,12 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     turnId,
     historyBoundaryMessageId,
     outputDelivery,
+    hostTodoRun,
     projectId,
     onFileWritten,
+    onShellFileObserved,
     onOutputsPublished,
+    imageStudioNativePngDelivery,
     hasProducedPath,
     onArtifactCreated,
     onCustomConnectorAdded,
@@ -1846,6 +1855,15 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   } = opts;
 
   const diagnostics = createModelRunLogDiagnostics();
+  const settledProviderUsage = { ...diagnostics.providerUsage };
+  const topCacheWriteRequests: Array<{
+    request_round: number;
+    candidate_index: number;
+    attempt: number;
+    cache_write_tokens: number;
+    cache_read_tokens?: number;
+    input_tokens?: number;
+  }> = [];
   let turnLogContext = modelTurnContextForLog({
     userId,
     sessionId,
@@ -2126,6 +2144,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(turnId ? { turnId } : {}),
       ...(historyBoundaryMessageId ? { historyBoundaryMessageId } : {}),
       ...(outputDelivery ? { outputDelivery } : {}),
+      ...(hostTodoRun ? { hostTodoRun: true } : {}),
       ...(message ? { userMessage: message } : {}),
       ...(currentUserMessage ? { currentUserMessage } : {}),
       ...(attachmentMetadata ? { attachmentMetadata } : {}),
@@ -2145,7 +2164,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(runtimeReadOnlyRoots ? { runtimeReadOnlyRoots } : {}),
       ...(richSteerEnabled ? { richSteerEnabled: true } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
+      ...(onShellFileObserved ? { onShellFileObserved } : {}),
       ...(onOutputsPublished ? { onOutputsPublished } : {}),
+      ...(imageStudioNativePngDelivery ? { imageStudioNativePngDelivery } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onCustomConnectorAdded ? { onCustomConnectorAdded } : {}),
@@ -2180,7 +2201,23 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
           cid: turnLogContext.cid, session_kind: turnLogContext.session_kind,
           ...sanitizeProviderFailureDiagnostics(safeFailure), aborted: failure.aborted,
           ...providerFailureContextForLog(failure),
+          ...(failure.requestRound === undefined ? {} : { request_round: failure.requestRound }),
         });
+      },
+      onRequestUsage: (rawUsage, { requestRound, candidateIndex, attempt }) => {
+        const usage = safeUsageForLog(rawUsage);
+        addProviderUsage(settledProviderUsage, usage);
+        const writes = usage?.cacheWriteTokens ?? 0;
+        if (writes <= 0 || (topCacheWriteRequests.length === MAX_CACHE_WRITE_REQUESTS
+          && writes <= topCacheWriteRequests[MAX_CACHE_WRITE_REQUESTS - 1].cache_write_tokens)) return;
+        topCacheWriteRequests.push({
+          request_round: requestRound, candidate_index: candidateIndex, attempt,
+          cache_write_tokens: writes,
+          ...(usage?.cacheReadTokens === undefined ? {} : { cache_read_tokens: usage.cacheReadTokens }),
+          ...(usage?.inputTokens === undefined ? {} : { input_tokens: usage.inputTokens }),
+        });
+        topCacheWriteRequests.sort((a, b) => b.cache_write_tokens - a.cache_write_tokens);
+        if (topCacheWriteRequests.length > MAX_CACHE_WRITE_REQUESTS) topCacheWriteRequests.pop();
       },
       onCandidatesObserved: (info) => {
         diagnostics.providerCandidateCount = Math.max(
@@ -2610,6 +2647,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
                   : (finalText || agentRunResult?.meta.termination?.status === 'handed_off' ? 'completed' : 'empty'))));
     yield agentRunResultEvent({
       status: terminalStatus,
+      convergenceSignals: agentRunResult?.meta.convergenceSignals,
       durationMs: Date.now() - runStartedAt,
       idleWindowSec: idleHit ? idleHitWindow : undefined,
       idleTimeoutSec: idleTimeout,
@@ -2624,6 +2662,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       Date.now() - runStartedAt,
       agentRunResult?.meta.timings || snapshotLiveRunTimings(liveRunTimings),
     );
+    // Provider receipts are a lower bound when the host stops before the
+    // runner's terminal total. Never add the two views of the same usage.
+    const observedUsage = settledProviderUsage.observedCalls ? settledProviderUsage
+      : diagnostics.providerUsage.observedCalls ? diagnostics.providerUsage : undefined;
+    const runUsage = diagnostics.usage ?? observedUsage;
     log.info('model turn finish', {
       session_id: turnLogContext.session_id,
       turn_id: turnLogContext.turn_id,
@@ -2632,6 +2675,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       provider: turnLogContext.provider,
       model: turnLogContext.model,
       status: terminalStatus,
+      ...(topCacheWriteRequests.length ? { top_cache_write_requests: topCacheWriteRequests.slice() } : {}),
+      ...(!diagnostics.usage && observedUsage ? { observed_usage_only: true } : {}),
       aborted: abortedFlag,
       idle_hit: idleHit,
       idle_window_sec: idleHit ? idleHitWindow : undefined,
@@ -2640,7 +2685,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       failure_code: terminalFailureCode || undefined,
       error: errText ? logErrorRef(new Error(errText)) : undefined,
       timings: timingSummary,
-      diagnostics: summarizeModelRunForLog(diagnostics),
+      diagnostics: summarizeModelRunForLog({ ...diagnostics, usage: runUsage }),
       context: turnLogContext,
     });
     try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }

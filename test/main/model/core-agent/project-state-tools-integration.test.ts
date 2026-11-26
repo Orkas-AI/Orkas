@@ -151,6 +151,32 @@ describe('project state tools → durable feature stores', () => {
     } finally { registry.mockRestore(); }
   });
 
+  it('lets a project to-do name a built-in Agent the project never added as its owner', async () => {
+    const agents = await import('../../../../src/main/features/agents');
+    const projects = await import('../../../../src/main/features/projects');
+    const tasks = await import('../../../../src/main/features/project_tasks');
+    const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
+    const created = await projects.createProject(UID, 'Video work');
+    if (!created.ok) throw new Error('project fixture failed');
+    const pid = created.project.project_id;
+    const registry = vi.spyOn(agents, 'listAgentSummaries').mockResolvedValue([
+      { agent_id: 'builtin-video', name: 'VideoStudio', source: 'marketplace', seed_source: 'builtin', enabled: true },
+      { agent_id: 'custom-outsider', name: 'Outsider', source: 'custom', enabled: true },
+    ] as any);
+    try {
+      const names = new Map([['builtin-video', 'VideoStudio'], ['custom-outsider', 'Outsider']]);
+      const tool = createProjectTasksTool(createProjectTasksHandler(UID, pid, 'project-chat', names));
+      const call = async (args: Record<string, unknown>) => tool.execute(args, { state: {} });
+      const made = await call({ action: 'create', content: 'Cut the pauses', owner: 'VideoStudio' });
+      expect(made.isError).toBeFalsy();
+      const saved = await tasks.getTask(UID, pid, JSON.parse(made.content).task.id);
+      expect(saved).toMatchObject({ owner_agent_id: 'builtin-video', owner_agent: 'VideoStudio' });
+      expect((await call({ action: 'update', task_id: saved!.id, owner: 'Outsider' })).isError).toBe(true);
+      expect(await tasks.getTask(UID, pid, saved!.id)).toMatchObject({ owner_agent_id: 'builtin-video' });
+      expect((await projects.getBindings(UID, pid)).agents).toEqual([]);
+    } finally { registry.mockRestore(); }
+  });
+
   it('round-trips instructions, durable memory, and task progress through real handlers', async () => {
     const state = await setupProjectStateTools();
     const ctx = {} as any;

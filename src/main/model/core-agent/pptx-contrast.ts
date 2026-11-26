@@ -13,11 +13,28 @@ interface ContrastFinding {
   background: string;
   ratio: number;
   requiredRatio: number;
-  /** The compared background was declared by the text's owner, an ancestor
-   *  shape, or the slide itself. When it is only the theme default, a picture
-   *  or another shape may sit under the text, so the reading is advisory. */
+  /** The color comes from a declared fill or a proven backing panel. */
   backgroundDeclared: boolean;
 }
+
+interface Background {
+  color: string | null;
+  declared: boolean;
+  needsVisualReview?: boolean;
+}
+
+interface LayerBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+const TEXT_OWNER_TYPES = new Set(['shape', 'title', 'placeholder', 'textbox', 'table-cell', 'cell']);
+const GEOMETRY_UNIT_EMU: Record<string, number> = { cm: 360_000, mm: 36_000, in: 914_400, pt: 12_700, emu: 1 };
+// Limit work on crowded decks just as the separate rendered collision audit
+// bounds layout comparisons. Exhaustion leaves an advisory instead of a guess.
+const MAX_LAYER_COMPARISONS = 100_000;
 
 function record(value: unknown): JsonRecord | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -66,10 +83,91 @@ function normalizeHex(value: unknown, theme: JsonRecord): string | null {
 
 function resolvedBackground(format: JsonRecord, inherited: string | null, theme: JsonRecord): string | null {
   const raw = format.fill ?? format.background;
-  if (raw === undefined || raw === null || /^(?:none|clear|transparent)$/i.test(String(raw).trim())) {
+  if (isTransparentFill(raw)) {
     return inherited;
   }
   return normalizeHex(raw, theme);
+}
+
+function isTransparentFill(value: unknown): boolean {
+  return value == null || /^(?:none|clear|transparent)$/i.test(String(value).trim());
+}
+
+function geometryLength(value: unknown): number {
+  const match = /^([+-]?\d+(?:\.\d+)?)\s*(cm|mm|in|pt|emu)?$/i.exec(String(value ?? '').trim());
+  if (!match) return NaN;
+  const amount = Number(match[1]);
+  const emu = match[2] ? Math.round(amount * GEOMETRY_UNIT_EMU[match[2].toLowerCase()]) : amount;
+  return Number.isSafeInteger(emu) ? emu : NaN;
+}
+
+function boundsFor(node: JsonRecord, format: JsonRecord): LayerBounds | null {
+  // Groups and transformed/effected shapes can paint outside their raw bounds.
+  if (String(node.type ?? '').toLowerCase() === 'group'
+    || Number(format.rotation ?? 0) !== 0
+    || Boolean(format.shadow || format.glow || format.reflection || format.softEdge)) return null;
+  const left = geometryLength(format.x);
+  const top = geometryLength(format.y);
+  const width = geometryLength(format.width);
+  const height = geometryLength(format.height);
+  const right = left + width;
+  const bottom = top + height;
+  return width > 0 && height > 0 && Number.isFinite(right) && Number.isFinite(bottom)
+    ? { left, top, right, bottom } : null;
+}
+
+function hasUncertainOpacity(format: JsonRecord, fill: unknown): boolean {
+  const alpha = /^#?[0-9a-f]{6}([0-9a-f]{2})$/i.exec(String(fill ?? '').trim())?.[1];
+  return (format.opacity != null && !/^1(?:\.0+)?$/.test(String(format.opacity).trim()))
+    || (alpha !== undefined && alpha.toLowerCase() !== 'ff');
+}
+
+function panelColor(node: JsonRecord, format: JsonRecord): string | null {
+  if (String(node.type ?? '').toLowerCase() !== 'shape'
+    || String(format.geometry ?? '').toLowerCase() !== 'rect'
+    || String(node.text ?? '').trim()
+    || format.gradient || format.pattern || hasUncertainOpacity(format, format.fill)) return null;
+  const hex = /^#?([0-9a-f]{6})(?:ff)?$/i.exec(String(format.fill ?? '').trim())?.[1];
+  return hex ? `#${hex.toUpperCase()}` : null;
+}
+
+// Undefined means no layer changes the ordinary background. Null means the
+// tree cannot establish a single background for the text.
+function slideBackdrops(children: JsonRecord[], budget: { remaining: number }) {
+  const usedOrders = new Set<number>();
+  const duplicateOrders = new Set<number>();
+  const layers = children.map(node => {
+    const format = formatOf(node);
+    const orderText = String(format.zorder ?? '').trim();
+    const order = /^\d+$/.test(orderText) && Number.isSafeInteger(Number(orderText)) ? Number(orderText) : null;
+    if (order !== null) {
+      if (usedOrders.has(order)) duplicateOrders.add(order);
+      usedOrders.add(order);
+    }
+    return { node, order, bounds: boundsFor(node, format), color: panelColor(node, format) };
+  });
+  const byNode = new Map(layers.map(layer => [layer.node, layer]));
+  // Unknown order may put a shape between the text and any candidate panel.
+  layers.sort((a, b) => a.order === b.order ? 0 : (b.order ?? Infinity) - (a.order ?? Infinity));
+  const hasLayout = layers.some(layer => layer.order !== null || layer.bounds !== null);
+  return (node: JsonRecord): string | null | undefined => {
+    const target = byNode.get(node);
+    if (!target || !hasLayout || layers.length === 1) return undefined;
+    for (const neighbor of layers) {
+      if (neighbor === target) continue;
+      if (budget.remaining-- <= 0) return null;
+      const front = target.bounds;
+      const back = neighbor.bounds;
+      if (front && back && (back.right <= front.left || back.bottom <= front.top
+        || back.left >= front.right || back.top >= front.bottom)) continue;
+      if (!front || !back || target.order === null || neighbor.order === null || neighbor.order >= target.order
+        || duplicateOrders.has(neighbor.order) || !neighbor.color
+        || back.left > front.left || back.top > front.top || back.right < front.right || back.bottom < front.bottom) return null;
+      // The first intersecting lower layer is opaque and covers the frame.
+      return neighbor.color;
+    }
+    return undefined;
+  };
 }
 
 function parsePoints(value: unknown): number | null {
@@ -134,9 +232,8 @@ function isOfficeLowContrastIssue(value: unknown, auditedPaths: Set<string>): bo
  * inherited black placeholder text on a dark slide, which the engine's
  * explicit-fill-only heuristic cannot see.
  *
- * This deliberately audits only backgrounds represented by the text node's
- * ancestors or the slide itself. Independent overlapping shapes, gradients,
- * images, and transparency remain the visual reviewer's responsibility.
+ * A direct slide shape can also use a simple, proven backing panel.
+ * Report ambiguous layers for visual review rather than guessing their color.
  */
 export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxContrastAuditResult {
   const root = unwrapTree(rawTree);
@@ -147,25 +244,28 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
   const defaultText = normalizeHex(rootFormat['theme.color.dk1'], theme) ?? '#000000';
   const defaultBackground = normalizeHex(rootFormat['theme.color.lt1'], theme) ?? '#FFFFFF';
   const findings = new Map<string, ContrastFinding>();
+  const visualReviewPaths = new Set<string>();
   const auditedPaths = new Set<string>();
+  const layerBudget = { remaining: MAX_LAYER_COMPARISONS };
   let scannedTextCount = 0;
 
   const auditNode = (
     node: JsonRecord,
-    inheritedBackground: string | null,
-    inheritedBackgroundDeclared: boolean,
+    inheritedBackground: Background,
     inheritedForeground: string,
     inheritedSize: number | null,
     inheritedBold: boolean,
     ownerPath: string,
+    backdropFor?: ReturnType<typeof slideBackdrops>,
   ): void => {
     const format = formatOf(node);
     const nodePath = String(node.path ?? '').trim();
     const nodeType = String(node.type ?? '').trim().toLowerCase();
-    const isOwner = ['shape', 'title', 'placeholder', 'textbox', 'table-cell', 'cell'].includes(nodeType);
+    const isOwner = TEXT_OWNER_TYPES.has(nodeType);
     const activeOwner = isOwner && nodePath ? nodePath : ownerPath;
-    const background = resolvedBackground(format, inheritedBackground, theme);
-    const backgroundDeclared = background !== inheritedBackground ? background !== null : inheritedBackgroundDeclared;
+    const background = resolvedBackground(format, inheritedBackground.color, theme);
+    const nodeBackground = background === inheritedBackground.color ? inheritedBackground
+      : { ...inheritedBackground, color: background, declared: background !== null };
     const foreground = normalizeHex(format.color ?? format['effective.color'], theme) ?? inheritedForeground;
     const size = parsePoints(format.size ?? format['font.size'] ?? format['effective.size']) ?? inheritedSize;
     const bold = format.bold !== undefined ? isBold(format.bold) : inheritedBold;
@@ -173,7 +273,10 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     const text = String(node.text ?? '').trim();
     const isTextLeaf = !!text && (nodeType === 'run' || children.length === 0);
 
-    if (isTextLeaf && background && activeOwner) {
+    if (isTextLeaf && activeOwner && inheritedBackground.needsVisualReview) {
+      visualReviewPaths.add(activeOwner);
+      auditedPaths.add(activeOwner);
+    } else if (isTextLeaf && background && activeOwner) {
       scannedTextCount += 1;
       auditedPaths.add(activeOwner);
       const ratio = contrastRatio(foreground, background);
@@ -186,7 +289,7 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
           background,
           ratio,
           requiredRatio,
-          backgroundDeclared,
+          backgroundDeclared: nodeBackground.declared,
         };
         const previous = findings.get(activeOwner);
         if (!previous || candidate.ratio < previous.ratio) findings.set(activeOwner, candidate);
@@ -194,7 +297,16 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     }
 
     for (const child of children) {
-      auditNode(child, background, backgroundDeclared, foreground, size, bold, activeOwner);
+      let childBackground = nodeBackground;
+      if (backdropFor && TEXT_OWNER_TYPES.has(String(child.type ?? '').toLowerCase())) {
+        const childFormat = formatOf(child);
+        const fill = childFormat.fill ?? childFormat.background;
+        const backing = isTransparentFill(fill) ? backdropFor(child)
+          : hasUncertainOpacity(childFormat, fill) ? null : undefined;
+        if (backing === null) childBackground = { ...nodeBackground, needsVisualReview: true };
+        else if (backing !== undefined) childBackground = { color: backing, declared: true };
+      }
+      auditNode(child, childBackground, foreground, size, bold, activeOwner);
     }
   };
 
@@ -206,7 +318,8 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     const slideBackground = slideFormat.background === undefined
       ? defaultBackground
       : normalizeHex(slideFormat.background, theme);
-    auditNode(slide, slideBackground, slideFormat.background !== undefined, defaultText, null, false, '');
+    auditNode(slide, { color: slideBackground, declared: slideFormat.background !== undefined },
+      defaultText, null, false, '', slideBackdrops(childrenOf(slide), layerBudget));
   }
 
   const preserved = issueList(rawIssues).filter((issue) => !isOfficeLowContrastIssue(issue, auditedPaths));
@@ -231,10 +344,21 @@ export function auditPptxContrast(rawIssues: unknown, rawTree: unknown): PptxCon
     contrast_ratio: Number(finding.ratio.toFixed(2)),
     required_ratio: finding.requiredRatio,
   }));
-  const issues = [...preserved, ...generated];
+  const visualReview = [...visualReviewPaths].map((path, index) => {
+    const slide = /^\/slide\[(\d+)\]/.exec(path)?.[1];
+    return {
+      id: `ORKAS_CONTRAST_REVIEW_${index + 1}`,
+      type: 'format',
+      subtype: 'contrast_needs_visual_review',
+      severity: 'warning',
+      path,
+      message: `Render slide ${slide ?? 'containing this element'} to check the text contrast. Its background could not be determined from the slide layers.`,
+    };
+  });
+  const issues = [...preserved, ...generated, ...visualReview];
   return {
     issues: withIssueList(rawIssues, issues),
-    findingCount: generated.length,
+    findingCount: generated.length + visualReview.length,
     scannedTextCount,
   };
 }

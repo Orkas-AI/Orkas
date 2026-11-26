@@ -6,6 +6,7 @@ import { AgentRunner, createConfig, createPiProvider, ProviderRegistry, Session,
   type CompletionParams, type CompletionResult, type LLMProvider, type StreamEvent } from '#core-agent';
 import { createRotatingProvider, type RotatingCandidate } from '../../../../src/main/model/core-agent/rotating-provider';
 import { mapCoreAgentEvents } from '../../../../src/main/model/core-agent/event-mapper';
+import { withTaskBudget } from '../../../../src/main/model/core-agent/task-budget-provider';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const result: CompletionResult = { model: 'fixture', content: [{ type: 'text', text: 'done' }], stopReason: 'end_turn', usage };
@@ -92,10 +93,18 @@ describe('candidate request capacity', () => {
 
   it.each(['stream', 'complete'] as const)('preserves the full request through a larger fallback and reuses the smaller candidate on the next request in %s', async mode => {
     const smallCalls: CompletionParams[] = [], largeCalls: CompletionParams[] = [];
-    const observations: unknown[] = [];
-    const small = candidate('small', 32000, 1024, success(smallCalls));
-    const provider = createRotatingProvider({ providerId: 'fixture', onRequestFailure: failure => observations.push(failure), candidates: [small,
-      candidate('large', 131072, 1024, success(largeCalls))] });
+    const otherSmallCalls: CompletionParams[] = [];
+    const failures = vi.fn();
+    const settled = vi.fn();
+    const tracked = (id: string, window: number, calls: CompletionParams[]): RotatingCandidate => ({
+      ...candidate(id, window, 1024, success(calls)),
+      build: async (observe?: Parameters<typeof withTaskBudget>[2]) => withTaskBudget(success(calls), undefined, observe),
+    });
+    const provider = createRotatingProvider({ providerId: 'fixture',
+      onRequestUsage: settled,
+      onRequestFailure: failures,
+      candidates: [tracked('small', 32000, smallCalls), tracked('other-small', 32000, otherSmallCalls),
+        tracked('large', 131072, largeCalls)] });
     const params: CompletionParams = { model: 'small', maxTokens: 1024,
       messages: [{ role: 'user', content: [{ type: 'text', text: 'a'.repeat(160000) }] }] };
     const invoke = (request: CompletionParams) => mode === 'stream' ? collect(provider.stream(request)) : provider.complete(request);
@@ -107,6 +116,15 @@ describe('candidate request capacity', () => {
     await invoke({ ...params, messages: [{ role: 'user', content: [{ type: 'text', text: 'Hi' }] }] });
     expect(smallCalls).toHaveLength(1);
     expect(largeCalls).toHaveLength(1);
+    expect(otherSmallCalls).toEqual([]);
+    expect(failures.mock.calls).toEqual([1, 2].map(candidateIndex => [expect.objectContaining({
+      phase: 'before_request', source: 'payload', code: 'context_capacity_insufficient', requestRound: 1,
+      contextBudget: expect.objectContaining({ candidate_index: candidateIndex }),
+    })]));
+    expect(settled.mock.calls).toEqual([
+      [expect.objectContaining(usage), { requestRound: 1, candidateIndex: 3, attempt: 1 }],
+      [expect.objectContaining(usage), { requestRound: 2, candidateIndex: 1, attempt: 1 }],
+    ]);
   });
 
   it.each(['stream', 'complete'] as const)('stops candidate admission when cancellation arrives during a local skip in %s', async mode => {
@@ -292,6 +310,126 @@ describe('candidate request capacity', () => {
       expect(JSON.stringify(calls[0].messages)).toContain('read-1');
     } finally { if (directory) fs.rmSync(directory, { recursive: true, force: true }); }
   });
+
+  it.each(['recovered', 'all-skipped', 'summary-too-large', 'actual-too-large', 'incomplete', 'empty-summary', 'cancelled'] as const)(
+    'resumes a long turn across candidate windows without replay or extra summaries (%s)', async outcome => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'candidate-checkpoint-'));
+      const sessionFile = path.join(directory, 'task.jsonl');
+      const session = new PersistentSession({ sessionFile });
+      const selectCheckpoint = vi.spyOn(session, 'selectPendingActiveCheckpoint');
+      const cancel = new AbortController();
+      try {
+        const instruction = 'Finish comparing the files. ' + 'constraint '.repeat(outcome === 'summary-too-large' ? 4000 : 8000);
+        const oldReceipt = 'OLD_EVIDENCE ' + 'record '.repeat(15000);
+        const latestReceipt = 'LATEST_UNREAD_EVIDENCE';
+        session.beginUserTurn([{ type: 'text', text: instruction }]);
+        session.addAssistantMessage([{ type: 'tool_use', id: 'older', name: 'read', input: {} }]);
+        session.addToolResult('older', oldReceipt);
+        session.addAssistantMessage([{ type: 'tool_use', id: 'latest', name: 'read', input: {} }]);
+        session.addToolResult('latest', latestReceipt);
+        const primaryCalls: CompletionParams[] = [];
+        const primary = success(primaryCalls);
+        primary.stream = async function* (params): AsyncIterable<StreamEvent> {
+          primaryCalls.push(params);
+          throw Object.assign(new Error('Service unavailable'), { status: 503 });
+        };
+        const calls: CompletionParams[] = [];
+        const fallback = success(calls);
+        const summaryText = 'Earlier file evidence reviewed. Continue from the latest receipt.';
+        fallback.stream = async function* (params) {
+          calls.push(params);
+          if (params.requestMetadata?.outputLimitSource === 'provider_default') {
+            if (outcome === 'cancelled') {
+              cancel.abort();
+              return;
+            }
+            if (outcome === 'empty-summary') {
+              yield { type: 'message_end', ...result, content: [] };
+              return;
+            }
+            const text = outcome === 'actual-too-large' ? summaryText + ' details'.repeat(6000) : summaryText;
+            yield { type: 'message_end', ...result, content: [{ type: 'text', text }],
+              stopReason: outcome === 'incomplete' ? 'max_tokens' : 'end_turn' };
+          } else if (params.model === 'compact' && outcome === 'recovered') {
+            throw Object.assign(new Error('Service unavailable'), { status: 503 });
+          } else {
+            yield { type: 'message_end', ...result };
+          }
+        };
+        const wide = candidate('wide', 1_000_000, 1024, primary);
+        const belowMinimum = candidate('below', 31999, 1024, fallback);
+        const necessaryTooLarge = candidate('too-small', 32000, 28000, fallback);
+        const summaryTooLarge = candidate('no-summary-room', 32000, outcome === 'summary-too-large' ? 4000 : 12000, fallback);
+        const compact = candidate('compact', outcome === 'actual-too-large' ? 39000 : 42000, 1024, fallback);
+        const next = candidate('next', outcome === 'summary-too-large' ? 100000 : 44000, 1024, fallback);
+        const providers = new ProviderRegistry();
+        providers.registerFactory('fixture', () => {
+          const rotating = createRotatingProvider({ providerId: 'fixture', networkRetryAttempts: 0,
+            candidates: [...(outcome === 'all-skipped' ? [] : [wide]), belowMinimum, necessaryTooLarge, summaryTooLarge,
+              ...(outcome === 'summary-too-large' ? [] : [compact]), next] });
+          if (outcome !== 'all-skipped') return rotating;
+          // A different window was used while building the original request.
+          // Both actual candidates must decline it before any transport starts.
+          return { ...rotating, contextBudget: phase => phase === 'served' ? rotating.contextBudget?.(phase)
+            : { key: 'preparation', model: 'wide', contextWindow: 1_000_000, maxOutputTokens: 1024 } };
+        });
+        const runner = new AgentRunner({ session, providers, tools: [], config: createConfig({
+          agent: { defaultProvider: 'fixture', defaultModel: 'wide', maxRetries: 0 }, evolution: { enabled: false },
+          models: { catalog: { wide: { provider: 'fixture', model: 'wide', contextWindow: 1_000_000, maxOutputTokens: 1024 } } },
+        }) });
+        const events = await collect(runner.runStream({ message: instruction, resumeActiveTurn: true, signal: cancel.signal }));
+        expect(primaryCalls).toHaveLength(outcome === 'all-skipped' ? 0 : 1);
+        expect(selectCheckpoint.mock.calls.filter(([, , , allowClippedGroup]) => allowClippedGroup === false)).toHaveLength(1);
+        expect(belowMinimum.build).not.toHaveBeenCalled();
+        expect(necessaryTooLarge.build).not.toHaveBeenCalled();
+        expect(summaryTooLarge.build).not.toHaveBeenCalled();
+        expect(events.some(event => event.type === 'tool_start')).toBe(false);
+        expect(calls.every(params => !params.recoverCandidateContext)).toBe(true);
+        const summaries = calls.filter(params => params.requestMetadata?.outputLimitSource === 'provider_default');
+        const main = calls.filter(params => params.requestMetadata?.outputLimitSource !== 'provider_default');
+        const terminal = events.find(event => event.type === 'done')?.result;
+        if (outcome === 'summary-too-large') {
+          expect(summaries).toEqual([]);
+          expect(main.map(params => params.model)).toEqual(['next']);
+          expect(JSON.stringify(main[0].messages)).toContain(oldReceipt);
+          expect(terminal?.meta.error).toBeUndefined();
+        } else {
+          const checkpoints = events.filter(event => event.type === 'context_status');
+          expect(summaries.map(params => params.model), JSON.stringify(checkpoints)).toEqual(['compact']);
+          expect(JSON.stringify(summaries[0].messages)).toContain(oldReceipt);
+          expect(JSON.stringify(summaries[0].messages)).not.toContain(latestReceipt);
+          if (outcome === 'recovered' || outcome === 'actual-too-large' || outcome === 'all-skipped') {
+            const models = outcome === 'recovered' ? ['compact', 'next']
+              : outcome === 'actual-too-large' ? ['next'] : ['compact'];
+            expect(main.map(params => params.model)).toEqual(models);
+            for (const params of main) {
+              const messages = JSON.stringify(params.messages);
+              expect(messages).toContain(summaryText);
+              expect(messages).toContain(latestReceipt);
+              expect(messages).toContain(instruction);
+              expect(messages).not.toContain(oldReceipt);
+            }
+            expect(events.filter(event => event.type === 'compaction')).toHaveLength(1);
+            const visible = await collect(mapCoreAgentEvents((async function* () { yield* events; })(), { failureTrackingScope: {} }));
+            const phases = visible.flatMap(event => event.type === 'event' && event.event.stream === 'context' ? [event.event.data.phase] : []);
+            expect(phases).toEqual(['active_process_compaction_start', 'active_process_compaction_done']);
+            expect(terminal?.meta.error).toBeUndefined();
+            expect(terminal?.meta.usage?.totalTokens).toBe(2 * usage.totalTokens);
+            expect(JSON.stringify(new PersistentSession({ sessionFile }).getMessages())).toContain(oldReceipt);
+          } else {
+            expect(main).toEqual([]);
+            expect(events.some(event => event.type === 'compaction')).toBe(false);
+            expect(terminal?.meta.error?.code).toBe(outcome === 'cancelled' ? 'ABORT_ERR' : 'PROVIDER_NETWORK_EXHAUSTED');
+            if (outcome === 'empty-summary') expect(terminal?.meta.usage?.totalTokens).toBe(usage.totalTokens);
+            const reopened = new PersistentSession({ sessionFile });
+            expect(JSON.stringify(reopened.getMessagesForModel())).toContain(oldReceipt);
+            expect(JSON.stringify(reopened.getMessagesForModel())).toContain(latestReceipt);
+          }
+        }
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
 
   it('does not underprice an unchanged request whose completed provider usage exceeds the local estimate', async () => {
     const calls: CompletionParams[] = [];

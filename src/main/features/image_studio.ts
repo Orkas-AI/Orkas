@@ -3,11 +3,12 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { NativeImage as ElectronNativeImage } from 'electron';
+import { readProducedFileVersion } from '../model/core-agent/task-file-ownership';
 
 import { hardenedWebPreferences } from '../util/window-security';
 import { isPathAllowed } from '../util/path-sandbox';
 import { encodeImage, imageMetadata, matchesPsdPreview } from '../util/sharp-runtime';
-import { imageStudioFileHash, isImageStudioGeneration, type ImageStudioGenerationOutput } from './image_studio_provenance';
+import { imageStudioBytesHash, imageStudioFileHash, isImageStudioGeneration, type ImageStudioGenerationOutput } from './image_studio_provenance';
 import {
   extractCssImports,
   extractCssUrls,
@@ -1006,6 +1007,9 @@ export async function inspectImageStudioProject(
   const sourceAbs = sourceRef ? path.resolve(sourceRef) : '';
   if (!sourceAbs) pushIssue(blockers, 'E_RASTER_SOURCE_REQUIRED', 'raster_source or input_path is required for a raster; use entry for an HTML composition.');
   else if (!isPathAllowed(sourceAbs, [projectDir])) pushIssue(blockers, 'E_RASTER_SOURCE_OUTSIDE_PROJECT', 'The raster source must stay inside the image project.');
+  else if (explicitRasterAbsPath && sourceAbs === read.manifestPath) {
+    pushIssue(blockers, 'E_RASTER_SOURCE_INVALID', 'input_path points to image-manifest.json. Omit input_path to use the project raster binding, or pass the path of a project-local raster image.');
+  }
   if (blockers.length) return { ok: false, route: manifest.route, blockers, advisories, resources: [], manifest };
 
   try {
@@ -1185,16 +1189,24 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
           scrollingAreas += 1;
         }
       }
-      const requiredCopyLayouts = requiredCopy.map((copy) => {
-        const copyChars = Array.from(String(copy)).filter((char) => !/\\s/u.test(char));
-        const candidates = elements.filter((element) => {
-          const style = getComputedStyle(element);
-          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
-          const chars = visibleText(element);
-          if (chars.length < copyChars.length) return false;
-          return chars.join('').includes(copyChars.join(''));
-        }).sort((left, right) => visibleText(left).length - visibleText(right).length);
-        const element = candidates[0];
+      const matches = requiredCopy.map((copy) => {
+        const chars = Array.from(String(copy)).filter((char) => !/\\s/u.test(char));
+        return { copy, chars, text: chars.join(''), element: null, length: Infinity };
+      });
+      for (const element of matches.length ? elements : []) {
+        const style = getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+        const chars = visibleText(element);
+        const text = chars.join('');
+        for (const match of matches) {
+          // Strict comparison keeps the first DOM match when lengths tie.
+          if (chars.length < match.length && chars.length >= match.chars.length && text.includes(match.text)) {
+            match.element = element;
+            match.length = chars.length;
+          }
+        }
+      }
+      const requiredCopyLayouts = matches.map(({ copy, chars: copyChars, element }) => {
         if (!element) return { copy, lineGlyphCounts: [], explicitBreak: false, writingMode: '' };
         const glyphs = [];
         const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
@@ -1262,7 +1274,7 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
     const bytes = await normalizeImageStudioSnapshot(captured.toPNG(), manifest.canvas);
     const image = electron.nativeImage.createFromBuffer(bytes);
     if (pdf) {
-      if (analyzeNativeImage(image).hash !== pdf.expectedImageHash) {
+      if (imageStudioBytesHash(image.toBitmap()) !== pdf.expectedImageHash) {
         throw new Error('E_IMAGE_PDF_PREVIEW_MISMATCH: print layout differs from the current reviewed preview; repair print styles and recapture.');
       }
       if (pdf.footerText) {
@@ -1278,7 +1290,7 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
         pageSize: { width: manifest.canvas.width / 96, height: manifest.canvas.height / 96 },
         margins: { top: 0, bottom: 0, left: 0, right: 0 }, displayHeaderFooter: false, scale: 1 }),
       timeoutMs(), 'E_IMAGE_PDF_TIMEOUT: PDF export timed out.');
-      return { image: analyzeNativeImage(image), layoutBlockers: requiredCopyLayoutIssues(layout.requiredCopyLayouts), pdfBytes };
+      return { layoutBlockers: requiredCopyLayoutIssues(layout.requiredCopyLayouts), pdfBytes };
     }
     await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
     await fs.writeFile(outputAbsPath, bytes);
@@ -1431,17 +1443,39 @@ export async function recordRasterEvidence(input: {
   return { ...inspection, is_generation: isGeneration };
 }
 
-export async function assertCurrentEvidence(stateAbsPath: string): Promise<{ state: ImageStudioEvidenceState; inspection: ImageStudioInspection }> {
+/** Check pixel identity after the source signature matches. */
+export async function imageStudioEvidencePixelsMatch(state: Pick<ImageStudioEvidenceState, 'evidence_path' | 'image_hash'>): Promise<boolean> {
+  const image = await nativeImageFromPath(state.evidence_path);
+  return imageStudioBytesHash(image.toBitmap()) === state.image_hash;
+}
+
+async function readCurrentEvidenceSources(stateAbsPath: string) {
   const state = await readImageStudioEvidenceState(stateAbsPath);
   if (!state) throw new Error('E_IMAGE_REVIEW_EVIDENCE_REQUIRED: inspect or snapshot the current image first.');
   const inspection = await inspectImageStudioProject(state.project_dir, state.source_path, state.page_id);
   if (!inspection.ok || inspection.signature !== state.signature) {
     throw new Error('E_IMAGE_REVIEW_EVIDENCE_STALE: project sources changed after the evidence was captured.');
   }
-  const image = await nativeImageFromPath(state.evidence_path);
-  if (analyzeNativeImage(image).hash !== state.image_hash) {
+  return { state, inspection };
+}
+
+function assertEvidencePixelsMatch(matches: boolean): void {
+  if (!matches) {
     throw new Error('E_IMAGE_REVIEW_EVIDENCE_CHANGED: the reviewed evidence image changed on disk.');
   }
+}
+
+async function readVerifiedEvidence(stateAbsPath: string) {
+  const { state, inspection } = await readCurrentEvidenceSources(stateAbsPath);
+  const image = await nativeImageFromPath(state.evidence_path);
+  const analysis = analyzeNativeImage(image);
+  assertEvidencePixelsMatch(analysis.hash === state.image_hash);
+  return { state, inspection, image, analysis };
+}
+
+export async function assertCurrentEvidence(stateAbsPath: string): Promise<{ state: ImageStudioEvidenceState; inspection: ImageStudioInspection }> {
+  const { state, inspection } = await readCurrentEvidenceSources(stateAbsPath);
+  assertEvidencePixelsMatch(await imageStudioEvidencePixelsMatch(state));
   return { state, inspection };
 }
 
@@ -1508,13 +1542,13 @@ export async function exportImageStudioProject(input: {
   signal?: AbortSignal;
   deadline?: number;
   finalizeOutput?: (absPath: string) => Promise<void>;
+  onVerifiedPng?: (absPath: string, version: string) => void;
 }): Promise<{ output_path: string; signature: string; is_generation: boolean; image: ReturnType<typeof analyzeNativeImage> }> {
-  const { state, inspection } = await assertCurrentEvidence(input.stateAbsPath);
+  const { state, inspection, image, analysis } = await readVerifiedEvidence(input.stateAbsPath);
   if (!imageStudioEvidenceIsGeneration(state)
     && (!state.review || state.review.verdict !== 'passed' || state.review.signature !== state.signature)) {
     throw new Error('E_IMAGE_REVIEW_PASS_REQUIRED: the exact current evidence needs a passing design review before export.');
   }
-  const image = await nativeImageFromPath(state.evidence_path);
   if (input.format === 'pdf') {
     if (inspection.source_kind !== 'html' || !inspection.manifest) {
       throw new Error('E_IMAGE_PDF_SOURCE_REQUIRED: use the current HTML/SVG design source for vector PDF delivery.');
@@ -1544,7 +1578,7 @@ export async function exportImageStudioProject(input: {
         }
       }
     } catch (error) { await fs.rm(input.outputAbsPath, { force: true }); throw error; }
-    return { output_path: input.outputAbsPath, signature: state.signature, is_generation: false, image: analyzeNativeImage(image) };
+    return { output_path: input.outputAbsPath, signature: state.signature, is_generation: false, image: analysis };
   }
   if (input.format === 'psd') {
     const png = state.exported_png;
@@ -1589,16 +1623,24 @@ export async function exportImageStudioProject(input: {
         }
       }
     } catch (error) { await fs.rm(input.outputAbsPath, { force: true }); throw error; }
-    return { output_path: input.outputAbsPath, signature: state.signature, is_generation: imageStudioEvidenceIsGeneration(state), image: analyzeNativeImage(image) };
+    return { output_path: input.outputAbsPath, signature: state.signature, is_generation: imageStudioEvidenceIsGeneration(state), image: analysis };
   }
   const bytes = input.format === 'jpeg' ? image.toJPEG(92) : image.toPNG();
   await fs.mkdir(path.dirname(input.outputAbsPath), { recursive: true });
   await fs.writeFile(input.outputAbsPath, bytes);
   await input.finalizeOutput?.(input.outputAbsPath);
+  const pngVersion = input.format === 'png' && input.onVerifiedPng
+    ? readProducedFileVersion(input.outputAbsPath) : undefined;
   const outputImage = await nativeImageFromPath(input.outputAbsPath);
   if (input.format === 'png') {
     await writeEvidenceState(input.stateAbsPath, { ...state,
       exported_png: { path: path.resolve(input.outputAbsPath), sha256: await imageStudioFileHash(input.outputAbsPath), signature: state.signature } });
+    if (input.onVerifiedPng) {
+      if (!pngVersion || pngVersion !== readProducedFileVersion(input.outputAbsPath)) {
+        throw new Error('E_IMAGE_EXPORT_CHANGED: The exported PNG changed before publication. Export the current version again.');
+      }
+      input.onVerifiedPng(input.outputAbsPath, pngVersion);
+    }
   }
   return { output_path: input.outputAbsPath, signature: state.signature, is_generation: imageStudioEvidenceIsGeneration(state), image: analyzeNativeImage(outputImage) };
 }

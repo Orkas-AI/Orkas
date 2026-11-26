@@ -160,7 +160,7 @@ async function _loadGlobalTodoGroup(project) {
   return {
     project,
     tasks: tasks.tasks,
-    agents: bindings.agentDetails || [],
+    agents: _projectAvailableAgents(bindings),
     driverEnabled: !!driver?.config?.enabled,
     driverConfig: driver?.config,
     driverDevice: driver?.device,
@@ -446,6 +446,7 @@ function _renderGlobalTodos() {
   const scroll = _captureTodoScroll(host);
   const trackScroll = _captureTodoScrollTrack(host);
   _closeProjectDriverHint();
+  _closeTodoAssignPicker(host);
   host.innerHTML = '';
   _syncTodoGroupingButtons();
   const groups = _globalTodoGroups;
@@ -509,9 +510,7 @@ function focusTodo(scope, taskId, opts = {}) {
   if (id) {
     _globalTodoActiveScope = pid;
   }
-  const viewOptions = opts.entryPoint ? { entryPoint: opts.entryPoint } : {};
-  if (opts.returnToConversation === true) viewOptions.returnToConversation = true;
-  setView('todos', null, viewOptions);
+  setView('todos', null, opts);
 }
 
 function _applyGlobalTodoPendingFocus() {

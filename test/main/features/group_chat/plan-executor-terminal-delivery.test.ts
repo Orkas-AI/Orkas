@@ -119,6 +119,19 @@ describe('group_chat plan executor terminal delivery', () => {
     }
   });
 
+  it('treats a control-only Agent handback that will resume Commander as a silent turn', async () => {
+    const event = commanderEvent({
+      actor: { id: 'writer', kind: 'agent' },
+      errText: null,
+      commanderResuming: true,
+    });
+    await expect(onTurnFinished('u1', 'c1', event)).resolves.toEqual({ kind: 'silent' });
+    await expect(onTurnFinished('u1', 'c1', { ...event, finalText: 'Commander can continue.' }))
+      .resolves.toEqual({ kind: 'persist', text: 'Commander can continue.' });
+    await expect(onTurnFinished('u1', 'c1', { ...event, errText: 'Provider failed', failureKind: 'model' }))
+      .resolves.toMatchObject({ kind: 'persist', failureKind: 'model' });
+  });
+
   it('labels a local agent runtime error as an agent run failure', async () => {
     const outcome = await onTurnFinished('u1', 'c1', commanderEvent({
       actor: { id: 'hermes', kind: 'agent' },

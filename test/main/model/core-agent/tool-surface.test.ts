@@ -12,6 +12,21 @@ import {
 import { TOOL_CATALOG_REVISION } from '../../../../src/main/model/core-agent/tool-catalog-revision';
 
 describe('tool-surface', () => {
+  it.each(['scoped', 'legacy'] as const)('exposes only apply_patch for text editing in %s mode', (mode) => {
+    process.env.ORKAS_TOOL_LOADING_MODE = mode;
+    const surface = createToolSurfaceController({
+      availableToolNames: ['apply_patch', 'edit_file', 'tool_load'],
+      scopedEligible: true,
+    });
+    if (mode === 'scoped') {
+      const loaded = JSON.parse(surface.load(['workspace.write.edit']).content);
+      expect(loaded.newly_activated_tools).toEqual(['apply_patch']);
+    }
+    expect(surface.isActive('apply_patch')).toBe(true);
+    expect(surface.isActive('edit_file')).toBe(false);
+    expect(surface.loadableGroupsForTool('edit_file')).toEqual([]);
+  });
+
   it('loads application operations separately from Orkas navigation and keeps them unavailable to named Agents', () => {
     const available = ['list_apps', 'save_app', 'open_app_view', 'app_health', 'tool_load'];
     const surface = createToolSurfaceController({ availableToolNames: available, scopedEligible: true });
@@ -92,7 +107,7 @@ describe('tool-surface', () => {
     for (let depth = 0; depth < TOOL_GROUPS.length; depth++) {
       for (const group of TOOL_GROUPS) if (group.parent && descendants.has(group.parent)) descendants.add(group.id);
     }
-    const expected = TOOL_CATALOG.filter((entry) => available.includes(entry.name)
+    const expected = TOOL_CATALOG.filter((entry) => entry.name !== 'edit_file' && available.includes(entry.name)
       && entry.loadGroups?.some((group) => descendants.has(group))).map((entry) => entry.name);
     expect(expected.length).toBeGreaterThan(0);
     expect(directory).toContain(`\`${groupId}\``);

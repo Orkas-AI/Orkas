@@ -155,6 +155,21 @@ describe('todo auto-advance device names', () => {
 });
 
 describe('global backlog scope refresh', () => {
+  it('offers the full project roster on cards and honors an explicitly empty roster', async () => {
+    const added = { agent_id: 'custom' };
+    const builtin = { agent_id: 'builtin' };
+    let roster = [added, builtin];
+    const h = harness(async (channel) => {
+      if (channel === 'projects.tasks.list') return { ok: true, tasks: [{ id: 'task' }] };
+      if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [added], availableAgents: roster };
+      return { ok: true };
+    });
+    const group = () => h.context._loadGlobalTodoGroup({ project_id: 'project' });
+    expect((await group()).agents).toEqual([added, builtin]);
+    roster = [];
+    expect((await group()).agents).toEqual([]);
+  });
+
   it('reloads only the changed project after a tasks-changed push and keeps the other sections', async () => {
     const f = backlogFixture();
     await f.context.loadGlobalTodos();

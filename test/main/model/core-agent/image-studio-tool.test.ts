@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { nativeImage } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const appMedia=vi.hoisted(()=>({route:vi.fn()}));
@@ -87,6 +88,7 @@ import {
   imageStudioStatePath,
 } from '../../../../src/main/model/core-agent/image-studio-tool';
 import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
+import { ImageStudioNativePngDelivery } from '../../../../src/main/features/image_studio_delivery';
 import {
   beginImageStudioGeneration,
   finishImageStudioGeneration,
@@ -97,14 +99,11 @@ const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 const USER_ID = 'u-image-studio';
 let root = '';
 let projectDir = '';
-let previousComfyBaseUrl: string | undefined;
 
 beforeEach(() => {
   electronImage.image = electronImage.baseImage;
   electronImage.requiredCopyLayouts = [];
   electronImage.scrollingAreas = 0;
-  previousComfyBaseUrl = process.env.ORKAS_COMFYUI_BASE_URL;
-  delete process.env.ORKAS_COMFYUI_BASE_URL;
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network call in ImageStudio integration test'); }));
   imageProvider.generate.mockReset().mockImplementation(async (request) => {
     const bytes = electronImage.image.toPNG();
@@ -150,8 +149,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  if (previousComfyBaseUrl === undefined) delete process.env.ORKAS_COMFYUI_BASE_URL;
-  else process.env.ORKAS_COMFYUI_BASE_URL = previousComfyBaseUrl;
+  vi.unstubAllEnvs();
   fs.rmSync(root, { recursive: true, force: true });
   if (process.env.ORKAS_WORKSPACE_ROOT) {
     fs.rmSync(path.join(process.env.ORKAS_WORKSPACE_ROOT, USER_ID, 'local', 'image_studio'), { recursive: true, force: true });
@@ -211,6 +209,16 @@ describe('image_studio tool', () => {
     expect(result.isError).not.toBe(true);
     expect(result.content).toContain('"signature"');
     expect(result.content).toContain('"route":"compose"');
+  });
+
+  // 2026-11-23: inspection reads only inside the image project; a file from elsewhere is
+  // refused with how to bring it in, not with a bare scope error.
+  it('says to copy an image from elsewhere into the project before inspecting it', async () => {
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root] });
+    const elsewhere = path.join(os.tmpdir(), `orkas-image-elsewhere-${process.pid}.png`);
+    const result = await tool.execute({ op: 'project.inspect', project_dir: projectDir, input_path: elsewhere }, { workingDir: root } as any);
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe(`E_PATH_OUT_OF_SCOPE: input_path is outside this conversation's files: ${elsewhere}. Copy it into the image project first, then inspect it there.`);
   });
 
   it('does not attach visual evidence before deterministic project inspection passes', async () => {
@@ -363,9 +371,10 @@ describe('image_studio tool', () => {
       'project.snapshot',
       'project.submit_design_review',
       'project.export',
-      'workflow.capabilities',
-      'workflow.run',
     ]);
+    for (const field of ['workflow_engine', 'workflow_path', 'output_node_id', 'output_index', 'timeout_ms']) {
+      expect((tool.inputSchema as any).properties[field]).toBeUndefined();
+    }
     expect((tool.inputSchema as any).properties.operations).toBeUndefined();
     expect((tool.inputSchema as any).properties.composite_layers).toBeUndefined();
     expect((tool.inputSchema as any).properties.quality_review).toBeUndefined();
@@ -673,6 +682,42 @@ describe('image_studio tool', () => {
       ok: false,
       error_code: 'E_IMAGE_REVIEW_EVIDENCE_REQUIRED',
     });
+  });
+
+  it('rejects a manifest passed as the raster and accepts an explicit corrected inspection', async ({ onTestFinished }) => {
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const rasterPath = path.join(projectDir, 'source.png');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    Object.assign(manifest, {
+      route: 'generate', canvas: { width: 128, height: 128 }, raster_source: 'source.png', generation_budget: { max_calls: 1 },
+    });
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    await generateProviderOutput(rasterPath);
+    const decoder = vi.spyOn(nativeImage, 'createFromPath').mockImplementation(file => (
+      file === manifestPath ? { ...electronImage.image, isEmpty: () => true } : electronImage.image
+    ) as ReturnType<typeof nativeImage.createFromPath>);
+    onTestFinished(() => { decoder.mockRestore(); });
+    const opts = { userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [projectDir] };
+    const tool = createImageStudioTool(opts);
+    const args = { op: 'project.inspect', project_dir: '.' };
+    const ctx = { workingDir: projectDir } as any;
+
+    const failed = await tool.execute({ ...args, input_path: 'image-manifest.json' }, ctx);
+    expect(failed.isError).toBe(true);
+    expect(JSON.parse(failed.content)).toMatchObject({
+      inspection: { blockers: [{ code: 'E_RASTER_SOURCE_INVALID', message: expect.stringContaining('Omit input_path') }] },
+    });
+    expect(failed.images).toBeUndefined();
+    expect(decoder).not.toHaveBeenCalled();
+    expect(fs.existsSync(imageStudioStatePath(opts, projectDir))).toBe(false);
+
+    for (const retry of [args, { ...args, input_path: 'source.png' }]) {
+      const inspected = await tool.execute(retry, ctx);
+      expect(inspected.isError).not.toBe(true);
+      expect(JSON.parse(inspected.content).inspection).toMatchObject({
+        ok: true, source_kind: 'raster', source_path: rasterPath,
+      });
+    }
   });
 
   it.each([
@@ -1041,7 +1086,10 @@ describe('image_studio tool', () => {
     else manifest.raster_source = 'composed.png';
     fs.writeFileSync(manifestPath, JSON.stringify(manifest));
     electronImage.image = electronImage.changedImage;
-    const opts = { userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root] };
+    const delivery = new ImageStudioNativePngDelivery();
+    const publish = vi.fn((paths: string[]) => paths.filter(file => delivery.permits(file)));
+    const opts = { userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, extraRoots: [root],
+      imageStudioNativePngDelivery: delivery, onOutputsPublished: publish };
     const tool = createImageStudioTool(opts);
     const ctx = { workingDir: root } as any;
     const execute = (op: string, extra = {}) => tool.execute({ op, project_dir: projectDir, ...extra }, ctx);
@@ -1058,6 +1106,7 @@ describe('image_studio tool', () => {
     expect(payload.current_candidate).not.toHaveProperty('review_required');
     expect((await execute('project.export', { output_path: path.join(root, 'blocked.png') })).isError).toBe(true);
     expect(fs.existsSync(path.join(root, 'blocked.png'))).toBe(false);
+    expect(publish).not.toHaveBeenCalled();
     const status = JSON.parse((await execute('project.status')).content);
     expect(status.current_candidate.path).toBe(evidencePath);
     expect(status.current_candidate.is_generation).toBe(false);
@@ -1068,7 +1117,15 @@ describe('image_studio tool', () => {
     expect(review.isError).not.toBe(true);
     // Reading the same authored raster again must not erase its passing review.
     if (kind === 'raster') expect(JSON.parse((await execute('project.inspect')).content).current_candidate.status).toBe('approved');
-    expect((await execute('project.export', { output_path: path.join(root, 'final.png') })).isError).not.toBe(true);
+    const final = path.join(root, 'final.png');
+    expect((await execute('project.export', { output_path: final })).isError).not.toBe(true);
+    expect(publish.mock.results[0].value).toEqual([final]);
+    expect(delivery.permits(candidatePath)).toBe(false);
+    const copy = path.join(root, 'copy.png');
+    fs.copyFileSync(final, copy);
+    expect(delivery.permits(copy)).toBe(false);
+    fs.renameSync(copy, final);
+    expect(delivery.permits(final)).toBe(false);
     expect(fs.readFileSync(providerPath)).toEqual(electronImage.baseImage.toPNG());
     expect(JSON.parse(fs.readFileSync(imageStudioStatePath(opts, projectDir), 'utf8'))).not.toHaveProperty('review_required');
   });
@@ -1581,221 +1638,31 @@ describe('image_studio tool', () => {
     }, ctx)).resolves.toMatchObject({ isError: false });
   });
 
-  it('runs a host-configured workflow through the current-turn budget, reuses its request id, and resets on the next turn', async () => {
-    const manifest = JSON.parse(fs.readFileSync(path.join(projectDir, 'image-manifest.json'), 'utf8'));
-    manifest.route = 'generate';
-    manifest.canvas = { width: 128, height: 128 };
-    manifest.generation_budget.max_calls = 1;
-    fs.writeFileSync(path.join(projectDir, 'image-manifest.json'), JSON.stringify(manifest));
-    fs.writeFileSync(path.join(projectDir, 'workflow.json'), JSON.stringify({
-      workflow: { '9': { class_type: 'SaveImage', inputs: {} } },
-      output_node_id: '9',
-    }));
-    process.env.ORKAS_COMFYUI_BASE_URL = 'http://127.0.0.1:8188';
-    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
-    let fetchCalls = 0;
-    vi.stubGlobal('fetch', async (url: string) => {
-      fetchCalls += 1;
-      if (url.endsWith('/prompt')) return new Response(JSON.stringify({ prompt_id: 'tool-prompt-1' }), { status: 200 });
-      if (url.endsWith('/history/tool-prompt-1')) return new Response(JSON.stringify({
-        'tool-prompt-1': { status: { completed: true, status_str: 'success' }, outputs: { '9': { images: [{ filename: 'tool.png', subfolder: '', type: 'output' }] } } },
-      }), { status: 200 });
-      if (url.includes('/view?')) return new Response(png, { status: 200 });
-      throw new Error(`unexpected URL ${url}`);
-    });
-
-    const tool = createImageStudioTool({
-      userId: USER_ID,
-      turnId: 'workflow-turn-1',
-      agentId: IMAGE_STUDIO_AGENT_ID,
-      extraRoots: [root],
-    });
-    const preDispatchFailure = await tool.execute({
-      op: 'workflow.run',
-      project_dir: projectDir,
-      workflow_engine: 'comfyui',
-      workflow_path: 'workflow.json',
-      output_path: 'invalid-timeout.png',
-      image_request_id: 'invalid-timeout',
-      timeout_ms: 999,
-    }, { workingDir: root } as any);
-    expect(JSON.parse(preDispatchFailure.content)).toMatchObject({
-      ok: false,
-      status: 'failed',
-      generation: {
-        attempts_recorded: 1,
-        calls_started: 0,
-        calls_remaining: 1,
-        pre_dispatch_failures: 1,
-      },
-    });
-
-    const first = await tool.execute({
-      op: 'workflow.run',
-      project_dir: projectDir,
-      workflow_engine: 'comfyui',
-      workflow_path: 'workflow.json',
-      output_path: 'generated.png',
-      image_request_id: 'hero-initial',
-      timeout_ms: 5_000,
-    }, { workingDir: root } as any);
-    expect(first.isError).not.toBe(true);
-    expect(first.content).toContain('"generation_calls":1');
-    expect(first.content).toContain('"calls_started":1');
-    expect(fs.existsSync(path.join(projectDir, 'generated.png'))).toBe(true);
-
-    const generatedPath = path.join(projectDir, 'generated.png');
-    const inspected = await tool.execute({
-      op: 'project.inspect',
-      project_dir: projectDir,
-      input_path: generatedPath,
-    }, { workingDir: root } as any);
-    expect(inspected.isError).not.toBe(true);
-    expect(inspected.images).toBeUndefined();
-    expect(JSON.parse(inspected.content)).toMatchObject({
-      current_candidate: {
-        status: 'validated',
-        path: generatedPath,
-        is_generation: true,
-      },
-      recovery_context: {
-        next_operation: 'project.export',
-      },
-    });
-    const exhausted = await tool.execute({
-      op: 'generation.quote',
-      project_dir: projectDir,
-      image_request_id: 'hero-repair',
-    }, { workingDir: root } as any);
-    expect(JSON.parse(exhausted.content)).toMatchObject({
-      ok: false,
-      error_code: 'E_IMAGE_GENERATION_BUDGET_EXHAUSTED',
-      current_candidate: {
-        status: 'validated',
-        path: generatedPath,
-        review_findings: [],
-      },
-      recovery_context: {
-        next_operation: 'project.export',
-        generation: {
-          calls_started: 1,
-          calls_remaining: 0,
-          budget_exhausted: true,
-        },
-      },
-    });
-
-    const nextTurnTool = createImageStudioTool({
-      userId: USER_ID,
-      turnId: 'workflow-turn-2',
-      agentId: IMAGE_STUDIO_AGENT_ID,
-      extraRoots: [root],
-    });
-    const nextTurnStatus = await nextTurnTool.execute({
-      op: 'project.status',
-      project_dir: projectDir,
-    }, { workingDir: root } as any);
-    expect(JSON.parse(nextTurnStatus.content)).toMatchObject({
-      generation: {
-        attempts_recorded: 0,
-        calls_started: 0,
-        calls_remaining: 1,
-      },
-      recovery_context: {
-        generation: {
-          calls_started: 0,
-          calls_remaining: 1,
-          budget_exhausted: false,
-        },
-      },
-    });
-    const nextTurnQuote = await nextTurnTool.execute({
-      op: 'generation.quote',
-      project_dir: projectDir,
-      image_request_id: 'hero-initial',
-    }, { workingDir: root } as any);
-    expect(JSON.parse(nextTurnQuote.content)).toMatchObject({
-      ok: true,
-      generation: {
-        calls_started: 0,
-        calls_remaining: 1,
-        max_calls: 1,
-      },
-    });
-
-    const reused = await tool.execute({
-      op: 'workflow.run',
-      project_dir: projectDir,
-      workflow_engine: 'comfyui',
-      workflow_path: 'workflow.json',
-      output_path: 'generated.png',
-      image_request_id: 'hero-initial',
-    }, { workingDir: root } as any);
-    expect(reused.isError).not.toBe(true);
-    expect(reused.content).toContain('"reused":true');
-    expect(fetchCalls).toBe(3);
-  });
-
-  it('keeps an uncertain dispatched workflow counted and blocks a duplicate call', async () => {
-    const manifest = JSON.parse(fs.readFileSync(path.join(projectDir, 'image-manifest.json'), 'utf8'));
+  it.each(['workflow.capabilities', 'workflow.run'])('rejects saved %s requests before contacting the configured host or writing output', async (op) => {
+    vi.stubEnv('ORKAS_COMFYUI_BASE_URL', 'http://127.0.0.1:8188');
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     manifest.route = 'generate';
     manifest.generation_budget.max_calls = 1;
-    fs.writeFileSync(path.join(projectDir, 'image-manifest.json'), JSON.stringify(manifest));
-    fs.writeFileSync(path.join(projectDir, 'workflow.json'), JSON.stringify({
-      workflow: { '9': { class_type: 'SaveImage', inputs: {} } },
-      output_node_id: '9',
-    }));
-    process.env.ORKAS_COMFYUI_BASE_URL = 'http://127.0.0.1:8188';
-    vi.stubGlobal('fetch', async () => {
-      throw new Error('synthetic connection loss after submit may have reached the host');
-    });
-    const tool = createImageStudioTool({
-      userId: USER_ID,
-      turnId: 'uncertain-turn-1',
-      agentId: IMAGE_STUDIO_AGENT_ID,
-      extraRoots: [root],
-    });
-    const ctx = { workingDir: root } as any;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const graph = JSON.stringify({ '9': { class_type: 'SaveImage', inputs: {} } });
+    const workflowPath = path.join(projectDir, 'workflow.json');
+    fs.writeFileSync(workflowPath, graph);
 
-    const uncertain = await tool.execute({
-      op: 'workflow.run',
-      project_dir: projectDir,
-      workflow_engine: 'comfyui',
-      workflow_path: 'workflow.json',
-      output_path: 'uncertain.png',
-      image_request_id: 'uncertain-call',
-    }, ctx);
-    expect(JSON.parse(uncertain.content)).toMatchObject({
-      ok: false,
-      status: 'pending_uncertain',
-      generation: {
-        attempts_recorded: 1,
-        calls_started: 1,
-        calls_remaining: 0,
-        pending: 1,
-        pre_dispatch_failures: 0,
-      },
-    });
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID, turnId: 'retired-workflow-turn' });
+    const result = await tool.execute({
+      op, project_dir: projectDir, workflow_engine: 'comfyui', workflow_path: 'workflow.json',
+      image_request_id: 'saved-request', output_path: 'new.png',
+    }, { workingDir: root } as any);
 
-    const duplicate = await tool.execute({
-      op: 'workflow.run',
-      project_dir: projectDir,
-      workflow_engine: 'comfyui',
-      workflow_path: 'workflow.json',
-      output_path: 'duplicate.png',
-      image_request_id: 'duplicate-call',
-    }, ctx);
-    expect(JSON.parse(duplicate.content)).toMatchObject({
-      ok: false,
-      error_code: 'E_IMAGE_GENERATION_BUDGET_EXHAUSTED',
-      recovery_context: {
-        generation: {
-          calls_started: 1,
-          calls_remaining: 0,
-          budget_exhausted: true,
-        },
-      },
-    });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('op must be one of:');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(servicePreflight.estimate).not.toHaveBeenCalled();
+    expect(imageProvider.generate).not.toHaveBeenCalled();
+    expect(fs.existsSync(imageGenerationControlStatePath(USER_ID, projectDir))).toBe(false);
+    expect(fs.existsSync(path.join(projectDir, 'new.png'))).toBe(false);
+    expect(fs.readFileSync(workflowPath, 'utf8')).toBe(graph);
   });
 });
 
@@ -1823,10 +1690,9 @@ describe('image_studio fixed-page document journeys', () => {
       const result = await tool.execute({ op, project_dir: projectDir, output_path: path.join(root, 'out.png') }, { workingDir: root } as any);
       expect(JSON.parse(result.content)).toMatchObject({ ok: false, error_code: 'E_IMAGE_DOCUMENT_PAGE_REQUIRED' });
     }
-    for (const op of ['generation.quote', 'workflow.run']) {
-      const result = await tool.execute({ op, project_dir: projectDir }, { workingDir: root } as any);
-      expect(result.isError).toBe(true); expect(result.content).toContain('E_IMAGE_DOCUMENT_ROUTE');
-    }
+    const quote = await tool.execute({ op: 'generation.quote', project_dir: projectDir }, { workingDir: root } as any);
+    expect(quote.isError).toBe(true);
+    expect(quote.content).toContain('E_IMAGE_DOCUMENT_ROUTE');
     fs.unlinkSync(path.join(projectDir, 'detail.html'));
     const invalid = await tool.execute({ op: 'project.inspect', project_dir: projectDir }, { workingDir: root } as any);
     expect(invalid.isError).toBe(true);

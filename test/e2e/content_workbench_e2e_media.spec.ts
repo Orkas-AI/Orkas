@@ -56,21 +56,97 @@ test('retries a failed video catalog after changing tabs without replacing the a
  await preview.screenshot({animations:'disabled',path:info.outputPath('video-catalog-unavailable-zh.png')});await frame.locator('#nav-image').click();await frame.locator('#brief').fill('Independent image instructions.');
  await orkas.electronApp.evaluate(()=>(globalThis as any).__mediaChoiceFixture.catalogFails=false);
  await frame.locator('#nav-video').click();await expect(frame.locator('#brief')).toHaveValue('Preserve these video instructions through catalog recovery.');await frame.locator('#refresh-services').click();await expect(frame.locator('#service-state')).toBeHidden();
- await frame.locator('#service-trigger').click();await expect(serviceOptions(frame)).toHaveCount(2);await expect(frame.locator('#service-listbox [data-value="configure-models"]')).toHaveCount(1);await expect(serviceOptions(frame).first()).toContainText('自有视频');await frame.locator('#service-trigger').press('Escape');
+ await frame.locator('#service-trigger').click();await expect(serviceOptions(frame)).toHaveCount(2);await expect(frame.locator('#service-listbox [data-value="configure-models"]')).toHaveCount(1);await expect(serviceOptions(frame).first()).toHaveText('Doubao Seedance 2.0');await frame.locator('#service-trigger').press('Escape');
  await frame.locator('#nav-image').click();await expect(frame.locator('#brief')).toHaveValue('Independent image instructions.');expect(orkas.modelRequests).toHaveLength(0);await orkas.closePreview(preview);
 });
 test.afterEach(async({modelOrkas:orkas})=>{const calls=await orkas.electronApp?.evaluate(()=>{const f=(globalThis as any).__mediaChoiceFixture;if(!f)return 0;f.restore();return f.mediaCalls;});expect(calls).toBe(0);});
 
+for(const appId of ['builtin-content-workbench','builtin-product-listing'])test('shows the missing material reply after a one-shot wait in '+appId,async({modelOrkas:orkas},info)=>{
+ const brief='把我刚上传的素材剪成 15 秒竖屏。',reply='这次没收到原视频，请把素材 <A & B> 重新传一遍。';
+ let {preview,frame}=await open(orkas,true,appId);
+ await frame.locator('#nav-video').click();
+ await frame.locator('#brief').fill(brief);
+ orkas.setModelTextReplies([reply+'\n<plan-interaction status="open" />']);
+ await frame.locator('#submit').click();
+ await expect(frame.locator('#job-status')).toHaveText('失败',{timeout:60000});
+ await expect.poll(async()=>(await state(frame))?.works[0]?.errorCode).toBe('E_INTERACTION_REQUIRED');
+ await expect(frame.locator('.record-failure-summary')).toHaveText('VideoStudio：'+reply);
+ await orkas.closePreview(preview);
+ ({preview,frame}=await open(orkas,true,appId));
+ await frame.locator('#nav-video').click();
+ const record=frame.locator('.history-row').filter({hasText:brief});
+ await expect(record.locator('.record-failure-summary')).toHaveText('VideoStudio：'+reply);
+ await record.scrollIntoViewIfNeeded();
+ await preview.screenshot({animations:'disabled',path:info.outputPath('commerce-reply-collapsed.png')});
+ await record.locator('.record-summary').click();
+ await expect(frame.locator('#record-error')).toHaveText('操作未完成，已保存的内容会保留。');
+ await expect(frame.locator('#record-reply')).toContainText('VideoStudio 回复');
+ await expect(frame.locator('#record-reply-text')).toHaveText(reply);
+ await frame.locator('#record-reply').scrollIntoViewIfNeeded();
+ await preview.screenshot({animations:'disabled',path:info.outputPath('commerce-reply-expanded.png')});
+ await record.hover();
+ await record.locator('.history-menu-trigger').click();
+ await frame.locator('#record-menu').getByRole('menuitem',{name:'编辑',exact:true}).click();
+ await expect(frame.locator('#brief')).toHaveValue(brief);
+ expect(orkas.modelRequests).toHaveLength(1);
+ await orkas.closePreview(preview);
+});
+
 test('shows a real terminal failure in collapsed and expanded history after reopening without exposing provider diagnostics',async({modelOrkas:orkas},info)=>{
  let{preview,frame}=await open(orkas,true);orkas.setModelMode('auth-error');await frame.locator('#brief').fill('制作一张商品图片');await frame.locator('#submit').click();
  await expect.poll(async()=>(await state(frame))?.works[0]?.status,{timeout:60000}).toBe('failed');expect(orkas.modelRequests.length).toBeGreaterThan(0);const refusals=orkas.apiResponses.filter(r=>r.method==='POST'&&r.path==='/api/v1/chat/completions'&&r.status===401);expect(refusals).toHaveLength(1);orkas.expectApiFailure('POST','/api/v1/chat/completions',401);const row=frame.locator('.history-row').first();await expect(row.locator('.record-failure-summary')).not.toBeEmpty();await expect(row.locator('.record-failure-summary')).not.toContainText('sk-e2e-private-secret');await expect(row.locator('.record-failure-summary')).not.toContainText('req_e2e_auth_failure');
- await row.locator('.record-summary').click();await expect(frame.locator('#record-error')).not.toBeEmpty();await expect(frame.locator('#record-error')).not.toContainText('sk-e2e-private-secret');await expect(frame.locator('#record-error')).not.toContainText('req_e2e_auth_failure');await expect(frame.locator('#no-output')).not.toHaveText('草稿');await preview.screenshot({animations:'disabled',path:info.outputPath('failed-history-zh.png')});const explanation=await frame.locator('#record-error').textContent();
+ await row.locator('.record-summary').click();await expect(frame.locator('#record-error')).not.toBeEmpty();await expect(frame.locator('#record-error')).not.toContainText('sk-e2e-private-secret');await expect(frame.locator('#record-error')).not.toContainText('req_e2e_auth_failure');await expect(frame.locator('#record-reply')).toBeHidden();await expect(frame.locator('#no-output')).not.toHaveText('草稿');await preview.screenshot({animations:'disabled',path:info.outputPath('failed-history-zh.png')});const explanation=await frame.locator('#record-error').textContent();
  await orkas.closePreview(preview);({preview,frame}=await open(orkas));await frame.locator('.record-summary').first().click();await expect(frame.locator('#record-error')).toHaveText(explanation!);await expect(frame.locator('#record-detail')).not.toContainText('<span');await orkas.closePreview(preview);
 });
 
+for(const appId of ['builtin-content-workbench','builtin-product-listing']){
+ test('shows a declared delivery save failure and keeps the reply in '+appId,async({modelOrkas:orkas})=>{
+  const reply='视频剪辑已结束。';
+  let {preview,frame}=await open(orkas,true,appId);
+  await orkas.electronApp.evaluate((_electron,workspaceModule)=>{
+   const load=(process as any).mainModule.require.bind((process as any).mainModule),
+     {getConversationWorkspacePath}=load(workspaceModule),fs=load('node:fs/promises'),path=load('node:path');
+   const deps=(globalThis as any).__mediaChoiceFixture.host.taskService.deps,send=deps.send,archive=deps.archive;
+   let file:string;
+   deps.send=async(uid:string,cid:string,...rest:any[])=>{
+    const workspace=await getConversationWorkspacePath(uid,cid);
+    file=path.join(workspace,'delivery-note.txt');
+    return send(uid,cid,...rest);
+   };
+   deps.archive=async(...args:any[])=>{
+    if(!args[2].files.some((out:any)=>out.name==='delivery-note.txt'&&out.published))throw Error('Declared output was not inspected');
+    await fs.unlink(file);
+    deps.archive=archive;
+    return archive(...args);
+   };
+  },path.resolve(__dirname,'../../src/main/features/group_chat/conv_workspace.ts'));
+  await frame.locator('#nav-video').click();
+  await frame.locator('#brief').fill('编辑视频并保存最终文件。');
+  let step=0;
+  orkas.setModelRequestScript((_request,tools)=>{
+   if(!tools.has('write_file'))return{calls:[{callId:'load-output',name:'tool_load',args:{groups:['workspace.write.output']}}]};
+   if(step++===0)return{calls:[{callId:'write-note',name:'write_file',args:{path:'delivery-note.txt',content:'Final edit notes.'}}]};
+   if(step===2)return{calls:[{callId:'publish-note',name:'publish_outputs',args:{paths:['delivery-note.txt']}}]};
+   return{text:reply};
+  });
+  await frame.locator('#submit').click();
+  await expect(frame.locator('#job-status')).toHaveText('结果保存失败',{timeout:60000});
+  const requests=orkas.modelRequests.length;
+  await orkas.closePreview(preview);
+  ({preview,frame}=await open(orkas,true,appId));
+  await frame.locator('#nav-video').click();
+  await expect(frame.locator('.record-failure-summary')).toContainText(reply);
+  await frame.locator('.record-summary').click();
+  await expect(frame.locator('#record-error')).toHaveText('结果保存失败');
+  await expect(frame.locator('#record-reply-text')).toHaveText(reply);
+  expect(orkas.modelRequests).toHaveLength(requests);
+  await orkas.closePreview(preview);
+ });
+}
+
 test('selects per-task services across media tabs, survives reopening and follows settings order without changing it',async({modelOrkas:orkas},info)=>{
  let{preview,frame}=await open(orkas,true);const images=(await services(frame,'image')).services;expect(images).toHaveLength(2);await expect(frame.locator('#service-trigger')).toContainText('商品图片');await choose(frame,images[1].id);await frame.locator('#brief').fill('保留这条原始制作要求');
- await frame.locator('#nav-video').click();const videos=(await services(frame,'video')).services;expect(videos.map((s:any)=>[s.managed,s.available])).toEqual([[false,true],[false,true]]);await frame.locator('#service-trigger').click();await expect(frame.locator('[role="option"][data-value="'+videos[0].id+'"]')).toContainText('自有视频');await expect(frame.locator('[role="option"][data-value="'+videos[1].id+'"]')).not.toHaveAttribute('aria-disabled','true');await frame.locator('[role="option"][data-value="'+videos[0].id+'"]').click();
+ await frame.locator('#nav-video').click();const videos=(await services(frame,'video')).services;expect(videos.map((s:any)=>[s.managed,s.available])).toEqual([[false,true],[false,true]]);await frame.locator('#service-trigger').click();await expect(frame.locator('[role="option"][data-value="'+videos[0].id+'"]')).toHaveText('Doubao Seedance 2.0');await expect(frame.locator('[role="option"][data-value="'+videos[1].id+'"]')).not.toHaveAttribute('aria-disabled','true');await frame.locator('[role="option"][data-value="'+videos[0].id+'"]').click();
  await frame.locator('#nav-audio').click();const voices=(await services(frame,'audio')).services;await choose(frame,voices[0].id);await expect(frame.locator('#service-label')).toHaveText('语音服务');await frame.locator('#nav-image').click();await expect(frame.locator('#service-trigger')).toContainText('海报');await expect(frame.locator('#brief')).toHaveValue('保留这条原始制作要求');
  await orkas.closePreview(preview);({preview,frame}=await open(orkas,true));await expect(frame.locator('#service-trigger')).toContainText('海报');
  await orkas.electronApp.evaluate(()=>{const f=(globalThis as any).__mediaChoiceFixture;f.auth.saveImageProfiles(f.auth.loadImageProfiles().slice().reverse());});await frame.locator('body').evaluate(()=>window.dispatchEvent(new Event('focus')));
@@ -86,10 +162,10 @@ test('keeps a removed selection visible and requires a new choice, preserving th
 });
 
 
-test('shows the first configured user services directly and resets to the first choice',async({modelOrkas:orkas},info)=>{
+test('shows configured video model names and keeps the selection after Reset',async({modelOrkas:orkas},info)=>{
  const{preview,frame}=await open(orkas,true);await expect(frame.locator('#service-trigger')).toContainText('商品图片');
  const images=(await services(frame,'image')).services;await frame.locator('#service-trigger').click();await expect(serviceOptions(frame)).toHaveCount(images.length);await expect(frame.locator('#service-listbox [data-value="configure-models"]')).toHaveCount(1);await expect(frame.locator('#service-listbox')).not.toContainText('默认服务');await frame.locator('#service-trigger').press('Escape');
- await frame.locator('#nav-video').click();const videos=(await services(frame,'video')).services;expect(videos).toHaveLength(2);await expect(frame.locator('#service-trigger')).toContainText('自有视频');await choose(frame,videos[1].id);await expect(frame.locator('#service-trigger')).toContainText('第二视频');await frame.locator('#reset-work').click();await expect(frame.locator('#service-trigger')).toContainText('自有视频');
+ await frame.locator('#nav-video').click();const videos=(await services(frame,'video')).services;expect(videos).toHaveLength(2);await expect(frame.locator('#service-trigger')).toContainText(videos[0].name);await choose(frame,videos[1].id);await expect(frame.locator('#service-trigger')).toContainText(videos[1].name);await frame.locator('#reset-work').click();await expect(frame.locator('#service-trigger')).toContainText(videos[1].name);
  await frame.locator('#service-trigger').click();await preview.screenshot({animations:'disabled',path:info.outputPath('user-video-models-zh.png')});await frame.locator('#service-trigger').press('Escape');
  await frame.locator('#nav-audio').click();await expect(frame.locator('#service-trigger')).toContainText('旁白');expect(orkas.modelRequests).toHaveLength(0);await orkas.closePreview(preview);
 });
@@ -124,7 +200,7 @@ for(const appId of ['builtin-content-workbench','builtin-product-listing'])test(
   await frame.locator('#nav-video').click();await frame.locator('#brief').fill('Keep this video request while models load.');await expect(frame.locator('#refresh-services')).toHaveText('加载中…');await expect(frame.locator('#refresh-services')).toBeDisabled();await expect(frame.locator('#refresh-services')).toHaveAttribute('aria-busy','true');await expect(frame.locator('#service-state')).toBeHidden();await expect(frame.locator('#service-trigger')).toBeDisabled();await preview.screenshot({path:info.outputPath('service-loading-inline-zh.png')});
   await frame.locator('#nav-image').click();await expect(frame.locator('#refresh-services')).toHaveText('刷新');await frame.locator('#nav-video').click();await expect(frame.locator('#refresh-services')).toHaveText('加载中…');await expect(frame.locator('#brief')).toHaveValue('Keep this video request while models load.');
   await orkas.page.evaluate(()=>(window as any).setLang('en'));await frame.locator('body').evaluate(()=>window.dispatchEvent(new Event('focus')));await expect(frame.locator('html')).toHaveAttribute('lang','en');await preview.setViewportSize({width:400,height:700});await expect(frame.locator('#refresh-services')).toHaveText('Loading…');await expect(frame.locator('#service-state')).toBeHidden();expect(await frame.locator('body').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);await preview.screenshot({path:info.outputPath('service-loading-inline-en-narrow.png')});
-  await release();await expect(frame.locator('#refresh-services')).toHaveText('Refresh');await expect(frame.locator('#refresh-services')).toBeEnabled();await expect(frame.locator('#refresh-services')).toHaveAttribute('aria-busy','false');await expect(frame.locator('#service-trigger')).toContainText('自有视频');
+  await release();await expect(frame.locator('#refresh-services')).toHaveText('Refresh');await expect(frame.locator('#refresh-services')).toBeEnabled();await expect(frame.locator('#refresh-services')).toHaveAttribute('aria-busy','false');await expect(frame.locator('#service-trigger')).toHaveText('Doubao Seedance 2.0');
   await orkas.electronApp.evaluate(()=>{const g=(globalThis as any).__mediaChoiceFixture.serviceGate;g.hold=true;g.fail=true;});await frame.locator('#refresh-services').click();await expect(frame.locator('#refresh-services')).toHaveText('Loading…');await expect(frame.locator('#service-state')).toBeHidden();await release();await expect(frame.locator('#refresh-services')).toHaveText('Refresh');await expect(frame.locator('#service-state')).toBeVisible();await expect(frame.locator('#service-state')).not.toBeEmpty();
   await frame.locator('#refresh-services').click();await expect(frame.locator('#refresh-services')).toBeEnabled();await expect(frame.locator('#service-state')).toBeHidden();await expect(frame.locator('#brief')).toHaveValue('Keep this video request while models load.');expect(orkas.modelRequests).toHaveLength(0);
  }finally{await release();await orkas.electronApp.evaluate(()=>(globalThis as any).__mediaChoiceFixture.serviceGate.restore());await orkas.closePreview(preview);}
@@ -151,7 +227,8 @@ test('renders the public Orkas·Voice choice through refresh and reopen without 
  }
  expect((await state(frame)).drafts.audio.settings.serviceId).toBe(choices[0].id);
  await choose(frame,choices[1].id);await expect(frame.locator('#service-trigger')).toContainText('旁白');
- await choose(frame,choices[0].id);await orkas.closePreview(preview);({preview,frame}=await open(orkas,true));
+ // Service choices share the existing 300ms draft autosave; verify durable acknowledgement before reopening.
+ await choose(frame,choices[0].id);await expect.poll(async()=>(await state(frame)).drafts.audio.settings.serviceId).toBe(choices[0].id);await orkas.closePreview(preview);({preview,frame}=await open(orkas,true));
  await frame.locator('#nav-audio').click();await expect(frame.locator('#service-trigger')).toContainText('Orkas·Voice');await expect(frame.locator('#brief')).toHaveValue('Keep my speech script.');
  const final=await orkas.electronApp.evaluate(()=>{const f=(globalThis as any).__mediaChoiceFixture;return{profiles:f.auth.loadTtsProfiles().map((p:any)=>[p.id,p.provider,p.model]),mediaCalls:f.mediaCalls};});
  expect(final.profiles).toEqual([['public-speech','orkas-api','orkas-tts-1'],['own-voice','openai','tts-1']]);expect(final.mediaCalls).toBe(0);expect(orkas.modelRequests).toHaveLength(0);await orkas.closePreview(preview);
