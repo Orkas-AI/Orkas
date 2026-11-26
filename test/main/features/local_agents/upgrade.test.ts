@@ -271,7 +271,7 @@ else process.exit(9);`);
     expect(await planCliUpgrade('codex', path.join(root, 'Cellar/codex/0.156.1/bin/codex'))).toEqual({ method: 'unavailable' });
   });
 });
-describe.skipIf(process.platform === 'win32')('native CLI maintenance lifecycle', () => {
+describe.skipIf(process.platform === 'win32')('CLI maintenance lifecycle', () => {
   function native(mode: string, initialVersion = '0.144.0') {
     const state = path.join(root, 'version'); fs.writeFileSync(state, initialVersion);
     const updates = path.join(root, 'updates');
@@ -287,9 +287,20 @@ else if (process.argv.includes('update')) {
   }
   it('coalesces surfaces and verifies the original executable after upgrade', async () => {
     const { bin, updates } = native('success');
-    const one = upgradeLocalCli('codex'); const two = upgradeLocalCli('codex'); expect(two).toBe(one);
+    const joined = vi.fn();
+    let two: ReturnType<typeof upgradeLocalCli> | undefined;
+    const progress = vi.fn(({ phase }: { phase: string }) => {
+      if (phase === 'upgrading') two = upgradeLocalCli('codex', joined);
+    });
+    const one = upgradeLocalCli('codex', progress);
+    const opening = progress.mock.calls.slice();
     const result = await one;
+    expect(opening).toEqual([[expect.objectContaining({ phase: 'checking' })]]);
+    expect(two).toBe(one);
     expect(result).toMatchObject({ ok: true, outcome: 'upgraded', method: 'native', version: '0.159.3', entry: { path: bin, available: true } });
+    expect(progress.mock.calls.map(([event]) => event.phase)).toEqual(['checking', 'upgrading', 'verifying']);
+    expect(joined.mock.calls.map(([event]) => event.phase)).toEqual(['upgrading', 'verifying']);
+    expect(joined.mock.calls[0][0].elapsed_ms).toBeGreaterThanOrEqual(progress.mock.calls[1][0].elapsed_ms);
     expect(fs.readFileSync(updates, 'utf8')).toBe('update\n');
   });
   it('reports an already-current supported CLI without claiming an upgrade', async () => {
@@ -298,6 +309,21 @@ else if (process.argv.includes('update')) {
       ok: true, outcome: 'up_to_date', version: '0.159.3', entry: { path: bin, available: true },
     });
     expect(fs.readFileSync(updates, 'utf8')).toBe('update\n');
+  });
+  it('reports the same stages when Homebrew owns the CLI update', async () => {
+    const state = path.join(root, 'brew-version');
+    fs.writeFileSync(state, '0.144.0');
+    const bin = executable(path.join(root, 'Caskroom/codex/0.144.0/bin/codex'),
+      `console.log(require('node:fs').readFileSync(${JSON.stringify(state)}, 'utf8'));`);
+    process.env.ORKAS_CODEX_PATH = bin;
+    executable(path.join(root, 'bin/brew'), `
+if (process.argv.slice(2).join(' ') !== 'upgrade --cask codex') process.exit(8);
+require('node:fs').writeFileSync(${JSON.stringify(state)}, '0.159.3');`);
+    const progress = vi.fn();
+    await expect(upgradeLocalCli('codex', progress)).resolves.toMatchObject({
+      ok: true, method: 'brew', outcome: 'upgraded', version: '0.159.3', entry: { path: bin, available: true },
+    });
+    expect(progress.mock.calls.map(([event]) => event.phase)).toEqual(['checking', 'upgrading', 'verifying']);
   });
   it('reports a prerelease-to-stable change as an upgrade even with the same core version', async () => {
     native('success', '0.159.3-beta.1');
@@ -327,8 +353,11 @@ else if (process.argv.includes('update')) {
   });
   it.each(['failure', 'unchanged'])('does not claim a successful upgrade for %s', async mode => {
     native(mode);
-    const result = await upgradeLocalCli('codex');
+    const progress = vi.fn();
+    const result = await upgradeLocalCli('codex', progress);
     expect(result).toMatchObject({ ok: false, error_code: mode === 'failure' ? 'failed' : 'verification_failed' });
+    expect(progress.mock.calls.map(([event]) => event.phase)).toEqual(mode === 'failure'
+      ? ['checking', 'upgrading'] : ['checking', 'upgrading', 'verifying']);
     expect(result).not.toHaveProperty('diagnostic'); // No new IPC/telemetry contract.
     if (mode === 'failure') {
       expect(warningLog).toHaveBeenCalledExactlyOnceWith('CLI upgrade command failed', {

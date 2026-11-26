@@ -1,8 +1,31 @@
+import type { LocalEvent } from './backends/base.js';
+
 /** Text phases exposed by CLIs that distinguish working commentary from the
  * canonical answer. Today Codex app-server is the only backend that emits
  * these values; keeping the accumulator backend-agnostic lets the group-chat
  * bridge preserve the same contract if another CLI adopts it later. */
 export type LocalTextPhase = 'commentary' | 'final_answer';
+
+/** ACP and ZCode stream public text before identifying the answer. A native
+ * tool boundary settles the preceding draft as process text. Keep the same
+ * pending/boundary events the chat renderer already uses for native runs. */
+export function createPendingCliText(onEvent: (event: LocalEvent) => void) {
+  let text = '';
+  return {
+    append(piece: string) {
+      if (!piece) return;
+      text += piece;
+      onEvent({ type: 'text-delta', phase: 'pending', text: piece });
+    },
+    finalizeCommentary() {
+      if (!text) return;
+      const commentary = text;
+      text = '';
+      onEvent({ type: 'commentary-finalized', text: commentary });
+    },
+    output: () => text,
+  };
+}
 
 export function normalizeLocalTextPhase(value: unknown): LocalTextPhase | undefined {
   return value === 'commentary' || value === 'final_answer' ? value : undefined;

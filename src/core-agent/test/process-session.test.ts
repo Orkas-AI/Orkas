@@ -23,7 +23,7 @@ import {
   stopAllProcessSessions,
 } from "../src/tools/process-session.js";
 import { bashTool } from "../src/tools/builtin.js";
-import { commandSessionWait } from "../src/tools/command-sessions.js";
+import { commandSessionWait, withCommandWaitProgress } from "../src/tools/command-sessions.js";
 import { markProgrammaticToolCallState } from "../src/tools/run-program.js";
 import type { ToolContext } from "../src/tools/base.js";
 
@@ -101,6 +101,92 @@ afterEach(async () => {
 });
 
 describe("persistent process sessions", () => {
+  it.each(["legacy", "managed"])("preserves split UTF-8 from a real child through completion: %s", async mode => {
+    const stdout = "中文 café 😀\n";
+    const stderr = "错误 🧪\n";
+    const script = `const out=Buffer.from(${JSON.stringify(stdout)}),err=Buffer.from(${JSON.stringify(stderr)});
+process.stdout.write(out.subarray(0,1));
+setTimeout(()=>{process.stderr.write(err);process.stdout.write(out.subarray(1));},100);`;
+    const ctx = { ...context("split-output"), state: { processSessionOwner: "split-output", commandSessionEnabled: mode === "managed" } };
+    // Keep the real shell boundary without reserializing inline JavaScript.
+    const scriptPath = path.join(workingDir, "split-output-fixture.cjs");
+    await fs.writeFile(scriptPath, script, "utf8");
+    const command = shellInvoke(TEST_NODE, [scriptPath]);
+    const started = mode === "managed"
+      ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
+      : await processStartTool.execute({ command }, ctx);
+    const result = await tool("process_session").execute({
+      action: "read", session_id: json(started.content).session_id, cursor: 0, wait_for: "exit", yield_time_ms: 5000,
+    }, ctx);
+    const payload = json(result.content);
+    expect(result.isError).toBeFalsy();
+    expect(payload).toMatchObject({ status: "exited", exit_code: 0 });
+    expect(payload.output).toContain(stdout);
+    expect(payload.output).toContain(stderr);
+    const execution = result.observations?.execution ?? started.observations?.execution;
+    expect(execution?.stdout.bytes).toBe(Buffer.byteLength(stdout));
+    expect(execution?.stderr.bytes).toBe(Buffer.byteLength(stderr));
+  });
+
+  it.each(["legacy", "managed"])("preserves UTF-8 and isolates streams in Windows continuation decoding: %s", async mode => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill: vi.fn(),
+    });
+    const stdout = Buffer.from("中文 café 😀\n");
+    const stderr = Buffer.from("错误 🧪\n");
+    const spawnMock = vi.mocked(spawn);
+    spawnMock.mockImplementationOnce((() => child) as typeof spawn);
+    try {
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      const ctx = { ...context("windows-split-output"), state: {
+        processSessionOwner: "windows-split-output", commandSessionEnabled: mode === "managed",
+      } };
+      const pending = mode === "managed"
+        ? bashTool.execute({ command: "fixture", yield_time_ms: 0 }, ctx)
+        : processStartTool.execute({ command: "fixture" }, ctx);
+      child.stdout.write(stdout.subarray(0, 1));
+      for (const byte of stderr) child.stderr.write(Buffer.from([byte]));
+      for (const byte of stdout.subarray(1)) child.stdout.write(Buffer.from([byte]));
+      child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+      const started = await pending;
+      const result = await tool("process_session").execute({
+        action: "read", session_id: json(started.content).session_id, cursor: 0, wait_for: "exit", yield_time_ms: 5000,
+      }, ctx);
+      expect(result.isError).toBeFalsy();
+      expect(json(result.content)).toMatchObject({ status: "exited", exit_code: 0,
+        output: stderr.toString("utf8") + stdout.toString("utf8") });
+      const execution = result.observations?.execution ?? started.observations?.execution;
+      expect(execution?.stdout.bytes).toBe(stdout.length);
+      expect(execution?.stderr.bytes).toBe(stderr.length);
+    } finally {
+      Object.defineProperty(process, "platform", descriptor);
+      spawnMock.mockReset();
+      const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      spawnMock.mockImplementation(actual.spawn);
+    }
+  });
+
+  it("bounds progress heartbeats to the lifetime of one completion wait", async () => {
+    vi.useFakeTimers();
+    try {
+      const emitProgress = vi.fn();
+      let release!: () => void;
+      const pending = withCommandWaitProgress({ ...context("heartbeat"), emitProgress }, 600000,
+        () => new Promise<void>(resolve => { release = resolve; }));
+      expect(emitProgress).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(120000);
+      expect(emitProgress).toHaveBeenCalledTimes(3);
+      expect(emitProgress.mock.lastCall?.[0].data).toMatchObject({ elapsedMs: 120000, timeoutMs: 600000 });
+      release(); await pending;
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(600000);
+      expect(emitProgress).toHaveBeenCalledTimes(3);
+      await expect(withCommandWaitProgress({ ...context("heartbeat"), emitProgress }, 600000,
+        async () => { throw new Error("controlled wait failure"); })).rejects.toThrow("controlled wait failure");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
   it.each(["legacy", "managed"])("keeps a local server alive through startup, readiness checks and explicit shutdown: %s", async mode => {
     const reservation = createTcpServer();
     await new Promise<void>(resolve => reservation.listen(0, "127.0.0.1", resolve));
@@ -141,10 +227,13 @@ process.stdin.resume();`);
     expect(await request()).toEqual({ error: "ECONNREFUSED" });
   });
 
-  it.each(["legacy", "foreground", "managed", "detached"])("honors the configured Windows shell at actual startup: %s", async mode => {
+  it.each(["legacy", "foreground", "managed", "detached"])("preserves the configured Windows shell and architecture at startup: %s", async mode => {
     const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
     vi.stubEnv("ORKAS_WINDOWS_SHELL", "cmd.exe");
     vi.stubEnv("SHELL", "fixture-unrelated-shell");
+    const emulated = mode === "managed" || mode === "legacy";
+    vi.stubEnv("PROCESSOR_ARCHITECTURE", emulated ? "x86" : "AMD64");
+    vi.stubEnv("PROCESSOR_ARCHITEW6432", emulated ? "ARM64" : undefined);
     const child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill: vi.fn(), unref: vi.fn(),
     });
@@ -170,6 +259,10 @@ process.stdin.resume();`);
       expect(result.isError).toBeFalsy();
       expect(spawnMock).toHaveBeenCalledOnce();
       expect(spawnMock.mock.calls[0].slice(0, 2)).toEqual(["cmd.exe", ["/d", "/s", "/c", command]]);
+      const environment = spawnMock.mock.calls[0][2]?.env;
+      expect(environment?.PROCESSOR_ARCHITECTURE).toBe(emulated ? "x86" : "AMD64");
+      if (emulated) expect(environment?.PROCESSOR_ARCHITEW6432).toBe("ARM64");
+      else expect(environment).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
       // The child is stubbed: this certifies startup selection, not native Windows semantics.
     } finally {
       Object.defineProperty(process, "platform", descriptor);
@@ -183,6 +276,9 @@ process.stdin.resume();`);
   it("uses the ten-second default for out-of-range waits while preserving polling and valid boundaries", () => {
     for (const value of [undefined, -1, 30001, 60000]) expect(commandSessionWait(value)).toBe(10000);
     for (const value of [0, 1, 10000, 30000]) expect(commandSessionWait(value)).toBe(value);
+    for (const value of [0, 30000, 30001, 600000]) expect(commandSessionWait(value, "exit")).toBe(value);
+    for (const value of [undefined, -1, 600001]) expect(commandSessionWait(value, "exit")).toBe(10000);
+    for (const value of [null, 1.5, Infinity, "600000"]) expect(commandSessionWait(value, "exit")).toBeNull();
   });
 
   it.each(["legacy", "managed"])("advances a read cursor for a positive fractional page size: %s", async (mode) => {
@@ -542,6 +638,121 @@ process.stdin.resume();`);
 });
 
 
+describe.each(["legacy", "managed"] as const)("explicit command completion waits: %s", mode => {
+  const ctx = (signal?: AbortSignal): ToolContext => ({
+    ...context("completion-owner"), signal,
+    state: { processSessionOwner: "completion-owner", commandSessionEnabled: true },
+  });
+  const sessionTool = () => tool("process_session");
+  async function start(exitCode = 0) {
+    const command = shellInvoke(TEST_NODE, ["-e",
+      "require('fs').appendFileSync('starts','1');console.log(process.pid);"
+      + "process.stdin.on('data',d=>{if(d.toString().includes('finish'))process.exit("
+      + exitCode + ");else console.log('progress')})"]);
+    const result = mode === "managed"
+      ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx())
+      : await processStartTool.execute({ command }, ctx());
+    const initial = json(result.content);
+    await waitForProcessRead("completion-owner", initial.session_id, 0, p => /^\d+/.test(p.output));
+    return initial.session_id as string;
+  }
+  const wait = (session_id: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) =>
+    sessionTool().execute({ action: "read", session_id, wait_for: "exit", yield_time_ms: 600000, ...extra }, ctx(signal));
+  const write = (session_id: string, chars: string) =>
+    sessionTool().execute({ action: "write", session_id, chars, add_newline: true }, ctx());
+
+  it.each([0, 7])("waits through unread and later output, then reports actual exit %s without another process", async exitCode => {
+    const session_id = await start(exitCode);
+    const spawns = vi.mocked(spawn).mock.calls.length;
+    let settled = false;
+    const pending = wait(session_id).then(result => { settled = true; return result; });
+    // Both the already buffered PID and a later progress chunk must not finish
+    // an explicit exit wait. Ordinary reads must remain immediately usable.
+    await write(session_id, "more");
+    const progress = await waitForProcessRead("completion-owner", session_id, 0, p => p.output.includes("progress"));
+    expect(settled).toBe(false);
+    expect(sessionTool().inspectReadContinuation!({ action: "read", session_id, wait_for: "exit", cursor: 0 }, ctx())?.waiting).toBe(true);
+    expect(progress.payload.status).toBe("running");
+    await write(session_id, "finish");
+    const result = await pending;
+    expect(json(result.content)).toMatchObject({ session_id, status: exitCode ? "error" : "exited", exit_code: exitCode });
+    expect(Boolean(result.isError)).toBe(exitCode !== 0);
+    expect(result.observations?.execution).toMatchObject({ status: exitCode ? "failed" : "succeeded", exitCode });
+    expect(vi.mocked(spawn).mock.calls.length).toBe(spawns);
+    expect(await fs.readFile(path.join(workingDir, "starts"), "utf8")).toBe("1");
+    expect((await wait(session_id, { yield_time_ms: 0 })).observations).toBeUndefined();
+    expect(sessionTool().inspectReadContinuation!({ action: "read", session_id, wait_for: "exit" }, ctx())?.waiting).toBe(false);
+  });
+
+  it("returns running at the wait deadline and resumes the same command with exact bounded output", async () => {
+    const session_id = await start();
+    const poll = await wait(session_id, { yield_time_ms: 0 });
+    expect(json(poll.content).status).toBe("running");
+    expect(sessionTool().inspectReadContinuation!({ action: "read", session_id, wait_for: "exit", yield_time_ms: 0 }, ctx())?.waiting).toBe(false);
+    const result = await wait(session_id, { yield_time_ms: 20, max_chars: 1, cursor: 0 });
+    const running = json(result.content);
+    expect(running).toMatchObject({ session_id, status: "running", next_cursor: 1, has_more: true });
+    expect(running.output).toHaveLength(1);
+    expect(result.observations?.execution).toBeUndefined();
+    await write(session_id, "finish");
+    const done = await wait(session_id, { cursor: running.next_cursor });
+    expect(json(done.content).status).toBe("exited");
+    expect(json(done.content).cursor).toBe(1);
+    expect(await fs.readFile(path.join(workingDir, "starts"), "utf8")).toBe("1");
+  });
+
+  it("cancels an independent wait without stopping or restarting its command", async () => {
+    const session_id = await start();
+    const controller = new AbortController();
+    const pending = wait(session_id, {}, controller.signal);
+    controller.abort();
+    expect(json((await pending).content).status).toBe("running");
+    await write(session_id, "finish");
+    expect(json((await wait(session_id)).content).status).toBe("exited");
+    expect(await fs.readFile(path.join(workingDir, "starts"), "utf8")).toBe("1");
+  });
+
+  it("keeps long waits observable and releases heartbeat timers on completion and cancellation", async () => {
+    const session_id = await start();
+    const emitProgress = vi.fn();
+    const readCtx = { ...ctx(), emitProgress };
+    const pending = sessionTool().execute({ action: "read", session_id, wait_for: "exit", yield_time_ms: 600000 }, readCtx);
+    await expect.poll(() => emitProgress.mock.calls.length).toBeGreaterThan(0);
+    expect(emitProgress).toHaveBeenCalledWith(expect.objectContaining({
+      data: { elapsedMs: expect.any(Number), timeoutMs: 600000, heartbeat: true },
+    }));
+    await write(session_id, "finish");
+    await pending;
+    const count = emitProgress.mock.calls.length;
+    // No heartbeat is installed for an already terminal session.
+    await sessionTool().execute({ action: "read", session_id, wait_for: "exit" }, readCtx);
+    expect(emitProgress).toHaveBeenCalledTimes(count);
+    const next = await start();
+    const controller = new AbortController();
+    // Cancellation can arrive synchronously through the progress consumer.
+    const cancelled = await sessionTool().execute({ action: "read", session_id: next, wait_for: "exit", yield_time_ms: 600000 }, {
+      ...ctx(controller.signal), emitProgress: () => controller.abort(),
+    });
+    expect(json(cancelled.content).status).toBe("running");
+  });
+
+  it("rejects invalid and foreign waits, but ignores this read-only option on other actions", async () => {
+    const session_id = await start();
+    for (const wait_for of [null, false, {}, "unknown"]) {
+      const result = await wait(session_id, { wait_for });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("wait_for");
+      expect(sessionTool().inspectReadContinuation!({ action: "read", session_id, wait_for }, ctx())).toBeUndefined();
+    }
+    const denied = await sessionTool().execute({ action: "read", session_id, wait_for: "exit" }, context("foreign"));
+    expect(denied).toMatchObject({ isError: true });
+    expect(denied.content).toContain("E_PROCESS_SESSION_NOT_FOUND");
+    const ignored = await sessionTool().execute({ action: "write", session_id, chars: "finish\n", wait_for: {} }, ctx());
+    expect(json(ignored.content).ignored_fields).toEqual(["wait_for"]);
+    expect(json((await wait(session_id)).content).status).toBe("exited");
+  });
+});
+
 describe("bash managed continuation", () => {
   function managed(owner = "command-owner", signal?: AbortSignal): ToolContext {
     return { ...context(owner), signal, state: {
@@ -621,6 +832,21 @@ describe("bash managed continuation", () => {
     expect(stopped.isError).toBe(true);
     expect(json(stopped.content).execution_status).toBe("timed_out");
     expect(stopped.observations).toBeUndefined();
+  });
+
+  it("keeps the original command deadline and run cancellation during an explicit completion wait", async () => {
+    for (const cancel of [false, true]) {
+      const run = new AbortController();
+      const initial = json((await bashTool.execute({ command: node("setInterval(()=>console.log('progress'),10)"),
+        timeoutMs: cancel ? 10000 : 100, yield_time_ms: 0 }, managed("command-owner", run.signal))).content);
+      const pending = tool("process_session").execute({ action: "read", session_id: initial.session_id,
+        wait_for: "exit", yield_time_ms: 600000 }, managed());
+      if (cancel) run.abort();
+      const result = await pending;
+      expect(json(result.content).status).toBe("stopped");
+      expect(result.isError).toBe(true);
+      expect(result.observations?.execution?.status).toBe(cancel ? "aborted" : "timed_out");
+    }
   });
 
   it.each(["run", "call"])("cancels the original %s after yield but aborting an independent read only ends that wait", async source => {
@@ -839,8 +1065,10 @@ describe("application exit", () => {
     const startedAt = performance.now();
     await stopAllProcessSessions();
     expect(processIsAlive(pid)).toBe(false);
-    // A command that honors TERM must not hold the quit for the SIGKILL grace.
-    expect(performance.now() - startedAt).toBeLessThan(2_500);
+    // Windows uses a bounded native tree sweep. POSIX should return before
+    // the escalation delay when the command honors TERM.
+    const shutdownBudgetMs = process.platform === "win32" ? 5_000 : 2_500;
+    expect(performance.now() - startedAt).toBeLessThan(shutdownBudgetMs);
     const read = await tool("process_session").execute({ action: "read", session_id: sessionId, yield_time_ms: 0 }, managedContext());
     expect(json(read.content).status).toBe("stopped");
   });

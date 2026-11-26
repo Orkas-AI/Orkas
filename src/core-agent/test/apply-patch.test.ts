@@ -26,6 +26,19 @@ function context(workingDir: string): ToolContext {
 }
 
 describe("apply_patch", () => {
+  it("changes only the requested text across mixed line endings", async () => {
+    const dir = await tempDir();
+    const target = path.join(dir, "target.txt");
+    await fs.writeFile(target, "first\r\nkey=old\nkeep\rnext=old\r\nlast");
+    const result = await createApplyPatchTool().execute({ patch: [
+      "*** Begin Patch", "*** Update File: target.txt", "@@",
+      " first", "-key=old", "+key=new", " keep", "@@",
+      "-next=old", "+next=new", " last", "*** End Patch",
+    ].join("\n") }, context(dir));
+    expect(result.isError).toBeFalsy();
+    expect(await fs.readFile(target)).toEqual(Buffer.from("first\r\nkey=new\nkeep\rnext=new\r\nlast"));
+  });
+
   it('bounds escaped ambiguity context and reports omitted insertion anchors', async () => {
     const dir = await tempDir();
     const original = Array.from({ length: 20 }, () => `anchor ${'"\\'.repeat(2000)}\n`).join('');

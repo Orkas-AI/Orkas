@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as net from 'node:net';
+import type { BackendRunOptions, LocalEvent } from '../../../../src/main/features/local_agents/backends/base';
 
 // Mocks must be declared at top-level for vi to hoist them. The
 // registry mock keeps real exports but swaps dispatch resolution; the claude
@@ -171,6 +172,19 @@ async function callRunnerBridge(
 }
 
 describe('local_agents/runner', () => {
+  it.each(['claude', 'codex'] as const)('runs %s without an Orkas-owned canvas companion', async cli => {
+      mockDetect.mockResolvedValue({ type: cli, available: true, path: '/fake/' + cli, version: '2.1.296' });
+      const backend = async (opts: any) => {
+        expect(opts).not.toHaveProperty('canvasClientPath');
+        opts.onEvent({ type: 'done', status: 'completed', output: 'Ready' });
+      };
+      mockBackendImpl = mockCodexBackendImpl = backend;
+      const runner = await loadRunner();
+      const result = await runner.run({ uid: TEST_UID, cid: 'canvas-original', agentId: 'canvas-agent', cli,
+        prompt: 'Make a video', cwd: tmpDir, signal: new AbortController().signal, onEvent: () => {} });
+      expect(result.status).toBe('completed');
+    });
+
   it.each(['claude', 'codex'] as const)('saves a native %s reply through the conversation owner before returning it to the CLI', async cli => {
     mockDetect.mockResolvedValue({ type: cli, available: true, path: '/fake/' + cli, version: cli === 'claude' ? '2.1.296' : '0.156.1' });
     const inputs = await import('../../../../src/main/features/local_agents/cli_user_input');
@@ -2040,6 +2054,36 @@ describe('local_agents/runner', () => {
     expect(done?.error).toMatch(/spawn went sideways/);
   });
 
+  it('forwards a native terminal error safely without treating its text as a resume rejection', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const attempts = vi.fn(async (opts: BackendRunOptions) => {
+      opts.onEvent({
+        type: 'done', status: 'failed', error: 'CLI request failed',
+        nativeError: 'Workspace dependency reported session not found; token=fixture-secret; cwd=/Users/test/private',
+      });
+    });
+    mockBackendImpl = attempts;
+    const runner = await loadRunner();
+    const events: LocalEvent[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-native-error', agentId: 'agent-x', cli: 'claude', prompt: 'Continue', cwd: tmpDir,
+      resumeSessionId: 'old-session', resumeFallbackPrompt: 'Bounded history',
+      signal: new AbortController().signal, onEvent: e => events.push(e),
+    });
+    expect(attempts).toHaveBeenCalledTimes(1);
+    const terminal = events.filter(event => event.type === 'done');
+    expect(terminal).toHaveLength(1);
+    expect(result).toMatchObject({ status: 'failed', error: expect.stringContaining('Workspace dependency reported session not found') });
+    expect(terminal[0].error).toBe(result.error);
+    expect(terminal[0]).not.toHaveProperty('nativeError');
+    expect(terminal[0]).not.toHaveProperty('resumeRejected');
+    expect(JSON.stringify([terminal, result])).not.toMatch(/fixture-secret|\/Users\/test/);
+    const logPath = path.join(tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'events.jsonl');
+    const persisted = fs.readFileSync(logPath, 'utf8');
+    expect(persisted).toContain('Workspace dependency reported session not found');
+    expect(persisted).not.toMatch(/nativeError|fixture-secret|\/Users\/test/);
+  });
+
   it('retries a pre-execution stale resume once with bounded recovery', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     const attempts: any[] = [];
@@ -3113,16 +3157,14 @@ describe('local_agents/runner', () => {
     const events: any[] = [];
     const result = await runner.run({
       uid: TEST_UID, cid: 'c', agentId: 'a',
-      // 'kimi' is a known type name but not registered yet (kept out of
-      // v1 backends on purpose). Any future addition needs the test
-      // pointed at a fresher placeholder.
-      cli: 'kimi' as any, prompt: 'p', cwd: tmpDir,
+      cli: 'future_cli' as any, prompt: 'p', cwd: tmpDir,
       signal: new AbortController().signal,
       onEvent: e => events.push(e),
     });
     expect(result.status).toBe('failed');
     expect(result.error).toMatch(/not implemented/);
   });
+
 });
 
 

@@ -25,6 +25,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await closeLogWorkers();
+  vi.unstubAllEnvs();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -105,6 +106,143 @@ async function makeProject(instructions?: string): Promise<string> {
   }
   return r.project.project_id;
 }
+
+describe('CLI context › resumed form task identity', () => {
+  it.each([
+    { label: 'without an intervening task', intervening: [] },
+    { label: 'for a delegated subtask', source: 'commander', intervening: [] },
+    { label: 'after an independent task addressed to Commander', intervening: [
+      { id: 'other-task', from: 'user', to: ['commander'], text: 'Inspect the invoice layout only.' },
+    ] },
+    { label: 'after that independent task was deleted', intervening: [
+      { id: 'other-task', from: 'user', to: ['commander'], text: 'Inspect the invoice layout only.', deleted_at: '2026-11-17T01:00:00Z' },
+    ] },
+  ])('resumes the directory form owner’s task $label', async ({ intervening, source }) => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const { encodeSubmission } = await import('../../../../src/main/features/group_chat/router');
+    const task = 'Repair the export cancellation race; preserve the successful export.';
+    const form = { form_id: 'aabbccdd11223344', agent_id: AGENT.agent_id, submitted: false, fields: [
+      { id: 'project_dir', type: 'directory' as const, label: 'Project directory', required: true },
+    ] };
+    const submission = encodeSubmission(form, { project_dir: tmpDir });
+    const rows = [
+      ...(source ? [{ id: 'parent-task', from: 'user', to: ['commander'], text: 'Review the entire export workflow.' }] : []),
+      { id: 'original-task', from: source || 'user', to: [AGENT.agent_id], text: task, ...(source ? { dispatch: true } : {}) },
+      { id: 'directory-question', from: AGENT.agent_id, to: ['user'], text: 'Choose the project directory.',
+        source_message_id: 'original-task', form },
+      ...intervening,
+      { id: 'directory-answer', from: 'user', to: [AGENT.agent_id], text: submission },
+    ];
+    const plan = await bus._buildCliContextPlanForTest(TEST_UID, CID, AGENT,
+      { ...ITEM, msgId: 'directory-answer', llmPayload: `<msg from="user" to="${AGENT.agent_id}">\n${submission}\n</msg>` },
+      rows as any);
+    // The persisted form and its source identify the task being resumed.
+    // A separate recipient's task is context, never the resumed task body.
+    expect(plan.turnPrompt).toBe(task);
+  });
+
+  it.each(['missing-form', 'foreign-agent', 'deleted-source', 'missing-source', 'cancelled-task', 'superseded-task'])(
+    'does not compile an unrelated task when the form association is %s', async kind => {
+      const users = await import('../../../../src/main/features/users'); users.activateUser(TEST_UID);
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const board = await import('../../../../src/main/features/group_chat/task_board');
+      const { encodeSubmission } = await import('../../../../src/main/features/group_chat/router');
+      const form = { form_id: 'aabbccdd11223344', agent_id: AGENT.agent_id, fields: [] };
+      const row = await board.createTask(TEST_UID, CID, { assignee: AGENT.agent_id,
+        instruction: 'Repair only the cancelled export.', createdBy: 'user', sourceMsgId: 'original-task' });
+      await board.claimTask(TEST_UID, CID, row.task_id);
+      await board.finishTask(TEST_UID, CID, row.task_id, 'waiting_input', { resume: { form_id: form.form_id } });
+      if (kind === 'cancelled-task') await board.cancelPending(TEST_UID, CID, row.task_id);
+      if (kind === 'superseded-task') {
+        const replacement = await board.createTask(TEST_UID, CID, { assignee: AGENT.agent_id,
+          instruction: 'Work on the replacement task.', createdBy: 'user', sourceMsgId: 'replacement' });
+        await board.claimTask(TEST_UID, CID, replacement.task_id);
+      }
+      const rows = [
+        { id: 'original-task', from: 'user', to: [AGENT.agent_id], text: row.instruction,
+          ...(kind === 'deleted-source' ? { deleted_at: 't' } : {}) },
+        { id: 'question', from: AGENT.agent_id, to: ['user'], text: 'Choose the directory.', task_id: row.task_id,
+          source_message_id: kind === 'missing-source' ? 'unknown' : 'original-task',
+          form: { ...form, agent_id: kind === 'foreign-agent' ? 'another-agent' : AGENT.agent_id } },
+        { id: 'unrelated', from: 'user', to: ['commander'], text: 'Rewrite the entire application.' },
+      ].filter(r => kind !== 'missing-form' || r.id !== 'question');
+      await expect(bus._buildCliContextPlanForTest(TEST_UID, CID, AGENT, { ...ITEM,
+        msgId: 'answer', taskId: row.task_id, llmPayload: encodeSubmission(form, { project_dir: tmpDir }) }, rows as any))
+        .rejects.toThrow('form task');
+    });
+
+  it('retains scoped assignment and confirmed non-directory parameters through every CLI resume mode', async () => {
+    const users = await import('../../../../src/main/features/users'); users.activateUser(TEST_UID);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const { encodeSubmission } = await import('../../../../src/main/features/group_chat/router');
+    const { materializeCliContext } = await import('../../../../src/main/features/local_agents/context');
+    const form = { form_id: 'aabbccdd11223344', agent_id: AGENT.agent_id, fields: [] };
+    const task = 'Repair the export race only.';
+    const plan = await bus._buildCliContextPlanForTest(TEST_UID, CID, AGENT, { ...ITEM,
+      msgId: 'answer', assignmentContext: 'The independent chart belongs to Researcher.',
+      llmPayload: encodeSubmission(form, { project_dir: tmpDir, output_format: 'csv' }) }, [
+      { id: 'original', from: 'commander', to: [AGENT.agent_id], text: task, dispatch: true },
+      { id: 'question', from: AGENT.agent_id, to: ['user'], text: 'Choose.', form, source_message_id: 'original' },
+    ] as any);
+    for (const cli of ['claude', 'codex', 'opencode', 'openclaw', 'hermes']) {
+      const ctx = materializeCliContext(plan, { cli, resumed: true });
+      for (const prompt of [ctx.prompt, ctx.resumeFallbackPrompt]) {
+        expect(prompt).toContain(task);
+        expect(prompt).toContain('output_format: csv');
+        expect(prompt).toContain('independent chart belongs to Researcher');
+        expect(prompt).not.toContain(`project_dir: ${tmpDir}`);
+      }
+    }
+  });
+
+  it('recovers chained form parameters without widening the original task', async () => {
+    const users = await import('../../../../src/main/features/users'); users.activateUser(TEST_UID);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    const { encodeSubmission } = await import('../../../../src/main/features/group_chat/router');
+    const first = { form_id: 'aabbccdd11223344', agent_id: AGENT.agent_id, fields: [] };
+    const second = { ...first, form_id: 'aabbccdd55667788' };
+    const task = await board.createTask(TEST_UID, CID, { assignee: AGENT.agent_id,
+      instruction: 'Fix the export race only.', createdBy: 'user', sourceMsgId: 'original' });
+    await board.claimTask(TEST_UID, CID, task.task_id);
+    await board.finishTask(TEST_UID, CID, task.task_id, 'waiting_input', { resume: { form_id: second.form_id } });
+    const plan = await bus._buildCliContextPlanForTest(TEST_UID, CID, AGENT, { ...ITEM, taskId: task.task_id,
+      llmPayload: encodeSubmission(second, { project_dir: tmpDir, output_format: 'xlsx' }) }, [
+      { id: 'original', from: 'user', to: [AGENT.agent_id], text: task.instruction },
+      { id: 'question-one', from: AGENT.agent_id, to: ['user'], text: 'Choose.', form: first, task_id: task.task_id, source_message_id: 'original' },
+      { id: 'answer-one', from: 'user', to: [AGENT.agent_id], text: encodeSubmission(first, { language: 'Korean', output_format: 'csv' }), task_id: task.task_id },
+      { id: 'question-two', from: AGENT.agent_id, to: ['user'], text: 'Choose again.', form: second, task_id: task.task_id, source_message_id: 'answer-one' },
+    ] as any);
+    expect(plan.turnPrompt).toContain(task.instruction);
+    expect(plan.turnPrompt).toContain('language: Korean');
+    expect(plan.turnPrompt).toContain('output_format: xlsx');
+    expect(plan.turnPrompt).not.toContain('output_format: csv');
+  });
+
+  it('recovers an old form source outside the CLI tail without materializing the full transcript', async () => {
+    const users = await import('../../../../src/main/features/users'); users.activateUser(TEST_UID);
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const storage = await import('../../../../src/main/storage');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const { encodeSubmission } = await import('../../../../src/main/features/group_chat/router');
+    const form = { form_id: 'aabbccdd11223344', agent_id: AGENT.agent_id, fields: [] };
+    const task = 'Repair the cancellation race only.';
+    const rows = [
+      { id: 'original', from: 'user', to: [AGENT.agent_id], text: task },
+      { id: 'question', from: AGENT.agent_id, to: ['user'], text: 'Choose.', form, source_message_id: 'original' },
+      ...Array.from({ length: 2000 }, (_, i) => ({ id: `unrelated-${i}`, from: 'user', to: ['commander'], text: `Independent work ${i}.` })),
+    ];
+    await seedConversation(rows);
+    const wholeRead = vi.spyOn(storage, 'readJsonl');
+    const plan = await bus._buildCliContextPlanForTest(TEST_UID, CID, AGENT, { ...ITEM,
+      llmPayload: encodeSubmission(form, { project_dir: tmpDir }) }, rows.slice(-6) as any);
+    expect(plan.turnPrompt).toBe(task);
+    expect(wholeRead.mock.calls.some(([file, limit]) => file === layout.conversationMessageReadFile(TEST_UID, CID) && limit === 0)).toBe(false);
+    wholeRead.mockRestore();
+  });
+});
 
 describe('CLI context › user language across dispatch and resume', () => {
   it('includes offers only in the final delivery turn, without changing CLI durable instructions or slash commands', async () => {
@@ -189,6 +327,32 @@ describe('CLI context › durable project instructions', () => {
     expect(plan.durableInstructions).toContain('## Project instructions (user-authored)');
     expect(plan.durableInstructions).toContain(REPO_LINE);
     expect(plan.turnPrompt).not.toContain(REPO_LINE);
+  });
+
+  it('gives a CLI Agent the project goal facts right after the instructions, without how Commander uses them', async () => {
+    vi.stubEnv('ORKAS_PROJECT_RECAP_TAB_ENABLED', '1');
+    const pid = await makeProject(`- ${REPO_LINE}`);
+    const goals = await import('../../../../src/main/features/project_goal');
+    expect((await goals.saveProjectGoal(TEST_UID, pid, { goal: '把 Orkas 的项目推进做完', success_criteria: ['指挥官回来会交代变化'] }, 'ui')).ok).toBe(true);
+    const durable = (await buildPlan(pid)).durableInstructions;
+    const projectIdx = durable.indexOf('## Project instructions (user-authored)');
+    const goalIdx = durable.indexOf('## Project goal (user-set)');
+    expect(goalIdx).toBeGreaterThan(projectIdx);
+    expect(goalIdx).toBeLessThan(durable.indexOf('## User language'));
+    expect(durable).toContain('Goal: 把 Orkas 的项目推进做完\nSuccess criteria: 1) 指挥官回来会交代变化\nStatus: active');
+    expect(durable).not.toContain('propose marking it achieved');
+    expect(durable.match(/## Project goal/g)).toHaveLength(1);
+    expect((await buildPlan(pid)).turnPrompt).not.toContain('## Project goal');
+  });
+
+  it('withholds the saved goal from CLI instructions while the Goal tab is off', async () => {
+    vi.stubEnv('ORKAS_PROJECT_RECAP_TAB_ENABLED', undefined);
+    const pid = await makeProject(`- ${REPO_LINE}`);
+    const goals = await import('../../../../src/main/features/project_goal');
+    expect((await goals.saveProjectGoal(TEST_UID, pid, { goal: 'Previously saved CLI objective' }, 'ui')).ok).toBe(true);
+    const plan = await buildPlan(pid);
+    expect(plan.durableInstructions).toContain(REPO_LINE);
+    expect(plan.durableInstructions + plan.turnPrompt).not.toContain('Previously saved CLI objective');
   });
 
   it('keeps workflow, XML directory switching, project policy, project instructions, and language in the durable layer', async () => {

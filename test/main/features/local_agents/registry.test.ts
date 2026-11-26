@@ -31,11 +31,18 @@ import * as versionProbe from '../../../../src/main/features/local_agents/versio
 
 const isWindows = process.platform === 'win32';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const stableCliTypes = ['claude', 'codex', 'openclaw', 'opencode', 'hermes'];
+const expandedCliCommands = {
+  kimi: 'kimi', dsh: 'dsh', traecli: 'traecli', zcode: 'zcode', copilot: 'copilot',
+  cursor: 'cursor-agent', antigravity: 'agy',
+};
+const allCliTypes = [...stableCliTypes, ...Object.keys(expandedCliCommands)];
 
 describe('local CLI context capabilities', () => {
   it('declares the complete conversation contract for every registered backend', () => {
     expect(Object.keys(LOCAL_CLI_CAPABILITIES).sort()).toEqual([...LOCAL_CLI_TYPES].sort());
-    expect(LOCAL_CLI_CAPABILITIES).toEqual({
+    expect([...LOCAL_CLI_TYPES].sort()).toEqual([...allCliTypes].sort());
+    expect(LOCAL_CLI_CAPABILITIES).toMatchObject({
       claude: {
         resume: 'native',
         instructionChannel: 'native',
@@ -92,6 +99,13 @@ describe('local CLI context capabilities', () => {
         permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
     });
+    for (const type of Object.keys(expandedCliCommands)) {
+      expect(localCliCapabilities(type)).toEqual({
+        resume: 'native', instructionChannel: 'user-message', durableInstructionScope: 'session',
+        codingProjectDirectory: true, orkasBridge: true, agentMemory: false, activeRunIngress: 'none',
+        progressEvents: true, permissionPolicies: ['inherit'],
+      });
+    }
   });
 
   it('fails closed for an unknown CLI instead of assuming session persistence', () => {
@@ -385,11 +399,19 @@ describe('local_agents/registry', () => {
     invalidateCache();
   });
 
-  it('returns one entry per known CLI type', async () => {
-    process.env.PATH = '';
-    const result = await detectAll();
-    const types = result.map(r => r.type).sort();
-    expect(types).toEqual([...LOCAL_CLI_TYPES].sort());
+  it('discovers and validates a supported CLI despite a stale disabled release setting', async () => {
+    const probeLog = path.join(tmpDir, 'kimi-probe.log');
+    const bin = writeCountingMockCli(path.join(tmpDir, 'kimi'), probeLog, '2.7.0');
+    vi.stubEnv('ORKAS_KIMI_PATH', bin);
+    vi.stubEnv('ORKAS_EXTERNAL_CLI_EXPANSION_ENABLED', '0');
+    try {
+      const installed = await findAllInstalled();
+      expect(installed.map(entry => entry.type).sort()).toEqual([...allCliTypes].sort());
+      expect(installed.find(entry => entry.type === 'kimi')).toMatchObject({ available: true, validation: 'pending' });
+      expect(fs.existsSync(probeLog)).toBe(false);
+      expect(await resolveCliForDispatch('kimi')).toMatchObject({ available: true, version: '2.7.0' });
+      expect(fs.existsSync(probeLog)).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it('finds installed CLIs without starting version processes', async () => {
@@ -419,7 +441,8 @@ describe('local_agents/registry', () => {
     const dirs = Array.from({ length: 30 }, (_, index) => path.join(tmpDir, 'path-' + index));
     dirs.forEach(dir => fs.mkdirSync(dir));
     const probeLog = path.join(tmpDir, 'unexpected-presence-process.log');
-    const installed = LOCAL_CLI_TYPES.map(type => writeCountingMockCli(path.join(dirs[29], type), probeLog, '999.0.0'));
+    const installed = [...stableCliTypes, ...Object.values(expandedCliCommands)]
+      .map(command => writeCountingMockCli(path.join(dirs[29], command), probeLog, '999.0.0'));
     process.env.PATH = dirs.join(path.delimiter);
     const samples: number[] = [];
     for (let round = 0; round < 10; round += 1) {
@@ -689,15 +712,17 @@ describe('local_agents/registry', () => {
 
   it('coalesces concurrent forced discovery into one set of version processes', async () => {
     const probeLog = path.join(tmpDir, 'probe-calls.log');
-    // The scheduling fixture represents all five CLIs, including OpenClaw's
-    // calendar-version floor; the availability oracle must use a valid version.
-    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog, '2026.4.11');
+    // This version clears all floors, including the date-based OpenClaw and Cursor floors.
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog, '2026.11.1');
     process.env.PATH = '';
     process.env.ORKAS_CLAUDE_PATH = fake;
     process.env.ORKAS_CODEX_PATH = fake;
     process.env.ORKAS_OPENCLAW_PATH = fake;
     process.env.ORKAS_OPENCODE_PATH = fake;
     process.env.ORKAS_HERMES_PATH = fake;
+    for (const type of Object.keys(expandedCliCommands)) {
+      process.env[`ORKAS_${type.toUpperCase()}_PATH`] = fake;
+    }
 
     const [first, second] = await Promise.all([
       detectAll({ force: true }),
@@ -707,15 +732,8 @@ describe('local_agents/registry', () => {
     expect(second).toBe(first);
     expect(first.filter(e => !e.available).map(e => ({ type: e.type, error: e.error, path: e.path }))).toEqual([]);
     const probes = fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/).sort();
-    // Four single-probe CLIs plus Hermes `version` and `--version`.
-    expect(probes).toEqual([
-      '--version',
-      '--version',
-      '--version',
-      '--version',
-      '--version',
-      'version',
-    ]);
+    // Each CLI uses --version once, and Hermes also tries its version subcommand.
+    expect(probes).toEqual([...allCliTypes.map(() => '--version'), 'version']);
   });
 
   it('lets dispatch join the startup idle probe instead of launching another process', async () => {

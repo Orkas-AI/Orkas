@@ -15,12 +15,30 @@ let _bashPermDialogOpen = false;
 const _bashPermCancelled = new Set();
 const _bashPermTaskApproved = new Set();
 const _bashPermDialogClosers = new Map();
+const _bashPermPendingTasks = new Map();
+
+function _hasPendingBashApproval(cid) {
+  for (const taskId of _bashPermPendingTasks.values()) {
+    if (taskId === cid) return true;
+  }
+  return false;
+}
+
+function _clearPendingBashApproval(requestId) {
+  const cid = _bashPermPendingTasks.get(requestId);
+  if (!cid) return;
+  _bashPermPendingTasks.delete(requestId);
+  if (typeof _repaintConvRowStatus === 'function') _repaintConvRowStatus(cid);
+}
 
 const _BASH_PERMISSION_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 const _BASH_PERMISSION_DEFAULT_MODE = 'all_files_approval';
 const _CLI_PERMISSION_POLICIES = ['inherit', 'ask', 'full_access'];
 const _BASH_PERMISSION_RISK_CATEGORIES = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path', 'system_package_change', 'external_mutation'];
 const _BASH_IRREVERSIBLE_ACTIONS = ['recursive_delete', 'untargeted_process_kill'];
+const _BASH_PATH_OPERATIONS = ['input_redirect', 'output_redirect', 'read', 'write', 'remove', 'mixed', 'unknown'];
+const _BASH_PATH_CAUSES = ['expansion', 'assignment_expansion', 'working_directory', 'symlink_parent',
+  'home_directory', 'ambiguous_operand', 'mixed', 'unknown'];
 
 function _bashIsMode(mode) {
   return _BASH_PERMISSION_MODES.includes(mode);
@@ -498,7 +516,8 @@ async function _drainBashPermissionQueue() {
       if (info && info._permission_kind === 'local-agent') {
         await _showLocalAgentPermissionDialog(info);
       } else {
-        await _showBashPermissionDialog(info);
+        try { await _showBashPermissionDialog(info); }
+        finally { if (info && !info._permission_kind) _clearPendingBashApproval(info.request_id); }
       }
     }
   } finally {
@@ -573,6 +592,7 @@ function _cancelBashPermissionRequests(payload, kind) {
     : [];
   const cancelled = new Set(ids);
   for (const id of ids) {
+    if (kind === undefined) _clearPendingBashApproval(id);
     if ((kind === 'connector' || kind === undefined) && payload.approved === true) _bashPermTaskApproved.add(id);
     _bashPermCancelled.add(id);
     const close = _bashPermDialogClosers.get(id);
@@ -595,6 +615,10 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
       window.orkas.onPushEvent('bash:permission', (info) => {
         if (!info || typeof info.request_id !== 'string') return;
         _bashPermQueue.push(info);
+        if (typeof info.cid === 'string' && info.cid) {
+          _bashPermPendingTasks.set(info.request_id, info.cid);
+          if (typeof _repaintConvRowStatus === 'function') _repaintConvRowStatus(info.cid);
+        }
         _drainBashPermissionQueue();
       });
       window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {

@@ -9,6 +9,7 @@ import {
   buildSandboxEnv,
   buildShellInvocation,
   decodeProcessOutput,
+  createProcessOutputDecoder,
   DEFAULT_SANDBOX_TIMEOUT_MS,
   defaultShellForPlatform,
   killProcessTree,
@@ -549,6 +550,28 @@ describe("augmentPath", () => {
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin");
   });
 
+  it("keeps host architecture available to Windows programs without exposing unrelated variables", () => {
+    vi.stubEnv("PROCESSOR_ARCHITECTURE", "x86");
+    vi.stubEnv("PROCESSOR_ARCHITEW6432", "ARM64");
+    vi.stubEnv("ORKAS_TEST_ENV_UNRELATED", "test-only-value");
+    try {
+      const windows = buildSandboxEnv(undefined, "win32");
+      expect(windows).toMatchObject({ PROCESSOR_ARCHITECTURE: "x86", PROCESSOR_ARCHITEW6432: "ARM64" });
+      expect(windows).not.toHaveProperty("ORKAS_TEST_ENV_UNRELATED");
+      const posix = buildSandboxEnv(undefined, "linux");
+      expect(posix).not.toHaveProperty("PROCESSOR_ARCHITECTURE");
+      expect(posix).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
+      vi.stubEnv("PROCESSOR_ARCHITEW6432", undefined);
+      const native = buildSandboxEnv(undefined, "win32");
+      expect(native.PROCESSOR_ARCHITECTURE).toBe("x86");
+      expect(native).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
+      vi.stubEnv("PROCESSOR_ARCHITECTURE", undefined);
+      expect(buildSandboxEnv(undefined, "win32")).not.toHaveProperty("PROCESSOR_ARCHITECTURE");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("defaults Windows Python subprocesses to UTF-8 stdio", () => {
     const env = buildSandboxEnv(undefined, "win32");
     expect(env.PYTHONIOENCODING).toBe("utf-8");
@@ -676,6 +699,40 @@ describe("augmentPath", () => {
 });
 
 describe("decodeProcessOutput", () => {
+  it.each(["darwin", "win32"] as const)("preserves UTF-8 at every split boundary on %s", platform => {
+    const text = "中文 café 😀\n";
+    const bytes = Buffer.from(text);
+    for (let split = 0; split <= bytes.length; split++) {
+      const decoder = createProcessOutputDecoder(platform);
+      expect(decoder.write(bytes.subarray(0, split)) + decoder.write(Buffer.alloc(0))
+        + decoder.write(bytes.subarray(split)) + decoder.end()).toBe(text);
+      expect(decoder.end()).toBe("");
+    }
+    const decoder = createProcessOutputDecoder(platform);
+    expect([...bytes].map(byte => decoder.write(Buffer.from([byte]))).join("") + decoder.end()).toBe(text);
+  });
+
+  it("retains Windows legacy fallback and flushes an incomplete tail once", () => {
+    const decoder = createProcessOutputDecoder("win32", { ORKAS_UI_LANG: "zh" });
+    const gbkVersion = Buffer.from([0xb0, 0xe6, 0xb1, 0xbe]);
+    expect(decoder.write(gbkVersion)).toBe("版本");
+    expect(decoder.write(Buffer.from("中文"))).toBe("中文");
+    const tail = Buffer.from([0xe4, 0xb8]);
+    expect(decoder.write(tail)).toBe("");
+    expect(decoder.end()).toBe(decodeProcessOutput(tail, "win32", { ORKAS_UI_LANG: "zh" }));
+    expect(decoder.end()).toBe("");
+    const utf8 = createProcessOutputDecoder("darwin");
+    expect(utf8.write(tail)).toBe("");
+    expect(utf8.end()).toBe("\uFFFD");
+    expect(utf8.end()).toBe("");
+  });
+
+  it("drops only the leading Windows BOM while preserving later BOMs across chunks", () => {
+    const decoder = createProcessOutputDecoder("win32");
+    const bytes = Buffer.from("\uFEFF中文\uFEFF😀");
+    expect([...bytes].map(byte => decoder.write(Buffer.from([byte]))).join("") + decoder.end()).toBe("中文\uFEFF😀");
+  });
+
   it("falls back to GB18030 for Chinese Windows console output", () => {
     const gbkVersion = Buffer.from([0xb0, 0xe6, 0xb1, 0xbe]);
     expect(decodeProcessOutput(gbkVersion, "win32", { ORKAS_UI_LANG: "zh" })).toBe("版本");

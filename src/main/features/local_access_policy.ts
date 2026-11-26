@@ -162,6 +162,15 @@ export function getLocalAccessSensitivePolicy(): LocalAccessSensitivePolicy {
   ) || DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY;
 }
 
+export function localAccessHasCustomPathPatterns(): boolean {
+  const policy = getLocalAccessSensitivePolicy();
+  if (!policy.enabled_categories.includes('sensitive_path')) return false;
+  const defaults = DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY;
+  return policy.sensitive_path_patterns.some(pattern => pattern !== LEGACY_LIBRARY_LOCATION_PATTERN
+    && !defaults.sensitive_path_patterns.includes(pattern))
+    || policy.sensitive_write_path_patterns.some(pattern => !defaults.sensitive_write_path_patterns.includes(pattern));
+}
+
 function compile(pattern: string): RegExp | null {
   try { return new RegExp(pattern, 'i'); }
   catch { return null; }

@@ -33,6 +33,7 @@ const escapedToolCleanup = new WeakMap<ChildProcessWithoutNullStreams, Promise<v
 export type LocalEventType =
   | 'process-info'
   | 'text-delta'
+  | 'commentary-finalized'
   | 'async-message'
   | 'thinking'
   | 'tool-event'
@@ -73,7 +74,8 @@ export interface LocalEvent {
   /** Free-form payload — exact keys vary per type. Documented inline at
    *  each emit site; a minimal index:
    *    process-info:       { pid, cwd, cmd, args, sessionId? }
-   *    text-delta:         { text, phase?: 'commentary'|'final_answer', itemId? }
+   *    text-delta:         { text, phase?: 'pending'|'commentary'|'final_answer', itemId? }
+   *    commentary-finalized: { text } // prior pending text moved to the process rail
    *    async-message:      { text, itemId, questions: LocalCliAsyncQuestion[] }
    *    thinking:           { text?, summary? } backend-side;
    *                        { chars, summary?, itemId?, heartbeat?, synthetic? } after the
@@ -97,6 +99,7 @@ export interface LocalEvent {
    *                        // silent spinner.
    *    done:               { status: 'completed'|'failed'|'cancelled'|'timeout'|
    *                                  'missing_cli', error?, durationMs?, sessionId?, usage?,
+   *                                  nativeError?: string (adapter-only protocol detail, consumed by runner),
    *                                  exitCode?, protocolRecordCount?, protocolErrorSeen?,
    *                                  finalMessageText?: string (Claude's last native result),
    *                                  timeoutPhase?: 'foreground'|'background',
@@ -104,6 +107,11 @@ export interface LocalEvent {
    *                                  bootstrapTimeout?: boolean (Codex control-call deadline) }
    */
   [key: string]: unknown;
+}
+
+export function rpcErrorMessage(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('message' in error) || typeof error.message !== 'string') return;
+  return error.message.trim() || undefined;
 }
 
 /** Host decision scope. `allow_run` is owned by Orkas and must never be
