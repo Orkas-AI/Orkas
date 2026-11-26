@@ -1005,7 +1005,9 @@ async function encodeDirectCut(input: {
   const filter = [
     `trim=end_frame=${frameCount}`,
     `select='eq(interlace_type,PROGRESSIVE)*lt(abs(t-n/${fps}),0.000001)'`,
-    `settb=1/${fps}`, 'setpts=N',
+    // Rescale the verified timestamps without setpts, which clears the
+    // declared output frame rate in FFmpeg 7.
+    `settb=1/${fps}`,
     ...(cut.scaling ? [`scale=${width}:${height}:flags=${cut.scaling}`] : []),
     // The JPEG/page capture path preserves the source sample matrix and the
     // raw BGRA encoder writes untagged, square-pixel video. Match its
