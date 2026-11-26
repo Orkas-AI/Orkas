@@ -6,8 +6,6 @@ import * as path from 'node:path';
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import {
   assertImageGenerationRequestId,
-  beginImageStudioGeneration,
-  finishImageStudioGeneration,
   imageGenerationControlStatePath,
   imageStudioGenerationOutputs,
   latestCompletedImageStudioGenerationOutput,
@@ -15,18 +13,8 @@ import {
   summarizeImageGenerationBudget,
 } from '../../features/image_production_control';
 import { checkImageProductionServices } from '../../features/image_production_services';
-import {
-  ImageWorkflowError,
-  assertImageWorkflowHostConfigured,
-  imageWorkflowCapabilities,
-  prepareImageWorkflow,
-  runImageWorkflow,
-  type ImageWorkflowEngine,
-} from '../../features/image_workflow_adapter';
-import {
-  inspectImageAssetBuffer,
-  prepareLosslessModelImage,
-} from '../../features/image_assets';
+import { prepareModelImageAsset } from '../../features/image_assets';
+import { registerImageStudioLayeredExport, type ImageStudioNativePngDelivery } from '../../features/image_studio_delivery';
 import {
   exportImageStudioProject,
   imageStudioEvidenceIsGeneration,
@@ -53,9 +41,7 @@ export type ImageStudioOp =
   | 'project.inspect'
   | 'project.snapshot'
   | 'project.submit_design_review'
-  | 'project.export'
-  | 'workflow.capabilities'
-  | 'workflow.run';
+  | 'project.export';
 
 const OPS = new Set<ImageStudioOp>([
   'project.status',
@@ -64,8 +50,6 @@ const OPS = new Set<ImageStudioOp>([
   'project.snapshot',
   'project.submit_design_review',
   'project.export',
-  'workflow.capabilities',
-  'workflow.run',
 ]);
 
 export interface ImageStudioToolOpts {
@@ -77,6 +61,7 @@ export interface ImageStudioToolOpts {
   extraRoots?: readonly string[];
   onFileWritten?: (absPath: string) => void | Promise<void>;
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  imageStudioNativePngDelivery?: ImageStudioNativePngDelivery;
   hasProducedPath?: (absPath: string) => boolean;
 }
 
@@ -149,27 +134,17 @@ async function jsonResultWithVisualEvidence(
     list.findIndex((candidate) => path.resolve(candidate.absPath) === path.resolve(entry.absPath)) === index
   ));
   const preparedEvidence = await Promise.all(uniqueEvidence.map(async (entry, index) => {
-    let source: Buffer = await fs.readFile(entry.absPath);
-    let inspected = await inspectImageAssetBuffer(source);
-    if (index > 0 && inspected.format === 'svg') {
+    const source = await fs.readFile(entry.absPath);
+    let prepared = await prepareModelImageAsset(source);
+    if (index > 0 && prepared.format === 'svg') {
       const { svgReferencePng } = await import('../../features/image_studio_svg_reference');
-      source = await svgReferencePng(source);
-      inspected = await inspectImageAssetBuffer(source);
+      prepared = await prepareModelImageAsset(await svgReferencePng(source));
     }
-    const prepared = inspected.format === 'png'
-      ? await prepareLosslessModelImage(source)
-      : {
-          buf: source,
-          mediaType: inspected.format === 'jpeg'
-            ? 'image/jpeg' as const
-            : inspected.format === 'webp'
-              ? 'image/webp' as const
-              : undefined,
-        };
-    if (!prepared.mediaType) {
-      throw new Error(`E_IMAGE_VISUAL_EVIDENCE_FORMAT: unsupported model evidence format ${inspected.format}.`);
+    const { buf, mediaType, width, height } = prepared;
+    if (!mediaType) {
+      throw new Error(`E_IMAGE_VISUAL_EVIDENCE_FORMAT: unsupported model evidence format ${prepared.format}.`);
     }
-    return { entry, index, inspected, prepared };
+    return { entry, index, buf, mediaType, width, height };
   }));
   const candidate = preparedEvidence[0];
   if (!candidate) throw new Error('E_IMAGE_VISUAL_EVIDENCE_MISSING: no candidate image was provided.');
@@ -180,18 +155,18 @@ async function jsonResultWithVisualEvidence(
       analysis_mode: 'quality_review',
       role: 'candidate',
       path: candidate.entry.absPath,
-      width: candidate.inspected.width,
-      height: candidate.inspected.height,
-      media_type: candidate.prepared.mediaType,
+      width: candidate.width,
+      height: candidate.height,
+      media_type: candidate.mediaType,
       image_count: preparedEvidence.length,
       images: preparedEvidence.map((item) => ({
         order: item.index + 1,
         role: item.entry.role,
         analysis_mode: item.index === 0 ? 'quality_review' : 'understand',
         path: item.entry.absPath,
-        width: item.inspected.width,
-        height: item.inspected.height,
-        media_type: item.prepared.mediaType,
+        width: item.width,
+        height: item.height,
+        media_type: item.mediaType,
       })),
       policy: 'attached_only_after_deterministic_inspection_passed',
       review_gate: {
@@ -213,8 +188,8 @@ async function jsonResultWithVisualEvidence(
   return {
     content: `${JSON.stringify(payload)}${renameNote}`,
     images: preparedEvidence.map((item) => ({
-      data: item.prepared.buf.toString('base64'),
-      mediaType: item.prepared.mediaType,
+      data: item.buf.toString('base64'),
+      mediaType: item.mediaType,
       analysisMode: item.index === 0 ? 'quality_review' : 'understand',
     })),
   };
@@ -383,19 +358,19 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
   const currentTurnId = String(opts.turnId || '').trim();
   return {
     name: 'image_studio',
-    description: 'Inspect, review, and export ImageStudio projects; quote generations, capture local HTML/SVG, and run host-configured image workflows.',
+    description: 'Inspect, review, and export ImageStudio projects; check configured image services and capture local HTML/SVG.',
     inputSchema: {
       type: 'object',
       properties: {
         op: {
           type: 'string',
           enum: [...OPS],
-          description: 'Project QA/export or host-configured external workflow operation.',
+          description: 'Project QA, export, or generation operation.',
         },
-        project_dir: { type: 'string', description: 'Image project directory containing image-manifest.json and local assets.' },
+        project_dir: { type: 'string', description: 'Absolute or workspace-relative folder containing image-manifest.json. Paths inside the manifest are relative to this folder.' },
         page_id: { type: 'string', description: 'Version 2 documents only: stable page id for inspect, snapshot, review or export. Omit for whole-document status/inspection or PDF export. Single-page projects omit this.' },
-        input_path: { type: 'string', description: 'For project.inspect, optional current project-local raster; otherwise uses manifest raster_source, prior evidence or current generation. For PSD project.export, required project-local verified PSD candidate. Use manifest entry for HTML.' },
-        output_path: { type: 'string', description: 'Snapshot, external workflow, or final export path.' },
+        input_path: { type: 'string', description: 'Absolute or workspace-relative file inside project_dir. For raster inspection, omit to use the project raster binding or current evidence, or pass a raster image. HTML inspection uses the manifest entry. For PSD export, pass the verified PSD candidate.' },
+        output_path: { type: 'string', description: 'Absolute or workspace-relative snapshot or export path.' },
         format: { type: 'string', enum: ['png', 'jpeg', 'psd', 'pdf'], description: 'Defaults from output_path, otherwise PNG. PSD preserves its candidate bytes after current native PNG export. PDF prints the manifest HTML entry at canvas size; wrap standalone SVG in local HTML. Photos/effects may stay raster. Scored review is only for non-generation evidence.' },
         evidence_path: { type: 'string', description: 'Required for project.submit_design_review: exact current evidence path returned by project.inspect or project.snapshot.' },
         review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'For project.submit_design_review; send in the same call as review_scope, review_findings, and complete quality_scores. One submission per exact evidence; retry requires changed source signature and rendered pixels.' },
@@ -432,12 +407,6 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             additionalProperties: false,
           },
         },
-        workflow_engine: { type: 'string', enum: ['comfyui', 'invokeai', 'automatic1111', 'iopaint'], description: 'Host-configured external workflow engine. The agent cannot supply an endpoint or token.' },
-        workflow_path: { type: 'string', description: 'Project-local engine request/workflow JSON. Private skills own reusable templates.' },
-        output_node_id: { type: 'string', description: 'Optional engine node id whose image output should be selected.' },
-        output_index: { type: 'number', description: 'Zero-based image index within the selected workflow output. Defaults to 0.' },
-        timeout_ms: { type: 'number', description: 'workflow.run terminal wait timeout from 1000 to 1800000 ms.' },
-        image_request_id: { type: 'string', description: 'Stable ImageStudio generation intent id within the current user turn. Required by workflow.run and generate_image; optional label for generation.quote.' },
         size: { type: 'string', description: 'generation.quote only: exact provider size that will be passed to generate_image.' },
         reference_count: { type: 'number', description: 'generation.quote only: number of local and URL references that will be passed to generate_image, from 0 to 4.' },
       },
@@ -465,139 +434,23 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
       try {
         if (input.page_id !== undefined && (!pageId || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(pageId)))
           throw new Error('E_IMAGE_DOCUMENT_PAGE_ID: page_id must be a stable document page identifier.');
-        if (op === 'workflow.capabilities' && input.page_id === undefined)
-          return jsonResult({ ok: true, op, capabilities: await imageWorkflowCapabilities(ctx.signal) });
         document = await readImageStudioDocument(projectDirAbs);
         if (pageId !== undefined) {
           if (!document) throw new Error('E_IMAGE_DOCUMENT_PAGE_UNEXPECTED: single-page projects omit page_id.');
           imageStudioDocumentPage(document, pageId);
-          if (op === 'workflow.capabilities' || op === 'workflow.run' || op === 'generation.quote')
+          if (op === 'generation.quote')
             throw new Error('E_IMAGE_DOCUMENT_PAGE_UNEXPECTED: page_id selects project QA and export operations only.');
         }
         if (document && !pageId && (op === 'project.status' || op === 'project.inspect')) {
           const inventory = await inspectImageStudioDocument(projectDirAbs, id => imageStudioStatePath(opts, projectDirAbs, id));
           return jsonResult({ ok: inventory.ok, op, document: inventory });
         }
-        if (document && (op === 'generation.quote' || op === 'workflow.run'))
+        if (document && op === 'generation.quote')
           throw new Error('E_IMAGE_DOCUMENT_ROUTE: fixed-page documents use local sources and no generation calls.');
         const wholeDocumentPdf = document && !pageId && op === 'project.export'
           && (input.format === 'pdf' || (!input.format && /\.pdf$/i.test(String(input.output_path || ''))));
-        if (document && !pageId && op !== 'workflow.capabilities' && !wholeDocumentPdf)
+        if (document && !pageId && !wholeDocumentPdf)
           throw new Error('E_IMAGE_DOCUMENT_PAGE_REQUIRED: select page_id from project.status for this operation.');
-        if (op === 'workflow.run') {
-          const engine = String(input.workflow_engine || '').trim() as ImageWorkflowEngine;
-          const workflowRaw = String(input.workflow_path || '').trim();
-          const outputRaw = String(input.output_path || '').trim();
-          const requestId = String(input.image_request_id || '').trim();
-          if (!['comfyui', 'invokeai', 'automatic1111', 'iopaint'].includes(engine)) {
-            return { content: 'workflow_engine must be comfyui, invokeai, automatic1111, or iopaint', isError: true } as ToolResult;
-          }
-          if (!workflowRaw || !outputRaw || !requestId) return { content: 'workflow_path, output_path, and image_request_id are required for workflow.run', isError: true } as ToolResult;
-          const workflowAbs = resolveProjectAsset(projectDirAbs, workflowRaw);
-          const requestedOutput = resolveProjectAsset(projectDirAbs, outputRaw);
-          if (!isPathAllowed(workflowAbs, [projectDirAbs]) || !isPathAllowed(requestedOutput, [projectDirAbs])) {
-            return { content: 'E_IMAGE_WORKFLOW_PATH: workflow and output must stay inside project_dir.', isError: true } as ToolResult;
-          }
-          const unique = await uniquifyPath(requestedOutput, (candidate) => !!opts.hasProducedPath?.(candidate));
-          const prepared = await prepareImageWorkflow({
-            engine,
-            projectDirAbs,
-            workflowAbsPath: workflowAbs,
-            ...(String(input.output_node_id || '').trim() ? { outputNodeId: String(input.output_node_id).trim() } : {}),
-            ...(input.output_index !== undefined ? { outputIndex: Number(input.output_index) } : {}),
-          });
-          assertImageWorkflowHostConfigured(engine);
-          const begun = await beginImageStudioGeneration({
-            stateAbsPath: generationStateAbsPath,
-            projectDirAbs,
-            requestId,
-            outputAbsPath: unique.finalPath,
-            ...(currentTurnId ? { turnId: currentTurnId } : {}),
-          });
-          if (begun.status === 'reused') {
-            const reusedPath = begun.transaction.output_path!;
-            await reportWritten(opts, reusedPath);
-            return jsonResult({
-              ok: true,
-              op,
-              reused: true,
-              request_id: requestId,
-              output_path: reusedPath,
-              media: versionedChatMediaLocalUrl(reusedPath),
-              generation: { calls_started: begun.callCount, max_calls: begun.maxCalls },
-              service_availability: {
-                source: 'not_applicable_reused_output',
-                new_external_charge: false,
-              },
-            });
-          }
-
-          ctx.emitProgress?.({ phase: 'workflow_dispatch', message: `Dispatching ${engine} image workflow` });
-          try {
-            const result = await runImageWorkflow({
-              prepared,
-              projectDirAbs,
-              outputAbsPath: unique.finalPath,
-              ...(input.timeout_ms !== undefined ? { timeoutMs: Number(input.timeout_ms) } : {}),
-              ...(ctx.signal ? { signal: ctx.signal } : {}),
-            });
-            await finishImageStudioGeneration({
-              stateAbsPath: generationStateAbsPath,
-              transactionId: begun.transaction.transaction_id,
-              ok: true,
-              outputPath: result.output_path,
-            });
-            await reportWritten(opts, result.output_path);
-            ctx.emitProgress?.({ phase: 'workflow_complete', message: `${engine} image workflow completed` });
-            return jsonResult({
-              ok: true,
-              op,
-              request_id: requestId,
-              result,
-              generation: { calls_started: begun.callCount, max_calls: begun.maxCalls },
-              service_availability: {
-                source: 'host_configured_external_workflow',
-                external_billing_not_estimated: true,
-              },
-              media: versionedChatMediaLocalUrl(result.output_path),
-            }, unique.renamed ? renderRenameSignal(requestedOutput, unique.finalPath) : '');
-          } catch (error) {
-            const workflowError = error instanceof ImageWorkflowError ? error : null;
-            const uncertain = !!workflowError?.dispatched && !workflowError.terminal;
-            let generation = await readImageGenerationControlState(generationStateAbsPath);
-            if (!uncertain) {
-              generation = await finishImageStudioGeneration({
-                stateAbsPath: generationStateAbsPath,
-                transactionId: begun.transaction.transaction_id,
-                ok: false,
-                errorCode: workflowError?.code || 'E_IMAGE_WORKFLOW_FAILED',
-                countsTowardBudget: workflowError ? workflowError.dispatched : true,
-              });
-            }
-            const usage = summarizeImageGenerationBudget(generation, begun.maxCalls, currentTurnId);
-            const handoff = await buildImageStudioRecoveryHandoff({
-              projectDirAbs,
-              stateAbsPath,
-              generationStateAbsPath,
-              turnId: currentTurnId,
-              pageId,
-              generation,
-            });
-            return jsonResult({
-              ok: false,
-              op,
-              status: uncertain ? 'pending_uncertain' : 'failed',
-              request_id: requestId,
-              error_code: workflowError?.code || 'E_IMAGE_WORKFLOW_FAILED',
-              message: (error as Error).message || String(error),
-              ...(workflowError?.dispatchId ? { dispatch_id: workflowError.dispatchId } : {}),
-              generation: { ...usage, max_calls: begun.maxCalls },
-              next_action: uncertain ? 'Do not retry this generation intent; inspect the host queue and keep the request pending.' : 'Repair the workflow before using a new request id within the remaining budget.',
-              ...handoff,
-            });
-          }
-        }
-
         if (op === 'generation.quote') {
           const evidenceState = await readImageStudioEvidenceState(stateAbsPath);
           const inspection = await inspectImageStudioProject(projectDirAbs, evidenceState?.source_path);
@@ -735,7 +588,9 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         if (op === 'project.inspect') {
           const explicitInputAbs = input.input_path ? resolveAbs(ctx, opts, input.input_path) : undefined;
           if (explicitInputAbs && !isPathAllowed(explicitInputAbs, roots)) {
-            return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside scope: ${explicitInputAbs}`, isError: true } as ToolResult;
+            // Inspection only reads inside the image project, so a file from elsewhere is copied
+            // in first, by tools that follow the user's access setting.
+            return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside this conversation's files: ${explicitInputAbs}. Copy it into the image project first, then inspect it there.`, isError: true } as ToolResult;
           }
           const generation = await readImageGenerationControlState(generationStateAbsPath);
           const state = await readImageStudioEvidenceState(stateAbsPath);
@@ -848,7 +703,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         // Ownership is deliberately *not* consulted here. `project.export` is the
         // delivery gate: each export is a finished artefact the user has already
         // been shown, not scratch space. The conversation-scoped
-        // `hasProducedPath` used by snapshot / workflow.run treats "produced this
+        // `hasProducedPath` used by snapshot treats "produced this
         // turn or earlier" as a refinement and overwrites in place, so a revision
         // requested in a *later* turn would silently replace the version already
         // attached to an earlier chat message. `() => false` keeps every revision
@@ -868,14 +723,22 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         });
         const footerText = format === 'pdf'
           ? producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, projectId: opts.projectId }) || undefined : undefined;
+        const nativePngDelivery = opts.imageStudioNativePngDelivery;
+        let verifiedPngVersion: string | undefined;
         const exported = wholeDocumentPdf
           ? await exportImageStudioDocument({ projectDir: projectDirAbs,
             statePath: id => imageStudioStatePath(opts, projectDirAbs, id),
             outputAbsPath: unique.finalPath, scratchDir: path.join(userLocalRoot(opts.userId), 'image_studio', 'temporary'),
             footerText, signal: ctx.signal, finalizeOutput })
           : await exportImageStudioProject({ stateAbsPath, outputAbsPath: unique.finalPath, format, inputAbsPath,
-            footerText, signal: ctx.signal, finalizeOutput });
+            footerText, signal: ctx.signal, finalizeOutput,
+            ...(nativePngDelivery ? { onVerifiedPng: (_file, version) => { verifiedPngVersion = version; } } : {}),
+          });
+        if (opts.cid && (format === 'png' || format === 'psd')) {
+          await registerImageStudioLayeredExport(opts.userId, opts.cid, unique.finalPath);
+        }
         await reportWritten(opts, unique.finalPath);
+        if (verifiedPngVersion) nativePngDelivery?.record(unique.finalPath, verifiedPngVersion);
         if (opts.onOutputsPublished) await opts.onOutputsPublished([unique.finalPath]);
         return jsonResult({
           ok: true,

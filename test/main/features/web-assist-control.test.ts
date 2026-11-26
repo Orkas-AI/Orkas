@@ -1,5 +1,6 @@
 import * as vm from 'node:vm';
 import * as path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { dialog, session } from 'electron';
 import { prepareWebAssistCache } from '../../../src/main/features/web_assist_cache';
 import { registerUserSwitchHook } from '../../../src/main/features/user-switch-hooks';
@@ -366,6 +367,8 @@ import {
   fitWebAssistObservation,
 } from '../../../src/main/features/web_assist';
 import { estimateToolResultTokens } from '../../../src/main/util/tool-result-cap';
+import { installWindowPresentationEvents } from '../../../src/main/util/window-presentation';
+import { buildConversationBrowserTool } from '../../../src/main/features/group_chat/browser_tool';
 import {
   beginBrowserTaskRun, finishBrowserTaskRun,
 } from '../../../src/main/features/web_assist_lifecycle';
@@ -415,6 +418,55 @@ describe('Web Assist controlled connector lifecycle', () => {
       closeWebAssist(electronMock.renderer);
       vi.restoreAllMocks();
       electronMock.pageText = 'Create an app';
+    });
+
+    it('provides private comparison evidence only for complete, task-owned observations', async () => {
+      const cid = 'c-observe-evidence';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      beginBrowserTaskRun('u1', cid, 'observation-evidence');
+      try {
+        const started = await openModelWebAssist('u1', cid, { url: 'https://example.com/read' });
+        const tabId = String(started.active_tab_id);
+        const tool = buildConversationBrowserTool('u1', cid);
+        const observe = (text_offset?: number) => tool.execute({
+          operation: 'observe', tab_id: tabId, ...(text_offset === undefined ? {} : { text_offset }),
+        }, { state: {} });
+        const first = await observe();
+        const second = await observe();
+        const evidence = first.observations?.browserObservation;
+        expect(evidence).toMatchObject({ target: expect.any(String), fingerprint: expect.any(String) });
+        expect(second.observations?.browserObservation).toEqual(evidence);
+        expect(JSON.parse(first.content).page_id).not.toBe(JSON.parse(second.content).page_id);
+        expect(first.content).not.toContain(JSON.stringify(evidence));
+        const wait = () => tool.execute({ operation: 'wait', tab_id: tabId, timeout_ms: 1000 }, { state: {} });
+        expect((await wait()).observations?.browserObservation).toBeUndefined();
+        const page = electronMock.page;
+        page.loading = true;
+        expect((await observe()).observations?.browserObservation).toBe('reset');
+        const pendingWait = wait();
+        try {
+          await vi.waitFor(() => expect(webAssistState(electronMock.renderer).state.assistant_action).toBe('waiting'));
+        } finally { page.loading = false; }
+        const completedWait = await pendingWait;
+        expect(JSON.parse(completedWait.content)).toMatchObject({ ok: true });
+        expect(completedWait.observations?.browserObservation).toBe('reset');
+        expect((await observe(1)).observations?.browserObservation).toBe('reset');
+        electronMock.pageText = 'New result is ready';
+        const changed = (await observe()).observations?.browserObservation;
+        expect(changed).toMatchObject({ target: (evidence as { target: string }).target });
+        expect(changed).not.toEqual(evidence);
+        electronMock.pageText = 'Long page '.repeat(700);
+        expect((await observe()).observations?.browserObservation).toBe('reset');
+        electronMock.pageText = 'Create an app';
+        await page.loadURL('https://example.com/another-page');
+        const anotherPage = (await observe()).observations?.browserObservation;
+        expect(anotherPage).toMatchObject({ target: expect.not.stringMatching((evidence as { target: string }).target) });
+        page.emit('before-input-event', {}, { type: 'keyDown', code: 'KeyA', isComposing: false });
+        expect((await observe()).observations?.browserObservation).toBe('reset');
+        page.emit('before-input-event', {}, { type: 'keyUp', code: 'KeyA', isComposing: false });
+      } finally {
+        finishBrowserTaskRun('u1', cid, 'observation-evidence');
+      }
     });
 
     async function pendingObservation(entry: 'browser' | 'connector', scope: 'full' | 'meta' = 'full') {
@@ -1255,6 +1307,127 @@ describe('Web Assist controlled connector lifecycle', () => {
     });
   });
 
+  describe('initial task browser navigation', () => {
+    it('distinguishes a missing main frame from a stale selected frame', async () => {
+      const cid = 'c-observe-frame-availability';
+      const url = 'https://example.invalid/first-document';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      const opened = await openModelWebAssist('u1', cid, { url });
+      const tabId = opened.active_tab_id;
+      const page = electronMock.page;
+      let frame: { id: string; url: string } | undefined;
+      let attached = false;
+      const debuggerSession = Object.assign(new EventEmitter(), {
+        isAttached: () => attached,
+        attach: () => { attached = true; },
+        detach: () => { attached = false; debuggerSession.emit('detach'); },
+        sendCommand: vi.fn(async (method: string, params: Record<string, unknown>) => {
+          if (method === 'Page.getFrameTree') return { frameTree: { frame } };
+          if (method === 'Page.createIsolatedWorld') return { executionContextId: 1 };
+          if (method === 'Runtime.evaluate') {
+            const value = await page.executeJavaScriptInIsolatedWorld(1001, [{ code: params.expression }]);
+            return { result: { value } };
+          }
+          return {};
+        }),
+      });
+      Object.assign(page, { mainFrame: {}, debugger: debuggerSession });
+      try {
+        page.loading = true;
+        const pending = await observeModelWebAssist('u1', cid, tabId);
+        expect.soft(pending).toMatchObject({ ok: false, code: 'page_loading' });
+        expect(pending).not.toHaveProperty('page_id');
+
+        page.loading = false;
+        const unavailable = await observeModelWebAssist('u1', cid, tabId);
+        expect.soft(unavailable).toMatchObject({ ok: false, code: 'observation_failed' });
+        expect(unavailable).not.toHaveProperty('page_id');
+        expect(debuggerSession.sendCommand).not.toHaveBeenCalledWith('Runtime.evaluate', expect.anything(), undefined);
+
+        page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', url, true);
+        await expect.soft(observeModelWebAssist('u1', cid, tabId)).resolves.toMatchObject({
+          ok: false, code: 'page_load_failed',
+        });
+        page.emit('did-navigate', {}, url, 200, 'OK');
+        frame = { id: 'current-frame', url };
+        const stale = await observeModelWebAssist('u1', cid, tabId, 'full', { frameId: 'old-frame' });
+        expect.soft(stale).toMatchObject({ ok: false, code: 'unknown_frame' });
+        expect.soft(stale.error).toContain('without frame_id');
+        await expect(observeModelWebAssist('u1', cid, tabId)).resolves.toMatchObject({
+          ok: true, tab_id: tabId, frame_id: frame.id, text: 'Create an app',
+        });
+      } finally {
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+
+    it.each(['', 'about:blank'])('observes a pending first document from %j on the same tab after commit', async initialUrl => {
+      const cid = 'c-initial-document';
+      const prototype = Object.getPrototypeOf(electronMock.createPage());
+      const nativeLoad = prototype.loadURL;
+      let finish!: () => Promise<void>;
+      const load = vi.spyOn(prototype, 'loadURL').mockImplementationOnce(function (this: any, url: string) {
+        return new Promise<void>(resolve => {
+          finish = async () => { await nativeLoad.call(this, url); resolve(); };
+        });
+      });
+      try {
+        bindWebAssistConversation('u1', cid, electronMock.renderer);
+        const opened = await openModelWebAssist('u1', cid, { url: 'https://example.invalid/pending' });
+        expect(opened).toMatchObject({ ok: true, tab: { loading: true, display_url: '' } });
+        const id = opened.active_tab_id;
+        const page = electronMock.page;
+        expect(id).toBeTruthy();
+        page.url = initialUrl;
+        expect(page.getURL()).toBe(initialUrl);
+        expect(load).toHaveBeenCalledTimes(1);
+        const pending = await observeModelWebAssist('u1', cid, id);
+        expect.soft(pending).toMatchObject({ ok: false, code: 'page_loading' });
+        expect(pending).not.toHaveProperty('page_id');
+        await finish();
+        await expect(waitForModelWebAssist('u1', cid, { tabId: id, condition: 'loaded' })).resolves.toMatchObject({ ok: true, tab_id: id });
+        await expect(observeModelWebAssist('u1', cid, id)).resolves.toMatchObject({ ok: true, tab_id: id });
+        expect(load).toHaveBeenCalledTimes(1);
+      } finally {
+        load.mockRestore();
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+
+    it('returns the actual first-document failure instead of waiting on a blank page', async () => {
+      const cid = 'c-initial-load-failure';
+      const prototype = Object.getPrototypeOf(electronMock.createPage());
+      const load = vi.spyOn(prototype, 'loadURL').mockImplementationOnce(async () => {});
+      try {
+        bindWebAssistConversation('u1', cid, electronMock.renderer);
+        const open = await openModelWebAssist('u1', cid, { url: 'https://example.invalid/failed' });
+        const page = electronMock.page;
+        page.url = 'about:blank';
+        page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', 'https://example.invalid/failed', true);
+        expect(await observeModelWebAssist('u1', cid, open.active_tab_id)).toMatchObject({
+          ok: false, code: 'page_load_failed',
+        });
+        expect(load).toHaveBeenCalledTimes(1);
+      } finally {
+        load.mockRestore();
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+
+    it('keeps an empty non-loading tab unavailable without telling the caller to wait', async () => {
+      const cid = 'c-empty-document';
+      bindWebAssistConversation('u1', cid, electronMock.renderer);
+      const added = await addWebAssistTab('u1', electronMock.renderer, { conversationId: cid });
+      if (!added.ok) throw new Error('Blank tab could not be prepared');
+      expect(added.state.tabs[0]).toMatchObject({ loading: false, display_url: '' });
+      try {
+        await expect(observeModelWebAssist('u1', cid, added.state.active_tab_id)).resolves.toMatchObject({ ok: false, code: 'page_unavailable' });
+      } finally {
+        closeWebAssist(electronMock.renderer);
+      }
+    });
+  });
+
   describe('idle native page reclamation', () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => {
@@ -1440,6 +1613,78 @@ describe('Web Assist controlled connector lifecycle', () => {
       await vi.advanceTimersByTimeAsync(599_999);
       expect(page.isDestroyed()).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
+      expect(page.isDestroyed()).toBe(true);
+    });
+
+    it.each([['hide', 'show'], ['minimize', 'restore']])(
+      'reclaims an idle page after native %s and recreates it on %s', async (background, foreground) => {
+        const { tabId, page } = await open();
+        const owner = electronMock.owner;
+        installWindowPresentationEvents(owner);
+        const bounds = { x: 0, y: 0, width: 600, height: 400 };
+        layoutWebAssist(electronMock.renderer, bounds);
+        await vi.advanceTimersByTimeAsync(1_200_000);
+        expect(page.isDestroyed()).toBe(false);
+
+        owner.emit(background);
+        await vi.advanceTimersByTimeAsync(599_999);
+        expect(page.isDestroyed()).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(page.isDestroyed()).toBe(true);
+        expect(webAssistState(electronMock.renderer).state.tabs).toMatchObject([{ tab_id: tabId, suspended: true }]);
+        layoutWebAssist(electronMock.renderer, bounds);
+        expect(electronMock.page).toBe(page);
+
+        owner.emit(foreground);
+        activateWebAssistTab(electronMock.renderer, tabId);
+        expect(electronMock.page).not.toBe(page);
+        expect(webAssistState(electronMock.renderer).state.tabs[0].suspended).toBeUndefined();
+        expect(electronMock.page.getURL()).toBe('https://example.com/work?item=1');
+      },
+    );
+
+    it('keeps a page when a window is shown during its idle safety check', async () => {
+      const { page } = await open();
+      const owner = electronMock.owner;
+      installWindowPresentationEvents(owner);
+      layoutWebAssist(electronMock.renderer, { x: 0, y: 0, width: 600, height: 400 });
+      owner.emit('hide');
+      let finish!: (safe: boolean) => void;
+      const probe = vi.spyOn(page, 'executeJavaScriptInIsolatedWorld')
+        .mockImplementation(() => new Promise<boolean>(resolve => { finish = resolve; }));
+      const checking = reclaimIdleWebAssistPages(Date.now() + 600_000);
+      expect(probe).toHaveBeenCalledOnce();
+      owner.emit('show');
+      finish(true);
+      await checking;
+      expect(page.isDestroyed()).toBe(false);
+    });
+
+    it('keeps an unanswered site permission while the native window is hidden', async () => {
+      const { tabId, page } = await open();
+      const { owner, renderer } = electronMock;
+      installWindowPresentationEvents(owner);
+      setActiveWebAssistConversation(renderer, 'c-idle');
+      layoutWebAssist(renderer, { x: 0, y: 0, width: 600, height: 400 });
+      const handler = vi.mocked(session.fromPath('/tmp/fixture').setPermissionRequestHandler).mock.calls.at(-1)![0]!;
+      const reply = vi.fn();
+      const response = new Promise<boolean>(resolve => {
+        reply.mockImplementation(resolve);
+        handler(page, 'notifications', reply, { requestingUrl: page.getURL(), isMainFrame: true });
+      });
+      const request = webAssistState(renderer).state.tabs[0].permission_request!;
+      expect(request).toMatchObject({ permission: 'notifications' });
+
+      owner.emit('hide');
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(page.isDestroyed()).toBe(false);
+      expect(reply).not.toHaveBeenCalled();
+
+      owner.emit('show');
+      expect(answerWebAssistPermission(renderer, { tabId, requestId: request.id, allowed: false })).toEqual({ handled: true });
+      expect(await response).toBe(false);
+      owner.emit('hide');
+      await vi.advanceTimersByTimeAsync(600_000);
       expect(page.isDestroyed()).toBe(true);
     });
 
@@ -3321,6 +3566,18 @@ describe('host-started task browser binding', () => {
         const failed = attempt('https://files.example/b', 'b.csv'); failed.item.handlers.done({}, 'cancelled');
         expect(states).toEqual([['downloading'], ['saved'], ['saved', 'downloading'], ['saved', 'failed']]);
       } finally { electronMock.renderer.send.mockReset(); }
+    });
+
+    it.each(['tab closed', 'account switched'])('updates the attachment inventory only for its account when the %s', change => {
+      const { renderer } = electronMock;
+      const { item } = attempt('https://files.example/export', 'report.xls');
+      if (change === 'tab closed') closeWebAssist(renderer);
+      else vi.mocked(registerUserSwitchHook).mock.calls.find(([name]) => name === 'web-assist')![1]('u1', 'u2');
+      renderer.send.mockClear();
+      item.handlers.done({}, 'completed');
+      const updates = renderer.send.mock.calls.filter(([channel]: [string]) => channel === 'web-assist:download-finished');
+      expect(updates).toEqual(change === 'tab closed'
+        ? [['web-assist:download-finished', { conversation_id: cid }]] : []);
     });
 
     it('cleans up the partial file when a download does not complete', () => {

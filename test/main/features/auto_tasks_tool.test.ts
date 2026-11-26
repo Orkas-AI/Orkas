@@ -431,13 +431,75 @@ describe('auto_tasks shared tool', () => {
     } finally { list.mockRestore(); }
   });
 
-  it('keeps unbound Commander explicit project selection and global schedules compatible', async () => {
-    const tool = createTool({ userId: uid });
-    const a = await run(tool, { action: 'create', ...draft, project_id: pid });
-    const b = await run(tool, { action: 'create', ...draft });
-    expect(a.task.project_id).toBe(pid);
-    expect(b.task).not.toHaveProperty('project_id');
-    expect((await run(tool, { action: 'list', project_id: pid })).tasks.map((t: any) => t.id)).toEqual([a.taskId]);
-    expect((await run(tool, { action: 'list', project_id: null })).tasks.map((t: any) => t.id)).toEqual([b.taskId]);
+  it.each(['update', 'enable', 'disable', 'delete'] as const)(
+    'keeps a concurrent move to a project when an older automation %s arrives',
+    async action => {
+      const enabled = action === 'disable';
+      const created = await run(createTool({ userId: uid }), { action: 'create', ...draft, enabled });
+      expect(created.ok).toBe(true);
+      const id = created.taskId;
+      const getTask = tasks.getTask;
+      const read = vi.spyOn(tasks, 'getTask').mockImplementationOnce(async (userId, taskId) => {
+        const before = await getTask(userId, taskId);
+        expect((await tasks.updateTask(uid, id, { project_id: pid })).ok).toBe(true);
+        return before;
+      });
+      try {
+        const result = await run(createTool({ userId: uid }), {
+          action, task_id: id, ...(action === 'update' ? { title: 'Stale title' } : {}),
+        });
+        expect(result).toMatchObject({ ok: false, isError: true, error: 'not_found' });
+        expect(await getTask(uid, id)).toMatchObject({ project_id: pid, enabled, content: draft.content });
+        expect((await getTask(uid, id))?.title).not.toBe('Stale title');
+      } finally { read.mockRestore(); }
+    });
+
+  it('lets unbound Commander read every project\'s automations but change only global ones and a project it just created', async () => {
+    // Plan §6, second phase R3: outside a project, another project's
+    // automations are read-only; that project's own conversations change them.
+    const chats = await import('../../../src/main/features/chats');
+    const filing = await import('../../../src/main/features/conversation_filing');
+    const here = (await chats.createConversation(uid, { title: 'Outside' })).conversation_id;
+    const tool = createTool({ userId: uid, cid: here });
+    const existing = await tasks.applyAutoTaskMutation(uid, { action: 'create', updates: draft as any }, { projectId: pid });
+    const id = existing.taskId!;
+    const global = await run(tool, { action: 'create', ...draft });
+    expect(global.task).not.toHaveProperty('project_id');
+    // Reads cover every scope, as before.
+    expect((await run(tool, { action: 'list', project_id: pid })).tasks.map((t: any) => t.id)).toEqual([id]);
+    expect((await run(tool, { action: 'list', project_id: null })).tasks.map((t: any) => t.id)).toEqual([global.taskId]);
+    expect((await run(tool, { action: 'get', task_id: id })).task).toMatchObject({ id, project_id: pid });
+    // Every write that would change another project's automations is refused with the confirmed receipt.
+    const readOnly = { ok: false, error: 'project_read_only',
+      message: "Another project's automations are read-only here; changing them requires a conversation in that project." };
+    for (const request of [
+      { action: 'create', ...draft, project_id: pid },
+      { action: 'update', task_id: id, title: 'Renamed' },
+      { action: 'update', task_id: id, project_id: null },
+      { action: 'enable', task_id: id },
+      { action: 'disable', task_id: id },
+      { action: 'delete', task_id: id },
+      { action: 'update', task_id: global.taskId, project_id: other },
+    ]) {
+      const result = await tool.execute(request as any, {} as any);
+      expect(result.isError, JSON.stringify(request)).toBe(true);
+      expect(JSON.parse(result.content as string), JSON.stringify(request)).toEqual(readOnly);
+    }
+    expect(await tasks.getTask(uid, id)).toMatchObject({ project_id: pid, content: draft.content, enabled: false });
+    expect(await tasks.getTask(uid, global.taskId)).not.toHaveProperty('project_id');
+    // Global automations stay editable.
+    expect((await run(tool, { action: 'update', task_id: global.taskId, title: 'Global report' })).task.title).toBe('Global report');
+    // A project this conversation just created can be scheduled in the same turn, as with its to-dos.
+    const createdHere = await filing.fileConversationUnderNewProject(uid, here, 'Launch', { moveNow: false, uniquifyName: true, origin: 'agent' });
+    if (!createdHere.ok) throw new Error('filing fixture failed');
+    const fresh = createdHere.result.project.project_id;
+    expect(filing.pendingCreatedProjectId(uid, here)).toBe(fresh);
+    const scheduled = await run(tool, { action: 'create', ...draft, project_id: fresh });
+    expect(scheduled.task.project_id).toBe(fresh);
+    expect((await run(tool, { action: 'update', task_id: scheduled.taskId, title: 'Launch report' })).task.title).toBe('Launch report');
+    expect((await run(tool, { action: 'update', task_id: global.taskId, project_id: fresh })).task.project_id).toBe(fresh);
+    const movedBack = await run(tool, { action: 'update', task_id: global.taskId, project_id: null });
+    expect(movedBack.ok).toBe(true);
+    expect(movedBack.task).not.toHaveProperty('project_id');
   });
 });

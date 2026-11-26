@@ -503,7 +503,7 @@ describe('project_files › copyProjectEntryFromPath', () => {
       'u1', 'p1', source, 'imports/corrupt-folder',
     );
 
-    expect(copied).toMatchObject({ ok: false, error: 'unsupported_destination' });
+    expect(copied).toMatchObject({ ok: false, error: 'invalid_source_encoding' });
     expect(fs.existsSync(path.join(root, 'imports/corrupt-folder'))).toBe(false);
     expect(enqueueCalls).toEqual([]);
   });
@@ -581,4 +581,64 @@ describe('project_files › path safety', () => {
       expect(fs.readFileSync(outside, 'utf8')).toBe('outside');
     },
   );
+});
+
+describe('observed project Library encoding feedback', () => {
+  it('identifies malformed source text through the real save tool while accepting the corrected bytes at the same destination', async () => {
+    const { activateUser } = await import('../../../src/main/features/users');
+    const { setWorkspacePath } = await import('../../../src/main/features/user_workspace');
+    const { createLocalTools } = await import('../../../src/main/model/core-agent/local-tools');
+    const { listProjectFiles, resolveProjectFileAbsPath } = await import('../../../src/main/features/project_files');
+    activateUser('u1');
+    expect(setWorkspacePath('u1', tmpDir).ok).toBe(true);
+    const save = createLocalTools({ userId: 'u1', projectId: 'p1' })
+      .find(tool => tool.name === 'library_save')!;
+    expect(save).toBeDefined();
+
+    const source = path.join(tmpDir, 'review.md');
+    const invalid = Buffer.concat([Buffer.from('# Accepted UTF-8 prefix\n'), Buffer.from([0x97, 0xa3])]);
+    const valid = Buffer.from('# Accepted UTF-8 prefix\n— £ test\n');
+    fs.writeFileSync(source, invalid);
+    const args = { source_path: 'review.md', name: 'review-report.md' };
+    const context = { workingDir: tmpDir, state: {} } as any;
+
+    const rejected = await save.execute(args, context);
+    expect(rejected.isError).toBe(true);
+    expect(await listProjectFiles('u1', 'p1')).toEqual([]);
+    expect(enqueueCalls).toEqual([]);
+    expect(fs.readFileSync(source)).toEqual(invalid);
+
+    fs.writeFileSync(source, valid);
+    const accepted = await save.execute(args, context);
+    expect(accepted.isError).not.toBe(true);
+    expect(JSON.parse(accepted.content)).toMatchObject({ ok: true, path: 'review-report.md', bytes: valid.length });
+    const published = await resolveProjectFileAbsPath('u1', 'p1', 'review-report.md');
+    expect(published.ok).toBe(true);
+    if (!published.ok) throw Error('missing published source');
+    expect(fs.readFileSync(published.absPath)).toEqual(valid);
+    expect(enqueueCalls).toEqual([{ userId: 'u1', projectId: 'p1', name: 'review-report.md', op: 'upsert' }]);
+
+    expect(rejected.content).toMatch(/source.*UTF-8/i);
+    const checkout = await save.execute({ action: 'checkout', source_path: 'working.md', name: args.name }, context);
+    expect(checkout.isError).not.toBe(true);
+    fs.writeFileSync(path.join(tmpDir, 'working.md'), invalid);
+    const replace = await save.execute({
+      source_path: 'working.md', name: args.name, expected_revision: JSON.parse(checkout.content).revision,
+    }, context);
+    expect(JSON.parse(replace.content)).toMatchObject({
+      ok: false, error: 'invalid_source_encoding', message: expect.stringContaining('UTF-8'),
+    });
+    expect(fs.readFileSync(published.absPath)).toEqual(valid);
+    expect(fs.readFileSync(path.join(tmpDir, 'working.md'))).toEqual(invalid);
+    expect(enqueueCalls).toHaveLength(1);
+  });
+
+  it('still distinguishes a valid source with a missing destination folder', async () => {
+    const files = await import('../../../src/main/features/project_files');
+    const source = path.join(tmpDir, 'valid.md');
+    fs.writeFileSync(source, '# Valid source\n');
+    const rejected = await files.copyProjectEntryFromPath('u1', 'p1', source, 'absent/report.md');
+    expect(rejected).toMatchObject({ ok: false, error: 'not_found' });
+    expect(enqueueCalls).toEqual([]);
+  });
 });

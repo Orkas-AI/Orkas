@@ -54,21 +54,9 @@ If a rendered view is available, review the rendered view, not only source code.
 
 ## Findings Format
 
-Use:
+When the findings are the result, deliver them as an HTML review page in its own artifact directory through `ui-artifact-workspace`, unless the user explicitly asks for another format. When the user asked you to change the reviewed screen or artifact, that change is the deliverable instead.
 
-```markdown
-## Findings
-- [P1] Title
-  Evidence: ...
-  Why it matters: ...
-  Fix: ...
-
-## Open Questions
-- ...
-
-## Summary
-- ...
-```
+Order the page as findings, then open questions, then a short summary. Each finding shows its severity, a title, the affected area, the evidence, why it matters, and the fix with its expected outcome. Use screenshots or crops only as evidence inside a finding, never as the whole deliverable.
 
 Severity guide:
 

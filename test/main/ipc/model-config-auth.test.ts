@@ -112,6 +112,7 @@ it('round-trips the current Wan tier through protected IPC and keeps regional cr
     const initial = await call('videoAuth.list');
     // Frozen native capability contract has20 choices; the public API adds one.
     expect(initial.providers).toHaveLength(21);
+    expect(initial.providers).toEqual(expect.arrayContaining([expect.objectContaining({ provider: 'doubao', model: 'doubao-seedance-2-5-flash' })]));
     const added = await call('videoAuth.add', { provider: 'aliyun', model: 'wan3.0-video-prime', apiKey: 'private-wan-key', workspaceId: 'workspace123', region: 'ap-southeast-1' });
     expect(added.ok).toBe(true);
     const list = await call('videoAuth.list');
@@ -427,12 +428,12 @@ it('retains a retired Gemini Veo profile visibly unavailable without exposing it
   [
     "doubao",
     "doubao-seedance-2-5-260628",
-    "Doubao Seedance 2.5"
+    "Seedance 2.5"
   ],
   [
     "doubao",
     "doubao-seedance-2-5-flash",
-    "Doubao Seedance 2.5 Flash"
+    "Seedance 2.5 Flash"
   ],
   [
     "doubao",
@@ -492,7 +493,7 @@ it('retains a retired Gemini Veo profile visibly unavailable without exposing it
   [
     "google",
     "gemini-omni-1.1-flash",
-    "Google Gemini Omni 1.1 Flash"
+    "Gemini Omni 1.1 Flash"
   ],
   [
     "google-cloud",
@@ -517,12 +518,12 @@ it('retains a retired Gemini Veo profile visibly unavailable without exposing it
   [
     "aliyun",
     "wan3.0-video",
-    "Alibaba Cloud Wan 3.0"
+    "Wan 3.0"
   ],
   [
     "aliyun",
     "wan3.0-video-prime",
-    "Alibaba Cloud Wan 3.0 Prime"
+    "Wan 3.0 Prime"
   ]
 ];
     expect(providers.filter(p => p.provider !== ORKAS_API_PROVIDER)

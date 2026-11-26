@@ -23,6 +23,7 @@ const envKeys = [
 const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   for (const key of envKeys) {
     const value = previous[key];
@@ -107,6 +108,32 @@ describe('TTS runtime capabilities', () => {
       nativeLocale: 'zh-CN',
       languageConfidence: 'verified',
       languageDeclared: true,
+    });
+  });
+
+  it('names the voice or language a request got wrong and how to correct it', async () => {
+    // 2026-11-16 baseline: a voice_ref copied short was answered with "reopen Gate B", a step
+    // from another workflow, and the Agent stopped, taking the voice service for broken.
+    process.env.ORKAS_TTS_BASE_URL = 'https://example.invalid/v1';
+    process.env.ORKAS_TTS_API_KEY = 'secret';
+    process.env.ORKAS_TTS_MODEL = 'tts-model';
+    process.env.ORKAS_TTS_VOICE = 'configured-voice';
+    const valid = await resolveTtsSelection({});
+    expect(valid.ok).toBe(true);
+    const voiceRef = (valid as { selection: { voiceRef: string } }).selection.voiceRef;
+
+    await expect(resolveTtsSelection({ voiceRef: `${voiceRef.slice(0, -6)}` })).resolves.toEqual({
+      ok: false,
+      errorCode: 'E_TTS_VOICE_UNRESOLVED',
+      message: `The voice_ref ${voiceRef.slice(0, -6)} is not one of the Environment TTS voices. Copy a voice_ref exactly as speech.capabilities lists it, for example ${voiceRef}, and run it again.`,
+    });
+    await expect(resolveTtsSelection({ legacyVoice: 'zh-CN-YunxiNeural' })).resolves.toMatchObject({
+      message: `The voice zh-CN-YunxiNeural is not one of the Environment TTS voices. Copy a voice_ref exactly as speech.capabilities lists it, for example ${voiceRef}, and run it again.`,
+    });
+    await expect(resolveTtsSelection({ voiceRef, language: 'constructor' })).resolves.toEqual({
+      ok: false,
+      errorCode: 'E_TTS_LANGUAGE_INVALID',
+      message: 'constructor is not a language tag. Use one such as zh-CN or en-US, as speech.capabilities lists them, and run it again.',
     });
   });
 

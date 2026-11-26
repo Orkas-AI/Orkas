@@ -125,6 +125,7 @@ it('preserves inspector setup failures instead of reporting graceful shutdown', 
 it.each([
   'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.',
   'electronApplication.evaluate: Target page, context or browser has been closed',
+  'electronApplication.evaluate: Resulting promise was garbage collected.',
 ])('waits for real process close after an inspector-disposal race: %s', async message => {
   const app = new EventEmitter() as any;
   app.windows = () => [{ isClosed: () => false, evaluate: vi.fn(async () => {}) }];

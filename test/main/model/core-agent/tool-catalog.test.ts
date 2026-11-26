@@ -413,6 +413,29 @@ describe('tool-catalog', () => {
     expect(resident).toContain('`project_setup`');
   });
 
+  it('describes a tool shared by several groups once while every group still names it', () => {
+    const availableToolNames = TOOL_CATALOG
+      .filter((entry) => entry.loadGroups?.some((group) => group.startsWith('office.')))
+      .map((entry) => entry.name);
+    const directory = getLoadableToolGroupsSystemPromptBlock({ availableToolNames, purpose: 'runtime' });
+    const lines = directory.split('\n');
+    const groupBlock = (id: string): string => {
+      const start = lines.findIndex((line) => line.trimStart().startsWith(`- \`${id}\` —`));
+      expect(start, id).toBeGreaterThanOrEqual(0);
+      const indent = lines[start].length - lines[start].trimStart().length;
+      let end = start + 1;
+      while (end < lines.length && lines[end].length - lines[end].trimStart().length > indent) end += 1;
+      return lines.slice(start, end).join('\n');
+    };
+    const shared = TOOL_CATALOG.filter((entry) => availableToolNames.includes(entry.name)
+      && (entry.loadGroups?.filter((group) => group.startsWith('office.')).length ?? 0) > 1);
+    expect(shared.length).toBeGreaterThan(0);
+    for (const entry of shared) {
+      expect(directory.split(entry.summary).length - 1, `${entry.name} summary`).toBe(1);
+      for (const group of entry.loadGroups!) expect(groupBlock(group), `${group} ${entry.name}`).toContain(`\`${entry.name}\``);
+    }
+  });
+
   it('scopes Office leaves while preserving the parent and pdf alias', () => {
     expect(TOOL_GROUPS.filter((group) => group.parent === 'office').map((group) => group.id))
       .toEqual(['office.word', 'office.spreadsheet', 'office.presentation', 'office.pdf']);
@@ -435,11 +458,11 @@ describe('tool-catalog', () => {
       'write_file', 'append_file', 'publish_outputs', 'library_save',
     ]);
     expect(toolNamesForGroups(['workspace.write.edit'])).toEqual([
-      'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
+      'apply_patch', 'delete_file', 'workspace_diff',
     ]);
     expect(toolNamesForGroups(['workspace.write'])).toEqual([
       'write_file', 'append_file', 'publish_outputs', 'library_save',
-      'apply_patch', 'edit_file', 'delete_file', 'workspace_diff',
+      'apply_patch', 'delete_file', 'workspace_diff',
     ]);
     expect(toolNamesForGroups(['workspace.execute.command'])).toEqual(['bash', 'process_session']);
     expect(toolNamesForGroups(['workspace.execute.session'])).toEqual([
@@ -629,6 +652,28 @@ describe('tool-catalog', () => {
     expect(imageStudio.properties.page_id).toEqual({ type: 'string' });
     expect(imageStudio.required).not.toContain('page_id');
     delete imageStudio.properties.page_id;
+    // 8e378f1e26 retires the hosted workflow controls and shared request label.
+    // Verify their absence before projecting the previous ordered schema.
+    expect(imageStudio.properties.op.enum).toEqual([
+      'project.status', 'generation.quote', 'project.inspect', 'project.snapshot',
+      'project.submit_design_review', 'project.export',
+    ]);
+    const retiredImageFields = {
+      workflow_engine: { type: 'string', enum: ['comfyui', 'invokeai', 'automatic1111', 'iopaint'] },
+      workflow_path: { type: 'string' },
+      output_node_id: { type: 'string' },
+      output_index: { type: 'number' },
+      timeout_ms: { type: 'number' },
+      image_request_id: { type: 'string' },
+    };
+    for (const field of Object.keys(retiredImageFields)) {
+      expect(imageStudio.properties).not.toHaveProperty(field);
+    }
+    imageStudio.properties.op.enum.push('workflow.capabilities', 'workflow.run');
+    imageStudio.properties = Object.fromEntries(
+      Object.entries(imageStudio.properties).flatMap(entry =>
+        entry[0] === 'size' ? [...Object.entries(retiredImageFields), entry] : [entry]),
+    );
     // 2026-11-10, requester-confirmed: generate_video adds the optional first_frame and
     // last_frame strings. Pin them, then compare the preceding corpus unchanged; video_gen and
     // video-gen-tool cases pin each provider's request and the refusals.
@@ -681,6 +726,57 @@ describe('tool-catalog', () => {
       const schema = schemas.find(tool => tool.name === name)!.inputSchema as any;
       expect(schema.properties.retry_of).toEqual({ type: 'string' });
       expect(schema.required).not.toContain('retry_of');
+    }
+    // Requester-approved explicit completion waits (436cdc1efb): assert the
+    // complete new fields, then reverse only that exact delta for the existing
+    // independent corpus fingerprint. Runtime wait/exit cases own behavior.
+    const process = schemas.find(tool => tool.name === 'process_session')!.inputSchema as any;
+    expect(process.properties.wait_for).toEqual({ type: 'string', enum: ['output', 'exit'], default: 'output' });
+    expect(process.properties.yield_time_ms).toEqual({ type: 'integer', minimum: 0, maximum: 600000, default: 10000 });
+    expect(process.required).toEqual(['action', 'session_id']);
+    delete process.properties.wait_for;
+    process.properties.yield_time_ms.maximum = 30000;
+    // 2026-11-19, requested tool-definition trim: chat_history no longer
+    // advertises zod's implicit safe-integer maximum; projection still rejects
+    // unsafe integers (chat-history-tools). Undo only that delta here.
+    const trimmedHistory = schemas.find(tool => tool.name === 'chat_history')!.inputSchema as any;
+    const historyFields = trimmedHistory.properties;
+    expect(historyFields.cursor).toBeUndefined();
+    expect(historyFields.max_tokens).toBeUndefined();
+    // Validate this scoped relocation, then keep the independent corpus pin.
+    for (const group of ['read', 'process', 'output']) {
+      const fields = historyFields[group].properties;
+      expect(fields.cursor).toEqual({ type: 'integer', minimum: 0 });
+      expect(fields.max_tokens).toEqual({ type: 'integer', minimum: 1, maximum: 10000 });
+      expect(historyFields[group].required ?? []).not.toContain('cursor');
+      expect(historyFields[group].required ?? []).not.toContain('max_tokens');
+      delete fields.cursor;
+      delete fields.max_tokens;
+    }
+    historyFields.cursor = { type: 'integer', minimum: 0 };
+    historyFields.max_tokens = { type: 'integer', minimum: 1, maximum: 10000 };
+    for (const field of [
+      trimmedHistory.properties.read.properties.page.properties.index,
+      trimmedHistory.properties.read.properties.page.properties.count,
+      trimmedHistory.properties.process.properties.process_index,
+      trimmedHistory.properties.cursor,
+    ]) {
+      expect(field).toEqual({ type: 'integer', minimum: 0 });
+      field.maximum = Number.MAX_SAFE_INTEGER;
+    }
+    expect(JSON.stringify(trimmedHistory).split(String(Number.MAX_SAFE_INTEGER)).length - 1).toBe(4);
+    // Remove only the two newly approved schema deltas for comparison with the
+    // independent public corpus fingerprint. Owning cases assert both additions.
+    const speech = schemas.find(tool => tool.name === 'generate_speech')!.inputSchema as any;
+    expect(speech.properties.action.enum).toEqual(['generate', 'capabilities', 'preflight']);
+    expect(speech.properties.lines).toMatchObject({ minItems: 1, maxItems: 50 });
+    speech.properties.action.enum.pop();
+    delete speech.properties.lines;
+    const saveApp = schemas.find(tool => tool.name === 'save_app');
+    if (saveApp) {
+      const fields = (saveApp.inputSchema as any).properties;
+      expect(fields.artifact_id.pattern).toBe('^[A-Za-z0-9_-]+$');
+      delete fields.artifact_id.pattern;
     }
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(schemas))
@@ -769,7 +865,15 @@ describe('tool-catalog', () => {
       }
     }
     const speech = withoutDescriptions(toolByName('generate_speech').inputSchema) as any;
-    expect(speech.properties.action.enum).toEqual(['generate', 'capabilities']);
+    expect(speech.properties.action.enum).toEqual(['generate', 'capabilities', 'preflight']);
+    expect(speech.properties.lines).toMatchObject({
+      type: 'array', minItems: 1, maxItems: 50, items: {
+        type: 'object', required: ['text', 'target_duration'], properties: {
+          text: { type: 'string', minLength: 1, maxLength: 4000 },
+          target_duration: { type: 'number', exclusiveMinimum: 0 },
+        },
+      },
+    });
     for (const key of ['production_plan_path', 'narration_segment_index']) {
       expect(speech.properties, key).not.toHaveProperty(key);
     }

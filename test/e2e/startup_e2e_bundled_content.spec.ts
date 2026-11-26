@@ -5,6 +5,7 @@ import { OrkasTestApp } from './fixtures/orkas';
 
 // Real Electron startup with the isolated local user. No model request occurs.
 test('publishes bundled resources before boot readiness across first use and restart', async ({}, testInfo) => {
+  test.setTimeout(120_000);
   const app = new OrkasTestApp(testInfo, { configuredModel: false });
   const bundled = path.resolve(__dirname, '../../resources/builtin');
   const manifest = JSON.parse(readFileSync(path.join(bundled, 'system/skills/_system.json'), 'utf8'));

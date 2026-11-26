@@ -69,7 +69,8 @@ export function registerGeneratedMediaUrl(absPath: string, url?: string): void {
   }
   const fileIdentity = localFileIdentity(cleanPath);
   if (!cleanPath || !cleanUrl || !fileIdentity) return;
-  if (generatedMediaUrls.size >= 256) generatedMediaUrls.delete(generatedMediaUrls.keys().next().value);
+  generatedMediaUrls.delete(cleanPath);
+  if (generatedMediaUrls.size >= 256) generatedMediaUrls.delete(generatedMediaUrls.keys().next().value!);
   generatedMediaUrls.set(cleanPath, {
     url: cleanUrl,
     ownerId: currentReferenceOwnerId(),
@@ -169,7 +170,7 @@ export async function loadImageReferenceBuffers(urls: string[] = [], paths: stri
 
 export async function loadImageReferenceBuffersWithProgress(
   urls: string[] = [], paths: string[] = [],
-  opts: { signal?: AbortSignal; onProgress?: GenerationReferenceProgressReporter } = {},
+  opts: { signal?: AbortSignal; onProgress?: GenerationReferenceProgressReporter; assertLocalPath?: (file: string) => void } = {},
 ): Promise<Buffer[]> {
   return withReferencePreparation(opts.signal, signal => loadImageReferenceBuffersWithinBudget(urls, paths, { ...opts, signal }));
 }
@@ -180,6 +181,7 @@ async function loadImageReferenceBuffersWithinBudget(
   opts: {
     signal?: AbortSignal;
     onProgress?: GenerationReferenceProgressReporter;
+    assertLocalPath?: (file: string) => void;
   } = {},
 ): Promise<Buffer[]> {
   const out: Buffer[] = [];
@@ -195,6 +197,7 @@ async function loadImageReferenceBuffersWithinBudget(
       index,
       total,
     });
+    opts.assertLocalPath?.(localPath);
     const buf = await fs.readFile(localPath, { signal: opts.signal });
     throwIfAborted(opts.signal);
     out.push(buf);
@@ -218,6 +221,8 @@ async function loadImageReferenceBuffersWithinBudget(
         label: 'reference image download',
         signal: composed.signal,
         maxBytes: MAX_REFERENCE_DOWNLOAD_BYTES,
+        isAllowedDirectAddress: address => isIP(address) !== 0 && !isPrivateReferenceHost(address),
+        validateRedirectUrl: isPublicHttpsReferenceUrl,
         validate: (body) => {
           if (!body.length) throw new Error('reference image download returned an empty body');
         },
@@ -475,6 +480,10 @@ function normalizePath(value?: string): string {
   return s ? path.resolve(s) : '';
 }
 
+function isPublicHttpsReferenceUrl(url: URL): boolean {
+  return url.protocol === 'https:' && !url.username && !url.password && !isPrivateReferenceHost(url.hostname);
+}
+
 function normalizeUrl(value?: string): string {
   const s = String(value || '').trim();
   if (!s) return '';
@@ -487,12 +496,7 @@ function normalizeUrl(value?: string): string {
   }
   try {
     const parsed = new URL(s);
-    if (
-      parsed.protocol === 'https:'
-      && !parsed.username
-      && !parsed.password
-      && !isPrivateReferenceHost(parsed.hostname)
-    ) {
+    if (isPublicHttpsReferenceUrl(parsed)) {
       return s;
     }
   } catch { /* rejected below */ }
@@ -525,26 +529,36 @@ function isPrivateReferenceHost(hostname: string): boolean {
   ) return true;
 
   const ipVersion = isIP(host);
-  if (ipVersion === 4) {
-    const octets = host.split('.').map(Number);
-    const [a, b] = octets;
-    return a === 0
-      || a === 10
-      || a === 127
-      || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168)
-      || a >= 224;
-  }
+  if (ipVersion === 4) return isPrivateReferenceIpv4(host);
   if (ipVersion === 6) {
+    // WHATWG URL rewrites `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`, so the
+    // mapped address arrives as two hex groups. Judge the IPv4 it carries.
+    const mapped = /^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(host);
+    if (mapped) {
+      if (mapped[1]) return isPrivateReferenceIpv4(mapped[1]);
+      const high = parseInt(mapped[2], 16);
+      const low = parseInt(mapped[3], 16);
+      return isPrivateReferenceIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+    }
     return host === '::'
       || host === '::1'
       || host.startsWith('fc')
       || host.startsWith('fd')
-      || /^fe[89ab]/.test(host)
-      || /^::ffff:(?:0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host);
+      || /^fe[89ab]/.test(host);
   }
   return false;
+}
+
+function isPrivateReferenceIpv4(host: string): boolean {
+  const [a, b] = host.split('.').map(Number);
+  return a === 0
+    || a === 10
+    || (a === 100 && b >= 64 && b <= 127)
+    || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || a >= 224;
 }
 
 function isLoopbackReferenceHost(hostname: string): boolean {

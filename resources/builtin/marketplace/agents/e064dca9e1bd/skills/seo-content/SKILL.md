@@ -22,7 +22,7 @@ Heuristic content/GEO-readiness analysis of the visible text from `seo-crawl`. N
 
 ## Preconditions
 
-- A `seo-crawl` JSON whose page includes `text_sample` (the crawler provides it). Python 3.9+ stdlib only.
+- A `seo-crawl` JSON whose page includes `text_sample` (the crawler provides it).
 
 ## How to call
 

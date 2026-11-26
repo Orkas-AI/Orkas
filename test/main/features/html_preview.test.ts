@@ -68,6 +68,7 @@ function fakeRuntime(options: {
   interactionFailures?: string[];
   interactionWarningCount?: number;
   interactionWarnings?: string[];
+  interactionUnavailable?: boolean;
   loadFailure?: boolean;
   extraRequests?: string[];
   /** Returned only when the evidence script carries the design audit. */
@@ -120,6 +121,7 @@ function fakeRuntime(options: {
       const listeners = this.listeners;
       this.webContents = {
         setWindowOpenHandler: () => undefined,
+        debugger: { attach: () => undefined, sendCommand: async () => undefined },
         on: (name: string, listener: Function) => listeners.set(name, listener),
         focus: () => undefined,
         sendInputEvent: (event: { type: string; keyCode?: string }) => {
@@ -139,6 +141,7 @@ function fakeRuntime(options: {
           }
           if (script.includes('downloadCandidates')) {
             interactionExecutions.push(String(windowOptions.width));
+            if (options.interactionUnavailable) throw new Error('Interaction execution interrupted');
             if (options.downloadObserved) {
               sessionListeners.get('will-download')?.(
                 { preventDefault: () => undefined },
@@ -193,7 +196,10 @@ function fakeRuntime(options: {
       (windows as any).push(this);
     }
 
+    setContentSize() {}
+
     async loadURL(url: string) {
+      if (url === 'about:blank') return;
       loadedEntryUrls.push(url);
       const entryPath = url.startsWith('chat-media:') ? chatMediaLocalPathFromUrl(url) : fileURLToPath(url);
       bridgeAvailableAtLoad.push(fs.existsSync(path.join(path.dirname(entryPath), '__orkas', 'bridge.js')));
@@ -502,7 +508,7 @@ describe('responsive HTML preview renderer', () => {
     expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
   });
 
-  it('records observed download metadata and rejects a download control that produces nothing', async () => {
+  it('reports browser download facts without inferring a missing download failure', async () => {
     const observed = fakeRuntime({ downloadCandidate: true, downloadObserved: true });
     const passed = await renderResponsiveHtmlPreview(
       path.join(root, 'index.html'),
@@ -521,15 +527,17 @@ describe('responsive HTML preview renderer', () => {
     });
 
     const missing = fakeRuntime({ downloadCandidate: true });
-    const failed = await renderResponsiveHtmlPreview(
+    const unobserved = await renderResponsiveHtmlPreview(
       path.join(root, 'index.html'),
       viewports,
       missing.deps,
     );
-    expect(failed.evidence.ok).toBe(false);
-    expect(failed.evidence.blockers).toContain(
-      '1 download action(s) were exercised but only 0 download(s) were observed',
-    );
+    expect(unobserved.evidence.ok).toBe(true);
+    expect(unobserved.evidence.interactions).toMatchObject({
+      downloadCandidates: ['Download resume'],
+      downloads: [],
+    });
+    expect(unobserved.evidence.blockers).toEqual([]);
 
     const empty = fakeRuntime({
       downloadCandidate: true,
@@ -545,6 +553,18 @@ describe('responsive HTML preview renderer', () => {
     expect(emptyPayload.evidence.blockers).toContain(
       '1 observed download(s) lacked a filename, MIME type, or non-empty payload',
     );
+  });
+
+  it('retains a captured screenshot when interaction playback is interrupted', async () => {
+    const runtime = fakeRuntime({ interactionUnavailable: true });
+    const result = await renderResponsiveHtmlPreview(path.join(root, 'index.html'), [viewports[0]], runtime.deps);
+
+    expect(result.screenshots).toHaveLength(1);
+    expect(result.evidence.screenshotCaptures).toMatchObject([{ viewport: 'desktop', captured: true }]);
+    expect(result.evidence.interactions).toMatchObject({ performed: false, controlsExercised: 0 });
+    expect(result.evidence.warnings).toContain('desktop: interaction playback did not complete; observations are unavailable');
+    expect(runtime.windows.every(win => win.destroyed)).toBe(true);
+    expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
   });
 
   it.each([

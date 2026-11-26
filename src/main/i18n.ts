@@ -222,9 +222,9 @@ export function getCurrentLang(): Lang {
 // The host runner keeps it last in its base prompt; learned-Skill guidance and
 // repository instructions may be appended later by core-agent.
 
-export function buildLanguageDirective(lang: Lang = _current): string {
+export function buildLanguageDirective(lang: Lang = _current, options: { descriptionFields?: boolean } = {}): string {
   const name = getLocaleMeta(lang).llmName;
-  return buildLanguageDirectiveText(name);
+  return buildLanguageDirectiveText(name, options);
 }
 
 export function buildHostTurnLanguageDirective(lang: Lang, continuation = false): string {

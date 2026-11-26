@@ -1,4 +1,5 @@
 import { getActiveUserId, hasActiveUser } from './users';
+import { registerUserSwitchHook } from './user-switch-hooks';
 /**
  * tts — pluggable text-to-speech backend for the `generate_speech`
  * tool. Encapsulated so new backends slot in behind one interface (mirrors the
@@ -126,6 +127,14 @@ function clamp(n: number, lo: number, hi: number): number { return Math.min(hi, 
  *  error, and every consumer of a measurement must read it the same way. */
 export const NARRATION_MEASURED_OVER_RATIO = 1.05;
 export const NARRATION_MEASURED_UNDER_RATIO = 0.85;
+/** How far an estimate not yet scaled to a measured voice may run past its target before
+ *  synthesis is refused: the estimator's own error. A short span between two lines of
+ *  dialogue keeps this proportional; a fixed floor of seconds would let a line cover them. */
+export const NARRATION_ESTIMATE_OVER_RATIO = 1.2;
+/** How many times a turn asks for a short line to be generated again, to the same file, to
+ *  fill its scene: the first take plus at most two fills, as other VideoStudio repairs are
+ *  bounded. The capped fit note says "twice"; change both together. */
+export const NARRATION_FILL_RETRY_LIMIT = 2;
 
 /** Whether synthesized audio runs past the window it was written for. The one
  *  predicate behind both the post-synthesis warning and the authorization for
@@ -142,7 +151,7 @@ export function narrationMeasurementOverruns(measuredSec: number, targetSec: num
 
 /** Compare a synthesized narration's measured duration to a target clip length.
  *  Returns null when either duration is unusable. Pure → unit-tested. */
-export function assessNarrationFit(input: { measuredSec: number; targetSec: number; wordCount: number; unit?: 'words' | 'characters' }): NarrationFit | null {
+export function assessNarrationFit(input: { measuredSec: number; targetSec: number; wordCount: number; unit?: 'words' | 'characters'; fillLimitReached?: boolean }): NarrationFit | null {
   const measured = input.measuredSec;
   const target = input.targetSec;
   if (!(measured > 0) || !(target > 0)) return null;
@@ -172,7 +181,10 @@ export function assessNarrationFit(input: { measuredSec: number; targetSec: numb
     status = 'under';
     const addWords = Math.max(0, suggestedWords - input.wordCount);
     const hint = addWords > 0 ? `add ~${addWords} ${unitLabel}` : 'lengthen the script';
-    message = `Narration is ${round2(measured)}s, ${round2(target - measured)}s shorter than the ${round2(target)}s clip — that much of the clip will have no narration. ${hint}, or accept an early finish.`;
+    const gap = `Narration is ${round2(measured)}s, ${round2(target - measured)}s shorter than the ${round2(target)}s clip — that much of the clip will have no narration.`;
+    message = input.fillLimitReached
+      ? `${gap} This line has already been generated again twice this turn, the limit: keep this audio and let the scene finish early.`
+      : `${gap} To fill it, ${hint} and generate the line once more to the same output_path.`;
   }
   return { status, measuredSec: round2(measured), targetSec: round2(target), deltaSec, ratio: round2(ratio), wordsPerSec: round2(wps), suggestedWords, suggestedSpeed, message };
 }
@@ -288,7 +300,10 @@ interface TtsBackend {
 // Waiting has no new timeout; transport timers start inside synthesize after admission.
 const speechSlots = new Semaphore(2);
 const rateLimitReceipts = new WeakMap<TtsFailure, { delay: number; status: number; code: string }>();
-const speechOwnerChanged = (owner: string) => !!owner && (!hasActiveUser() || getActiveUserId() !== owner);
+let speechOwnerVersion = 0;
+registerUserSwitchHook('tts-request-owner', () => { speechOwnerVersion += 1; });
+const speechOwnerChanged = (owner: string, version: number) => version !== speechOwnerVersion
+  || (!!owner && (!hasActiveUser() || getActiveUserId() !== owner));
 
 async function speechLimitFailure(response: Response, signal?: AbortSignal): Promise<TtsFailure | null> {
   if (response.status !== 429) return null;
@@ -901,6 +916,7 @@ export function configuredTtsBackendId(): string {
 
 export async function generateSpeech(p: TtsParams): Promise<TtsResult> {
   const owner = hasActiveUser() ? getActiveUserId() : '';
+  const ownerVersion = speechOwnerVersion;
   let release: (() => void) | undefined;
   const queuedAt = Date.now();
   const queueRef = speechSlots.isLocked() ? randomUUID() : undefined;
@@ -915,20 +931,20 @@ export async function generateSpeech(p: TtsParams): Promise<TtsResult> {
       const acquire = async () => (await speechSlots.acquire())[1];
       release = p.signal ? await acquireWithAbort(acquire, p.signal) : await acquire();
       throwIfAborted(p.signal);
-      if (speechOwnerChanged(owner)) throw new Error('speech owner changed');
+      if (speechOwnerChanged(owner, ownerVersion)) throw new Error('speech owner changed');
       queueLog('result', 'admitted');
     } catch {
-      queueLog('result', speechOwnerChanged(owner) && !p.signal?.aborted ? 'owner_changed' : 'cancelled');
+      queueLog('result', speechOwnerChanged(owner, ownerVersion) && !p.signal?.aborted ? 'owner_changed' : 'cancelled');
       return { ok: false, errorCode: 'E_TTS_ABORTED', message: 'TTS was aborted before dispatch.',
         requestDisposition: 'not_sent', chargeStatus: 'not_charged', retryPolicy: 'unknown' };
     }
-    return await generateSpeechObserved(p, owner);
+    return await generateSpeechObserved(p, owner, ownerVersion);
   } finally {
     release?.();
   }
 }
 
-async function generateSpeechObserved(p: TtsParams, owner: string): Promise<TtsResult> {
+async function generateSpeechObserved(p: TtsParams, owner: string, ownerVersion: number): Promise<TtsResult> {
   if (!p.text.trim()) return { ok: false, errorCode: 'E_TTS_ARG', message: 'text is required' };
   const resolved = await resolveTtsSelection({
     ...(p.routeRef ? { routeRef: p.routeRef } : {}),
@@ -972,7 +988,7 @@ async function generateSpeechObserved(p: TtsParams, owner: string): Promise<TtsR
   let res: TtsResult;
   try {
     for (let attempt = 0; ; attempt++) {
-      if (p.signal?.aborted || speechOwnerChanged(owner)) {
+      if (p.signal?.aborted || speechOwnerChanged(owner, ownerVersion)) {
         diagnostics.finish(p.signal?.aborted ? 'cancelled' : 'owner_changed');
         return { ok: false, errorCode: 'E_TTS_ABORTED', message: 'TTS was aborted before dispatch.',
           requestDisposition: 'not_sent', chargeStatus: 'not_charged', retryPolicy: 'unknown' };

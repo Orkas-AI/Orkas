@@ -235,6 +235,25 @@ describe('bash-permissions', () => {
     bp.respond(info.request_id, 'deny'); await pending;
   });
 
+  it.each([[9, 11], [109, 100]])('summarizes distinct unknown operands with %s additional facts before clipping the preview', async (additional, count) => {
+    const unknown = {
+      kind: 'write' as const, operation: 'redirection', target: '$PRIVATE_VAR',
+      detail: 'PRIVATE_VAR=$(mktemp /Users/private-hidden)', unresolved: true, analysisGap: 'expansion' as const,
+    };
+    const pending = ask({ unresolvedPaths: true, reasons: [], keyFacts: [
+      unknown, unknown,
+      ...Array.from({ length: additional }, (_, index) => ({ ...unknown, target: `\${PRIVATE_VAR}/private-${index}` })),
+      { kind: 'read', operation: 'input redirection', target: 'private-input', unresolved: true, analysisGap: 'working_directory' },
+      { kind: 'write', operation: 'redirection', target: 'ordinary-path' },
+    ] });
+    const info = permissionPushes()[0].payload;
+    expect(info.path_diagnostics).toEqual({ operation: 'mixed', cause: 'mixed', count });
+    expect(info.key_facts).toHaveLength(6);
+    expect(info.can_allow_run).toBe(false);
+    bp.respond(info.request_id, 'deny');
+    expect(await pending).toBe('deny');
+  });
+
   it('ignores stale response ids without settling the live request', async () => {
     const p = ask();
     let settled = false;

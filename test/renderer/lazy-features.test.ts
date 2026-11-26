@@ -127,6 +127,8 @@ describe('renderer lazy feature loader', () => {
     for (const script of [
       'library-transfer.js',
       'project-detail.js',
+      'project-goal.js',
+      'project-recap.js',
       'todos.js',
       'contexts.js',
       'kb-picker.js',
@@ -153,6 +155,8 @@ describe('renderer lazy feature loader', () => {
       './modules/library-transfer.js',
       './modules/date-picker.js',
       './modules/project-detail.js',
+      './modules/project-goal.js',
+      './modules/project-recap.js',
       './modules/todos.js',
       './modules/todo-cleanup.js',
     ]);
@@ -163,6 +167,8 @@ describe('renderer lazy feature loader', () => {
       './modules/library-transfer.js',
       './modules/date-picker.js',
       './modules/project-detail.js',
+      './modules/project-goal.js',
+      './modules/project-recap.js',
       './modules/todos.js',
       './modules/todo-cleanup.js',
       './modules/auto.js',

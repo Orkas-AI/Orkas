@@ -19,6 +19,7 @@ import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import { t } from '../../../i18n.js';
 import { AcpDiagnostics } from './acp-diagnostics.js';
+import { createPendingCliText } from '../text-phase.js';
 import {
   type LocalBackend,
   type BackendRunOptions,
@@ -26,6 +27,7 @@ import {
   spawnCli,
   armKillWatchdog,
   reapCliAfterProtocolTerminal,
+  rpcErrorMessage,
   LineSplitter,
 } from './base.js';
 
@@ -36,9 +38,10 @@ export interface AcpBackendDef {
   argv: string[] | ((opts: BackendRunOptions) => string[]);
   /** Identifier we report via `clientInfo.name`. Cosmetic. */
   clientName: string;
-  /** Use the stabilized `session/resume` lifecycle when the runner supplies a
-   * native session id. Backends that omit this continue with fresh sessions. */
-  resume?: boolean;
+  /** Display name of the running CLI, rather than the ACP client identity. */
+  cliName?: string;
+  /** Legacy fixed resume, or a strict ACP v1 handshake with negotiated resume. */
+  resume?: boolean | 'negotiated';
   /** Fresh Hermes model selection rebuilds its Agent and loses session MCP tools.
    * Rebind them through advertised session/load before the first prompt. */
   refreshMcpAfterModelSelection?: boolean;
@@ -51,6 +54,8 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
   return {
     async run(opts: BackendRunOptions): Promise<void> {
       const argv = typeof def.argv === 'function' ? def.argv(opts) : def.argv;
+      const negotiate = def.resume === 'negotiated';
+      const pendingText = negotiate ? createPendingCliText(opts.onEvent) : undefined;
       const extraEnv = typeof def.extraEnv === 'function' ? def.extraEnv(opts) : def.extraEnv;
       const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;
       const child = spawnCli(opts.binPath, argv, opts.cwd, env);
@@ -64,9 +69,10 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       let finishProtocol!: () => void;
       let sessionId: string | undefined;
       let resultText = '';
-      let resultStatus: 'completed' | 'failed' | undefined;
+      let resultStatus: 'completed' | 'failed' | 'cancelled' | undefined;
       let resultError: string | undefined;
-      let compatibilityFailure = false;
+      let nativeError: string | undefined;
+      let compatibilityFailure: 'parameter_unsupported' | 'tool_restore_failed' | undefined;
       const toolNames = new Map<string, string>();
       // Captured upstream-provider error text from stderr. ACP servers
       // (notably hermes 0.9) treat upstream HTTP 400/auth errors as
@@ -141,6 +147,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         mcpServers,
       };
       const requestedResumeId = def.resume ? String(opts.resumeSessionId || '') : '';
+      let resumeMethod: 'session/resume' | 'session/load' = 'session/resume';
 
       let sessionStartSent = false;
       const sendSessionStart = () => {
@@ -149,7 +156,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         send({
           jsonrpc: '2.0',
           id: 2,
-          method: requestedResumeId ? 'session/resume' : 'session/new',
+          method: requestedResumeId ? resumeMethod : 'session/new',
           params: requestedResumeId
             ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers }
             : sessionNewParams,
@@ -182,23 +189,29 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         ...(opts.modelOverride ? [{ category: 'model', value: opts.modelOverride }] : []),
         ...(opts.thinkingLevel ? [{ category: 'thought_level', value: opts.thinkingLevel }] : []),
       ];
-      const failSelection = (parameter: string) => {
+      const failCompatibility = (code: typeof compatibilityFailure, message: string, detail?: string) => {
         resultStatus = 'failed';
-        resultError = t('cli_agent.parameter_unsupported', { cli: def.clientName, parameter });
-        compatibilityFailure = true;
+        resultError = message;
+        nativeError = detail;
+        compatibilityFailure = code;
         finishProtocol();
       };
+      const cli = def.cliName ?? def.clientName;
+      const failSelection = (parameter: string, detail?: string) => failCompatibility('parameter_unsupported',
+        t('cli_agent.parameter_unsupported', { cli, parameter }), detail);
+      const failToolRestore = (reason: 'unsupported' | 'rejected' | 'timeout', detail?: string) => failCompatibility(
+        'tool_restore_failed', t(`cli_agent.tool_restore_${reason}`, { cli }), detail);
       const applyNextSelection = (id: string) => {
         if (cancellationRequested || opts.signal.aborted || watchdog.fired()) return;
         const selection = selections.shift();
         if (!selection) {
           if (needsMcpRefresh && opts.bridge && def.refreshMcpAfterModelSelection && !requestedResumeId) {
-            if (!supportsSessionLoad) { failSelection('model'); return; }
+            if (!supportsSessionLoad) { failToolRestore('unsupported'); return; }
             needsMcpRefresh = false;
             mcpRefreshPending = true;
             send({ jsonrpc: '2.0', id: 4, method: 'session/load', params: { sessionId: id, cwd: opts.cwd, mcpServers } });
             const remaining = opts.deadlineAt === undefined ? opts.timeoutMs : opts.deadlineAt - Date.now();
-            modelSetTimer = setTimeout(() => failSelection('model'), Math.max(1, Math.min(15_000, remaining)));
+            modelSetTimer = setTimeout(() => failToolRestore('timeout'), Math.max(1, Math.min(15_000, remaining)));
             modelSetTimer.unref?.();
           } else sendPrompt(id);
           return;
@@ -235,7 +248,9 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         modelSetTimer.unref?.();
       };
       const onSessionReady = (id: string) => {
+        if (negotiate && sessionId) return;
         sessionId = id;
+        if (bootstrapTimer) clearTimeout(bootstrapTimer);
         opts.onEvent({ type: 'status', status: 'session_ready', sessionId });
         applyNextSelection(id);
       };
@@ -251,10 +266,11 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           // something straight to stdout (hermes occasionally does
           // this on startup). Surface as raw-line so it appears in
           // the process rail.
-          opts.onEvent({ type: 'raw-line', line: trimmed });
+          if (!negotiate) opts.onEvent({ type: 'raw-line', line: trimmed });
           return;
         }
         diagnostics.received(env);
+        if (negotiate && (!env || typeof env !== 'object' || Array.isArray(env))) return;
         if (env?.method === 'session/request_permission' && env.id !== undefined) {
           const params = env.params && typeof env.params === 'object' ? env.params : {};
           const toolCall = params.toolCall && typeof params.toolCall === 'object'
@@ -264,11 +280,14 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             ? toolCall.rawInput
             : {};
           const options = Array.isArray(params.options) ? params.options : [];
+          const scopedOption = (kind: 'allow_once' | 'reject_once') => options.find((option: any) =>
+            option?.kind === kind && typeof option.optionId === 'string' && option.optionId.trim())?.optionId as string | undefined;
           const optionId = () => {
+            if (negotiate) return scopedOption('allow_once') || '';
             const once = options.find((option: any) => {
               const id = String(option?.optionId || option?.option_id || '');
               const kind = String(option?.kind || '');
-              return id === 'allow_once' || id === 'once' || kind === 'allow_once' || kind === 'once';
+              return id === 'allow_once' || id === 'allow-once' || id === 'once' || kind === 'allow_once' || kind === 'once';
             });
             if (once) return String(once.optionId || once.option_id || 'allow_once');
             // Version-skewed agents may expose a differently named allow
@@ -282,27 +301,35 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             });
             return bounded ? String(bounded.optionId || bounded.option_id || '') : '';
           };
+          const description = typeof rawInput.description === 'string' && rawInput.description.trim()
+            ? rawInput.description : typeof toolCall.title === 'string' ? toolCall.title : undefined;
+          const command = typeof rawInput.command === 'string' ? rawInput.command : undefined;
           diagnostics.permissionStarted();
           void (async () => {
+            if (negotiate && (!promptSent || cancellationRequested || params.sessionId !== sessionId || !optionId()
+              || !(description?.trim() || command?.trim()))) {
+              send({ jsonrpc: '2.0', id: env.id, result: { outcome: { outcome: 'cancelled' } } });
+              return;
+            }
             const fullAccess = opts.permissionPolicy === 'full_access';
             const decision = fullAccess
               ? 'allow_once'
               : await (opts.requestPermission?.({
                 id: String(env.id),
                 tool: String(toolCall.kind || 'command'),
-                description: typeof rawInput.description === 'string'
-                  ? rawInput.description
-                  : typeof toolCall.title === 'string' ? toolCall.title : undefined,
-                command: typeof rawInput.command === 'string' ? rawInput.command : undefined,
+                description: negotiate ? description : typeof rawInput.description === 'string'
+                  ? rawInput.description : typeof toolCall.title === 'string' ? toolCall.title : undefined,
+                command,
               }) ?? Promise.resolve('deny'));
             if (exited) return;
-            const selected = decision === 'deny' ? '' : optionId();
+            const selected = decision === 'deny' || (negotiate && cancellationRequested) ? '' : optionId();
+            const option = selected || (negotiate && !cancellationRequested ? scopedOption('reject_once') : undefined);
             send({
               jsonrpc: '2.0',
               id: env.id,
               result: {
-                outcome: selected
-                  ? { outcome: 'selected', optionId: selected }
+                outcome: option
+                  ? { outcome: 'selected', optionId: option }
                   : { outcome: 'cancelled' },
               },
             });
@@ -325,6 +352,29 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           }).finally(() => diagnostics.permissionEnded());
           return;
         }
+        if (negotiate && typeof env?.method === 'string' && env.id !== undefined) {
+          send({ jsonrpc: '2.0', id: env.id, error: { code: -32601, message: 'Unsupported client request' } });
+          return;
+        }
+        if (negotiate && Number(env?.id) === 1) {
+          if (env.error) {
+            resultStatus = 'failed';
+            const requiresSignIn = env.error.code === -32000;
+            resultError = t(requiresSignIn ? 'cli_agent.sign_in_required' : 'cli_agent.session_start_failed', { cli });
+            if (!requiresSignIn) nativeError = rpcErrorMessage(env.error);
+            finishProtocol();
+            return;
+          }
+          if (env.result?.protocolVersion !== 1) {
+            failSelection('ACP v1');
+            return;
+          }
+          const capabilities = env.result.agentCapabilities;
+          if (requestedResumeId && capabilities?.sessionCapabilities?.resume == null) {
+            if (capabilities?.loadSession !== true) { failSelection('session resume'); return; }
+            resumeMethod = 'session/load';
+          }
+        }
         if (Number(env.id) === 1 && !env.error) {
           supportsSessionLoad = env.result?.agentCapabilities?.loadSession === true;
           sendSessionStart();
@@ -332,7 +382,9 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         if (Number(env.id) === 4 && sessionId && mcpRefreshPending) {
           mcpRefreshPending = false;
           if (modelSetTimer) clearTimeout(modelSetTimer);
-          if (env.error || !env.result || typeof env.result !== 'object') { failSelection('model'); return; }
+          if (env.error || !env.result || typeof env.result !== 'object' || Array.isArray(env.result)) {
+            failToolRestore('rejected', rpcErrorMessage(env.error)); return;
+          }
           sendPrompt(sessionId); return;
         }
         if (Number(env.id) === 3 && sessionId && pendingSelection) {
@@ -341,7 +393,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           const accepted = !env.error && (!selection.configId ||
             (Array.isArray(env.result?.configOptions) && env.result.configOptions.some((option: any) => option?.id === selection.configId
               && option.currentValue === selection.value)));
-          if (!accepted) { failSelection(selection.configId || 'model'); return; }
+          if (!accepted) { failSelection(selection.configId || 'model', rpcErrorMessage(env.error)); return; }
           if (selection.configId) sessionConfiguration = env.result;
           applyNextSelection(sessionId);
           return;
@@ -349,24 +401,60 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         if (Number(env.id) === 2 && !env.error) sessionConfiguration = env.result;
         if (Number(env.id) === 2 && env.error) {
           resultStatus = 'failed';
-          resultError = typeof env.error.message === 'string'
+          const requiresSignIn = negotiate && env.error.code === -32000;
+          resultError = negotiate
+            ? t(requiresSignIn ? 'cli_agent.sign_in_required' : 'cli_agent.session_start_failed', { cli })
+            : typeof env.error.message === 'string'
             ? env.error.message
             : 'ACP session could not be started';
+          if (negotiate && !requiresSignIn) nativeError = rpcErrorMessage(env.error);
           finishProtocol();
           return;
         }
         if (Number(env.id) === 2 && requestedResumeId && !env.error) {
+          if (negotiate && (!env.result || typeof env.result !== 'object' || Array.isArray(env.result)
+            || (typeof env.result.sessionId === 'string' && env.result.sessionId !== requestedResumeId))) {
+            failSelection('session resume');
+            return;
+          }
           onSessionReady(requestedResumeId);
           return;
+        }
+        if (negotiate && env.method === 'session/update') {
+          if (!promptSent || env.params?.sessionId !== sessionId) return;
+          const update = env.params.update;
+          if (update?.sessionUpdate === 'tool_call_update'
+            && (update.status === 'pending' || update.status === 'in_progress')) {
+            opts.onActivity?.();
+            return;
+          }
+        }
+        if (negotiate && Number(env.id) === PROMPT_REQ_ID) {
+          if (!promptSent) return;
+          if (env.error || typeof env.result?.stopReason !== 'string') {
+            resultStatus = 'failed';
+            const requiresSignIn = env.error?.code === -32000;
+            resultError = t(requiresSignIn ? 'cli_agent.sign_in_required' : 'cli_agent.turn_failed', { cli });
+            if (!requiresSignIn) nativeError = rpcErrorMessage(env.error);
+            finishProtocol();
+            return;
+          }
+          if (env.result.stopReason === 'cancelled') {
+            resultStatus = 'cancelled';
+            finishProtocol();
+            return;
+          }
         }
         handleAcpMessage(env, {
           onSessionNew: onSessionReady,
           onTextDelta: text => {
+            if (pendingText) { pendingText.append(text); return; }
             resultText += text;
             opts.onEvent({ type: 'text-delta', text });
           },
           onThinking: text => opts.onEvent({ type: 'thinking', text }),
           onToolUse: tool => {
+            if (tool.callId && !toolNames.has(tool.callId)) pendingText?.finalizeCommentary();
             if (tool.callId) toolNames.set(tool.callId, tool.name);
             opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'use', input: tool.input });
           },
@@ -390,6 +478,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             finishProtocol();
           },
           onUnknown: raw => {
+            if (negotiate) return;
             // Previously surfaced as a fake `tool:'acp'` tool-event,
             // which polluted the tools rail with category-error rows.
             // Reroute to a log event so the rail's tool list stays
@@ -416,17 +505,24 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       // ack initialize without printing anything we'd recognize as the
       // ack, and then sit idle. The one-shot guard prevents a late fallback
       // from creating a second session after a normal initialize response.
-      const initTimer = setTimeout(sendSessionStart, 250);
-      if (typeof initTimer.unref === 'function') initTimer.unref();
+      const initTimer = negotiate ? undefined : setTimeout(sendSessionStart, 250);
+      initTimer?.unref?.();
+      const bootstrapTimer = negotiate ? setTimeout(() => {
+        resultStatus = 'failed';
+        resultError = t('cli_agent.session_start_failed', { cli });
+        finishProtocol();
+      }, 15_000) : undefined;
+      bootstrapTimer?.unref?.();
 
       const stderrLines = new LineSplitter(64 * 1024);
       const stderrLine = (line: string) => {
-        if (line) opts.onEvent({ type: 'stderr-line', line });
+        if (line && !negotiate) opts.onEvent({ type: 'stderr-line', line });
       };
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', chunk => {
         if (exited) return;
         diagnostics.bytes('stderr');
+        if (negotiate) return;
         tail.push(chunk);
         stderrLines.push(chunk, stderrLine);
         // Preserve the existing error-hint interpretation on received chunks.
@@ -451,9 +547,11 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           exited = true;
           stderrLines.flush(stderrLine);
           watchdog.disarm();
-          clearTimeout(initTimer);
+          if (initTimer) clearTimeout(initTimer);
+          if (bootstrapTimer) clearTimeout(bootstrapTimer);
           if (modelSetTimer) clearTimeout(modelSetTimer);
           detachAbort();
+          if (status !== 'completed') pendingText?.finalizeCommentary();
           // Keep one bounded local diagnostic summary per dispatch.
           // It must not count as fresh CLI progress.
           const summary = diagnostics.snapshot(status, endReason, processState, child.exitCode);
@@ -468,6 +566,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             durationMs: Date.now() - startedAt,
             sessionId,
             ...extra,
+            ...(pendingText ? { output: pendingText.output() } : {}),
           });
           resolve();
         };
@@ -477,14 +576,16 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           endReason = 'protocol';
           try {
             if (opts.signal.aborted) return finish('cancelled', { output: resultText });
-            if (watchdog.fired()) return finish('timeout', {
+            if (watchdog.fired() && !compatibilityFailure) return finish('timeout', {
               timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`,
               output: resultText, stderrTail: tail.toString(),
             });
             if (resultStatus === 'failed') return finish('failed', {
               error: resultError, output: resultText, stderrTail: tail.toString(),
-              ...(compatibilityFailure ? { cliError: 'parameter_unsupported', failureKind: 'cli_compatibility', retrySafe: false } : {}),
+              ...(nativeError ? { nativeError } : {}),
+              ...(compatibilityFailure ? { cliError: compatibilityFailure, failureKind: 'cli_compatibility', retrySafe: false } : {}),
             });
+            if (resultStatus === 'cancelled') return finish('cancelled', { output: resultText });
             // Preserve the existing Hermes silent-provider-failure handling
             // for diagnostic evidence received before the protocol terminal.
             if (!resultText && stderrErrorHint) return finish('failed', {
@@ -515,6 +616,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           stderrLines.flush(stderrLine);
           processState = 'close';
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
+          if (watchdog.fired() && mcpRefreshPending) return failToolRestore('timeout');
           if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
           const err = resultError || (code !== 0 ? `cli exited with code ${code}` : 'cli closed without prompt result');
           finish('failed', { error: err, output: resultText, stderrTail: tail.toString() });

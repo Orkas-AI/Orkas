@@ -669,11 +669,9 @@ async function _validateProjectScope(
   // orphan directory that no real Project view can surface.
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return 'invalid_project';
   if (!recipient || recipient.kind !== 'agent') return null;
-  // Match the project picker and execution scope, including member-private
-  // choices and shared packages that do not live in bindings.json.
+  // Match the project picker and execution scope for built-ins and added Agents.
   const projects = await import('./projects');
-  const bindings = await projects.getBindings(uid, projectId);
-  return bindings.agents.includes(recipient.id) ? null : 'invalid_recipient';
+  return await projects.isAgentAvailableInProject(uid, projectId, recipient.id) ? null : 'invalid_recipient';
 }
 
 export async function listTasks(uid: string, opts?: { projectId?: string | null }): Promise<AutoTask[]> {
@@ -763,12 +761,19 @@ export async function createTask(
 export async function updateTask(
   uid: string, taskId: string, patch: TaskUpdatePatch,
   expectedProjectId?: string | null,
+  expectedSourceProjectId?: string | null,
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
+  const sourceProjectId = expectedProjectId !== undefined ? expectedProjectId : expectedSourceProjectId;
   return _runExclusive(uid, async () => {
     const stored = await _readOne(uid, taskId);
     if (!stored) return { ok: false as const, error: 'not_found' as const };
-    if (expectedProjectId !== undefined && ((stored.project_id ?? null) !== expectedProjectId || (patch.project_id !== undefined && patch.project_id !== expectedProjectId))) return { ok: false as const, error: 'not_found' as const };
+    if (sourceProjectId !== undefined && (stored.project_id ?? null) !== sourceProjectId) {
+      return { ok: false as const, error: 'not_found' as const };
+    }
+    if (expectedProjectId !== undefined && patch.project_id !== undefined && patch.project_id !== expectedProjectId) {
+      return { ok: false as const, error: 'not_found' as const };
+    }
     const cur = await _migrateLegacyDeviceBindingIfOwned(uid, stored);
     const priorDueAtMs = _timers.get(taskId)?.dueAtMs;
     const legacyMessageChanged = patch.content !== undefined
@@ -932,6 +937,8 @@ export interface AutoTaskMutationOptions {
   sourceAttachmentCid?: string;
   /** Host-bound scope: null is global, undefined preserves Commander selection. */
   projectId?: string | null;
+  /** Source scope verified by an unbound caller; the storage lock rechecks it. */
+  expectedSourceProjectId?: string | null;
   /** Conversation the mutation was made in. A created task runs there;
    *  an update leaves the run conversation unchanged. */
   conversationId?: string;
@@ -952,6 +959,7 @@ export async function applyAutoTaskMutation(
 ): Promise<AutoTaskMutationResult> {
   const action = mutation.action || (mutation.taskId ? 'update' : 'create');
   const taskId = mutation.taskId || '';
+  const sourceProjectId = opts.projectId !== undefined ? opts.projectId : opts.expectedSourceProjectId;
   try {
     if (opts.projectId !== undefined) {
       if (mutation.updates.project_id !== undefined && mutation.updates.project_id !== opts.projectId) return { ok: false, error: 'project_scope_mismatch' };
@@ -978,7 +986,7 @@ export async function applyAutoTaskMutation(
     if (!taskId) return { ok: false, error: 'task_id_required' };
     if (action === 'delete') {
       const before = await getTask(uid, taskId);
-      const result = await deleteTask(uid, taskId, opts.projectId);
+      const result = await deleteTask(uid, taskId, sourceProjectId);
       if (!result.ok) return { ok: false, error: 'not_found' };
       return {
         ok: true,
@@ -988,7 +996,7 @@ export async function applyAutoTaskMutation(
       };
     }
     if (action === 'enable' || action === 'disable') {
-      const result = await setTaskEnabled(uid, taskId, action === 'enable', opts.projectId);
+      const result = await setTaskEnabled(uid, taskId, action === 'enable', sourceProjectId);
       if (!result.ok) return { ok: false, error: (result as { error: string }).error };
       return {
         ok: true,
@@ -999,7 +1007,7 @@ export async function applyAutoTaskMutation(
       };
     }
     if (!Object.keys(mutation.updates).length) return { ok: false, error: 'empty_update' };
-    const result = await updateTask(uid, taskId, mutation.updates, opts.projectId);
+    const result = await updateTask(uid, taskId, mutation.updates, opts.projectId, sourceProjectId);
     if (!result.ok) return { ok: false, error: (result as { error: string }).error };
     await _stageMutationAttachments(uid, taskId, mutation, opts);
     return {
@@ -1120,10 +1128,23 @@ const _activeRuns: Map<string, ActiveRun> = ((globalThis as Record<symbol, unkno
 
 function _activeRunKey(uid: string, cid: string): string { return `${uid}\u0000${cid}`; }
 
+type AutoRunEndListener = (event: { userId: string; cid: string; taskId: string }) => void;
+const _runEndListeners = new Set<AutoRunEndListener>();
+
+export function subscribeRunEnds(listener: AutoRunEndListener): () => void {
+  _runEndListeners.add(listener);
+  return () => { _runEndListeners.delete(listener); };
+}
+
 function _endActiveRun(uid: string, cid: string, taskId: string, startedAt: string): void {
   const key = _activeRunKey(uid, cid);
   const active = _activeRuns.get(key);
-  if (active?.taskId === taskId && active.startedAt === startedAt) _activeRuns.delete(key);
+  if (active?.taskId !== taskId || active.startedAt !== startedAt) return;
+  _activeRuns.delete(key);
+  for (const listener of _runEndListeners) {
+    try { listener({ userId: uid, cid, taskId }); }
+    catch (_) { log.warn('automation run end listener failed'); }
+  }
 }
 
 /** The task whose run is in progress in this conversation, or ''. */
@@ -2481,6 +2502,16 @@ export function resumeSchedulerForTest(uid: string): Promise<void> {
   return _resumeScheduler(uid);
 }
 
+// Both ordinary and late-loaded clients share the live scheduler owner.
+const SCHEDULER_SWITCH_OWNER = Symbol.for('orkas.auto-tasks.scheduler-switch-owner');
+const schedulerSwitchState = globalThis as typeof globalThis & {
+  [SCHEDULER_SWITCH_OWNER]?: (previousUid: string, nextUid: string) => void;
+};
+
+function dispatchSchedulerUserSwitch(previousUid: string, nextUid: string): void {
+  (schedulerSwitchState[SCHEDULER_SWITCH_OWNER] ?? handleSchedulerUserSwitch)(previousUid, nextUid);
+}
+
 /** Initial bootstrap — list every task and register a timer for each
  *  enabled / own-device one, catching up an occurrence missed while Orkas was
  *  closed. Called once on startup; deferred via the deferred boot phase
@@ -2488,6 +2519,8 @@ export function resumeSchedulerForTest(uid: string): Promise<void> {
 export function startScheduler(): void {
   if (_started) return;
   _started = true;
+  schedulerSwitchState[SCHEDULER_SWITCH_OWNER] = handleSchedulerUserSwitch;
+  registerUserSwitchHook('auto-tasks-scheduler', dispatchSchedulerUserSwitch);
   _schedulerSuspended = false;
   _startClockMonitor();
   void _attachSchedulerPowerMonitor();
@@ -2518,10 +2551,13 @@ export function stopScheduler(): void {
   _detachSchedulerPowerMonitor();
   _schedulerSuspended = false;
   _started = false;
+  if (schedulerSwitchState[SCHEDULER_SWITCH_OWNER] === handleSchedulerUserSwitch) {
+    delete schedulerSwitchState[SCHEDULER_SWITCH_OWNER];
+  }
   log.info('scheduler stopped');
 }
 
-registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
+function handleSchedulerUserSwitch(_previousUid: string, nextUid: string): void {
   // Invalidate callbacks before users.activateUser swaps filesystem and
   // credential roots. clearTimeout alone is insufficient when a callback has
   // already left the timer queue and is awaiting disk or sleep-state IO.
@@ -2534,4 +2570,6 @@ registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
     _rescheduleAll(nextUid, 'restore', switchEpoch)
       .catch((err) => log.warn(`account-switch reschedule failed uid=${maskId(nextUid)}`, logErrorSummary(err)));
   });
-});
+}
+
+registerUserSwitchHook('auto-tasks-scheduler', dispatchSchedulerUserSwitch);

@@ -288,9 +288,14 @@ describe('prompts ↔ code contract', () => {
     // An independent conversation-scope block owns the explanation before
     // tool selection; the conditional snapshot must not mirror it.
     expect(account).not.toContain('When asked about them, explain');
-    expect(context).toContain("prompts.load('global_todo_scope'");
+    expect(context).toContain("prompts.load(commander ? 'global_todo_scope_commander' : 'global_todo_scope',");
     expect(fs.readFileSync(path.join(PROMPTS_DIR, 'global_todo_scope.md'), 'utf8'))
       .toContain('except that Commander can manage the project it creates for this conversation during this turn immediately');
+    // Commander's variant owns the read-only cross-project rule; the other one never mentions it.
+    const commanderScope = fs.readFileSync(path.join(PROMPTS_DIR, 'global_todo_scope_commander.md'), 'utf8');
+    expect(commanderScope).toContain('## Global to-do scope');
+    expect(commanderScope).toContain('they are read-only here');
+    expect(fs.readFileSync(path.join(PROMPTS_DIR, 'global_todo_scope.md'), 'utf8')).not.toContain('read-only');
     expect(project).not.toContain('untrusted');
     expect(context).toContain("prompts.load('open_work_account'");
     expect(context).toContain("prompts.load('open_work_project'");
@@ -521,7 +526,7 @@ describe('prompts ↔ code contract', () => {
     const i18n = readFile('src/main/i18n.ts');
     const composer = readFile('src/main/prompts/chat_prompt_composer.ts');
 
-    expect(i18n).toContain('buildLanguageDirectiveText(name)');
+    expect(i18n).toMatch(/buildLanguageDirectiveText\(name\b/);
     expect(composer).toContain('Fallback UI language: **${languageName}**');
     const directive = buildLanguageDirectiveText('Chinese (简体中文)');
     expect(directive).toContain('a current explicit request about reply language');
@@ -1258,10 +1263,10 @@ describe('prompts ↔ code contract', () => {
     // activation state; neither the system nor turn tail duplicates it.
     expect(runner).toContain('splitCommanderOrchestrationBlock');
     expect(runner).toMatch(/if \(connectorBlock\) parts\.push\(connectorBlock\.trim\(\)\);\s+if \(systemSkillsBlock\) parts\.push\(systemSkillsBlock\.trim\(\)\);\s+if \(skillsBlock\) parts\.push\(skillsBlock\.trim\(\)\);\s+if \(agentsBlock\) parts\.push\(agentsBlock\);/);
-    // User-authored project instructions are low-churn configuration and sit
-    // in the stable cache prefix: after the agents block, before the
-    // runtime-injection region begins.
-    expect(runner).toMatch(/if \(agentsBlock\) parts\.push\(agentsBlock\);[\s\S]{0,1200}?if \(projectContextPolicyBlock\) parts\.push\(projectContextPolicyBlock\);[\s\S]{0,600}?if \(projectInstructionsBlock\) parts\.push\(projectInstructionsBlock\);\s+if \(runtimeInjectionBlock\) parts\.push\(runtimeInjectionBlock\);/);
+    // User-authored project instructions and the user-set project goal are
+    // low-churn configuration and sit in the stable cache prefix: after the
+    // agents block, before the runtime-injection region begins.
+    expect(runner).toMatch(/if \(agentsBlock\) parts\.push\(agentsBlock\);[\s\S]{0,1200}?if \(projectContextPolicyBlock\) parts\.push\(projectContextPolicyBlock\);[\s\S]{0,600}?if \(projectInstructionsBlock\) parts\.push\(projectInstructionsBlock\);[\s\S]{0,400}?if \(projectGoalBlock\) parts\.push\(projectGoalBlock\);\s+if \(runtimeInjectionBlock\) parts\.push\(runtimeInjectionBlock\);/);
     // Memory stays cached, then the response-language contract is the final
     // system instruction so English-authored context cannot override it.
     expect(runner).toMatch(/if \(memoryBlock\) parts\.push\(memoryBlock\);/);

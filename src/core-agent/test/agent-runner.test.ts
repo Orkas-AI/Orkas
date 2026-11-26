@@ -5485,7 +5485,7 @@ describe("AgentRunner", () => {
     expect(events.some((event) => event.type === "done")).toBe(true);
   });
 
-  it.each(["success", "empty", "abort"] as const)("handles a 200K parallel checkpoint atomically (%s)", async (outcome) => {
+  it.each(["success", "empty", "abort", "max_tokens", "bare_eof", "safety"] as const)("handles a 200K parallel checkpoint atomically (%s)", async (outcome) => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Compare the parallel observations" }]);
     const ids = Array.from({ length: 8 }, (_, i) => `parallel-${i}`);
@@ -5503,6 +5503,7 @@ describe("AgentRunner", () => {
       async complete() { throw new Error("streaming expected"); },
       async *stream(params) {
         let text = "done";
+        let stopReason: CompletionResult["stopReason"] = "end_turn";
         if (params.systemPrompt?.startsWith("You are a context compaction engine.")) {
           summaryCalls++;
           expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
@@ -5519,13 +5520,28 @@ describe("AgentRunner", () => {
             controller.abort();
             throw new Error("checkpoint cancelled by test");
           }
+          if (outcome === "bare_eof") {
+            yield { type: "text_delta", text: "partial checkpoint without a terminal" };
+            return;
+          }
+          if (outcome === "safety") {
+            yield { type: "text_delta", text: "partial checkpoint before provider filtering" };
+            yield { type: "message_end", stopReason: "end_turn", providerTermination: { category: "safety" } };
+            return;
+          }
           // Summary content is derived solely from the actual supplied input.
-          text = outcome === "empty" ? "" : (input.match(/(?:HEAD|TAIL)_parallel-\d/g) ?? []).join("\n");
+          const facts = input.match(/(?:HEAD|TAIL)_parallel-\d/g) ?? [];
+          if (outcome === "max_tokens") {
+            stopReason = "max_tokens";
+            text = facts.slice(0, 3).join("\n");
+          } else {
+            text = outcome === "empty" ? "" : facts.join("\n");
+          }
         } else {
           mainCalls++;
           mainView = JSON.stringify(params.messages);
         }
-        yield* streamCompletionResult({ content: [{ type: "text", text }], stopReason: "end_turn",
+        yield* streamCompletionResult({ content: [{ type: "text", text }], stopReason,
           usage: { inputTokens: 0, outputTokens: text ? 5 : 0, totalTokens: text ? 5 : 0 }, model: "mock-model" });
       },
       async validateAuth() { return true; },
@@ -5540,19 +5556,131 @@ describe("AgentRunner", () => {
     const events: AgentRunEvent[] = [];
     for await (const event of runner.runStream({ message: "Compare the parallel observations", resumeActiveTurn: true, signal: controller.signal })) events.push(event);
     expect(summaryCalls).toBe(1);
-    expect(events.filter(e => e.type === "compaction")).toHaveLength(outcome === "success" ? 1 : 0);
+    expect.soft(events.filter(e => e.type === "compaction")).toHaveLength(outcome === "success" ? 1 : 0);
     if (outcome === "abort") {
       expect(mainCalls).toBe(0);
       expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
     } else {
       expect(mainCalls).toBe(1);
       expect(mainView).toContain("LATEST_EXACT_RESULT");
-      expect(mainView.includes("x".repeat(100_000))).toBe(outcome === "empty");
-      for (const id of ids) expect(mainView).toContain(`TAIL_${id}`);
+      expect.soft(mainView.includes("x".repeat(100_000))).toBe(outcome !== "success");
+      if (outcome === "max_tokens" || outcome === "bare_eof" || outcome === "safety") {
+        expect.soft(events.some(e => e.type === "context_status" && e.phase === "active_process_compaction_failed")).toBe(true);
+        expect(ids.every(id => mainView.includes(`TAIL_${id}`))).toBe(true);
+      } else {
+        for (const id of ids) expect(mainView).toContain(`TAIL_${id}`);
+      }
       if (outcome === "empty") expect(events.some(e => e.type === "context_status"
         && e.phase === "active_process_compaction_failed" && e.data.errorCode === CONTEXT_COMPACTION_EMPTY_SUMMARY_CODE)).toBe(true);
     }
   });
+
+  it.each(["end_turn", "max_tokens", "cancelled"] as const)(
+    "retries a truncated checkpoint with only the oldest four complete groups (%s)",
+    async (retryOutcome) => {
+      const controller = new AbortController();
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Compare all results" }]);
+      const groupCount = 8;
+      for (let index = 0; index < groupCount; index++) {
+        session.addAssistantMessage([
+          { type: "tool_use", id: `first-${index}`, name: "read_files", input: {} },
+          { type: "tool_use", id: `second-${index}`, name: "read_files", input: {} },
+        ]);
+        session.addToolResult(`first-${index}`, `FIRST_${index}\n${"x".repeat(33_000)}`);
+        session.addToolResult(`second-${index}`, `TAIL_${index}`);
+      }
+      session.addAssistantMessage([{ type: "tool_use", id: "latest", name: "read_files", input: {} }]);
+      session.addToolResult("latest", `LATEST_EXACT_RESULT\n${"y".repeat(68_000)}`);
+      const rawBefore = JSON.stringify(session.getMessages());
+      const summaryViews: string[] = [];
+      const summaryCacheModes: CompletionParams["cacheRetention"][] = [];
+      let mainView = "";
+      let mainCacheMode: CompletionParams["cacheRetention"];
+      let checkpointThrough: number | undefined;
+      const provider: LLMProvider = {
+        id: "mock", name: "Mock",
+        async complete() { throw new Error("streaming expected"); },
+        async *stream(params) {
+          if (params.systemPrompt?.startsWith("You are a context compaction engine.")) {
+            expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+            summaryViews.push(JSON.stringify(params.messages));
+            summaryCacheModes.push(params.cacheRetention);
+            const initial = summaryViews.length === 1;
+            if (!initial && retryOutcome === "cancelled") {
+              yield { type: "text_delta", text: "RETRY_SUMMARY" };
+              controller.abort();
+              return;
+            }
+            yield* streamCompletionResult({
+              content: [{ type: "text", text: initial ? "INITIAL_PARTIAL" : "RETRY_SUMMARY" }],
+              stopReason: !initial && retryOutcome === "end_turn" ? "end_turn" : "max_tokens",
+              usage: { inputTokens: initial ? 11 : 7, outputTokens: initial ? 5 : 3, totalTokens: initial ? 16 : 10 },
+              model: "mock-model",
+            });
+          } else {
+            mainView = JSON.stringify(params.messages);
+            mainCacheMode = params.cacheRetention;
+            checkpointThrough = session.getSerializedContextState()?.activeTurn?.checkpointThroughMessageIndex;
+            yield* streamCompletionResult({
+              content: [{ type: "text", text: "done" }],
+              stopReason: "end_turn",
+              usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+              model: "mock-model",
+            });
+          }
+        },
+        async validateAuth() { return true; },
+      };
+      const registry = new ProviderRegistry();
+      registry.registerFactory("mock", () => provider);
+      const config = createConfig({
+        agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+        models: { catalog: { "mock-model": {
+          provider: "mock", model: "mock-model", contextWindow: 110_000, maxOutputTokens: 8_192,
+        } } },
+      });
+      const runner = new AgentRunner({ config, providers: registry, session, disableTools: true });
+      const events: AgentRunEvent[] = [];
+      for await (const event of runner.runStream({
+        message: "Compare all results", resumeActiveTurn: true, signal: controller.signal, cacheRetention: "long",
+      })) {
+        events.push(event);
+      }
+
+      expect(summaryViews).toHaveLength(2);
+      expect(summaryCacheModes).toEqual(["none", "none"]);
+      const [first, retry] = summaryViews;
+      const completed = retryOutcome === "end_turn";
+      for (let index = 0; index < groupCount; index++) {
+        for (const marker of [`FIRST_${index}`, `TAIL_${index}`]) {
+          expect(first).toContain(marker);
+          expect(retry.includes(marker)).toBe(index < 4);
+          expect(mainView.includes(marker)).toBe(retryOutcome !== "cancelled" && (!completed || index >= 4));
+        }
+      }
+      expect(first).not.toContain("LATEST_EXACT_RESULT");
+      expect(retry).not.toContain("LATEST_EXACT_RESULT");
+      if (retryOutcome === "cancelled") {
+        expect(mainView).toBe("");
+        expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+      } else {
+        expect(mainView).toContain("LATEST_EXACT_RESULT");
+        expect(mainCacheMode).toBe("long");
+      }
+      // The user message precedes four complete groups of one call row and two result rows.
+      expect(checkpointThrough).toBe(completed ? 12 : undefined);
+      expect(mainView).not.toContain("INITIAL_PARTIAL");
+      expect(mainView.includes("RETRY_SUMMARY")).toBe(completed);
+      expect(events.filter(e => e.type === "compaction")).toEqual(completed ? [
+        expect.objectContaining({ usage: expect.objectContaining({
+          inputTokens: 18, outputTokens: 8, totalTokens: 26,
+        }) }),
+      ] : []);
+      expect(events.filter(e => e.type === "context_status"
+        && e.phase === "active_process_compaction_failed")).toHaveLength(retryOutcome === "max_tokens" ? 1 : 0);
+    },
+  );
 
   it("checkpoints oversized active-turn tool process before the next model call", async () => {
     let completeCalls = 0;
@@ -7735,6 +7863,50 @@ describe("AgentRunner", () => {
     expect(result.text).toBe("completed available batch items");
     expect(result.meta.convergenceSignals ?? []).not.toContain("no_progress_nudge");
     expect(result.meta.convergenceSignals ?? []).not.toContain("no_progress_stop");
+  });
+
+  it("advises once on repeated browser observations and keeps the run executing", async () => {
+    const requests: CompletionParams[] = [];
+    const rounds = 9;
+    const provider = createMockProvider([
+      ...Array.from({ length: rounds }, (_, index): CompletionResult => ({
+        content: [{ type: "tool_use", id: `browser-${index}`, name: "inner_browser", input: { operation: "observe" } }],
+        stopReason: "tool_use", usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, model: "mock-model",
+      })),
+      {
+        content: [{ type: "text", text: "finished checking the page" }],
+        stopReason: "end_turn", usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, model: "mock-model",
+      },
+    ], params => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    let observed = 0;
+    const tool = defineTool({
+      name: "inner_browser", description: "Observe the task page", inputSchema: { type: "object" },
+      async execute() {
+        const index = observed++;
+        return {
+          content: JSON.stringify({ page_id: `new-page-id-${index}`, text: "Status: waiting" }),
+          observations: {
+            browserObservation: index === 2 ? "reset" : { target: "private-target", fingerprint: "private-fingerprint" },
+          },
+        };
+      },
+    });
+    const runner = new AgentRunner({
+      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 30 } }),
+      providers: registry, tools: [tool],
+    });
+    const result = await runner.run({ message: "Check the application status" });
+    expect(observed).toBe(rounds);
+    expect(result.text).toBe("finished checking the page");
+    expect(result.meta.termination).toBeUndefined();
+    expect(result.meta.convergenceSignals).toContain("no_progress_nudge");
+    expect(result.meta.convergenceSignals).not.toContain("no_progress_stop");
+    expect(requests.map((request, index) => ({ request: JSON.stringify(request), index }))
+      .filter(({ request }) => request.includes("Since the last observed progress"))
+      .map(({ index }) => index)).toEqual([6]);
+    expect(JSON.stringify(requests)).not.toMatch(/private-target|private-fingerprint/);
   });
 
   it("progress governor: unchanged empty and nonempty files do not manufacture progress", async () => {

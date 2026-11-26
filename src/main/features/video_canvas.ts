@@ -106,6 +106,9 @@ export type VideoCanvasAssetCard = {
   kind: 'image' | 'video';
   label: string;
   media_path: string;
+  /** A stock file's source and author, with its page when that is on the provider's own site,
+   *  and its licence when the licence asks for credit. */
+  credit?: { source: string; author?: string; license?: string; url?: string };
 };
 
 /** What a generation call asked for, where it said. */
@@ -446,7 +449,7 @@ function sanitizeDraft(value: unknown): VideoCanvasStoredDraft | null {
 }
 
 function isDraftSeconds(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_DRAFT_SECONDS;
+  return value === -1 || (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= MAX_DRAFT_SECONDS);
 }
 
 /** A scene as it was taken out, with where it stood: after the scene it followed (null for the
@@ -697,11 +700,36 @@ function narrationLanguage(manifest: VideoManifestV3, rowOf: ReadonlyMap<string,
   return manifest.canvas.language ?? '';
 }
 
+/** Stock providers as the user knows them, and the sites their pages live on. Pexels is no longer
+ *  searched; files imported from it before keep their credit. */
+const STOCK_SOURCES = {
+  pexels: { name: 'Pexels', pages: ['www.pexels.com', 'pexels.com'] },
+  pixabay: { name: 'Pixabay', pages: ['pixabay.com'] },
+  wikimedia: { name: 'Wikimedia Commons', pages: ['commons.wikimedia.org'] },
+  nasa: { name: 'NASA', pages: ['images.nasa.gov'] },
+} as const;
+
+/** The ledger can be edited by hand, so a page is linked only when it is the provider's own. */
+function stockCredit(row: VideoAssetRecord): VideoCanvasAssetCard['credit'] {
+  if (row.origin !== 'stock' || !row.source) return undefined;
+  const known = STOCK_SOURCES[row.source.provider];
+  const author = row.source.author?.trim().slice(0, 120);
+  let url: string | undefined;
+  try {
+    const page = new URL(row.source.page_url ?? '');
+    if (page.protocol === 'https:' && !page.username && !page.password && !page.port
+      && (known.pages as readonly string[]).includes(page.hostname.toLowerCase())) url = page.href;
+  } catch { /* no page */ }
+  const license = row.source.credit ? row.source.license.trim().slice(0, 80) : '';
+  return { source: known.name, ...(author ? { author } : {}), ...(license ? { license } : {}), ...(url ? { url } : {}) };
+}
+
 function buildAssetCards(productionAbs: string, ledger: readonly VideoAssetRecord[]): VideoCanvasAssetCard[] {
   return ledger.flatMap((row) => {
     if (row.origin === 'generated' || row.kind === 'audio') return [];
     const mediaPath = fileInProduction(productionAbs, row.path);
-    return mediaPath ? [{ key: cardOfAsset(row), id: row.id, kind: row.kind, label: row.label, media_path: mediaPath }] : [];
+    const credit = stockCredit(row);
+    return mediaPath ? [{ key: cardOfAsset(row), id: row.id, kind: row.kind, label: row.label, media_path: mediaPath, ...(credit ? { credit } : {}) }] : [];
   });
 }
 
@@ -1204,12 +1232,12 @@ export async function pictureShape(fileAbs: string): Promise<{ width: number; he
  * (decided 2026-11-11). Nothing on record counts as unchanged, as for an upgraded video, since the
  * first change notes the timeline before it.
  */
-export async function videoUpToDate(productionAbs: string, videoId: string): Promise<boolean> {
+export async function videoUpToDate(productionAbs: string, videoId: string, allowedRoots: readonly string[] = [productionAbs]): Promise<boolean> {
   const videoDirAbs = videoDirIn(productionAbs, videoId);
   const manifest = videoDirAbs ? await readManifest(videoDirAbs) : null;
   if (!videoDirAbs || !manifest) return false;
   if (!(await readVersions(productionAbs)).some((version) => version.video_id === manifest.id)) return false;
-  return !await timelineAheadOfDelivery({ productionDirAbs: productionAbs, videoDirAbs });
+  return !await timelineAheadOfDelivery({ productionDirAbs: productionAbs, videoDirAbs }, allowedRoots);
 }
 
 /** The new shot was made: its card gives way to the shot's, in the same place. */

@@ -81,6 +81,19 @@ describe("repository instructions", () => {
       .toBeLessThanOrEqual(REPOSITORY_INSTRUCTION_MAX_FILE_BYTES);
   });
 
+  it("reports a completed check with no rules in scope while leaving deeper rules discoverable", async () => {
+    const root = tempRepository();
+    const deeper = path.join(root, "out");
+    fs.mkdirSync(deeper);
+    fs.writeFileSync(path.join(deeper, "AGENTS.md"), "Output directory rule");
+
+    const rendered = repositoryInstructionsText(await discoverRepositoryInstructions(root));
+    expect(rendered).toMatch(/no applicable AGENTS\.md instructions/i);
+    expect(rendered).toContain("Before modifying files in a deeper or other authorized directory");
+    expect(rendered).not.toContain("Output directory rule");
+    expect(repositoryInstructionsText(await discoverRepositoryInstructions(deeper))).toContain("Output directory rule");
+  });
+
   it("reuses unchanged bodies but sees edited, newly created, and deleted ancestor rules", async () => {
     const root = tempRepository();
     const nested = path.join(root, "src");
@@ -150,6 +163,7 @@ describe("repository instructions", () => {
     expect(unavailable?.files).toEqual([]);
     expect(unavailable?.discoveryTruncated).toBe(true);
     expect(repositoryInstructionsText(unavailable)).toContain("Read missing or truncated applicable instructions");
+    expect(repositoryInstructionsText(unavailable)).not.toMatch(/no applicable AGENTS\.md instructions/i);
     stat.mockRestore();
     const open = vi.spyOn(fsp, "open").mockRejectedValueOnce(Object.assign(new Error("read fixture"), { code: "EIO" }));
     expect((await discoverRepositoryInstructions(root, session))?.files).toEqual([]);

@@ -4,7 +4,8 @@ import * as path from 'node:path';
 import { expect, test } from './fixtures/orkas';
 
 // A console exposes its report in ordinary cells and commits component state,
-// not the DOM input value. HTTP receipts independently establish what it saved.
+// not the DOM input value. HTTP receipts and a reload independently establish
+// what was saved and what was only filled (P20261121-194).
 test('task browser reads a console report and submits the accepted field value', async ({ orkas }) => {
   const submissions: string[] = [];
   let completeDownload: (() => void) | undefined;
@@ -39,7 +40,8 @@ test('task browser reads a console report and submits the accepted field value',
       <p role="status" id="receipt"></p>
       <script>
         const field = document.getElementById('address');
-        let state = 'initial';
+        let state = decodeURIComponent(${JSON.stringify(encodeURIComponent(submissions.at(-1) ?? 'initial'))});
+        field.value = state;
         field.addEventListener('focus', () => { field.value = state; });
         field.addEventListener('input', event => {
           if (event instanceof InputEvent) state = field.value;
@@ -96,6 +98,18 @@ test('task browser reads a console report and submits the accepted field value',
       const entry = observed.elements.find((entry: any) => entry.label === label);
       return call({ operation: 'act', page_id: observed.page_id, element_ref: entry.ref, page_action: 'fill', text });
     };
+    const readAddress = async () => {
+      const page = await call({ operation: 'observe' });
+      const field = page.elements.find((entry: any) => entry.label === 'Inspect address');
+      return call({ operation: 'read_value', page_id: page.page_id, element_ref: field.ref });
+    };
+    expect(await fill('Unsubmitted first draft')).toMatchObject({ ok: true });
+    expect(await readAddress()).toMatchObject({ ok: true, value: 'Unsubmitted first draft' });
+    expect(submissions).toEqual([]);
+    expect(await call({ operation: 'navigate', navigation: 'reload' })).toMatchObject({ ok: true });
+    expect(await call({ operation: 'wait' })).toMatchObject({ ok: true });
+    expect(await readAddress()).toMatchObject({ ok: true, value: 'initial' });
+
     for (const text of ['https://orkas.ai/blog/cloud-sync/', '日本語 & second', '']) {
       expect(await fill(text)).toMatchObject({ ok: true });
       observed = await call({ operation: 'observe' });
@@ -105,6 +119,11 @@ test('task browser reads a console report and submits the accepted field value',
     }
     expect(await fill('must-not-change', 'Readonly field')).toMatchObject({ ok: false, code: 'element_readonly' });
     expect(await fill('must-not-claim-success', 'Rejected field')).toMatchObject({ ok: false, code: 'fill_rejected' });
+    expect(submissions).toEqual(['https://orkas.ai/blog/cloud-sync/', '日本語 & second', '']);
+    expect(await fill('Unsubmitted replacement')).toMatchObject({ ok: true });
+    expect(await call({ operation: 'navigate', navigation: 'reload' })).toMatchObject({ ok: true });
+    expect(await call({ operation: 'wait' })).toMatchObject({ ok: true });
+    expect(await readAddress()).toMatchObject({ ok: true, value: '' });
     expect(submissions).toEqual(['https://orkas.ai/blog/cloud-sync/', '日本語 & second', '']);
     observed = await call({ operation: 'observe' });
     const download = observed.elements.find((entry: any) => entry.label === 'Download report');

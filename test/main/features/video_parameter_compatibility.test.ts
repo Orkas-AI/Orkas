@@ -66,6 +66,17 @@ describe('desired video output versus native provider settings', () => {
     expect(fitVideoParameters({ resolution: asked }, provider, model).resolution).toBe(resolution);
   });
 
+  // The VideoStudio canvas fits its settings with this same rule (review S4-6, 2026-11-18).
+  it('takes the lowest resolution offered not below one between tiers, and rounds a length up to a whole second', () => {
+    expect(fitVideoParameters({ resolution: '540p' }, 'doubao', 'doubao-seedance-2-0-fast-260128').resolution).toBe('720p');
+    expect(fitVideoParameters({ resolution: '540p' }, 'minimax', 'MiniMax-H3-Lite').resolution).toBe('768p');
+    expect(fitVideoParameters({ resolution: '360p' }, 'minimax', 'MiniMax-H3-Highspeed').resolution).toBe('480p');
+    expect(fitVideoParameters({ resolution: '540P' }, 'vidu', 'viduq3-turbo').resolution).toBe('540p');
+    expect(fitVideoParameters({ duration: 8.4 }, 'doubao', 'doubao-seedance-2-0-260128').duration).toBe(9);
+    expect(fitVideoParameters({ duration: 4.2 }, 'google-cloud', 'veo-3.1-fast-generate-001').duration).toBe(6);
+    expect(fitVideoParameters({ duration: 1 }, 'runway', 'gen4.5').duration).toBe(2);
+  });
+
   it.each([
     ['doubao', 'doubao-seedance-2-5-260628'], ['minimax', 'MiniMax-H3'], ['vidu', 'viduq3-pro'],
   ])('keeps the first frame native on %s/%s and leaves the desired canvas to local conversion', (provider, model) => {

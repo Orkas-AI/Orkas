@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentRunner, ProviderRegistry, createConfig, defineTool } from '#core-agent';
-import type { LLMProvider, CompletionParams, StreamEvent } from '#core-agent';
+import type { LLMProvider, CompletionParams, StreamEvent, Usage } from '#core-agent';
 import { withTaskBudget } from '../../../../src/main/model/core-agent/task-budget-provider';
 import { createRotatingProvider } from '../../../../src/main/model/core-agent/rotating-provider';
 import { taskTokens, resetTaskTokens } from '../../../../src/main/util/conversation-cost-meter';
@@ -15,12 +15,12 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   for await (const event of stream) events.push(event);
   return events;
 }
-function provider(events?: StreamEvent[]): LLMProvider {
+function provider(events?: StreamEvent[], reportedUsage: Usage = usage): LLMProvider {
   return {
     id: 'fixture', name: 'Fixture', validateAuth: async () => true,
-    complete: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'done' }], model: 'fixture', stopReason: 'end_turn' as const, usage })),
+    complete: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'done' }], model: 'fixture', stopReason: 'end_turn' as const, usage: reportedUsage })),
     stream: vi.fn(async function* () {
-      yield* events ?? [{ type: 'text_delta', text: 'done' }, { type: 'message_end', stopReason: 'end_turn', model: 'fixture', usage }];
+      yield* events ?? [{ type: 'text_delta', text: 'done' }, { type: 'message_end', stopReason: 'end_turn', model: 'fixture', usage: reportedUsage }];
     }),
   };
 }
@@ -28,7 +28,7 @@ beforeEach(() => { vi.stubEnv('ORKAS_MAX_TASK_TOKENS', '500'); resetTaskTokens(c
 afterEach(() => { vi.unstubAllEnvs(); resetTaskTokens(cid); resetTaskTokens('other'); });
 
 describe('per-request task token backstop', () => {
-  it('counts only input/output once, blocks the next request and permits a fresh user allowance', async () => {
+  it('excludes cache reads, blocks the next request and permits a fresh user allowance', async () => {
     const raw = provider();
     const guarded = withTaskBudget(raw, cid);
     expect(await collect(guarded.stream(request))).toHaveLength(2);
@@ -44,15 +44,31 @@ describe('per-request task token backstop', () => {
     expect(taskTokens('other')).toBe(500);
   });
 
+  it.each(['complete', 'stream'] as const)('blocks the next request after cache writes reach the limit in %s', async (kind) => {
+    const raw = provider(undefined, {
+      inputTokens: 20, outputTokens: 10, cacheWriteTokens: 470, cacheReadTokens: 900, totalTokens: 1400,
+    });
+    const guarded = withTaskBudget(raw, cid);
+    const call = () => kind === 'complete' ? guarded.complete(request) : collect(guarded.stream(request));
+
+    await call();
+    expect(taskTokens(cid)).toBe(500);
+    await expect(call()).rejects.toMatchObject({ code: 'TASK_TOKEN_LIMIT_REACHED' });
+    expect(raw[kind]).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the final usage snapshot even if a stream fails after reporting it', async () => {
     const raw = provider();
+    const observed = vi.fn();
     raw.stream = async function* () {
-      yield { type: 'message_end', model: 'fixture', stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } };
-      yield { type: 'message_end', model: 'fixture', stopReason: 'end_turn', usage: { inputTokens: 200, outputTokens: 30, totalTokens: 230 } };
+      yield { type: 'message_end', model: 'fixture', stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20, cacheWriteTokens: 300, totalTokens: 420 } };
+      yield { type: 'message_end', model: 'fixture', stopReason: 'end_turn', usage: { inputTokens: 200, outputTokens: 30, cacheWriteTokens: 400, cacheReadTokens: 800, totalTokens: 1430 } };
       throw new Error('fixture disconnect');
     };
-    await expect(collect(withTaskBudget(raw, cid).stream(request))).rejects.toThrow('fixture disconnect');
-    expect(taskTokens(cid)).toBe(230);
+    await expect(collect(withTaskBudget(raw, cid, observed).stream(request))).rejects.toThrow('fixture disconnect');
+    expect(taskTokens(cid)).toBe(630);
+    expect(observed.mock.calls).toEqual([[{ inputTokens: 200, outputTokens: 30, cacheWriteTokens: 400,
+      cacheReadTokens: 800, totalTokens: 1430 }]]);
   });
 
   it('allows both already-issued parallel calls to settle and refuses later work', async () => {

@@ -90,6 +90,12 @@ export interface LocalCliCapabilities {
   permissionPolicies: readonly LocalCliPermissionPolicy[];
 }
 
+const expandedCodingCli = {
+  resume: 'native', instructionChannel: 'user-message', durableInstructionScope: 'session',
+  codingProjectDirectory: true, orkasBridge: true, agentMemory: false, activeRunIngress: 'none',
+  progressEvents: true, permissionPolicies: ['inherit'],
+} as const satisfies LocalCliCapabilities;
+
 /** Canonical CLI inventory and context/session contract. */
 export const LOCAL_CLI_CAPABILITIES = {
   claude: {
@@ -150,6 +156,13 @@ export const LOCAL_CLI_CAPABILITIES = {
     progressEvents: true,
     permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
+  kimi: expandedCodingCli,
+  dsh: expandedCodingCli,
+  traecli: expandedCodingCli,
+  zcode: expandedCodingCli,
+  copilot: expandedCodingCli,
+  cursor: expandedCodingCli,
+  antigravity: expandedCodingCli,
 } as const satisfies Record<string, LocalCliCapabilities>;
 
 export type LocalCliType = keyof typeof LOCAL_CLI_CAPABILITIES;
@@ -219,6 +232,8 @@ const BIN_NAMES: Record<LocalCliType, string> = {
   openclaw: 'openclaw',
   opencode: 'opencode',
   hermes: 'hermes',
+  kimi: 'kimi', dsh: 'dsh', traecli: 'traecli', zcode: 'zcode',
+  copilot: 'copilot', cursor: 'cursor-agent', antigravity: 'agy',
 };
 
 /** Env var to override default binary path per CLI. */
@@ -228,10 +243,13 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   openclaw: 'ORKAS_OPENCLAW_PATH',
   opencode: 'ORKAS_OPENCODE_PATH',
   hermes: 'ORKAS_HERMES_PATH',
+  kimi: 'ORKAS_KIMI_PATH', dsh: 'ORKAS_DSH_PATH', traecli: 'ORKAS_TRAECLI_PATH',
+  zcode: 'ORKAS_ZCODE_PATH', copilot: 'ORKAS_COPILOT_PATH',
+  cursor: 'ORKAS_CURSOR_PATH', antigravity: 'ORKAS_ANTIGRAVITY_PATH',
 };
 
 /** Documented version probes for each CLI, in compatibility order. */
-const VERSION_PROBES: Record<LocalCliType, readonly (readonly string[])[]> = {
+const VERSION_PROBES: Partial<Record<LocalCliType, readonly (readonly string[])[]>> = {
   claude: [['--version']],
   codex: [['--version']],
   openclaw: [['--version']],
@@ -240,6 +258,7 @@ const VERSION_PROBES: Record<LocalCliType, readonly (readonly string[])[]> = {
   // subcommand, then tolerate installations that expose only the flag.
   hermes: [['version'], ['--version']],
 };
+const DEFAULT_VERSION_PROBES = [['--version']] as const;
 
 // Version commands are normally quick, but bundled CLIs can take several
 // seconds on their first cold start (for example while macOS verifies the
@@ -641,7 +660,7 @@ export async function detectOne(
   // The npm @openai/codex wrapper can hang on `--version` in GUI-launched
   // environments. Prefer its package.json version when available; fall back to
   // the normal subprocess probe for standalone/non-npm installs.
-  const versionProbes = VERSION_PROBES[type];
+  const versionProbes = VERSION_PROBES[type] || DEFAULT_VERSION_PROBES;
   let versionResult: VersionProbeResult | null = null;
   let version = type === 'codex' ? await detectCodexPackageVersion(resolved) : null;
   if (!version) {
@@ -807,7 +826,7 @@ async function detectPreferredCandidates(
     path: candidate,
     result: await detectPreferredVersionResult(
       candidate,
-      VERSION_PROBES[type],
+      VERSION_PROBES[type] || DEFAULT_VERSION_PROBES,
       detectVersionResult,
       timeoutMs,
     ),

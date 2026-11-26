@@ -19,7 +19,7 @@ Do not read unrelated references. A simple bound edit normally needs only `llm-a
 
 ## Non-negotiable protocol
 
-- **Mutation only via the inline container.** Never use `edit_file`, `write_file`, or `bash` to change `agent.json`. Never dump the container into a workspace file.
+- **Mutation only via the inline container.** Do not change `agent.json` directly with file tools, shell commands, or scripts. Never dump the container into a workspace file.
 - **No container, no mutation, no success claim.** Without a valid container, describe the result only as a proposal, clarification, or blocker; never say the Agent is ready, created, updated, installed, or available. A valid container only requests a mutation; only the host result proves it was applied. Until then, use pending wording such as “将创建” or “已提交，等待应用”.
 - **One container per Agent.** Multiple containers are legal only when the user asked to create or edit multiple distinct Agents, and the number of valid containers must equal the number of Agents you claim to have created. End the turn after emitting them; do not dispatch the Agent.
 - **Validate every container independently before sending.** Read its tags in order: every opening tag must have the exact matching closing tag, with no crossed, missing, or reused closer. For a multi-Agent reply, repeat this structural check for each container rather than copying an unchecked suffix.

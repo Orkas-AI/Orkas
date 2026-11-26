@@ -1,4 +1,5 @@
 import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
+import { parameterErrorContent } from '../../../../bin/tool-parameter-errors.cjs';
 /**
  * Local-machine tool wrappers injected into every AgentRunner built by
  * this app.
@@ -64,6 +65,7 @@ import type {
   ToolResult,
 } from '#core-agent';
 import {
+  commitExistingTextReplacement,
   createApplyPatchTool as createCoreApplyPatchTool,
   type ApplyPatchCommittedFile,
 } from '../../../core-agent/src/tools/apply-patch';
@@ -97,16 +99,16 @@ import {
   localAccessAllowsOutsideWorkspace,
   localAccessRequiresSensitiveApproval,
 } from '../../features/permissions';
-import { classifyConfiguredBashCommand, locationOnlyRead, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
+import { classifyConfiguredBashCommand, localAccessHasCustomPathPatterns, locationOnlyRead, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
 import { classifyBashCommand, hasDestructiveBashRedirection } from './bash-risk';
 import { ordinaryBashReasons } from './ordinary-shell-operations';
-import { CreationSnapshot, TaskFileOwnership } from './task-file-ownership';
+import { producedFileVersion, readProducedFileVersion, TaskFileOwnership } from './task-file-ownership';
 import {
   classifyExternalMutationScript,
   referencedExecutableScripts,
   type ExternalMutationFinding,
 } from './external-mutation-risk';
-import { requestBashDecision, type BashPermissionFact } from './bash-permissions';
+import { requestBashDecision, type BashPathAnalysisGap, type BashPermissionFact } from './bash-permissions';
 import { librarySaveFieldError } from '../../util/library-save-input';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPathForWrite, renderRenameSignal } from '../../util/uniquify-path';
@@ -137,6 +139,11 @@ import {
   type HtmlPreviewViewport,
 } from '../../features/html_preview';
 import { prepareLosslessModelImage } from '../../features/image_assets';
+import {
+  isLayeredFileVersion, layeredFileIdentity, LAYERED_CANDIDATE_KIND, type LayeredFileVersion,
+  partitionImageStudioLayeredOutputs, registerImageStudioLayeredCandidates,
+} from '../../features/image_studio_delivery';
+import { IMAGE_STUDIO_AGENT_ID } from './tool-catalog';
 import {
   cancelConfirmation as cancelDeleteConfirmation,
   consumeGrantedConfirmation,
@@ -255,9 +262,12 @@ export interface LocalToolsOpts {
    * deliverables can leave the user's own files byte-identical. Producers
    * that always create their output omit it. */
   onFileWritten?: (absPath: string, info?: ProducedFileWriteInfo) => void | Promise<void>;
+  /** Reports a shell output candidate without attributing a write to this runner. */
+  onShellFileObserved?: (absPath: string, version: string) => void | Promise<void>;
   /** Filters and records the complete list declared through
    * `publish_outputs`; returns only paths eligible for resource display. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  imageStudioNativePngDelivery?: import('../../features/image_studio_delivery').ImageStudioNativePngDelivery;
   /** Fires after a successful `create_artifact` call. The caller (group_chat
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
@@ -268,8 +278,7 @@ export interface LocalToolsOpts {
   /** Predicate: returns true when the given absolute path was already
    *  written by this caller in the current scope (typically: a Set
    *  populated by `onFileWritten` this turn). When true, wrapped output
-   *  tools overwrite in place — the refinement pattern — and the shared bash
-   *  gate may delete that exact file without a generic destructive prompt.
+   *  tools may overwrite in place — the refinement pattern.
    *  When false / absent, an existing output target is treated as a foreign
    *  collision and uniquify (`-2 / -3 / ...`) kicks in. `edit_file` ignores
    *  it because its semantics is explicitly to modify an existing file. */
@@ -371,13 +380,14 @@ const BASH_SNAPSHOT_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
 type BashFileSnapshotEntry = {
   mtimeMs: number;
   size: number;
+  version?: string;
   hash?: string;
   content?: string;
   binary: boolean;
 };
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
-const creationSnapshots = new WeakMap<BashFileSnapshot, CreationSnapshot>();
 const taskFileOwnership = new WeakMap<LocalToolsOpts, TaskFileOwnership>();
+const shellPreviewCandidates = new WeakMap<LocalToolsOpts, Map<string, string>>();
 
 function shouldSkipBashProducedDir(name: string): boolean {
   return BASH_PRODUCED_SKIP_DIRS.has(name);
@@ -387,10 +397,8 @@ function shouldSkipBashProducedFile(name: string): boolean {
   return BASH_PRODUCED_SKIP_FILES.has(name) || name.startsWith(`${BASH_OUTPUT_MANIFEST_NAME}-`);
 }
 
-function collectBashFileSnapshot(root: string, owner?: symbol): BashFileSnapshot {
+function collectBashFileSnapshot(root: string): BashFileSnapshot {
   const out: BashFileSnapshot = new Map();
-  const creation = new CreationSnapshot(owner);
-  creationSnapshots.set(out, creation);
   const absRoot = path.resolve(root);
   let captureBytesRemaining = BASH_SNAPSHOT_TOTAL_MAX_BYTES;
   const visit = (dir: string) => {
@@ -398,7 +406,6 @@ function collectBashFileSnapshot(root: string, owner?: symbol): BashFileSnapshot
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
     catch { return; }
-    creation.directory(dir, entries);
     for (const ent of entries) {
       if (out.size >= BASH_PRODUCED_SCAN_LIMIT) return;
       const name = ent.name;
@@ -412,7 +419,6 @@ function collectBashFileSnapshot(root: string, owner?: symbol): BashFileSnapshot
       try { st = fs.lstatSync(abs); }
       catch { continue; }
       if (!st.isFile()) continue;
-      creation.node(abs, st);
       let hash: string | undefined;
       let content: string | undefined;
       let binary = kindOf(abs) !== 'text';
@@ -431,6 +437,7 @@ function collectBashFileSnapshot(root: string, owner?: symbol): BashFileSnapshot
       out.set(path.resolve(abs), {
         mtimeMs: st.mtimeMs,
         size: st.size,
+        version: producedFileVersion(st),
         ...(hash ? { hash } : {}),
         ...(content !== undefined ? { content } : {}),
         binary,
@@ -712,12 +719,7 @@ async function emitBashProducedFiles(
   command: string,
   manifestedPaths: readonly string[] = [],
 ): Promise<FileChangeObservation[]> {
-  const after = collectBashFileSnapshot(root, taskFileOwnership.get(opts)?.token);
-  const beforeCreation = creationSnapshots.get(before);
-  const afterCreation = creationSnapshots.get(after);
-  if (beforeCreation && afterCreation && beforeCreation.owner === afterCreation.owner) {
-    taskFileOwnership.get(opts)?.observe(beforeCreation, afterCreation);
-  }
+  const after = collectBashFileSnapshot(root);
   const isExternalDownload = _buildExternalDownloadSkipper(command, root);
   const discovered = new Set<string>(manifestedPaths);
   for (const [abs, next] of after) {
@@ -727,19 +729,20 @@ async function emitBashProducedFiles(
       prev
       && prev.mtimeMs === next.mtimeMs
       && prev.size === next.size
+      && prev.version === next.version
       && !capturedChanged
     ) continue;
     if (isExternalDownload(abs)) continue;
     discovered.add(abs);
   }
-  if (opts.onFileWritten) {
-    for (const abs of discovered) {
-      // The pre-command snapshot already answers "was this the user's file?":
-      // a path present in `before` was only modified by the command, not
-      // produced by it.
-      try { await opts.onFileWritten(abs, { preExisting: before.has(abs) }); }
-      catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
-    }
+  const previews = shellPreviewCandidates.get(opts);
+  for (const abs of discovered) {
+    const entry = after.get(abs);
+    const version = entry ? entry.version : readProducedFileVersion(abs);
+    if (version === undefined) continue;
+    if (previews && (previews.has(abs) || previews.size < BASH_PRODUCED_SCAN_LIMIT)) previews.set(abs, version);
+    try { await opts.onShellFileObserved?.(abs, version); }
+    catch (err) { log.warn('shell file observation callback failed', { error: logErrorRef(err) }); }
   }
   const changes: FileChangeObservation[] = [];
   for (const abs of discovered) {
@@ -763,6 +766,7 @@ async function emitBashProducedFiles(
   }
   for (const [abs, prev] of before) {
     if (after.has(abs) || isExternalDownload(abs)) continue;
+    previews?.delete(abs);
     changes.push({
       operation: 'delete',
       sourcePath: abs,
@@ -778,7 +782,7 @@ async function emitBashProducedFiles(
   return changes;
 }
 
-function readBashOutputManifest(manifestPath: string, root: string): string[] {
+function readBashOutputManifest(manifestPath: string, root: string, layeredCandidates?: Map<string, LayeredFileVersion>): string[] {
   let st: fs.Stats;
   try { st = fs.statSync(manifestPath); }
   catch { return []; }
@@ -790,17 +794,30 @@ function readBashOutputManifest(manifestPath: string, root: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const rawLine of body.split(/\r?\n/)) {
-    if (out.length >= BASH_OUTPUT_MANIFEST_MAX_FILES) break;
+    if (out.length + (layeredCandidates?.size ?? 0) >= BASH_OUTPUT_MANIFEST_MAX_FILES) break;
     let declared = rawLine.trim();
     if (!declared) continue;
-    if (declared.startsWith('"')) {
+    if (declared.startsWith('{') && layeredCandidates) {
+      try {
+        const record = JSON.parse(declared) as Partial<{ kind: string; path: string } & LayeredFileVersion>;
+        const candidatePath = record?.path;
+        if (record?.kind !== LAYERED_CANDIDATE_KIND || !isLayeredFileVersion(record)
+          || typeof candidatePath !== 'string' || !/\.(png|psd)$/i.test(candidatePath)
+          || !isPathAllowed(candidatePath, [root])) continue;
+        const written = fs.lstatSync(candidatePath, { throwIfNoEntry: false });
+        if (!written?.isFile() || record.identity !== layeredFileIdentity(written) || record.size !== written.size) continue;
+        const { identity, size, sha256 } = record;
+        layeredCandidates.set(identity, { identity, size, sha256 });
+        declared = candidatePath;
+      } catch { continue; }
+    } else if (declared.startsWith('"')) {
       try {
         const parsed = JSON.parse(declared);
         if (typeof parsed === 'string') declared = parsed;
       } catch { continue; }
     }
     const abs = path.isAbsolute(declared) ? path.normalize(declared) : path.resolve(root, declared);
-    if (!_sameOrInside(root, abs) || seen.has(abs)) continue;
+    if (!_sameOrInside(root, abs) || !isPathAllowed(abs, [root]) || seen.has(abs)) continue;
     try {
       const fileStat = fs.lstatSync(abs);
       if (!fileStat.isFile() || fileStat.isSymbolicLink()) continue;
@@ -889,7 +906,7 @@ function hasUnquotedShellControlSyntax(input: string): boolean {
   return false;
 }
 
-function shellWords(input: string): string[] | null {
+function shellWords(input: string, powerShell: boolean): string[] | null {
   const words: string[] = [];
   let cur = '';
   let quote: "'" | '"' | null = null;
@@ -903,14 +920,14 @@ function shellWords(input: string): string[] | null {
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
-    if (quote === "'") {
-      if (ch === "'") quote = null;
-      else { cur += ch; hasCur = true; }
-      continue;
-    }
-    if (quote === '"') {
-      if (ch === '"') { quote = null; continue; }
-      if (ch === '\\' && i + 1 < input.length) {
+    if (quote) {
+      if (ch === quote) {
+        // Leave doubled quotes and concatenated parts to the native shell.
+        if (powerShell && i + 1 < input.length && !/\s/.test(input[i + 1])) return null;
+        quote = null;
+        continue;
+      }
+      if (!powerShell && quote === '"' && ch === '\\' && i + 1 < input.length) {
         cur += input[++i];
       } else {
         cur += ch;
@@ -919,11 +936,12 @@ function shellWords(input: string): string[] | null {
       continue;
     }
     if (ch === "'" || ch === '"') {
+      if (powerShell && hasCur) return null;
       quote = ch;
       hasCur = true;
       continue;
     }
-    if (ch === '\\' && i + 1 < input.length) {
+    if (!powerShell && ch === '\\' && i + 1 < input.length) {
       cur += input[++i];
       hasCur = true;
       continue;
@@ -989,6 +1007,7 @@ function sameResolvedPath(a: string, b: string): boolean {
 function parseOrkasCliInvocation(
   input: Record<string, unknown>,
   ctx: ToolContext,
+  platform: NodeJS.Platform,
 ): OrkasCliInvocation | null {
   if (input.run_in_background === true) return null;
   const rawCommand = String(input.command ?? '');
@@ -997,8 +1016,17 @@ function parseOrkasCliInvocation(
   // Orkas CLI invocations are executed directly by the host, so accept that
   // prefix and keep the same cross-platform fast/safe path.
   const command = (heredoc?.command ?? rawCommand).replace(/^\s*&\s+/, '');
-  if (hasUnquotedShellControlSyntax(command)) return null;
-  const words = shellWords(command);
+  const powerShell = platform === 'win32'
+    && resolveShellTarget(defaultShellForPlatform(platform), rawCommand, platform).kind === 'powershell';
+  if (powerShell) {
+    // The direct form also accepts the portable placeholders used in Skills.
+    const syntax = replaceKnownShellEnvTokens(command, { ORKAS_NODE: 'orkas-node', ORKAS_PC_DIR: 'orkas-pc' });
+    const lexical = scanPowerShell(syntax);
+    if (!lexical.simpleChainSyntax || lexical.operators.length || lexical.surface.includes('&')) return null;
+  } else if (hasUnquotedShellControlSyntax(command)) {
+    return null;
+  }
+  const words = shellWords(command, powerShell);
   if (!words || words.length < 2) return null;
 
   const sandboxEnv = (ctx.state.sandboxEnv ?? {}) as Record<string, string>;
@@ -1441,7 +1469,7 @@ async function executeCoreBashWithOutputTracking(
   }
   const manifestPath = path.join(outputDir, `${BASH_OUTPUT_MANIFEST_NAME}-${crypto.randomUUID()}`);
   try { fs.rmSync(manifestPath, { force: true }); } catch { /* stale cleanup */ }
-  const before = collectBashFileSnapshot(outputDir, taskFileOwnership.get(opts)?.token);
+  const before = collectBashFileSnapshot(outputDir);
   const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(ctx, skillRuntime.binding);
   const restoreEnv = withBashOutputEnv(ctx, outputDir, manifestPath);
   const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
@@ -1449,7 +1477,14 @@ async function executeCoreBashWithOutputTracking(
   let delegatedTerminal = false;
   const finish = async (result: ToolResult): Promise<ToolResult> => {
     try {
-      const manifestedPaths = readBashOutputManifest(manifestPath, outputDir);
+      const layeredCandidates = opts.agentId === IMAGE_STUDIO_AGENT_ID && opts.userId && opts.cid
+        && skillRuntime.binding?.id === 'image-compose'
+        && extractRunSkillRefs(command, 0, opts.hostPlatform ?? process.platform, 'layered_document').length
+        ? new Map<string, LayeredFileVersion>() : undefined;
+      const manifestedPaths = readBashOutputManifest(manifestPath, outputDir, layeredCandidates);
+      if (layeredCandidates?.size && opts.userId && opts.cid) {
+        await registerImageStudioLayeredCandidates(opts.userId, opts.cid, [...layeredCandidates.values()]);
+      }
       const fileChanges = await emitBashProducedFiles(opts, before, outputDir, command, manifestedPaths);
       return translateFixedBashError({ ...result,
         ...(fileChanges.length ? { observations: { ...(result.observations ?? {}),
@@ -1461,7 +1496,7 @@ async function executeCoreBashWithOutputTracking(
     }
   };
   try {
-    const direct = parseOrkasCliInvocation(input, ctx);
+    const direct = parseOrkasCliInvocation(input, ctx, opts.hostPlatform ?? process.platform);
     const macWriteSandboxActive = process.platform === 'darwin'
       && fs.existsSync('/usr/bin/sandbox-exec')
       && Array.isArray(ctx.state.sandboxAllowedDirs)
@@ -1618,19 +1653,24 @@ type BashPathSegment = {
   words: string[];
   rawWords: string[];
   redirectTargets: string[];
+  rawRedirectTargets: string[];
   inputTargets: string[];
+  rawInputTargets: string[];
+  hasRedirection: boolean;
+  hasExpandingHereInput: boolean;
   separatorAfter?: string;
   pathExpressions?: Record<string, string>;
 };
 /** `removesSource` marks an operand the command takes AWAY from where it is
  *  now — an `rm`/`shred`/`Remove-Item` target, or an `mv` source. Those are
  *  deletes as far as the user's file is concerned, whatever verb spelled it. */
-type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; removesSource?: boolean; operatesOnEntry?: boolean; detail?: string };
+type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean; analysisGap?: BashPathAnalysisGap; verifiedTemporary?: boolean; removesSource?: boolean; operatesOnEntry?: boolean; detail?: string };
 type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
 type BashFilesystemGuardResult = {
   result: ToolResult | null;
   approvedReasons: LocalAccessRiskCategory[];
   unresolvedPaths?: boolean;
+  verifiedTemporary?: boolean;
   keyFacts?: BashPermissionFact[];
 };
 
@@ -2051,16 +2091,25 @@ function bashPathSegments(command: string, executionSyntax = false): BashPathSeg
   let words: string[] = [];
   let rawWords: string[] = [];
   let redirectTargets: string[] = [];
+  let rawRedirectTargets: string[] = [];
   let inputTargets: string[] = [];
+  let rawInputTargets: string[] = [];
+  let hasRedirection = false;
+  let hasExpandingHereInput = false;
   let expect: 'out' | 'in' | 'skip' | null = null;
   const push = (separatorAfter?: string) => {
     if (words.length || redirectTargets.length || inputTargets.length) {
-      out.push({ words, rawWords, redirectTargets, inputTargets, ...(separatorAfter ? { separatorAfter } : {}) });
+      out.push({ words, rawWords, redirectTargets, rawRedirectTargets, inputTargets, rawInputTargets,
+        hasRedirection, hasExpandingHereInput, ...(separatorAfter ? { separatorAfter } : {}) });
     }
     words = [];
     rawWords = [];
     redirectTargets = [];
+    rawRedirectTargets = [];
     inputTargets = [];
+    rawInputTargets = [];
+    hasRedirection = false;
+    hasExpandingHereInput = false;
   };
 
   for (const tok of tokenizeBashPathGuard(maskBashHeredocBodies(command), executionSyntax)) {
@@ -2069,10 +2118,14 @@ function bashPathSegments(command: string, executionSyntax = false): BashPathSeg
         push(tok.value);
         expect = null;
       } else if (BASH_OUTPUT_REDIR_OPS.has(tok.value)) {
+        hasRedirection = true;
         expect = 'out';
       } else if (BASH_FILE_INPUT_REDIR_OPS.has(tok.value)) {
+        hasRedirection = true;
         expect = 'in';
       } else if (BASH_NON_FILE_INPUT_REDIR_OPS.has(tok.value)) {
+        hasRedirection = true;
+        hasExpandingHereInput = tok.value === '<<<' || hasExpandingHereInput;
         expect = 'skip';
       } else {
         expect = null;
@@ -2081,15 +2134,18 @@ function bashPathSegments(command: string, executionSyntax = false): BashPathSeg
     }
     if (expect === 'out') {
       redirectTargets.push(tok.value);
+      rawRedirectTargets.push(tok.raw ?? tok.value);
       expect = null;
       continue;
     }
     if (expect === 'in') {
       inputTargets.push(tok.value);
+      rawInputTargets.push(tok.raw ?? tok.value);
       expect = null;
       continue;
     }
     if (expect === 'skip') {
+      hasExpandingHereInput ||= !/^(?:'[^']+'|"[^"]+")$/.test(tok.raw ?? tok.value);
       expect = null;
       continue;
     }
@@ -2111,6 +2167,69 @@ function bashLiteralAssignmentValue(value: string): string | null {
     || /%[A-Za-z_][A-Za-z0-9_]*%/.test(value)
     || /(^|:)~(?:[/\\]|$)/.test(value)) return null;
   return value;
+}
+
+const POSIX_PATH_VALUE_LIMIT = 4096;
+const POSIX_PATH_FRAGMENT = /^[\p{L}\p{N} ._/-]+$/u;
+const POSIX_PATH_VARIABLE = /\$\{([a-z][A-Za-z0-9_]*)\}|\$([a-z][A-Za-z0-9_]*)(?![A-Za-z0-9_])/g;
+const POSIX_COMPOUND_COMMAND_STARTS = new Set(['if', 'for', 'while', 'until', 'case', 'select', 'function', 'time', 'coproc', 'repeat']);
+
+function resolvePosixPathWord(raw: string, values: ReadonlyMap<string, string>): string | null {
+  if (raw.length > POSIX_PATH_VALUE_LIMIT) return null;
+  const doubleQuoted = raw.startsWith('"') && raw.endsWith('"');
+  const singleQuoted = raw.startsWith("'") && raw.endsWith("'");
+  const body = doubleQuoted || singleQuoted ? raw.slice(1, -1) : raw;
+  let complete = true;
+  let length = body.length;
+  const value = singleQuoted ? body : body.replace(POSIX_PATH_VARIABLE, (_token, braced, plain) => {
+    const known = values.get(braced ?? plain);
+    if (known === undefined || (length += known.length - _token.length) > POSIX_PATH_VALUE_LIMIT) complete = false;
+    return complete ? known : '';
+  });
+  if (!complete || value.length > POSIX_PATH_VALUE_LIMIT || !POSIX_PATH_FRAGMENT.test(value)) return null;
+  if (!doubleQuoted && !singleQuoted && value.includes(' ')) return null;
+  return value;
+}
+
+/** Recognize a straight-line prefix of simple path assignments in a fresh
+ * POSIX shell. Keep these values out of the legacy environment expansion:
+ * a single-quoted or escaped dollar, a different case, and a split word do
+ * not refer to the same path. Stop at the first command that can change state. */
+function resolvePosixComposedOperands(segments: BashPathSegment[]): void {
+  const values = new Map<string, string>();
+  const composed = new Map<string, string>();
+  for (let index = 0; index < segments.length && index < 64; index++) {
+    const segment = segments[index];
+    const assignment = segment.rawWords.length === 1 && !segment.hasRedirection
+      && BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter ?? '')
+      && /^([a-z][A-Za-z0-9_]*)=(.+)$/s.exec(segment.rawWords[0]);
+    if (assignment) {
+      const [, name, expression] = assignment;
+      const value = resolvePosixPathWord(expression, values);
+      if (value === null) break;
+      values.set(name, value);
+      if (expression.includes('$')) composed.set(name, value);
+      else composed.delete(name);
+      continue;
+    }
+    const head = segment.rawWords[0];
+    if (!composed.size || segment.hasExpandingHereInput
+      || (head && (!/^[A-Za-z0-9_./-]+$/.test(head) || POSIX_COMPOUND_COMMAND_STARTS.has(head)))) break;
+    const operands = [...segment.rawWords, ...segment.rawRedirectTargets, ...segment.rawInputTargets];
+    if (operands.some(raw => /\$\(|`|\$\{/.test(raw.replace(/\$\{[A-Za-z_][A-Za-z0-9_]*\}/g, '')))) break;
+    const expand = (word: string, raw: string) => {
+      if (!raw.startsWith('"') || !raw.includes('$')) return word;
+      const value = resolvePosixPathWord(raw, composed);
+      return value && !value.startsWith('-') ? value : word;
+    };
+    segments[index] = {
+      ...segment,
+      words: segment.words.map((word, i) => i === 0 ? word : expand(word, segment.rawWords[i])),
+      redirectTargets: segment.redirectTargets.map((word, i) => expand(word, segment.rawRedirectTargets[i])),
+      inputTargets: segment.inputTargets.map((word, i) => expand(word, segment.rawInputTargets[i])),
+    };
+    break;
+  }
 }
 
 /** Resolve only assignments whose value is already a literal in a completed
@@ -2256,11 +2375,16 @@ function bashPathSegmentsWithEnv(
   command: string,
   baseEnv: Record<string, string>,
   hostPlatform: NodeJS.Platform = process.platform,
+  resolveComposedOperands = false,
 ): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
   const env = { ...baseEnv };
   const expressions: Record<string, string> = {};
   const out: Array<{ segment: BashPathSegment; env: Record<string, string> }> = [];
-  for (const segment of bashPathSegments(command)) {
+  const segments = bashPathSegments(command);
+  if (resolveComposedOperands && hostPlatform !== 'win32' && command.includes('$') && !/\\\r?\n/.test(command)) {
+    resolvePosixComposedOperands(segments);
+  }
+  for (const segment of segments) {
     segment.pathExpressions = { ...expressions };
     out.push({ segment, env: { ...env } });
     const assignments = bashPersistentLiteralAssignments(segment, hostPlatform, env);
@@ -2326,12 +2450,22 @@ function bashGuardCommandVariants(
 }
 
 const POSIX_DIRECTORY_CHANGES = new Set(['cd', 'pushd', 'popd']);
+const POSIX_LITERAL_DATA_COMMANDS = new Set(['echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg']);
 const POWERSHELL_DIRECTORY_CHANGES = new Set([
   'cd', 'chdir', 'sl', 'set-location', 'pushd', 'push-location', 'popd', 'pop-location',
 ]);
 // A shell function or alias can make these names go anywhere.
 const POSIX_DIRECTORY_CHANGE_REDEFINITION = /\b(?:cd|pushd|popd)\s*\(\s*\)|\bfunction\s+(?:cd|pushd|popd)\b|\balias\s+(?:cd|pushd|popd)=/;
 const POWERSHELL_DIRECTORY_CHANGE_REDEFINITION = /\b(?:function|filter)\s+(?:global:|script:|local:|private:)?(?:cd|chdir|sl|set-location|pushd|push-location|popd|pop-location)\b|\b(?:set-alias|new-alias|sal|nal)\b/i;
+
+function hasPosixShellStartupOverride(env: Record<string, string>): boolean {
+  return Object.entries(env).some(([key, value]) => (typeof value === 'string' && value.startsWith('() {'))
+    || /^BASH_FUNC_|^(?:ENV|BASH_ENV|SHELLOPTS)$/.test(key));
+}
+
+function isLiteralPosixShellWord(raw: string): boolean {
+  return /^(?:'[^']*'|"[^"$`\\]*"|[A-Za-z0-9_./%+:-]+)$/.test(raw);
+}
 
 /** How one segment moves the location used by later relative paths:
  * undefined when it does not, `target: null` when this walk cannot follow it.
@@ -2407,10 +2541,11 @@ function bashGuardPathSegments(
   baseEnv: Record<string, string>,
   hostPlatform: NodeJS.Platform,
   initialDirectory: string,
+  resolveComposedOperands = false,
 ): Array<{ segment: BashPathSegment; env: Record<string, string>; workingDir: string | null }> {
   return bashGuardCommandVariants(command, baseEnv, hostPlatform).flatMap((variant) => {
     const out: Array<{ segment: BashPathSegment; env: Record<string, string>; workingDir: string | null }> = [];
-    const segments = bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform);
+    const segments = bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform, resolveComposedOperands);
     const conditionalFlow = segments.some(({ segment }) => ['||', '|', '|&', '&'].includes(segment.separatorAfter ?? ''));
     const directoryChangeRedefined = (hostPlatform === 'win32'
       ? POWERSHELL_DIRECTORY_CHANGE_REDEFINITION
@@ -2419,6 +2554,9 @@ function bashGuardPathSegments(
     let skippedDirectories: Array<string | null> = [];
     let exitsOnError = false;
     let changedDirectory = false;
+    let literalDataPrefix = hostPlatform !== 'win32' && POSIX_LITERAL_DATA_COMMANDS.has(segments[0]?.segment.rawWords[0])
+      && variant.command === command && variant.env === baseEnv
+      && !/\\\r?\n/.test(command) && !hasPosixShellStartupOverride(baseEnv);
     for (const { segment, env } of segments) {
       const scopedEnv = { ...env };
       // A cd may succeed or fail on different branches. Do not keep the
@@ -2428,6 +2566,11 @@ function bashGuardPathSegments(
         out.push({ segment, env: scopedEnv, workingDir });
       }
       const [cmd, ...args] = segment.words;
+      // In a fresh shell, plain data commands cannot execute their operands.
+      // Drop this proof after any other construct or a compound separator.
+      const dataOnly = literalDataPrefix && POSIX_LITERAL_DATA_COMMANDS.has(segment.rawWords[0])
+        && !segment.hasRedirection && segment.rawWords.slice(1).every(isLiteralPosixShellWord);
+      literalDataPrefix = dataOnly && BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter ?? '');
       // Only direct, sequential directory changes have these semantics. Keep
       // both outcomes when a failed change can fall through (PowerShell has no
       // `set -e`, and a failed Set-Location leaves the location unchanged).
@@ -2443,7 +2586,7 @@ function bashGuardPathSegments(
       // unknown. 2026-10-07: `(cd <outside> && rm -f y)` deleted outside.
       const grouped = segment.words.some((word) => /^[({]|[)}]$/.test(word));
       const sharedScript = locationSharingScript(segment.words, hostPlatform);
-      const directoryChange = (grouped ? undefined : shellDirectoryChange(segment.words, hostPlatform))
+      const directoryChange = dataOnly ? undefined : (grouped ? undefined : shellDirectoryChange(segment.words, hostPlatform))
         ?? (segment.words.some((word, index) => (grouped || index > 0)
           && shellDirectoryChange([word.replace(/^[({]+|[)}]+$/g, '')], hostPlatform)) ? { target: null } : undefined)
         ?? (sharedScript !== undefined && (sharedScript === null || directories.some((directory) => (
@@ -2887,37 +3030,38 @@ export function expandKnownShellPathVars(raw: string, env: Record<string, string
   };
 }
 
-function resolveBashCandidate(raw: string, workingDir: string | null, env: Record<string, string>): { abs?: string; dynamic?: boolean } | null {
-  const trimmed = String(raw || '').trim();
-  if (!trimmed || trimmed === '-' || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return null;
+function resolveBashCandidate(raw: string, workingDir: string | null, env: Record<string, string>, literal = false):
+  Pick<BashPathCandidate, 'abs' | 'dynamic' | 'analysisGap'> | null {
+  const target = literal ? raw : String(raw || '').trim();
+  if (!target || (!literal && (target === '-' || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(target)))) return null;
+  const expanded = literal ? { value: target, dynamic: false } : expandKnownShellPathVars(target, env);
   // Lexical normalization cannot resolve `link/..`: the OS traverses the
   // link first. Keep that uncertainty in the existing one-time approval path.
   if (workingDir === null) {
-    const expanded = expandKnownShellPathVars(trimmed, env);
-    if (expanded.dynamic || !path.isAbsolute(expanded.value)) return { dynamic: true };
+    if (expanded.dynamic) return { dynamic: true, analysisGap: 'expansion' };
+    if (!path.isAbsolute(expanded.value)) return { dynamic: true, analysisGap: 'working_directory' };
     workingDir = path.parse(expanded.value).root;
   }
-  const unnormalized = replaceKnownShellEnvTokens(trimmed, env, () => {});
+  const unnormalized = literal ? target : replaceKnownShellEnvTokens(target, env, () => {});
   const parts = unnormalized.split(path.sep);
   if (parts.includes('..')) {
     let prefix = path.isAbsolute(unnormalized) ? path.parse(unnormalized).root : workingDir;
     let crossedLink = false;
     for (const part of parts) {
-      if (part === '..' && crossedLink) return { dynamic: true };
+      if (part === '..' && crossedLink) return { dynamic: true, analysisGap: 'symlink_parent' };
       prefix = path.join(prefix, part);
       try { crossedLink ||= fs.lstatSync(prefix).isSymbolicLink(); }
       catch { /* Missing paths retain the existing lexical fallback. */ }
     }
   }
-  const expanded = expandKnownShellPathVars(trimmed, env);
-  if (expanded.dynamic) return { dynamic: true };
+  if (expanded.dynamic) return { dynamic: true, analysisGap: 'expansion' };
   let value = expanded.value;
-  if (value === '~' || value.startsWith('~/')) {
+  if (!literal && (value === '~' || value.startsWith('~/'))) {
     const home = env.HOME || process.env.HOME || process.env.USERPROFILE || '';
-    if (!home) return { dynamic: true };
+    if (!home) return { dynamic: true, analysisGap: 'home_directory' };
     value = path.join(home, value.slice(2));
   }
-  const globAt = value.search(/[*?\[\]{}]/);
+  const globAt = literal ? -1 : value.search(/[*?\[\]{}]/);
   if (globAt >= 0) {
     const prefix = value.slice(0, globAt);
     value = prefix.endsWith(path.sep) ? prefix.slice(0, -1) : path.dirname(prefix || '.');
@@ -2939,11 +3083,30 @@ function addBashCandidate(
   out.push({
     raw,
     reason,
-    ...(resolved.abs ? { abs: resolved.abs } : {}),
-    ...(resolved.dynamic ? { dynamic: true } : {}),
+    ...resolved,
     ...(removesSource ? { removesSource: true } : {}),
     ...(operatesOnEntry ? { operatesOnEntry: true } : {}),
   });
+}
+
+function addBashRedirectionCandidate(
+  out: BashPathCandidate[],
+  target: string,
+  raw: string,
+  reason: 'redirection' | 'input redirection',
+  workingDir: string | null,
+  env: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+): void {
+  // The shell does not expand a wholly single-quoted POSIX filename. Use the
+  // original spelling, while still checking the actual path and symlinks.
+  const quoted = hostPlatform !== 'win32' ? /^'([^']*)'$/.exec(raw) : null;
+  if (!quoted) {
+    addBashCandidate(out, target, reason, workingDir, env);
+    return;
+  }
+  const resolved = resolveBashCandidate(quoted[1], workingDir, env, true);
+  if (resolved) out.push({ raw: quoted[1], reason, ...resolved });
 }
 
 /** Split `mv` operands into the paths that lose their current location and
@@ -3074,18 +3237,115 @@ function isBashNullRedirection(target: string, hostPlatform: NodeJS.Platform): b
   catch { return false; }
 }
 
+const MAC_SYSTEM_MKTEMP = '/usr/bin/mktemp';
+
+function resolvesToMacSystemTool(executable: string, systemPath: string, env: Record<string, string>): boolean {
+  const directories = executable === systemPath
+    ? [path.dirname(executable)] : (env.PATH ?? '').split(':').slice(0, 64);
+  const name = path.basename(systemPath);
+  for (const directory of directories) {
+    if (!path.isAbsolute(directory)) return false;
+    // Keep the shell's traversal order through an ancestor symlink and '..'.
+    const candidate = `${directory.replace(/\/+$/, '')}/${name}`;
+    try {
+      const entry = fs.lstatSync(candidate, { throwIfNoEntry: false });
+      if (!entry) continue;
+      return candidate === systemPath && entry.isFile() && entry.uid === 0
+        && (entry.mode & 0o022) === 0 && (entry.mode & 0o111) !== 0;
+    } catch { return false; }
+  }
+  return false;
+}
+
+/** The first write after an atomic allocation cannot overwrite a pre-existing
+ * entry. Prove the binding and the quoted operand in the original shell
+ * segments. Never run the substitution or change the command or its PATH. */
+function verifiedMacTemporaryRedirect(
+  scopes: ReturnType<typeof bashGuardPathSegments>,
+  workingDir: string,
+  opts: LocalToolsOpts,
+  ctx: ToolContext,
+): BashPathSegment | null {
+  const literals = new Map<string, string>();
+  for (let index = 0; index < scopes.length && index < 32; index++) {
+    const { segment } = scopes[index];
+    const separator = segment.separatorAfter;
+    if (segment.hasRedirection || (separator !== ';' && separator !== '&&')) return null;
+    const assignment = segment.rawWords.join(' ');
+    const allocation = /^([a-z][A-Za-z0-9_]*)=\$\((mktemp|\/usr\/bin\/mktemp)(?: (.+))?\)$/.exec(assignment);
+    if (!allocation) {
+      const literal = segment.rawWords.length === 1 && /^([a-z][A-Za-z0-9_]*)=(.+)$/.exec(assignment);
+      if (!literal) return null;
+      const value = resolvePosixPathWord(literal[2], literals);
+      if (value === null) return null;
+      literals.set(literal[1], value);
+      continue;
+    }
+
+    const [, variable, executable, argument] = allocation;
+    if ((!argument || argument === '-d') && !localAccessAllowsOutsideWorkspace()) return null;
+    const output = scopes[index + 1]?.segment;
+    if (!output || output.hasExpandingHereInput || output.inputTargets.length || output.rawRedirectTargets.length !== 1
+      || !['cat', 'printf'].includes(output.rawWords[0])
+      || !output.rawWords.slice(1).every(isLiteralPosixShellWord)
+      || (output.separatorAfter && !BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(output.separatorAfter))) return null;
+
+    const target = output.rawRedirectTargets[0];
+    const references = [`"$${variable}`, `"\${${variable}}`];
+    let examplePath = '/private/tmp/tmp.XXXXXX';
+    if (argument === '-d') {
+      const reference = references.find(prefix => target.startsWith(`${prefix}/`));
+      if (separator !== '&&' || !reference || !target.endsWith('"')) return null;
+      const child = target.slice(reference.length + 1, -1);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/.test(child)) return null;
+      examplePath = path.join(examplePath, child);
+    } else {
+      // If the allocation fails, the exact quoted file operand is empty and
+      // the shell cannot open it. A suffix would instead name another path.
+      if (!references.some(prefix => target === `${prefix}"`)) return null;
+      if (argument) {
+        const template = resolvePosixPathWord(argument, literals);
+        if (!template || template.startsWith('-') || path.isAbsolute(template) || template.split('/').includes('..')
+          || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.X{6,}$/.test(path.basename(template))) return null;
+        examplePath = path.resolve(workingDir, template);
+        if (!isPathAllowed(examplePath, [workingDir])) return null;
+      }
+    }
+
+    // The random part is unavailable at preflight, so a custom path policy
+    // cannot be evaluated against the final path or silently waived.
+    if (localAccessHasCustomPathPatterns() || guardBashScopedPath(opts, examplePath, workingDir, 'write')
+      || sensitivePathReasons(examplePath, 'write', { trustedRoots: allowedRootsFor(opts) }).length) return null;
+    const env = buildSandboxEnv(ctx.state.sandboxEnv as Record<string, string> | undefined);
+    if (Object.hasOwn(env, variable) || hasPosixShellStartupOverride(env)
+      || Object.keys(env).some(key => /^(?:DYLD_|LD_)|^(?:TMPDIR|IFS)$/.test(key))) return null;
+    if (!resolvesToMacSystemTool(executable, MAC_SYSTEM_MKTEMP, env)) return null;
+    return output.rawWords[0] === 'printf' || resolvesToMacSystemTool('cat', '/bin/cat', env) ? output : null;
+  }
+  return null;
+}
+
 function collectBashMutationCandidates(
   command: string,
   workingDir: string,
   env: Record<string, string>,
   hostPlatform: NodeJS.Platform,
+  temporary?: { opts: LocalToolsOpts; ctx: ToolContext },
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
+  const scopes = bashGuardPathSegments(command, env, hostPlatform, workingDir, true);
+  const verifiedTemporary = temporary && hostPlatform === 'darwin' && process.platform === 'darwin'
+    && /\$\((?:\/usr\/bin\/)?mktemp[ )]/.test(command) && !/\r|\\\n/.test(command)
+    ? verifiedMacTemporaryRedirect(scopes, workingDir, temporary.opts, temporary.ctx) : null;
+  for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of scopes) {
     const firstCandidate = out.length;
-    for (const target of seg.redirectTargets) {
+    for (const [index, target] of seg.redirectTargets.entries()) {
       if (isBashNullRedirection(target, hostPlatform)) continue;
-      addBashCandidate(out, target, 'redirection', segmentDirectory, segmentEnv);
+      if (seg === verifiedTemporary) {
+        out.push({ raw: target, reason: 'redirection', verifiedTemporary: true, detail: MAC_SYSTEM_MKTEMP });
+        continue;
+      }
+      addBashRedirectionCandidate(out, target, seg.rawRedirectTargets[index], 'redirection', segmentDirectory, segmentEnv, hostPlatform);
     }
     const eff = bashEffectiveCommand(seg.words, hostPlatform);
     if (!eff) continue;
@@ -3093,7 +3353,7 @@ function collectBashMutationCandidates(
 
     if (cmd === 'new-item' || (hostPlatform === 'win32' && cmd === 'ni')) {
       for (const operand of powershellNewItemOperands(args)) {
-        if (operand.uncertain) out.push({ raw: operand.raw, reason: cmd, dynamic: true });
+        if (operand.uncertain) out.push({ raw: operand.raw, reason: cmd, dynamic: true, analysisGap: 'ambiguous_operand' });
         else addBashCandidate(out, operand.raw, cmd, segmentDirectory, segmentEnv);
       }
     } else if (POWERSHELL_CONTENT_WRITE_CMDS.has(cmd)) {
@@ -3181,11 +3441,11 @@ function collectBashReadCandidates(
   hostPlatform: NodeJS.Platform,
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir)) {
+  for (const { segment: seg, env: segmentEnv, workingDir: segmentDirectory } of bashGuardPathSegments(command, env, hostPlatform, workingDir, true)) {
     const firstCandidate = out.length;
-    for (const target of seg.inputTargets) {
+    for (const [index, target] of seg.inputTargets.entries()) {
       if (hostPlatform !== 'win32' && isBashNullRedirection(target, hostPlatform)) continue;
-      addBashCandidate(out, target, 'input redirection', segmentDirectory, segmentEnv);
+      addBashRedirectionCandidate(out, target, seg.rawInputTargets[index], 'input redirection', segmentDirectory, segmentEnv, hostPlatform);
     }
     const eff = bashEffectiveCommand(seg.words, hostPlatform);
     if (!eff) continue;
@@ -3384,7 +3644,12 @@ async function classifyBashRiskIncludingScripts(command: string, workingDir: str
         && !protectedRootForPath(opts, abs) && isPathAllowed(abs, ordinaryRoots)
         && sensitivePathReasons(abs, 'write', { trustedRoots: ordinaryRoots }).length === 0;
     },
-    isProduced: file => opts.hasProducedPath?.(file) === true || taskFileOwnership.get(opts)?.canRemoveTree(file) === true,
+    isProduced: file => {
+      const version = shellPreviewCandidates.get(opts)?.get(file);
+      return opts.hasProducedPath?.(file) === true
+        || (version !== undefined && version === readProducedFileVersion(file))
+        || taskFileOwnership.get(opts)?.ownsFile(file) === true;
+    },
     ownsTree: file => taskFileOwnership.get(opts)?.canRemoveTree(file) === true,
   });
   base.reasons = base.reasons.filter(reason => !ordinary.has(reason));
@@ -3527,7 +3792,8 @@ async function guardBashPathCandidates(
   const seen = new Set<string>();
   // Unknown paths are an approval fact, not unsupported shell syntax. Check
   // known targets first so an approval never overrides a concrete scope denial.
-  const unresolvedPaths = !allowUnresolvedPaths && candidates.some((c) => c.dynamic || !c.abs);
+  const pathUnresolved = (c: BashPathCandidate) => !c.verifiedTemporary && (c.dynamic || !c.abs);
+  const unresolvedPaths = !allowUnresolvedPaths && candidates.some(pathUnresolved);
   for (const c of candidates) {
     const key = `${c.removesSource ? 'remove' : 'access'}:${c.operatesOnEntry ? 'entry' : 'target'}:${c.abs}`;
     if (!c.abs || seen.has(key)) continue;
@@ -3567,12 +3833,13 @@ async function guardBashPathCandidates(
   }
   return {
     result: null, approvedReasons, unresolvedPaths,
+    verifiedTemporary: candidates.some(candidate => candidate.verifiedTemporary),
     keyFacts: candidates.map((candidate) => ({
       kind: candidate.removesSource ? 'remove' : access,
       operation: candidate.reason,
       target: candidate.abs || candidate.raw,
       ...(candidate.detail ? { detail: candidate.detail } : {}),
-      ...((candidate.dynamic || !candidate.abs) ? { unresolved: true } : {}),
+      ...(pathUnresolved(candidate) ? { unresolved: true, analysisGap: candidate.analysisGap } : {}),
     })),
   };
 }
@@ -3619,7 +3886,8 @@ async function guardBashFilesystemTargets(
     opts,
     ctx,
     workingDir,
-    collectBashMutationCandidates(command, workingDir, env, opts.hostPlatform ?? process.platform),
+    collectBashMutationCandidates(command, workingDir, env, opts.hostPlatform ?? process.platform,
+      allowUnresolvedPaths ? undefined : { opts, ctx }),
     'write',
     command,
     allowUnresolvedPaths,
@@ -3639,7 +3907,8 @@ async function guardBashFilesystemTargets(
   mergeRiskReasons(approvedReasons, read.approvedReasons);
   if (read.result) return { result: read.result, approvedReasons };
   return {
-    result: null, approvedReasons, unresolvedPaths: mutation.unresolvedPaths || read.unresolvedPaths,
+    result: null, approvedReasons, verifiedTemporary: mutation.verifiedTemporary,
+    unresolvedPaths: mutation.unresolvedPaths || read.unresolvedPaths || (mutation.verifiedTemporary && approvedReasons.length > 0),
     keyFacts: [...(mutation.keyFacts ?? []), ...(read.keyFacts ?? [])],
   };
 }
@@ -3826,7 +4095,7 @@ function shellCommandSubstitution(input: string, start: number, depth = 0): { bo
   return null;
 }
 
-function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Platform = process.platform): string[] {
+function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Platform = process.platform, scriptName?: string): string[] {
   const out: string[] = [];
   // Unquoted heredocs expand command substitutions before stdin reaches the
   // receiver. Quotes and comment markers inside that payload are ordinary data.
@@ -3847,7 +4116,7 @@ function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Pl
         const substitution = (surface.startsWith('$(', i) || ch === '`')
           ? shellCommandSubstitution(surface, i) : null;
         if (substitution) {
-          out.push(...extractRunSkillRefs(substitution.body, depth + 1, hostPlatform));
+          out.push(...extractRunSkillRefs(substitution.body, depth + 1, hostPlatform, scriptName));
           i = substitution.end;
           continue;
         }
@@ -3875,13 +4144,14 @@ function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Pl
         ? /^(?:-command|-c)$/i.test(arg)
         : /^-[a-z]*c[a-z]*$/i.test(arg));
       if (depth < 4 && commandAt >= 0 && args[commandAt + 1]) {
-        out.push(...extractRunSkillRefs(args[commandAt + 1], depth + 1, isPowerShell ? 'win32' : 'linux'));
+        out.push(...extractRunSkillRefs(args[commandAt + 1], depth + 1, isPowerShell ? 'win32' : 'linux', scriptName));
       }
       continue;
     }
     let ref: string | undefined;
+    let script: string | undefined;
     if (cmd === 'run-skill.cjs') {
-      ref = args[0];
+      [ref, script] = args;
     } else if (/^(?:node|nodejs)(?:\.exe)?$/.test(cmd)
       || /^(?:\$(?:env:)?orkas_node|\$\{(?:env:)?orkas_node\}|%orkas_node%)$/.test(cmd)) {
       for (let i = 0; i < args.length; i++) {
@@ -3890,15 +4160,15 @@ function extractRunSkillRefs(command: string, depth = 0, hostPlatform: NodeJS.Pl
         if (/^(?:-[epc]|--eval|--print|--check)(?:=|$)/.test(arg) || /^-[ep].+/.test(arg)) break;
         if (nodeValueOptions.has(arg)) { i++; continue; }
         if (arg === '--') {
-          if (basename(args[i + 1] || '') === 'run-skill.cjs') ref = args[i + 2];
+          if (basename(args[i + 1] || '') === 'run-skill.cjs') [ref, script] = [args[i + 2], args[i + 3]];
           break;
         }
         if (arg.startsWith('-')) continue;
-        if (basename(arg) === 'run-skill.cjs') ref = args[i + 1];
+        if (basename(arg) === 'run-skill.cjs') [ref, script] = [args[i + 1], args[i + 2]];
         break;
       }
     }
-    if (ref?.trim()) out.push(ref.trim());
+    if (ref?.trim() && (!scriptName || script === scriptName)) out.push(ref.trim());
   }
   return out;
 }
@@ -4149,7 +4419,7 @@ export function windowsPowerShellCompatibilityError(
   const findings: string[] = [];
   if (chain.kind === 'unsupported' || /&&|\|\|/.test(surface)) findings.push('unsupported complex &&/|| chain');
   if (/<<-?/.test(surface)) findings.push('POSIX heredoc');
-  if (/(?:^|[;({\r\n])\s*(?:source|export)\b/m.test(surface)) findings.push('source/export');
+  if (/(?:^|[;({\r\n])\s*(?:source|export)(?=$|[\s;|&(){}])/m.test(surface)) findings.push('source/export');
   if (/(?:^|[;|({\r\n])\s*head(?:\s|$)/m.test(surface)) findings.push('head');
   if (/(?:^|[;|({\r\n])\s*mktemp(?:\s|$)/m.test(surface)) findings.push('mktemp');
   const curlAliasWithSilentFlag = /(?:^|[;|&({\r\n])\s*curl\s+-s(?=\s|$)/mi.test(surface);
@@ -4177,15 +4447,40 @@ export function windowsPowerShellCompatibilityError(
   );
 }
 
+export function describeBashShell(platform: NodeJS.Platform) {
+  const shell = resolveShellTarget(defaultShellForPlatform(platform), '', platform);
+  if (shell.kind === 'powershell') {
+    return {
+      interpreter: shell.legacyPowerShell ? 'Windows PowerShell 5.1' : 'PowerShell (`pwsh`)',
+      outputDir: '`$env:ORKAS_OUTPUT_DIR`',
+      syntax: 'On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.',
+    };
+  }
+  if (shell.kind === 'cmd') {
+    return { interpreter: 'Windows Command Prompt (`cmd.exe`)', outputDir: '`%ORKAS_OUTPUT_DIR%`', syntax: 'Use cmd syntax.' };
+  }
+  const executable = path.win32.basename(shell.command).toLowerCase().replace(/\.exe$/, '');
+  if (executable === 'sh') {
+    return {
+      interpreter: shell.command === '/bin/sh' ? '`/bin/sh`' : '`sh`',
+      outputDir: '`$ORKAS_OUTPUT_DIR`',
+      syntax: 'Use POSIX shell syntax. Avoid `<(...)`.',
+    };
+  }
+  if (executable === 'bash') {
+    return { interpreter: 'Bash', outputDir: '`$ORKAS_OUTPUT_DIR`', syntax: 'Use Bash syntax.' };
+  }
+  // Custom executable paths are local configuration, not model instructions.
+  return {
+    interpreter: 'the configured Windows shell',
+    outputDir: 'the `ORKAS_OUTPUT_DIR` environment variable',
+    syntax: "Use the configured shell's syntax.",
+  };
+}
+
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
-  const hostPlatform = opts.hostPlatform ?? process.platform;
-  const windowsShellDescription = hostPlatform === 'win32'
-    ? ' On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.'
-    : '';
-  const outputDirDescription = hostPlatform === 'win32'
-    ? '`$env:ORKAS_OUTPUT_DIR`'
-    : '`$ORKAS_OUTPUT_DIR`';
+  const shell = describeBashShell(opts.hostPlatform ?? process.platform);
 
   return {
     name: 'bash',
@@ -4196,19 +4491,16 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
     executionMode: 'parallel',
     parallelWhen: (input) => bashCommandIsProvablyReadOnly(String(input.command ?? '')),
     description:
-      'Run one shell command on the user\'s local machine and return its output. '
-      + (hostPlatform === 'win32' ? 'On Windows, this compatibility-named `bash` tool runs Windows PowerShell 5.1 by default. ' : '')
-      + 'Built-in Python and Node.js are available as `python` and `node`; use a script for deterministic transformations over many local files or records, and a dedicated tool for a targeted operation. ' +
-      'A running result includes a session_id for process_session; use interactive_cli for user-entered secrets or OAuth.',
+      `Run a command on the local host with ${shell.interpreter}. `
+      + 'Built-in Python and Node.js (`python` and `node`) handle deterministic transformations over many local files or records. Use a dedicated tool for a targeted operation. '
+      + 'Continue a session_id with process_session. Use interactive_cli for user-entered secrets or OAuth.',
     inputSchema: {
       ...(coreBashTool.inputSchema as Record<string, unknown>),
       properties: {
         ...(((coreBashTool.inputSchema as Record<string, unknown>).properties || {}) as Record<string, unknown>),
         command: {
           type: 'string',
-          description:
-            `Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under ${outputDirDescription}.`
-            + windowsShellDescription,
+          description: `Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under ${shell.outputDir}. ${shell.syntax}`,
         },
       },
     },
@@ -4297,7 +4589,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             command,
             workingDirForGuard,
             pathEnv,
-            opts.hasProducedPath,
+            file => taskFileOwnership.get(opts)?.ownsFile(file) === true,
             opts.hostPlatform ?? process.platform,
           )) {
             baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
@@ -4310,7 +4602,10 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           })
           : baseReasons
         ).filter((reason) => reason !== 'destructive' || !pathApprovalCoveredDestructive);
-        if (reasons.length || filesystemGate.unresolvedPaths) {
+        // A fresh temporary write only removes a standalone path prompt. A
+        // separately risky command retains its prior decision and grant rules.
+        const unresolvedPaths = filesystemGate.unresolvedPaths || (filesystemGate.verifiedTemporary && reasons.length > 0);
+        if (reasons.length || unresolvedPaths) {
           const decision = await requestBashDecision({
             uid: opts.userId ?? '',
             cid: opts.cid ?? '',
@@ -4318,7 +4613,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             agentName: opts.agentName ?? opts.agentId ?? '',
             command,
             reasons,
-            unresolvedPaths: filesystemGate.unresolvedPaths,
+            unresolvedPaths,
             workingDirectory: workingDirForGuard,
             keyFacts: [
               ...(filesystemGate.keyFacts ?? []),
@@ -4339,12 +4634,12 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
               agent_id: maskId(opts.agentId),
               command_chars: command.length,
               reasons,
-              unresolved_paths: filesystemGate.unresolvedPaths === true,
+              unresolved_paths: unresolvedPaths === true,
             });
             return {
               content: errText(
                 'E_BASH_RISK_DENIED',
-                `this command was not approved (flagged: ${[...reasons, ...(filesystemGate.unresolvedPaths ? ['unresolved paths'] : [])].join(', ')}). `
+                `this command was not approved (flagged: ${[...reasons, ...(unresolvedPaths ? ['unresolved paths'] : [])].join(', ')}). `
                 + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
               ),
               isError: true,
@@ -4450,7 +4745,7 @@ async function gateInteractiveCliStart(
           command,
           workingDir,
           pathEnv,
-          opts.hasProducedPath,
+          file => taskFileOwnership.get(opts)?.ownsFile(file) === true,
           opts.hostPlatform ?? process.platform,
         )) {
         baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
@@ -4793,7 +5088,7 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
         action: {
           type: 'string',
           enum: ['start', 'read', 'send', 'close'],
-          description: 'start: command; read: session_id; send: session_id/input; close: session_id/force/reason. Known unused fields are ignored and listed in ignored_fields; session_id selects an existing session.',
+          description: 'start: launch with command. read: session_id. send: session_id/input. close: session_id/force/reason. Harmless unused fields are listed in ignored_fields.',
         },
         command: { type: 'string', description: 'Start only. Shell command to launch.' },
         max_lifetime_ms: {
@@ -4805,7 +5100,7 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
           type: 'boolean',
           description: 'Start only. True only when the user explicitly says browser OAuth cannot be used.',
         },
-        session_id: { type: 'string', description: 'Required for read, send, and close.' },
+        session_id: { type: 'string', description: 'Existing session ID, required for read, send, and close. Omit for start.' },
         input: { type: 'string', description: 'Send only. Agent-known non-secret stdin.' },
         add_newline: { type: 'boolean', description: 'Send only. Append a newline; default true.' },
         force: {
@@ -4824,15 +5119,21 @@ function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
+      const sessionId = input.session_id;
+      const startSessionConflict = action === 'start' && sessionId != null
+        && !(typeof sessionId === 'string' && sessionId.trim() === '');
       const unexpected = Object.keys(input)
         .filter((key) => !Object.values(actionFields).some((fields) => fields.has(key))
-          || (action === 'start' && key === 'session_id'))
+          || (startSessionConflict && key === 'session_id'))
         .sort();
       if (unexpected.length) {
+        const guidance = unexpected.includes('session_id')
+          ? '. Omit session_id to start a new session. Use read or send to continue an existing session.'
+          : '';
         return {
           content: errText(
             'E_BAD_INPUT',
-            `interactive_cli(${action}) does not accept: ${unexpected.join(', ')}`,
+            `interactive_cli(${action}) does not accept: ${unexpected.join(', ')}${guidance}`,
           ),
           isError: true,
         };
@@ -4890,7 +5191,7 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'write_file',
     description:
-      'Create a UTF-8 text file in the workspace, including parent directories, and return its final path and revision. Foreign path collisions are auto-suffixed. Use edit_file or apply_patch for existing files, or append_file to continue a long new file.',
+      'Create a UTF-8 text file in the workspace, including parent directories, and return its final path and revision. Foreign path collisions are auto-suffixed. Use apply_patch for existing files, or append_file to continue a long new file.',
     inputSchema: coreWriteFileTool.inputSchema,
     async execute(input, ctx) {
       const inputPath = String(input.path ?? '');
@@ -4901,23 +5202,23 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         log.warn('write_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
         return { content: scopeErr, isError: true };
       }
-      // Read before the write decides it: once uniquify has run, an overwrite
-      // of the user's own file and a fresh create look identical on disk.
-      const targetExistedBeforeWrite = fs.existsSync(inputAbs);
       const ownership = taskFileOwnership.get(opts);
+      const isMine = isMineFor(opts);
       // Probe+write hold one per-path lock: a concurrent same-target writer
       // (parallel agent turn in the same conversation workspace) must see this
       // write when it uniquifies, not race past the probe and clobber it.
-      const { finalPath, renamed, result } = await uniquifyPathForWrite(
-        inputAbs, isMineFor(opts),
+      const { finalPath, renamed, result, preExisting } = await uniquifyPathForWrite(
+        inputAbs, isMine,
         async (decision) => {
+          const preExisting = fs.existsSync(decision.finalPath)
+            && opts.hasProducedPath?.(decision.finalPath) !== true;
           const beforeCreation = ownership?.beforeWrite(decision.finalPath);
           const result = await coreWriteFileTool.execute(
             decision.finalPath !== inputAbs ? { ...input, path: decision.finalPath } : input,
             ctx,
           );
           if (!result.isError && beforeCreation) ownership?.afterWrite(decision.finalPath, beforeCreation);
-          return { ...decision, result };
+          return { ...decision, result, preExisting };
         },
       );
       const rewritten = finalPath !== inputAbs
@@ -4932,25 +5233,21 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         recordRead(ctx, finalPath, undefined, fileHash);
         if (opts.onFileWritten) {
           try {
-            // A uniquified path is new by construction, and overwriting our own
-            // earlier output is still production. Only an in-place write over a
-            // target the user already had keeps their file.
-            await opts.onFileWritten(finalPath, {
-              preExisting: finalPath === inputAbs
-                && targetExistedBeforeWrite
-                && !isMineFor(opts)(finalPath),
-            });
+            await opts.onFileWritten(finalPath, { preExisting });
           } catch (err) {
             log.warn('onFileWritten callback failed', { error: logErrorRef(err) });
           }
         }
         const revision = issueFileRevision(ctx, finalPath, written.length, fileHash);
         const receipt = `<file path="${finalPath}" total_bytes="${written.length}" file_hash="${fileHash}" revision="${revision}"/>`;
+        const jsonProblem = jsonWriteProblem(finalPath, String(rewritten.content ?? ''),
+          result.observations?.fileChanges?.[0]?.beforeContent);
         return {
           ...result,
           content: [
             result.content ?? '',
             receipt,
+            ...(jsonProblem ? [jsonValidityNotice(finalPath, jsonProblem)] : []),
             ...(renamed ? [renderRenameSignal(inputAbs, finalPath)] : []),
           ].filter(Boolean).join('\n'),
         };
@@ -4964,6 +5261,39 @@ function fileBufferHash(body: Buffer, suffix?: Buffer): string {
   const hash = crypto.createHash('sha256').update(body);
   if (suffix) hash.update(suffix);
   return `sha256:${hash.digest('hex')}`;
+}
+
+/** Larger `.json` writes are not parsed: the check stays a bounded cost. */
+const JSON_CHECK_MAX_BYTES = 2 * 1024 * 1024;
+
+function strictJsonError(text: string): string | undefined {
+  try {
+    JSON.parse(text.replace(/^﻿/, ''));
+    return undefined;
+  } catch (err) {
+    return String((err as Error)?.message || 'invalid JSON').replace(/\s+/g, ' ').trim().slice(0, 200);
+  }
+}
+
+/**
+ * Why a native write left a `.json` file that strict JSON parsing rejects, or
+ * undefined. A file that already failed before the write (comment-bearing
+ * JSONC such as tsconfig.json) stays silent, so only a write that breaks the
+ * file or creates a broken one is reported. A model reading its own write back
+ * does not reliably notice a stray bracket; the receipt states the fact.
+ */
+function jsonWriteProblem(filePath: string, after: string, before?: string): string | undefined {
+  if (path.extname(filePath).toLowerCase() !== '.json') return undefined;
+  if (Buffer.byteLength(after, 'utf8') > JSON_CHECK_MAX_BYTES) return undefined;
+  const problem = strictJsonError(after);
+  if (!problem) return undefined;
+  if (before !== undefined && Buffer.byteLength(before, 'utf8') <= JSON_CHECK_MAX_BYTES && strictJsonError(before)) return undefined;
+  return problem;
+}
+
+function jsonValidityNotice(filePath: string, problem: string): string {
+  const text = problem.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<json-validity path="${filePath}" valid="false">The file as written is not valid JSON: ${text}</json-validity>`;
 }
 
 function appendFileReceipt(
@@ -4995,7 +5325,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
     name: 'append_file',
     compatibilityInputFields: ['expected_size'],
     description:
-      'Append one complete UTF-8 chunk to an existing text file with optimistic concurrency and replay-safe behavior. Use edit_file or apply_patch for targeted changes.',
+      'Append one complete UTF-8 chunk to an existing text file with optimistic concurrency and replay-safe behavior. Use apply_patch for targeted changes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5237,7 +5567,7 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
   return {
     ...coreTool,
     description:
-      'Apply multiple known edits in one transactional patch to one or more existing or new text files. Existing targets require an unchanged baseline from this run: read_files and successful file-tool writes establish it; bash reads/writes do not. Validation or conflicts leave every target unchanged. Use edit_file for one small replacement.',
+      'Apply one or more targeted edits in a single transactional patch. Existing targets require an unchanged baseline from this run: read_files and successful file-tool writes establish it; bash reads/writes do not. Validation or conflicts leave every target unchanged.',
     async execute(input, ctx) {
       const result = await coreTool.execute(input, ctx);
       if (result.isError) return result;
@@ -5245,17 +5575,24 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
       // this host. Use committed observations, never re-read potentially newer
       // bytes and silently grant an append against an unseen external edit.
       const revisions = new Map<string, string>();
+      const jsonProblems = new Map<string, string>();
       for (const file of result.observations?.fileChanges ?? []) {
         if (file.afterExists && file.afterHash && file.afterBytes !== undefined) {
           revisions.set(file.sourcePath, issueFileRevision(
             ctx, file.destinationPath ?? file.sourcePath, file.afterBytes, file.afterHash,
           ));
         }
+        const problem = file.afterExists && file.afterContent !== undefined
+          ? jsonWriteProblem(file.destinationPath ?? file.sourcePath, file.afterContent, file.beforeContent)
+          : undefined;
+        if (problem) jsonProblems.set(file.sourcePath, problem);
       }
       const receipt = JSON.parse(result.content);
       for (const file of receipt.files) {
         const revision = revisions.get(file.path);
         if (revision) file.revision = revision;
+        const problem = jsonProblems.get(file.path);
+        if (problem) file.json_invalid = `The file as written is not valid JSON: ${problem}`;
       }
       return { ...result, content: JSON.stringify(receipt) };
     },
@@ -5376,12 +5713,13 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
 
-        if (oldStr === newStr) {
+        const unchanged = () => {
           // No replacement is needed; retain the verified version without a write.
           recordRead(ctx, abs, st, currentHash);
           const revision = issueFileRevision(ctx, abs, Buffer.byteLength(body, 'utf8'), currentHash);
           return { content: `<file path="${abs}" edited="0" kind="${kind}" file_hash="${currentHash}" revision="${revision}"/>` };
-        }
+        };
+        if (oldStr === newStr) return unchanged();
 
         let count = countOccurrences(body, oldStr);
         // The text actually present in the file. It differs from `old_string`
@@ -5419,8 +5757,9 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         }
 
         const next = replaceAll ? body.split(matchText).join(newStr) : body.replace(matchText, () => newStr);
+        if (next === body) return unchanged();
         try {
-          fs.writeFileSync(abs, next, 'utf8');
+          commitExistingTextReplacement(abs, next, st);
         } catch (err) {
           const msg = (err as Error).message;
           log.warn('edit_file write failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
@@ -5436,6 +5775,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
 
         const replaced = replaceAll ? count : 1;
         log.info('edit_file applied', { user_id: maskId(opts.userId), path: logPathRef(abs), replaced });
+        const jsonProblem = jsonWriteProblem(abs, next, body);
 
         if (opts.onFileWritten) {
           // edit_file only ever modifies a file that already had the matched
@@ -5448,7 +5788,10 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           // `match="whitespace_relaxed"` says the edit landed on text that
           // differs from `old_string` in line-end whitespace only, so a caller
           // comparing its own string against the file is not left guessing.
-          content: `<file path="${abs}" edited="${replaced}" kind="${kind}"${whitespaceRelaxed ? ' match="whitespace_relaxed"' : ''} file_hash="${nextHash}" revision="${revision}"/>`,
+          content: [
+            `<file path="${abs}" edited="${replaced}" kind="${kind}"${whitespaceRelaxed ? ' match="whitespace_relaxed"' : ''} file_hash="${nextHash}" revision="${revision}"/>`,
+            ...(jsonProblem ? [jsonValidityNotice(abs, jsonProblem)] : []),
+          ].join('\n'),
           observations: {
             fileChanges: [{
               operation: 'update',
@@ -5513,9 +5856,29 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
         return { content: errText('E_OUTPUT_PUBLICATION_UNAVAILABLE', 'this conversation cannot publish file outputs'), isError: true };
       }
       try {
-        const accepted = await opts.onOutputsPublished(normalized);
+        const { eligible, candidates } = opts.agentId === IMAGE_STUDIO_AGENT_ID && opts.userId && opts.cid && ctx.workingDir
+          ? await partitionImageStudioLayeredOutputs(opts.userId, opts.cid, normalized, ctx.workingDir)
+          : { eligible: normalized, candidates: [] };
+        const nativePngDelivery = opts.imageStudioNativePngDelivery;
+        const unpublishedPngs = nativePngDelivery ? normalized.filter(file => !nativePngDelivery.permits(file)) : [];
+        const accepted = await opts.onOutputsPublished(nativePngDelivery
+          ? eligible.filter(file => nativePngDelivery.permits(file)) : eligible);
+        const receipt = outputPublicationReceipt(normalized, Array.isArray(accepted) ? accepted : []);
+        if (unpublishedPngs.length) {
+          return { content: JSON.stringify({
+            ...receipt,
+            status: 'incomplete',
+            blocked_candidates: [...new Set([...unpublishedPngs, ...candidates])],
+            next_action: 'Keep the existing PNG as a candidate. If needed, create image-manifest.json and set raster_source to that PNG. Inspect the project, complete the required design review, and deliver the PNG returned by image_studio project.export.',
+          }) };
+        }
         return {
-          content: JSON.stringify(outputPublicationReceipt(normalized, Array.isArray(accepted) ? accepted : [])),
+          content: JSON.stringify(candidates.length ? {
+            ...receipt,
+            status: 'incomplete',
+            blocked_candidates: candidates,
+            next_action: 'Continue this turn with image_studio project.inspect on the current layered preview. Complete the required review, then call project.export (PNG before PSD). Keep drafts at separate working paths and publish the native exports.',
+          } : receipt),
         };
       } catch (err) {
         return {
@@ -5568,14 +5931,23 @@ function createLibrarySaveTool(opts: LocalToolsOpts): AgentTool {
       if (input.action === 'checkout' && (!name || input.expected_revision !== undefined)) {
         return { content: errText('E_BAD_INPUT', !name ? 'name must be a non-empty string for checkout' : 'expected_revision is not accepted for checkout'), isError: true };
       }
+      const encodingMessage = 'Save the source text file as UTF-8, then retry.';
       if (input.action === 'checkout' || input.expected_revision !== undefined) {
         const result = input.action === 'checkout'
           ? await projectFiles.checkoutProjectFile(opts.userId, opts.projectId, name, sourceAbs)
           : await projectFiles.replaceProjectFileFromPath(opts.userId, opts.projectId, sourceAbs, targetName, input.expected_revision as string);
+        if (result.ok === false && result.error === 'invalid_source_encoding') {
+          return { content: JSON.stringify({ ...result, message: encodingMessage }), isError: true };
+        }
         return { content: JSON.stringify(result.ok ? { ...result, path: result.name } : result), isError: !result.ok };
       }
       const r = await projectFiles.copyProjectEntryFromPath(opts.userId, opts.projectId, sourceAbs, targetName);
-      if (!r.ok) return { content: errText('E_LIBRARY_SAVE_FAILED', (r as { error: string }).error), isError: true };
+      if (r.ok === false) {
+        const content = r.error === 'invalid_source_encoding'
+          ? errText('E_LIBRARY_SOURCE_ENCODING', encodingMessage)
+          : errText('E_LIBRARY_SAVE_FAILED', r.error);
+        return { content, isError: true };
+      }
       return { content: JSON.stringify({ ok: true, path: r.name, bytes: r.bytes }) };
     },
   };
@@ -5812,17 +6184,17 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'html_preview',
     description:
-      'Audit local HTML or a current-conversation app in an isolated browser and return runtime, resource, overflow, layout, focus, and interaction findings.',
+      'Preview local HTML or an app in the current conversation in an isolated browser. Use exactly one source. Reports layout, overflow, runtime, and interaction observations for review.',
     inputSchema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
-          description: 'Existing local .html/.htm entry path, absolute or relative to $working_dir. Supply exactly one of path or artifact_id.',
+          description: 'For a local file, pass its existing .html/.htm entry path, absolute or relative to $working_dir, and omit artifact_id.',
         },
         artifact_id: {
           type: 'string',
-          description: 'App ID returned by create_artifact in the current conversation. Previews its index.html. Supply exactly one of artifact_id or path.',
+          description: 'For an app in the current conversation, pass the ID returned by create_artifact and omit path. Previews its index.html.',
         },
         target: {
           type: 'string',
@@ -5833,12 +6205,12 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         screenshots: {
           type: 'boolean',
           default: false,
-          description: 'Whether a passing result should include lossless viewport screenshots as model-visible image blocks. Defaults to false. This never invokes a separate vision API, and failed checks never include images.',
+          description: 'Include captured viewport screenshots as lossless model-visible images alongside any findings. Defaults to false and never invokes a separate vision API.',
         },
         interactions: {
           type: 'boolean',
           default: true,
-          description: 'Whether to exercise bounded controls, forms, links, and downloads. Defaults to true. Set false for visual-only UI review; runtime, resource, layout, focus, and screenshot checks still run.',
+          description: 'Exercise a bounded sample of controls, forms, links, and explicit download links. Defaults to true. Set false for visual-only UI review; layout, runtime, resource, and focus observations remain.',
         },
         desktop: {
           type: 'object',
@@ -5862,7 +6234,14 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
     async execute(input, ctx) {
       const artifactMode = input.artifact_id !== undefined;
       if (artifactMode === (input.path !== undefined)) {
-        return { content: errText('E_BAD_INPUT', 'supply exactly one of `path` or `artifact_id`'), isError: true };
+        const reason = artifactMode ? 'conflicting_sources' : 'missing_source';
+        return {
+          content: parameterErrorContent('Supply exactly one preview source.', [
+            { field: 'path', reason, expected: 'For a local HTML file, pass path and omit artifact_id.' },
+            { field: 'artifact_id', reason, expected: 'For an app in this conversation, pass artifact_id and omit path.' },
+          ]),
+          isError: true,
+        };
       }
       let abs: string;
       let artifactId: string | undefined;
@@ -5971,19 +6350,6 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         });
         const { entryPath: _entryPath, ...artifactEvidence } = rendered.evidence;
         const evidence = artifactMode ? { ...artifactEvidence, artifact_id: artifactId } : rendered.evidence;
-        if (!rendered.evidence.ok) {
-          return {
-            content: JSON.stringify({
-              ...evidence,
-              visual_evidence: {
-                attached: false,
-                reason: 'deterministic_checks_failed',
-                policy: 'attach_only_after_requested_preview_checks_pass',
-              },
-            }),
-            isError: true,
-          };
-        }
         if (input.screenshots !== true) {
           return {
             content: JSON.stringify({
@@ -5991,7 +6357,6 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
               visual_evidence: {
                 attached: false,
                 reason: 'not_requested',
-                policy: 'attach_only_when_requested_after_preview_checks_passed',
               },
             }),
           };
@@ -6005,7 +6370,6 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
             visual_evidence: {
               attached: true,
               viewports: rendered.evidence.viewports.map((viewport) => viewport.name),
-              policy: 'attached_when_requested_after_preview_checks_passed',
             },
           }),
           images: modelScreenshots.map((image) => ({
@@ -6374,6 +6738,7 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   // A fresh tools instance owns fresh evidence, even if a caller reuses opts.
   opts = { ...opts };
   taskFileOwnership.set(opts, new TaskFileOwnership());
+  shellPreviewCandidates.set(opts, new Map());
   const tools: AgentTool[] = [
     createBashTool(opts),
     ...createHostProcessTools(opts),

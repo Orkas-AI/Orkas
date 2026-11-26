@@ -119,10 +119,11 @@ describe('automation scheduler account ownership', () => {
     expect(autoTasks.armedDueAtForTest('at_ccccdddd')).toBeNull();
 
     users.activateUser(ACCOUNT_B);
-    await flushAsyncWork();
-
     expect(autoTasks.armedDueAtForTest('at_aaaabbbb')).toBeNull();
-    expect(autoTasks.armedDueAtForTest('at_ccccdddd')).toBe(Date.parse(dueAt));
+    await waitForAsyncCondition(
+      () => autoTasks.armedDueAtForTest('at_ccccdddd') === Date.parse(dueAt),
+      'account B tasks to be armed',
+    );
 
     const lateAccountAMutation = await autoTasks.createTask(ACCOUNT_A, {
       // Account-scoped ids may collide. A late mutation must neither arm A
@@ -154,6 +155,30 @@ describe('automation scheduler account ownership', () => {
       enabled: false,
       content: 'run only for active account B',
     });
+  });
+
+  it('keeps the live scheduler responsible for cleanup after a late module load', async () => {
+    const users = await import('../../../src/main/features/users');
+    const active = await import('../../../src/main/features/auto_tasks');
+    users.activateUser(ACCOUNT_A);
+    const id = 'at_9999aaaa';
+    const at = new Date(Date.now() + 60_000).toISOString();
+    expect((await active.createTask(ACCOUNT_A, {
+      id, content: 'belongs to account A', schedule: { type: 'one_time', at },
+    })).ok).toBe(true);
+    active.startScheduler();
+    try {
+      await active.rescheduleAllForTest(ACCOUNT_A);
+      expect(active.armedDueAtForTest(id)).toBe(Date.parse(at));
+      vi.resetModules();
+      const later = await import('../../../src/main/features/auto_tasks');
+      expect(later.armedDueAtForTest(id)).toBeNull();
+
+      users.activateUser(ACCOUNT_B);
+      expect(active.armedDueAtForTest(id)).toBeNull();
+    } finally {
+      active.stopScheduler();
+    }
   });
 
   it('does not let a superseded account reschedule finish after a newer switch', async () => {

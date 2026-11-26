@@ -46,7 +46,7 @@ body {
   color: var(--muted);
 }
 .label {
-  font-size: 38px;
+  font-size: 42px;
   line-height: 1;
   font-weight: 650;
   letter-spacing: .06em;
@@ -210,14 +210,15 @@ For multimodal, systems, ecosystems, or synthesis:
 Use a small number of semantic groups:
 
 ```js
-// Establish -> explain -> resolve -> hold.
-tl.set(scene, { opacity: 1 }, start)
-  .fromTo(`${id} .structure`, { opacity: .35 }, { opacity: 1, duration: .55 }, start)
-  .fromTo(`${id} .build`, { strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.25 }, start + .18)
-  .fromTo(`${id} .result`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: .65 }, start + 1.05);
+// Establish -> explain -> resolve -> hold, on this scene's own timeline (0 = scene start).
+const s = '[data-scene-id="explain"]';
+window.__timelines.explain = gsap.timeline({ paused: true })
+  .fromTo(`${s} .structure`, { opacity: .35 }, { opacity: 1, duration: .55 }, 0)
+  .fromTo(`${s} .build`, { strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.25 }, .18)
+  .fromTo(`${s} .result`, { opacity: 0, y: 22 }, { opacity: 1, y: 0, duration: .65 }, 1.05);
 ```
 
-Use explicit timeline positions. CSS animations, timers, random particles, and runtime network calls are not render-safe.
+Use explicit positions from the scene's start; the host shows and hides scenes. CSS animations, timers, random particles, and runtime network calls are not render-safe.
 
 ## Primitive selection guide
 

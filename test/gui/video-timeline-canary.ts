@@ -206,6 +206,136 @@ function buildCases(root: string, clipFile: string): Case[] {
   const clipAssets = [{ id: 'clip', kind: 'video', label: 'Numbered', path: clipFile, origin: 'generated' }];
   return [
     {
+      name: 'a resized direct cut preserves non-keyframe edits, color patches and kept audio beside a page-rendered cut',
+      run: async () => {
+        const source = path.join(root, 'tagged-cut-source.mp4');
+        const made = await run(ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', clipFile,
+          '-f', 'lavfi', '-i', 'aevalsrc=0.25*sin(2*PI*440*t)*between(t\\,0.5\\,0.65):s=48000:d=4',
+          '-vf', ['drawbox=x=10:y=240:w=120:h=180:c=lime:t=fill',
+            'drawbox=x=145:y=240:w=120:h=180:c=magenta:t=fill',
+            'drawbox=x=280:y=240:w=120:h=180:c=0xff7000:t=fill',
+            'drawbox=x=415:y=240:w=120:h=180:c=0x0060ff:t=fill', 'scale=360:640', 'setsar=1'].join(','),
+          '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-color_range', 'tv', '-colorspace', 'bt709',
+          '-color_primaries', 'bt709', '-color_trc', 'bt709', '-c:a', 'aac', source]);
+        if (made.code !== 0 || made.stderr) return [`fixture encode failed: ${made.stderr}`];
+        const assets = [...clipAssets, { id: 'tagged', kind: 'video', label: 'Tagged with tone', path: source, origin: 'generated' }];
+        const scenes = [
+          { id: 'cut', clips: [{ id: 'a', asset: 'tagged', in: 7 / 30, dur: 17 / 30, audio: 'keep' }] },
+          { id: 'page', clips: [{ id: 'b', asset: 'clip', in: 24 / 30, dur: 14 / 30 }] },
+          { id: 'tail', clips: [{ id: 'c', asset: 'tagged', in: 68 / 30, dur: 16 / 30 }] },
+        ];
+        const compiled = await project(root, 'direct-cut-mixed', assets);
+        const reference = await project(root, 'direct-cut-reference', assets);
+        await Promise.all([compiled.writeManifest(manifest(scenes)), reference.writeManifest(manifest(scenes))]);
+        await reference.writePage(page(scenes.map(({ id }) => `<section data-scene-id="${id}"></section>`).join('')));
+        const progress: Array<{ data?: { sceneId?: string; directCut?: boolean; directCutFallback?: boolean } }> = [];
+        const direct = await timelineApi.renderVideoTimeline({ ...compiled.renderOptions(), onProgress: (event: typeof progress[number]) => progress.push(event) });
+        const rendered = await timelineApi.renderVideoTimeline(reference.renderOptions());
+        assertWindow(rendered);
+        if (!direct.ok || !rendered.ok) return [`render failed: ${direct.message || rendered.message}`];
+        const expected = [...range(7, 17), ...range(24, 14), ...range(68, 16)];
+        const failures = [...diff(await decodeFrameNumbers(compiled.out), expected), ...diff(await decodeFrameNumbers(reference.out), expected)];
+        const directScenes = progress.flatMap(event => event.data?.directCut ? [event.data.sceneId] : []);
+        const fallbackScenes = progress.flatMap(event => event.data?.directCutFallback ? [event.data.sceneId] : []);
+        if (directScenes.length !== 2 || fallbackScenes.length) {
+          failures.push(`expected two direct cuts and one page-rendered cut; direct=${JSON.stringify(directScenes)} fallback=${JSON.stringify(fallbackScenes)}`);
+          const probe = await run(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_streams', '-show_format', '-of', 'json', source]);
+          const versions = await Promise.all([ffmpeg, ffprobe].map(binary => run(binary, ['-version'])));
+          const summary = versions.map(result => result.stdout.toString().split(/\r?\n/, 1)[0]);
+          const data = probe.code === 0 ? JSON.parse(probe.stdout.toString()) : undefined;
+          if (data?.format) delete data.format.filename;
+          failures.push(`direct-cut fixture: ${JSON.stringify({ versions: summary, probeExit: probe.code, stream: data?.streams?.[0], format: data?.format })}`);
+        }
+        const readOutput = async (file: string, args: string[]) => {
+          const decoded = await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', file, ...args, 'pipe:1']);
+          if (decoded.code !== 0 || decoded.stderr) throw new Error(`output decode failed: ${decoded.stderr}`);
+          return decoded.stdout;
+        };
+        const patches = ['-map', '0:v:0', '-frames:v', '1', '-vf', 'crop=540:32:0:300,scale=54:4:flags=area,format=rgb24', '-f', 'rawvideo'];
+        const [fastPixels, pagePixels, fastAudio, pageAudio] = await Promise.all([
+          readOutput(compiled.out, patches), readOutput(reference.out, patches),
+          readOutput(compiled.out, ['-map', '0:a:0', '-ac', '1', '-ar', '48000', '-f', 's16le']),
+          readOutput(reference.out, ['-map', '0:a:0', '-ac', '1', '-ar', '48000', '-f', 's16le']),
+        ]);
+        for (const center of [7, 20, 34, 47]) {
+          const offset = ((54 * 2) + center) * 3;
+          const difference = [0, 1, 2].map((channel) => Math.abs(fastPixels[offset + channel] - pagePixels[offset + channel]));
+          if (difference.some((value) => value > 12)) failures.push(`color patch differs by RGB ${difference.join(', ')}`);
+        }
+        const firstTone = (pcm: Buffer) => {
+          for (let offset = 0; offset + 2 <= pcm.length; offset += 2) {
+            if (Math.abs(pcm.readInt16LE(offset)) > 900) return offset / (2 * 48_000);
+          }
+          return Infinity;
+        };
+        const onset = firstTone(fastAudio);
+        if (Math.abs(onset - (0.5 - 7 / 30)) > 1 / 30 || Math.abs(onset - firstTone(pageAudio)) > 1 / 30) {
+          failures.push(`kept tone is out of sync at ${onset}s`);
+        }
+        return failures;
+      },
+    },
+    {
+      name: 'a scene-local style edit reuses other shots and matches the full render',
+      run: async () => {
+        const p = await project(root, 'scene-local-style', []);
+        await p.writeManifest(manifest(['open', 'price', 'close'].map(id => ({ id, duration: 0.2 }))));
+        const initial = page(`
+<section data-scene-id="open"><h1>Open</h1></section>
+<section data-scene-id="price"><h1 id="amount">49</h1></section>
+<section data-scene-id="close"><h1>Close</h1></section>`, '', '<style>#amount{font-size:48px}</style>');
+        const variants = [
+          { html: initial, expectedRendered: 3 },
+          { html: initial.replace('48px', '84px'), expectedRendered: 3 },
+          { html: initial.replace('id="amount"', 'id="amount" style="font-size:84px"'), expectedRendered: 1 },
+        ];
+        const hashes: string[] = [];
+        for (const [index, variant] of variants.entries()) {
+          await p.writePage(variant.html);
+          const output = path.join(p.production, 'render', `${index}.mp4`);
+          const result = await timelineApi.renderVideoTimeline(p.renderOptions(output));
+          assertWindow(result);
+          if (!result.ok) return [`render failed: ${result.errorCode} ${result.message}`];
+          const counts = result.scene_segments as { rendered: number; reused: number };
+          if (counts.rendered !== variant.expectedRendered || counts.reused !== 3 - variant.expectedRendered) {
+            return [`variant ${index} has incorrect scene reuse: ${JSON.stringify(counts)}`];
+          }
+          const decoded = await run(ffmpeg, ['-v', 'error', '-xerror', '-i', output, '-map', '0:v:0',
+            '-f', 'hash', '-hash', 'sha256', 'pipe:1']);
+          if (decoded.code !== 0) return [`could not decode variant ${index}: ${decoded.stderr}`];
+          hashes.push(decoded.stdout.toString());
+        }
+        return hashes[0] !== hashes[1] && hashes[1] === hashes[2]
+          ? [] : ['the scene edit must change the pixels and match the full rerender'];
+      },
+    },
+    {
+      name: 'preserves the authored viewport and corner pixels across identical frames and scene cuts',
+      run: async () => {
+        const p = await project(root, 'painted-frame-corners', []);
+        await p.writePage(page(`
+<section data-scene-id="a" style="background:#303030"></section>
+<section data-scene-id="b" style="background:#b0b0b0"></section>`, `
+if (innerWidth !== ${WIDTH} || innerHeight !== ${HEIGHT}) throw new Error('wrong authored viewport');`));
+        await p.writeManifest(manifest([{ id: 'a', duration: 0.2 }, { id: 'b', duration: 0.2 }]));
+        const result = await timelineApi.renderVideoTimeline(p.renderOptions());
+        assertWindow(result);
+        if (!result.ok) return [`render failed: ${result.errorCode} ${result.message}`];
+        const raw = await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', p.out, '-vf', 'crop=16:4:0:0',
+          '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']);
+        if (raw.code !== 0) return [`could not read the frame corners: ${raw.stderr}`];
+        const stride = 16 * 4 * 3;
+        const failures: string[] = [];
+        if (raw.stdout.length !== 12 * stride) failures.push('expected twelve complete frames');
+        for (let frame = 0; frame < 12 && frame * stride < raw.stdout.length; frame++) {
+          const shade = frame < 6 ? 0x30 : 0xb0;
+          const pixels = raw.stdout.subarray(frame * stride, (frame + 1) * stride);
+          if (pixels.some((v) => Math.abs(v - shade) > 12)) failures.push(`frame ${frame} has a wrong corner color`);
+        }
+        return failures;
+      },
+    },
+    {
       name: 'every delivered frame shows the source frame the timeline asked for',
       run: async () => {
         const p = await project(root, 'accuracy', clipAssets);
@@ -362,6 +492,112 @@ window.__timelines.b = { pause() {}, seek() {}, time() { return 0; }, duration()
         const counts = resumed.scene_segments as { rendered: number; reused: number };
         if (counts.reused !== 1 || counts.rendered !== 2) failures.push(`expected 2 rendered and 1 reused, got ${JSON.stringify(counts)}`);
         failures.push(...diff(await decodeFrameNumbers(p.out), [...range(0, 15), ...range(30, 15), ...range(60, 15)]));
+        return failures;
+      },
+    },
+    {
+      name: 'the screen demo helper taps where asked, renders any frame alone, and its typed text is screen content',
+      run: async () => {
+        const p = await project(root, 'screen-demo', []);
+        const media = path.join(p.production, 'media');
+        await fs.mkdir(media, { recursive: true });
+        // A plain light screenshot at a desktop size: the helper's dark pointer is the only dark ink on it.
+        const shot = nativeImage.createFromBitmap(Buffer.alloc(1440 * 900 * 4, 0xf0), { width: 1440, height: 900 }).toPNG();
+        await fs.writeFile(path.join(media, 'screen.png'), shot);
+        await fs.writeFile(path.join(p.production, 'assets.json'), JSON.stringify({
+          assets: [{ id: 'screen', kind: 'image', label: 'Screen', path: 'media/screen.png', origin: 'upload' }],
+        }), 'utf8');
+        // The box has the screenshot's own shape, so the screen fills it: x 30..510, y 300..600.
+        await p.writePage(page(`
+<section data-scene-id="demo"><div class="demo" style="position:absolute;left:30px;top:300px;width:480px;height:300px"><img data-clip="shot" alt=""></div></section>
+<section data-scene-id="held"><img class="held" data-clip="held-shot" style="position:absolute;left:30px;top:300px;width:480px;height:300px" alt=""></section>
+<section data-scene-id="follow"><div class="demo" style="position:absolute;left:30px;top:300px;width:480px;height:300px"><img data-clip="follow-shot" alt=""></div></section>`, `
+// ORKAS-SCENE-MOTION-BEGIN:demo
+window.__timelines.demo = gsap.timeline({ paused: true });
+ScreenDemo('[data-scene-id="demo"] .demo', window.__timelines.demo, { frame: 'none', follow: false })
+  .tap(0.5, 0.5, 1)
+  .type([1100, 60, 300, 27], 'typed into a small field', 2)
+  .tap(0.25, 0.8, 3.2);
+// ORKAS-SCENE-MOTION-END:demo
+// ORKAS-SCENE-MOTION-BEGIN:held
+window.__timelines.held = gsap.timeline({ paused: true }).fromTo('.held', { scale: 1 }, { scale: 1.08, duration: 2, ease: 'none' }, 0);
+// ORKAS-SCENE-MOTION-END:held
+// ORKAS-SCENE-MOTION-BEGIN:follow
+window.__timelines.follow = gsap.timeline({ paused: true });
+ScreenDemo('[data-scene-id="follow"] .demo', window.__timelines.follow, { frame: 'none' }).tap(0.25, 0.8, 1);
+// ORKAS-SCENE-MOTION-END:follow
+`, '<script src="./assets/vendor/gsap.min.js"></script><script src="./assets/vendor/screen-demo.js"></script>'));
+        await p.writeManifest(manifest([
+          { id: 'demo', clips: [{ id: 'shot', asset: 'screen', in: 0, dur: 3.6 }] },
+          { id: 'held', clips: [{ id: 'held-shot', asset: 'screen', in: 0, dur: 2 }] },
+          { id: 'follow', clips: [{ id: 'follow-shot', asset: 'screen', in: 0, dur: 3.6 }] },
+        ]));
+        const failures: string[] = [];
+        const checked = await timelineApi.checkVideoTimeline({
+          productionDirAbs: p.production,
+          videoDirAbs: p.video,
+          allowedRoots: [root],
+          segmentCacheDirAbs: p.cache,
+        });
+        assertWindow(checked);
+        if (!checked.ok) return [`check failed: ${checked.errorCode} ${checked.message}`];
+        if (JSON.stringify(checked).includes('FONT_TOO_SMALL')) failures.push('text typed inside the screen was held to the scene text size floor');
+        // A screen held with only a zoom is pointed out; the one a step is done on is not.
+        const hint = String(checked.message || '');
+        if (!hint.includes('Scene held shows what looks like a screen')) failures.push(`the held screen was not pointed out: ${hint || '(no message)'}`);
+        if (/\bdemo\b/.test(hint.split('screen-demo.js').join(''))) failures.push('the screen a step is done on was pointed out too');
+        const sheetAt = async (label: string, times: number[]) => {
+          const sheet = await timelineApi.sheetVideoTimeline({
+            productionDirAbs: p.production,
+            videoDirAbs: p.video,
+            allowedRoots: [root],
+            segmentCacheDirAbs: p.cache,
+            outputDirAbs: path.join(p.production, label),
+            times,
+          });
+          assertWindow(sheet);
+          if (!sheet.ok) throw new Error(`sheet failed: ${sheet.errorCode} ${sheet.message}`);
+          return sheet.samples as Array<{ path: string; hash: string }>;
+        };
+        const forward = await sheetAt('forward', [0, 1, 2.8, 3.2]);
+        const backward = await sheetAt('backward', [3.2, 2.8, 1, 0]);
+        const darkest = async (sample: { path: string }, cx: number, cy: number) => {
+          const image = nativeImage.createFromBuffer(await fileBytes(sample.path));
+          const bitmap = image.toBitmap();
+          const size = image.getSize();
+          let min = 255;
+          for (let y = cy; y < cy + 14; y += 1) {
+            for (let x = cx; x < cx + 8; x += 1) min = Math.min(min, bitmap[(y * size.width + x) * 4 + 1]);
+          }
+          return min;
+        };
+        // The arrow's tip is the point: its body is just below and right of it.
+        if (await darkest(forward[0], 270, 450) < 80) failures.push('the pointer shows before its first step');
+        if (await darkest(forward[1], 270, 450) > 80) failures.push('the pointer is not on the first tap at 1s');
+        if (await darkest(forward[3], 150, 540) > 80) failures.push('the pointer is not on the second tap at 3.2s');
+        const typed = await darkest(forward[2], 30 + 480 * (1100 / 1440), 300 + 300 * (60 / 900));
+        if (typed > 200) failures.push('no typed text in the field at 2.8s');
+        for (const [index, sample] of forward.entries()) {
+          const same = backward[forward.length - 1 - index];
+          if (sample.hash !== same.hash) failures.push(`frame ${index} differs when frames are rendered in the other order`);
+        }
+        // By default the view moves in on a tap (1.55x, kept inside the screen, so the point
+        // x 0.25, y 0.8 shows at 0.3875, 0.69 of the view) and back out 1.5 s later.
+        const follow = await sheetAt('follow', [5.6 + 1, 5.6 + 3.4]);
+        if (await darkest(follow[0], 216, 507) > 80) failures.push('the view did not move in on the tap');
+        if (await darkest(follow[1], 150, 540) > 80) failures.push('the view did not move back out after the tap');
+        // The same measure the check uses, on a real decode: a flat page is a screen, noise is not.
+        const render = await import('../../src/main/features/video_timeline_render');
+        const noise = Buffer.alloc(320 * 200 * 4);
+        let seed = 12345;
+        for (let i = 0; i < noise.length; i += 1) {
+          seed = (seed * 1103515245 + 12345) >>> 0;
+          noise[i] = i % 4 === 3 ? 255 : seed >>> 24;
+        }
+        const noisy = path.join(media, 'noise.png');
+        await fs.writeFile(noisy, nativeImage.createFromBitmap(noise, { width: 320, height: 200 }).toPNG());
+        if (!await render.pictureLooksLikeScreen(path.join(media, 'screen.png'))) failures.push('a flat page was not taken for a screen');
+        if (await render.pictureLooksLikeScreen(noisy)) failures.push('a picture of noise was taken for a screen');
         return failures;
       },
     },
@@ -870,13 +1106,13 @@ ${shades.map((_shade, index) => `<section data-scene-id="s${index}"><img data-cl
         });
         assertWindow(result);
         const failures: string[] = [];
-        const warnings = (result.warnings ?? []) as Array<{ code: string }>;
+        const review = result.visual_review as { status?: string; advisory?: boolean; findings?: Array<{ code: string }> } | undefined;
+        const warnings = review?.findings ?? [];
         if (!result.ok) failures.push(`expected warnings only, got ${result.errorCode}: ${result.message}`);
         if (!warnings.some((issue) => issue.code === 'FONT_TOO_SMALL')) failures.push(`no FONT_TOO_SMALL in ${warnings.map((issue) => issue.code).join(',')}`);
         if (!warnings.some((issue) => issue.code === 'SCENE_STATIC')) failures.push('a motionless two second scene went unmentioned');
         if (!warnings.some((issue) => issue.code === 'SCENE_MOSTLY_EMPTY')) failures.push('a nearly blank frame went unmentioned');
         if (!String(result.message).includes('too small to read')) failures.push(`text below the readable size should say so at the top, got: ${String(result.message).slice(0, 200)}`);
-        const review = result.visual_review as { status?: string; advisory?: boolean } | undefined;
         if (review?.status !== 'has_findings' || !review.advisory || !String(result.message).includes('slides')) failures.push('a nearly blank scene should retain advisory visual findings');
         const rendered = await timelineApi.renderVideoTimeline(p.renderOptions());
         if (!rendered.ok) failures.push(`advisory findings blocked rendering: ${rendered.errorCode}`);
@@ -897,7 +1133,7 @@ ${shades.map((_shade, index) => `<section data-scene-id="s${index}"><img data-cl
           allowedRoots: [root],
           segmentCacheDirAbs: filled.cache,
         });
-        const moving = (clean.warnings ?? []) as Array<{ code: string }>;
+        const moving = (clean.visual_review as typeof review)?.findings ?? [];
         if (moving.some((issue) => issue.code === 'SCENE_STATIC')) failures.push('footage was called static');
         if ((clean.visual_review as { status?: string } | undefined)?.status !== 'no_findings') failures.push(`full-frame footage should have no sampled findings: ${JSON.stringify(clean.visual_review)}`);
         return failures;

@@ -36,10 +36,10 @@ Apply these craft principles while scripting, composing, prompting and editing; 
 
 - Composition: rule-of-thirds for key elements; center for stable establishing frames. One clear focal point per frame.
 - Palette: **≤ 3–5 colors on screen** at once. Background is the least-saturated; foreground (largest, most saturated, central) reads first.
-- Typography: **1–2 font families** total. Follow the active design system's type scale (at 1080p roughly titles 72–140 px, body 28–48 px; native QA blocks text under 18 px); title at least ~50% larger than body. Max ~2 lines, ~32–42 chars/line.
+- Typography: **1–2 font families** total. Follow the active design system's type scale (on a 1080 px short side roughly titles 72–140 px, body 42–54 px; native QA flags text under 42 px there, about 14 px on a phone); title at least ~50% larger than body. Max ~2 lines, ~32–42 chars/line.
 - **Safe zones**: keep text inside ~80% of the frame (~192 px margin at 1080p). For vertical, keep essential content out of the bottom ~300 px (platform UI sits there) and away from the very top.
 - Contrast ≥ **4.5:1** for any text. Use brightness/saturation, not red-green, to distinguish elements.
-- Consistency is a feeling of quality: one color grade/LUT, one type system, 2–3 transition types — for the whole video.
+- Consistency is a feeling of quality: one color grade/LUT and one type system for the whole video.
 
 ## 5. Motion & animation
 
@@ -48,7 +48,7 @@ Apply these craft principles while scripting, composing, prompting and editing; 
 - *Weak → strong:* ✗ four cards fly in together, linear, all 0.3 s → ✓ stagger them ~120 ms, ease-out, each settling before the next starts (one focal point at a time).
 - Entrances ~0.3–0.5 s then hold for readable dwell; exits ~0.5–1 s. Optional small overshoot (~10–15%, settle in a few frames) adds life for playful pieces.
 - Kinetic type: reveal text to a readable dwell (~3 s per ~60 chars); word-by-word reveal synced to narration boosts attention.
-- Transitions carry meaning: **hard cut** = same topic/new angle (most invisible, most professional); **crossfade** = gentle topic change; **wipe/slide** = sequential steps; **zoom in/out** = into detail / out to context. Pick a small set and keep them consistent.
+- In footage edits, transitions carry meaning (page-timeline scenes always hard-cut): **hard cut** = same topic/new angle (most invisible, most professional); **crossfade** = gentle topic change; **wipe/slide** = sequential steps; **zoom in/out** = into detail / out to context. Pick a small set and keep them consistent.
 
 ## 6. Captions / on-screen text
 
@@ -106,7 +106,7 @@ use the content review in [ecommerce.md](references/ecommerce.md).
 
 ### Then confirm (each line = where a finding hides)
 
-- **Readable** — text within the design system's type scale (native QA blocks under 18 px) and ≥ 4.5:1 contrast; captions synced; nothing covers the face/critical content; readable at phone size.
+- **Readable** — text within the design system's type scale (native QA flags what is under about 14 px on a phone) and ≥ 4.5:1 contrast; captions synced; nothing covers the face/critical content; readable at phone size.
 - **Timed** — hook lands in the first seconds; first payoff early; pattern interrupt on cadence; each scene held long enough to read; narration wpm fits the format.
 - **On message** — the core point is actually stated; visuals reinforce (not fight) the narration; no padding/dead time; exact text correct (no hallucinated stats).
 - **Consistent** — one grade, one type system, a small transition set; subject identity preserved across cuts.

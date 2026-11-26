@@ -25,7 +25,13 @@ export async function startVoiceSpeechProvider(audio: Record<string, Buffer>, vo
   Object.assign(process.env, { ORKAS_TTS_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, ORKAS_TTS_API_KEY: 'local-eval-only', ORKAS_TTS_MODEL: 'local-speech-fixture', ORKAS_TTS_VOICE: voice, ORKAS_TTS_FORMAT: 'wav' });
   return {
     requests,
-    snapshot: () => ({ local: true, requests: requests.length, fulfilled: requests.length === Object.keys(audio).length && Object.keys(audio).every(text => requests.filter(r => r.text === text && r.voice === voice && r.format === 'wav' && (r.speed === undefined || r.speed === 1)).length === 1) }),
+    snapshot: () => ({
+      local: true,
+      billingRoute: 'configured-own-account-fixture' as const,
+      requests: requests.length,
+      fulfilled: requests.length === Object.keys(audio).length && Object.keys(audio).every(text =>
+        requests.filter(r => r.text === text && r.voice === voice && r.format === 'wav' && (r.speed === undefined || r.speed === 1)).length === 1),
+    }),
     close: async () => {
       for (const k of keys) { if (prior[k] === undefined) delete process.env[k]; else process.env[k] = prior[k]; }
       server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));

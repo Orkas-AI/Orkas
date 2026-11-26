@@ -7,11 +7,13 @@
  * pass silently. Printed text is bounded and built only from redacted
  * signatures, repository-relative test files and test names.
  */
-import { relative } from 'node:path';
+import { Console } from 'node:console';
+import { relative, resolve } from 'node:path';
 import { writeFileSync } from 'node:fs';
-import type { Reporter, TestModule } from 'vitest/node';
+import { Writable } from 'node:stream';
+import { DefaultReporter, parseCLI, type TestModule, type TestSpecification, type Vitest } from 'vitest/node';
 import type { TestLogScopeSummary, TestLogSignature } from './helpers/test-log-analysis';
-import { combineStderrReceipts } from '../scripts/test-stderr-receipt.mjs';
+import { combineStderrReceipts, createStderrReceipt } from '../scripts/test-stderr-receipt.mjs';
 
 /** Task-meta key shared with the worker tap; this module must not load Vitest's runtime. */
 export const TEST_LOG_META_KEY = 'orkasLogAnalysis';
@@ -117,36 +119,99 @@ export function formatTestLogSummary(summary: TestLogRunSummary): string {
   return `${out.join('\n')}\n`;
 }
 
-export class TestLogAnalysisReporter implements Reporter {
+export function reconcileTestFileSelection(filters: readonly string[], moduleIds: readonly string[], root: string, incremental = false) {
+  const discovered = moduleIds.map(file => resolve(file).replace(/\\/g, '/'));
+  const missing = incremental ? [] : filters.flatMap((filter, index) => {
+    const file = filter.replace(/:\d+(?:-\d+)?$/, '').replace(/\\/g, '/').replace(/^\.\//, '');
+    return discovered.some(candidate => candidate === resolve(root, file).replace(/\\/g, '/')
+      || candidate.endsWith(`/${file}`)) ? [] : [index];
+  });
+  return { requested: filters.length, missing, incremental };
+}
+
+export class TestLogAnalysisReporter extends DefaultReporter {
   private root = process.cwd();
   private inventory: string[] = [];
+  private requestedFiles: string[] = [];
+  private incremental = false;
+  private selection = { requested: 0, missing: [] as number[], incremental: false };
 
-  onInit(vitest: { config: { root: string } }): void {
+  override onInit(vitest: Vitest): void {
+    super.onInit(vitest);
     this.root = vitest.config.root;
+    this.incremental = vitest.config.watch === true;
+    // Use the owning CLI parser, so option values and commands cannot become
+    // positional selections. Partial/directory filters keep Vitest semantics.
+    this.requestedFiles = parseCLI(['vitest', ...process.argv.slice(2)]).filter
+      .filter(file => /\.[cm]?[jt]sx?(?::\d+(?:-\d+)?)?$/.test(file) && !/[?*{}]/.test(file));
   }
 
-  onTestRunStart(): void {
+  override onTestRunStart(specifications: readonly TestSpecification[]): void {
+    super.onTestRunStart(specifications);
     this.inventory = [];
+    // The pre-shard inventory is deliberate: later shards own the remaining
+    // files, while an excluded/nonexistent requested file is never discovered.
+    // Watch reruns intentionally contain only invalidated files, not a full
+    // selection. They cannot certify a terminal whole-selection result.
+    this.selection = reconcileTestFileSelection(this.requestedFiles,
+      specifications.map(spec => spec.moduleId), this.root, this.incremental);
   }
 
-  onTestModuleQueued(module: TestModule): void {
+  override onTestModuleQueued(module: TestModule): void {
+    super.onTestModuleQueued(module);
     // onTestRunStart receives the pre-shard inventory in Vitest 4. Queue events
     // identify the selected shard, including files that fail during collection.
     this.inventory.push(relative(this.root, module.moduleId).replace(/\\/g, '/'));
   }
 
-  onTestRunEnd(modules: readonly TestModule[], errors: readonly unknown[] = [], reason = 'passed'): void {
-    const summary = summarizeTestLogs(modules, this.root);
-    process.stdout.write(formatTestLogSummary(summary));
-    if (summary.status === 'FAIL') process.exitCode = 1;
-    if (process.env.ORKAS_TEST_PROCESS_REPORT) {
-      // Only the bounded receipt crosses this launcher boundary, never raw text.
-      writeFileSync(process.env.ORKAS_TEST_PROCESS_REPORT, JSON.stringify({ schema: 1,
-        stderr: combineStderrReceipts(modules.filter(module => module.state() !== 'skipped')
-          .map(module => (module.meta() as Record<string, unknown>).orkasStderrReceipt)),
-      }), { mode: 0o600 });
+  override onTestRunEnd(...args: Parameters<DefaultReporter['onTestRunEnd']>): void {
+    const [modules, errors, reason] = args;
+    const processReport = process.env.ORKAS_TEST_PROCESS_REPORT;
+    const batchReport = process.env.ORKAS_TEST_BATCH_REPORT;
+    const reportingStderr = createStderrReceipt();
+    if (processReport || batchReport) {
+      // Attribute bytes at the framework's synchronous result formatter.
+      // Worker stderr, direct FD writes, and other reporters still go through
+      // the ordinary stream without inheriting this receipt.
+      const logger = this.ctx.logger;
+      const originalConsole = logger.console;
+      const stderr = new Writable({
+        write(chunk, _encoding, done) {
+          reportingStderr.ingest(chunk);
+          logger.errorStream.write(chunk);
+          done();
+        },
+      });
+      logger.console = new Console({ stdout: logger.outputStream, stderr });
+      try { super.onTestRunEnd(...args); }
+      finally { logger.console = originalConsole; }
+    } else {
+      super.onTestRunEnd(...args);
     }
-    if (process.env.ORKAS_TEST_BATCH_REPORT) {
+
+    const summary = summarizeTestLogs(modules, this.root);
+    if (this.selection.missing.length) {
+      summary.coverageGaps.push(`Requested files not discovered (filter indices: ${this.selection.missing.slice(0, 40).join(',')})`);
+      summary.status = 'FAIL';
+    }
+    process.stdout.write(formatTestLogSummary(summary));
+    if (this.selection.missing.length) {
+      process.stdout.write(`[test-selection] FAIL requested file was not discovered; filter indices=${this.selection.missing.slice(0, 40).join(',')}`
+        + ` missing=${this.selection.missing.length}\n`);
+      process.exitCode = 1;
+    }
+    if (summary.status === 'FAIL') process.exitCode = 1;
+    if (!processReport && !batchReport) return;
+    const stderr = combineStderrReceipts([
+      reportingStderr.finish(),
+      ...modules.filter(module => module.state() !== 'skipped')
+        .map(module => (module.meta() as Record<string, unknown>).orkasStderrReceipt),
+    ]);
+    if (processReport) {
+      // Only the bounded receipt crosses this launcher boundary, never raw text.
+      writeFileSync(processReport, JSON.stringify({ schema: 1, stderr }), { mode: 0o600 });
+    }
+    if (batchReport) {
       const files = modules.map(module => {
         const counts = { passed: 0, failed: 0, skipped: 0 };
         for (const test of module.children.allTests()) {
@@ -160,10 +225,8 @@ export class TestLogAnalysisReporter implements Reporter {
       });
       // No raw logs, environment values or test payloads in structured reports.
       // The launcher retains stdout/stderr separately with restricted permissions.
-      writeFileSync(process.env.ORKAS_TEST_BATCH_REPORT, JSON.stringify({ schema: 1, reason,
-        unhandledErrors: errors.length, inventory: this.inventory, files, logs: summary,
-        stderr: combineStderrReceipts(modules.filter(module => module.state() !== 'skipped')
-          .map(module => (module.meta() as Record<string, unknown>).orkasStderrReceipt)),
+      writeFileSync(batchReport, JSON.stringify({ schema: 1, reason, selection: this.selection,
+        unhandledErrors: errors.length, inventory: this.inventory, files, logs: summary, stderr,
       }), { mode: 0o600 });
     }
   }

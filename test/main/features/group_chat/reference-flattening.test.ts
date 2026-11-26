@@ -42,6 +42,36 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe('conversation send failure receipts', () => {
+  it('keeps an indeterminate storage failure private without labelling the send rejected', async () => {
+    const logging = await import('../../../../src/main/logger');
+    const create = logging.createLogger;
+    const error = vi.fn();
+    const logger = vi.spyOn(logging, 'createLogger').mockImplementation(scope => {
+      const scoped = create(scope);
+      return scope === 'group_chat.facade' ? { ...scoped, error } : scoped;
+    });
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const enqueue = vi.spyOn(bus, 'enqueue');
+    try {
+      const group = await import('../../../../src/main/features/group_chat');
+      for (const failure of [new Error('fixture-private-storage-detail'), null]) {
+        enqueue.mockRejectedValueOnce(failure);
+        const result = await group.send({ userId: UID, cid: 'target-cid', text: 'Hello' });
+        expect(result).toEqual({ ok: false, error: 'send failed' });
+      }
+      expect(error).toHaveBeenCalledTimes(2);
+      const recorded = JSON.stringify(error.mock.calls);
+      for (const detail of [UID, 'target-cid', 'fixture-private-storage-detail']) {
+        expect(recorded).not.toContain(detail);
+      }
+    } finally {
+      enqueue.mockRestore();
+      logger.mockRestore();
+    }
+  });
+});
+
 describe('cross-task reference flattening', () => {
   it('rejects missing or deleted quote locators as empty without renaming the target, then accepts a real quote', async () => {
     const chats = await import('../../../../src/main/features/chats');
@@ -61,7 +91,7 @@ describe('cross-task reference flattening', () => {
     for (const sourceMsgId of ['missing-msg', 'deleted-msg']) {
       expect(await groupChat.send({ userId: UID, cid: target.conversation_id, text: '@commander',
         references: [{ source_cid: source.conversation_id, source_msg_id: sourceMsgId }],
-      })).toEqual({ ok: false, error: 'empty message' });
+      })).toEqual({ ok: false, error: 'empty message', admission_rejected: true });
       expect((await chats.getConversation(UID, target.conversation_id))?.title).toBe('New Chat');
       expect(fs.readFileSync(targetHistory, 'utf8')).toBe(originalHistory);
       expect(modelInputs).toEqual([]);

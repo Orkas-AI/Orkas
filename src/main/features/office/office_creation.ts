@@ -88,7 +88,13 @@ export class OfficeCreationJournal {
     return fileEditLock(this.lockKey).runExclusive(() => {
       const prior = this.atPath(target);
       if (retryOf !== undefined) {
-        if (typeof retryOf !== 'string' || !ID.test(retryOf)) return { error: 'retry_of must identify the original failed creation.' };
+        if (typeof retryOf !== 'string' || !ID.test(retryOf)) {
+          if (!prior) return { error: 'Omit retry_of for an initial creation.' };
+          if (prior.requestedPath === target && prior.status === 'retryable' && prior.attempt === 1) {
+            return { operation: prior, error: 'Use the returned operation_id as retry_of with corrected input at the original path.' };
+          }
+          return { error: 'This creation has no correction attempt available.' };
+        }
         // Looking up by the original operation also prevents a changed filename
         // from allocating fresh correction allowance.
         const original = this.operation(retryOf);

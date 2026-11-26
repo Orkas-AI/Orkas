@@ -2846,8 +2846,8 @@ function _settingsRenderImageEntries() {
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
   {id:'orkas-api',provider:'orkas-api',model:'orkas-video',label:_settingsOrkasServiceLabel('Video'),docs:_ORKAS_API_KEYS_URL},
-  { id: 'doubao:doubao-seedance-2-5-260628', provider: 'doubao', model: 'doubao-seedance-2-5-260628', label: 'Doubao Seedance 2.5' },
-  { id: 'doubao:doubao-seedance-2-5-flash', provider: 'doubao', model: 'doubao-seedance-2-5-flash', label: 'Doubao Seedance 2.5 Flash' },
+  { id: 'doubao:doubao-seedance-2-5-260628', provider: 'doubao', model: 'doubao-seedance-2-5-260628', label: 'Seedance 2.5' },
+  { id: 'doubao:doubao-seedance-2-5-flash', provider: 'doubao', model: 'doubao-seedance-2-5-flash', label: 'Seedance 2.5 Flash' },
   { id: 'doubao:doubao-seedance-2-0-260128', provider: 'doubao', model: 'doubao-seedance-2-0-260128', label: 'Doubao Seedance 2.0' },
   { id: 'doubao:doubao-seedance-2-0-fast-260128', provider: 'doubao', model: 'doubao-seedance-2-0-fast-260128', label: 'Doubao Seedance 2.0 Fast' },
   { id: 'doubao:doubao-seedance-2-0-mini', provider: 'doubao', model: 'doubao-seedance-2-0-mini', label: 'Doubao Seedance 2.0 Mini' },
@@ -2859,12 +2859,12 @@ const _VIDEO_AUTH_PROVIDER_OPTIONS = [
   { id: 'vidu:viduq3-turbo', provider: 'vidu', model: 'viduq3-turbo', label: 'Vidu Q3 Turbo' },
   { id: 'kling:kling-v4-0', provider: 'kling', model: 'kling-v4-0', label: 'Kling 4.0' },
   { id: 'kling:kling-v4-0-flash', provider: 'kling', model: 'kling-v4-0-flash', label: 'Kling 4.0 Flash' },
-  { id: 'google', provider: 'google', model: 'gemini-omni-1.1-flash', label: 'Google Gemini Omni 1.1 Flash' },
+  { id: 'google', provider: 'google', model: 'gemini-omni-1.1-flash', label: 'Gemini Omni 1.1 Flash' },
   { id: 'google-cloud:veo-3.1-generate-001', provider: 'google-cloud', model: 'veo-3.1-generate-001', label: 'Google Cloud Veo 3.1' },
   { id: 'google-cloud:veo-3.1-fast-generate-001', provider: 'google-cloud', model: 'veo-3.1-fast-generate-001', label: 'Google Cloud Veo 3.1 Fast' },
   { id: 'google-cloud:veo-3.1-lite-generate-001', provider: 'google-cloud', model: 'veo-3.1-lite-generate-001', label: 'Google Cloud Veo 3.1 Lite' },
-  { id: 'aliyun:wan3.0-video', provider: 'aliyun', model: 'wan3.0-video', label: 'Alibaba Cloud Wan 3.0' },
-  { id: 'aliyun:wan3.0-video-prime', provider: 'aliyun', model: 'wan3.0-video-prime', label: 'Alibaba Cloud Wan 3.0 Prime' },
+  { id: 'aliyun:wan3.0-video', provider: 'aliyun', model: 'wan3.0-video', label: 'Wan 3.0' },
+  { id: 'aliyun:wan3.0-video-prime', provider: 'aliyun', model: 'wan3.0-video-prime', label: 'Wan 3.0 Prime' },
   { id: 'runway', provider: 'runway', model: 'gen4.5', label: 'Runway Gen-4.5' },
 ];
 
@@ -2907,6 +2907,11 @@ async function _settingsRefreshVideoProfiles() {
     ? res.providers
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
   _settingsRenderOrkasApiCard();
+}
+
+async function _settingsVideoProfilesChanged() {
+  window.VideoCanvas?.refreshModelOptions?.();
+  await _settingsRefreshVideoProfiles();
 }
 
 function _settingsRenderVideoSection() {
@@ -2973,7 +2978,7 @@ async function _settingsClickAddVideoKey() {
     if (workspaceInput) workspaceInput.value = '';
     _settingsSetStatus('settings-video-status', 'ok', t('settings.video.add_ok'));
     _settingsCloseAddModal();
-    await _settingsRefreshVideoProfiles();
+    await _settingsVideoProfilesChanged();
     _settingsRenderVideoEntries();
   } catch (err) {
     _settingsSetStatus('settings-video-status', 'error', (err && err.message) || String(err));
@@ -3043,7 +3048,7 @@ function _settingsRenderVideoEntries() {
       if (!ok) return;
       const res = await window.orkas.invoke('videoAuth.remove', { id: p.id });
       if (res && res.ok) {
-        await _settingsRefreshVideoProfiles();
+        await _settingsVideoProfilesChanged();
         _settingsRenderVideoEntries();
       }
     });
@@ -3057,7 +3062,7 @@ function _settingsRenderVideoEntries() {
         .filter(profile => !_settingsApiProfileIsUnavailable(profile)).map((x) => x.id),
       ipcName: 'videoAuth.reorder',
       onSuccess: async () => {
-        await _settingsRefreshVideoProfiles();
+        await _settingsVideoProfilesChanged();
         _settingsRenderVideoEntries();
       },
     });

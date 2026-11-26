@@ -26,13 +26,74 @@ export interface TaskNotificationHandle {
 export interface TaskNotificationRuntime {
   getActiveUserId(): string;
   isEnabled(): boolean;
-  hasFocusedWindow(): boolean;
+  isForeground(): boolean;
   isSupported(): boolean;
   resolveLanguageForUser(userId: string): Lang;
   setBadgeCount(count: number): void;
-  onDidFocus(listener: () => void): () => void;
+  onDidEnterForeground(listener: () => void): () => void;
+  onDidEnterBackground(listener: () => void): () => void;
+  watchBashPermission(requestId: string, uid: string, cid: string, onResolved: () => void): (() => void) | undefined;
   createNotification(options: { title: string; body: string }): TaskNotificationHandle;
   openConversation(conversationId: string, status: TaskTerminalStatus, userId: string): void;
+}
+
+type ForegroundEvent = 'browser-window-focus' | 'did-become-active' | 'browser-window-blur' | 'did-resign-active';
+interface TaskNotificationApp {
+  isActive(): boolean;
+  on(event: ForegroundEvent, listener: () => void): unknown;
+  off(event: ForegroundEvent, listener: () => void): unknown;
+}
+interface TaskNotificationWindow {
+  isDestroyed(): boolean;
+  isFocused(): boolean;
+  isVisible(): boolean;
+  isMinimized(): boolean;
+}
+
+export function createTaskNotificationForeground(
+  app: TaskNotificationApp,
+  getWindows: () => readonly TaskNotificationWindow[],
+  platform: NodeJS.Platform = process.platform,
+): Pick<TaskNotificationRuntime, 'isForeground' | 'onDidEnterForeground' | 'onDidEnterBackground'> {
+  const isMac = platform === 'darwin';
+  const isForeground = isMac
+    // A native sheet can take window focus while Orkas stays active. An
+    // active app with only hidden or minimized windows still needs alerts.
+    ? () => app.isActive() && getWindows().some(win => !win.isDestroyed() && win.isVisible() && !win.isMinimized())
+    : () => getWindows().some(win => !win.isDestroyed() && win.isFocused());
+  return {
+    isForeground,
+    onDidEnterForeground(listener) {
+      const acknowledge = () => {
+        if (!isMac || isForeground()) listener();
+      };
+      // A window can also be restored while the macOS app is already active.
+      app.on('browser-window-focus', acknowledge);
+      if (isMac) app.on('did-become-active', acknowledge);
+      return () => {
+        app.off('browser-window-focus', acknowledge);
+        if (isMac) app.off('did-become-active', acknowledge);
+      };
+    },
+    onDidEnterBackground(listener) {
+      let scheduled: ReturnType<typeof setImmediate> | undefined;
+      const check = () => {
+        if (scheduled !== undefined) return;
+        // A blur can be the first half of a switch between Orkas windows.
+        scheduled = setImmediate(() => {
+          scheduled = undefined;
+          if (!isForeground()) listener();
+        });
+      };
+      app.on('browser-window-blur', check);
+      if (isMac) app.on('did-resign-active', check);
+      return () => {
+        app.off('browser-window-blur', check);
+        if (isMac) app.off('did-resign-active', check);
+        if (scheduled !== undefined) clearImmediate(scheduled);
+      };
+    },
+  };
 }
 
 type TaskTerminalSubscribe = (listener: TaskTerminalListener) => () => void;
@@ -89,6 +150,7 @@ export function startTaskNotifications(
   let unreadCount = 0;
   const activeNotifications = new Set<TaskNotificationHandle>();
   const recentInterventions = new Map<string, number>();
+  const bashReminders = new Map<string, { stopWatching: () => void; remind: () => void }>();
   /** The one visible notification per account, kind and status, with how
    *  many events it stands for and the conversation its click opens. */
   const groups = new Map<string, { count: number; handle: TaskNotificationHandle; conversationId: string }>();
@@ -126,18 +188,18 @@ export function startTaskNotifications(
 
   // Clear any stale OS-owned badge left behind by an unclean prior exit.
   updateBadge(0);
-  const stopFocusListener = runtime.onDidFocus(markNotificationsRead);
-  const deliver = (event: TaskNotificationEvent, intervention = false): void => {
+  const stopForegroundListener = runtime.onDidEnterForeground(markNotificationsRead);
+  const deliver = (event: TaskNotificationEvent, intervention = false, bashRequestId?: string): (() => void) | undefined => {
     if (appConversationOwner(event.conversation_id)) return;
     const key = eventKey(event);
-    const group = groupKey(event);
+    const group = bashRequestId ? `${groupKey(event)}\0${bashRequestId}` : groupKey(event);
     let badgeOwned = false;
     let interventionShownAt = 0;
     let notification: TaskNotificationHandle | null = null;
     try {
       if (runtime.getActiveUserId() !== event.user_id) return;
       if (!runtime.isEnabled()) return;
-      if (runtime.hasFocusedWindow() || !runtime.isSupported()) return;
+      if (runtime.isForeground() || !runtime.isSupported()) return;
 
       // Read the originating account's persisted language at delivery time.
       // The process-global locale can be stale when another Orkas process or
@@ -168,7 +230,9 @@ export function startTaskNotifications(
         // and keep counting into it until the user acts on it.
         if (reason === 'timedOut') return;
         activeNotifications.delete(createdNotification);
-        releaseGroup();
+        // Dismissing the banner leaves its pending approval in the unread count.
+        // Keep that request's slot until settlement or foreground acknowledgement.
+        if (!bashRequestId) releaseGroup();
       });
       createdNotification.onFailed(() => {
         // Native delivery failures are asynchronous on macOS and Windows.
@@ -186,6 +250,7 @@ export function startTaskNotifications(
       });
       createdNotification.onClick(() => {
         try {
+          if (bashRequestId && !bashReminders.has(bashRequestId)) return;
           // A stale notification must never navigate into another account's
           // local conversation namespace after an account switch.
           if (runtime.getActiveUserId() !== event.user_id) {
@@ -212,6 +277,13 @@ export function startTaskNotifications(
         recentInterventions.set(key, interventionShownAt);
       }
       createdNotification.show();
+      return () => {
+        if (recentInterventions.get(key) === interventionShownAt) recentInterventions.delete(key);
+        if (groups.get(group)?.handle !== createdNotification) return;
+        releaseGroup();
+        if (activeNotifications.delete(createdNotification)) closeNotification(createdNotification);
+        if (badgeOwned) updateBadge(unreadCount - 1);
+      };
     } catch (err) {
       // Notifications are a best-effort attention layer. They must never
       // affect persistence, task completion, the worker scheduler, or leave a
@@ -250,13 +322,30 @@ export function startTaskNotifications(
     });
   });
   const unsubscribeInterventions = subscribeInterventions((event: TaskInterventionEvent) => {
-    // An intervention carries no entry point; it reads as a task needing a reply.
-    deliver({
+    const target = {
       user_id: event.user_id,
       conversation_id: event.conversation_id,
       status: 'waiting_input',
       kind: 'task',
-    }, true);
+    } as const;
+    const requestId = event.bash_request_id;
+    if (!requestId) {
+      deliver(target, true);
+      return;
+    }
+    if (bashReminders.has(requestId) || runtime.getActiveUserId() !== event.user_id) return;
+    let retract: (() => void) | undefined;
+    const stopWatching = runtime.watchBashPermission(requestId, event.user_id, event.conversation_id, () => {
+      bashReminders.delete(requestId);
+      retract?.();
+    });
+    if (!stopWatching) return;
+    const remind = () => { retract ??= deliver(target, true, requestId); };
+    bashReminders.set(requestId, { stopWatching, remind });
+    remind();
+  });
+  const stopBackgroundListener = runtime.onDidEnterBackground(() => {
+    for (const reminder of bashReminders.values()) reminder.remind();
   });
 
   let stopped = false;
@@ -265,7 +354,10 @@ export function startTaskNotifications(
     stopped = true;
     unsubscribeTerminals();
     unsubscribeInterventions();
-    stopFocusListener();
+    stopForegroundListener();
+    stopBackgroundListener();
+    for (const reminder of bashReminders.values()) reminder.stopWatching();
+    bashReminders.clear();
     markNotificationsRead();
   };
 }

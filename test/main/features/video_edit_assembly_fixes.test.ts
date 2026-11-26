@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import {
   captionFontForText,
@@ -393,12 +393,26 @@ describe.skipIf(!haveFfmpeg)('concat when only some parts carry sound', () => {
     expect(r.status, r.stderr).toBe(0);
     return out;
   }
-  function audioDuration(file: string): number | null {
+  function streamDuration(file: string, stream: 'a' | 'v'): number | null {
     const r = spawnSync(bins.ffprobe!, [
-      '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=duration', '-of', 'csv=p=0', file,
+      '-v', 'error', '-select_streams', `${stream}:0`, '-show_entries', 'stream=duration', '-of', 'csv=p=0', file,
     ], { encoding: 'utf8' });
+    expect(r.status, r.stderr).toBe(0);
     const value = Number(r.stdout.trim());
     return r.stdout.trim() && Number.isFinite(value) ? value : null;
+  }
+  function audioPeak(file: string, start: number): number {
+    const decoded = spawnSync(bins.ffmpeg!, [
+      '-v', 'error', '-ss', String(start), '-i', file, '-t', '1',
+      '-map', '0:a:0', '-ac', '1', '-ar', '8000', '-f', 's16le', 'pipe:1',
+    ], { timeout: 10_000 });
+    expect(decoded.status, String(decoded.stderr)).toBe(0);
+    expect(decoded.stdout.length).toBe(16_000);
+    let peak = 0;
+    for (let offset = 0; offset < decoded.stdout.length; offset += 2) {
+      peak = Math.max(peak, Math.abs(decoded.stdout.readInt16LE(offset)));
+    }
+    return peak / 32768;
   }
 
   it.each([
@@ -410,7 +424,13 @@ describe.skipIf(!haveFfmpeg)('concat when only some parts carry sound', () => {
     const out = path.join(dir, 'joined.mp4');
     const result = await editVideo({ op: 'concat', inputAbsPaths: parts, outputAbsPath: out });
     expect(result.ok, JSON.stringify(result)).toBe(true);
-    expect(audioDuration(out)).toBeGreaterThan(3.8);
+    expect(streamDuration(out, 'a')).toBeGreaterThan(3.8);
+    expect(streamDuration(out, 'v')).toBeCloseTo(4, 1);
+    for (const [index, withAudio] of (layout as boolean[]).entries()) {
+      const peak = audioPeak(out, index * 2 + 0.5);
+      if (withAudio) expect(peak).toBeGreaterThan(0.05);
+      else expect(peak).toBeLessThan(0.001);
+    }
     const audioConform = (result as any).audio_conform;
     expect(audioConform.padded_inputs).toEqual(parts.filter((_, index) => !(layout as boolean[])[index]));
     expect(audioConform.note).toMatch(/keeps the sound of the others/);
@@ -425,7 +445,7 @@ describe.skipIf(!haveFfmpeg)('concat when only some parts carry sound', () => {
     const out = path.join(dir, 'joined.mp4');
     const result = await editVideo({ op: 'concat', inputAbsPaths: parts, outputAbsPath: out });
     expect(result.ok, JSON.stringify(result)).toBe(true);
-    expect(audioDuration(out) !== null).toBe(hasAudio);
+    expect(streamDuration(out, 'a') !== null).toBe(hasAudio);
     expect((result as any).audio_conform).toBeUndefined();
   }, 120_000);
 });
@@ -558,8 +578,50 @@ describe.skipIf(!haveFfmpeg)('captions over captions already in the picture', ()
     expect(count(after, w, [0, band[0] - 2], white)).toBe(0);
     expect(count(after, w, [0, band[0] - 2], (r, g, b) => r + g + b < 60)).toBe(0);
 
-    const wide = await editVideo({ op: 'burnsubs', inputAbsPath: input, subtitlesAbsPath: subtitles, cover: { top: 0.2, bottom: 0.9 }, outputAbsPath: path.join(dir, 'wide.mp4') });
-    expect(wide).toMatchObject({ ok: false, errorCode: 'E_EDIT_ARG' });
+    fs.writeFileSync(subtitles, '1\n00:00:00,000 --> 00:00:02,000\n' + '很长的字幕'.repeat(10) + '\n');
+    const scratch = tmp();
+    const envKey = process.platform === 'win32' ? 'TEMP' : 'TMPDIR';
+    vi.stubEnv(envKey, scratch);
+    try {
+      const wide = await editVideo({ op: 'burnsubs', inputAbsPath: input, subtitlesAbsPath: subtitles,
+        cover: { top: 0.2, bottom: 0.9 }, outputAbsPath: path.join(dir, 'wide.mp4') });
+      expect(wide).toMatchObject({ ok: false, errorCode: 'E_EDIT_ARG' });
+      expect(fs.readdirSync(scratch)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 60_000);
+});
+
+// 2026-11-23: a 16-character Chinese line burned on a vertical video ran off both edges.
+describe.skipIf(!haveFfmpeg)('long caption lines on a vertical frame', () => {
+  function grayFrame(file: string, w: number, h: number, at: number): Buffer {
+    const r = spawnSync(bins.ffmpeg!, ['-v', 'error', '-ss', String(at), '-i', file, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'], { maxBuffer: 1 << 26 });
+    expect(r.status).toBe(0);
+    return r.stdout as Buffer;
+  }
+  it('keeps every character inside the frame and leaves the caption file as it was', async () => {
+    const dir = tmp();
+    const [w, h] = [360, 640];
+    const input = path.join(dir, 'clip.mp4');
+    const made = spawnSync(bins.ffmpeg!, ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=c=black:s=${w}x${h}:r=30:d=2`, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', input], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+    const subtitles = path.join(dir, 'captions.srt');
+    const body = '1\n00:00:00,000 --> 00:00:02,000\n想吃的朋友，可以提前在群里跟我说，帮你留着。\n';
+    fs.writeFileSync(subtitles, body);
+    const out = path.join(dir, 'captioned.mp4');
+    const result = await editVideo({ op: 'burnsubs', inputAbsPath: input, subtitlesAbsPath: subtitles, outputAbsPath: out });
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(fs.readFileSync(subtitles, 'utf8')).toBe(body);
+    const px = grayFrame(out, w, h, 1);
+    let lit = 0; let atEdge = 0;
+    for (let y = 0; y < h; y += 1) for (let x = 0; x < w; x += 1) {
+      if (px[y * w + x] <= 100) continue;
+      lit += 1;
+      if (x < 4 || x >= w - 4) atEdge += 1;
+    }
+    expect(lit).toBeGreaterThan(500);
+    expect(atEdge).toBe(0);
   }, 60_000);
 });
 

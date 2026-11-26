@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { openclawBackend } from '../../../../src/main/features/local_agents/backends/openclaw';
 import { prepareOpenclawBridge } from '../../../../src/main/features/local_agents/backends/openclaw-bridge';
+import type { LocalEvent } from '../../../../src/main/features/local_agents/backends/base';
 
 vi.mock('../../../../src/main/logger', () => ({ createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }) }));
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
@@ -131,16 +132,39 @@ describe('OpenClaw per-run bridge configuration', () => {
     expect(fs.readdirSync(root).filter(name => name.startsWith('.orkas-run-'))).toEqual([]);
   });
 
-  it.each(['invalid', 'timeout', 'cancel'] as const)('stops before agent execution on config probe %s', async (failure) => {
-    fs.writeFileSync(path.join(root, 'config'), failure === 'invalid'
-      ? "process.stderr.write('private config diagnostic'); process.exitCode=1;"
-      : 'setInterval(() => {}, 1000);');
+  it.each([
+    { failure: 'exit', status: 'failed', error: 'exit code 7' },
+    { failure: 'invalid location', status: 'failed', error: 'did not return a valid configuration location' },
+    { failure: 'overlay write', status: 'failed', error: 'could not write the temporary configuration' },
+    { failure: 'timeout', status: 'timeout', error: 'configuration check timed out' },
+    { failure: 'cancel', status: 'cancelled', error: undefined },
+  ])('reports $failure before starting the OpenClaw task process', async ({ failure, status, error }) => {
+    if (failure === 'exit') {
+      fs.writeFileSync(path.join(root, 'config'), "process.stderr.write('private config diagnostic'); process.exitCode=7;");
+    } else if (failure === 'invalid location') {
+      fs.writeFileSync(path.join(root, 'config'), "process.stdout.write('relative.json');");
+    } else if (failure === 'overlay write') {
+      fs.unlinkSync(source);
+    } else {
+      fs.writeFileSync(path.join(root, 'config'), 'setInterval(() => {}, 1000);');
+    }
     fs.writeFileSync(path.join(root, 'agent'), "require('node:fs').writeFileSync('must-not-run', 'bad');");
     const controller = new AbortController();
-    const running = openclawBackend.run({ ...options(controller.signal), timeoutMs: 150 });
-    const rejection = expect(running).rejects.toThrow(/OpenClaw/);
+    const opts = options(controller.signal);
+    if (failure === 'overlay write') opts.bridge.mcpConfigPath = path.join(root, 'missing-directory', 'run.json');
+    const events: LocalEvent[] = [];
+    const running = openclawBackend.run({ ...opts, timeoutMs: failure === 'timeout' || failure === 'cancel' ? 500 : 5000,
+      onEvent: event => events.push(event) });
     if (failure === 'cancel') controller.abort();
-    await rejection;
+    await running;
+    const terminal = events.filter(event => event.type === 'done');
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ status });
+    if (error) {
+      expect(terminal[0]).toMatchObject({ cliError: 'tool_setup_failed', error: expect.stringContaining(error) });
+      expect(terminal[0].error).toContain('The task did not start');
+    }
+    expect(JSON.stringify(events)).not.toContain('private config diagnostic');
     expect(fs.existsSync(path.join(root, 'must-not-run'))).toBe(false);
     expect(fs.readdirSync(root).filter(name => name.startsWith('.orkas-run-'))).toEqual([]);
   });

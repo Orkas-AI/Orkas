@@ -58,9 +58,11 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     // Context windows come from pi-ai. Output reservations remain independent
     // of the vendor ceiling; main turns send no output limit
     // (see omitReservedOutputLimitForProvider).
-    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-6.2-astra', name: 'GPT-6.2 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-6.2-sol', name: 'GPT-6.2 Sol', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', maxTokens: 64_000, maxInputImages: 20 },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
     { id: 'gpt-6-sol', name: 'GPT-6 Sol', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-6-luna', name: 'GPT-6 Luna', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
@@ -71,9 +73,11 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     // Context windows come from pi-ai. Output reservations remain independent
     // of the vendor ceiling; main turns send no output limit
     // (see omitReservedOutputLimitForProvider).
-    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-6.2-astra', name: 'GPT-6.2 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'gpt-6.2-sol', name: 'GPT-6.2 Sol', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', maxTokens: 64_000, maxInputImages: 20 },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
     { id: 'gpt-6-sol', name: 'GPT-6 Sol', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-6-luna', name: 'GPT-6 Luna', maxTokens: 64_000, maxInputImages: 20 },
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
@@ -81,11 +85,14 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', maxTokens: 64000, maxInputImages: 20 },
   ],
   google: [
-    { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
+    { id: 'gemini-4-neon', name: 'Gemini 4 Neon', maxInputImages: 20 },
+    { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', maxInputImages: 20 },
+    { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', maxInputImages: 20 },
     { id: 'gemini-4-argon', name: 'Gemini 4 Argon', maxInputImages: 20 },
-    { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20 },
-    { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20 },
+    { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
     { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },
+    { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20, hiddenFromPicker: true },
+    { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20, hiddenFromPicker: true },
   ],
   zai: [
     { id: 'glm-5.3', name: 'GLM-5.3' },
@@ -97,7 +104,8 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
   ],
   'kimi-coding': [
     { id: 'k3', name: 'Kimi K3', template: 'kimi-for-coding', contextWindow: 1_000_000, maxTokens: 131072 },
-    { id: 'k3-256k', name: 'Kimi K3 (256K)' },
+    // Retain the host's input budget when the SDK advertises a larger output limit.
+    { id: 'k3-256k', name: 'Kimi K3 (256K)', maxTokens: 131_072 },
     { id: 'kimi-for-coding', name: 'Kimi K2.8 Preview' },
     { id: 'k2p7', name: 'Kimi K2.7 Code', hiddenFromPicker: true },
   ],
@@ -132,9 +140,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'doubao-seed-2-0-lite-260428', name: 'Doubao Seed 2.0 Lite' },
   ],
   openrouter: [
-    // OpenRouter exposes hundreds of models. Prefer recent generations but
-    // retain capability-driven exceptions such as Gemini 3.1 Pro. Settings
-    // also accepts a user-entered model id.
+    // Settings also accepts a user-entered OpenRouter model id.
     { id: 'anthropic/claude-opus-5.5', name: 'Claude Opus 5.5', maxInputImages: 20 },
     { id: 'anthropic/claude-opus-5', name: 'Claude Opus 5', maxInputImages: 20 },
     { id: 'anthropic/claude-fable-5.2', name: 'Claude Fable 5.2', maxInputImages: 20 },
@@ -143,21 +149,26 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
     { id: 'anthropic/claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
     { id: 'anthropic/claude-haiku-5.5', name: 'Claude Haiku 5.5', maxInputImages: 20 },
-    { id: 'openai/gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'openai/gpt-6.2-astra', name: 'GPT-6.2 Astra', maxTokens: 128_000, maxInputImages: 20 },
+    { id: 'openai/gpt-6.2-sol', name: 'GPT-6.2 Sol', maxInputImages: 20 },
     { id: 'openai/gpt-6.1-sol', name: 'GPT-6.1 Sol', maxInputImages: 20 },
     { id: 'openai/gpt-6.1-terra', name: 'GPT-6.1 Terra', maxInputImages: 20 },
+    { id: 'openai/gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
     { id: 'openai/gpt-6-sol', name: 'GPT-6 Sol', maxInputImages: 20 },
     { id: 'openai/gpt-6-luna', name: 'GPT-6 Luna', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'openai/gpt-5.5', maxInputImages: 20 },
     { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'openai/gpt-5.5', maxInputImages: 20 },
-    { id: 'google/gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
     // Keep host reservations independent of the SDK's near-window output
     // ceilings so a catalog refresh does not squeeze long-conversation input.
+    { id: 'google/gemini-4-neon', name: 'Gemini 4 Neon', maxTokens: 65536, maxInputImages: 20 },
+    { id: 'google/gemini-4-hydrogen', name: 'Gemini 4 Hydrogen', maxTokens: 65536, maxInputImages: 20 },
+    { id: 'google/gemini-4-carbon', name: 'Gemini 4 Carbon', maxTokens: 65536, maxInputImages: 20 },
     { id: 'google/gemini-4-argon', name: 'Gemini 4 Argon', maxTokens: 65536, maxInputImages: 20 },
-    { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20 },
-    { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20 },
+    { id: 'google/gemini-3.8-flash', name: 'Gemini 3.8 Flash', maxInputImages: 20 },
     { id: 'google/gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },
+    { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash', maxInputImages: 20, hiddenFromPicker: true },
+    { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)', maxInputImages: 20, hiddenFromPicker: true },
     { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', template: 'deepseek/deepseek-v4-flash-vision-exp', contextWindow: 1_000_000, maxTokens: 128_000, supportsVision: true, maxInputImages: 20 },
     { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
     { id: 'deepseek/deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731', template: 'deepseek/deepseek-v4-flash', contextWindow: 1_000_000, maxTokens: 128000 },
@@ -173,8 +184,10 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'minimax/minimax-m3', name: 'MiniMax 3', maxTokens: 131072 },
     // Keep the host reservation when the SDK raises the vendor's ceiling.
     { id: 'minimax/minimax-m2.7', name: 'MiniMax 2.7', maxTokens: 131072 },
-    { id: 'xiaomi/mimo-v2.5-pro', name: 'Xiaomi MiMo V2.5 Pro', maxTokens: 131072 },
-    { id: 'xiaomi/mimo-v2.5', name: 'Xiaomi MiMo V2.5', maxTokens: 65536 },
+    // OpenRouter retired both IDs. Keeping them curated prevents the generic
+    // custom-ID fallback and preserves their labels in saved configurations.
+    { id: 'xiaomi/mimo-v2.5-pro', name: 'Xiaomi MiMo V2.5 Pro', maxTokens: 131072, hiddenFromPicker: true },
+    { id: 'xiaomi/mimo-v2.5', name: 'Xiaomi MiMo V2.5', maxTokens: 65536, hiddenFromPicker: true },
     { id: 'x-ai/grok-4.20', name: 'Grok 4.20', maxTokens: 131072, maxInputImages: 20 },
     { id: 'x-ai/grok-4.5', name: 'Grok 4.5', maxTokens: 131072, maxInputImages: 20 },
   ],

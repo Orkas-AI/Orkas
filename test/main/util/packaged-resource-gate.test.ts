@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { LOCALES } from '../../../src/main/i18n';
 
 const require = createRequire(import.meta.url);
 const {
@@ -109,6 +110,10 @@ describe('packaged-resource-gate', () => {
 
   it('verifies the complete macOS localized metadata tree and translations', () => {
     const root = path.join(process.cwd(), 'resources', 'mac-locales');
+    for (const { code, htmlLang } of LOCALES) {
+      const tag = code === 'zh' ? 'zh-Hans' : code === 'zh-tw' ? 'zh-Hant' : htmlLang;
+      expect(fs.existsSync(path.join(root, tag + '.lproj', 'InfoPlist.strings')), tag).toBe(true);
+    }
     expect(verifyMacLocalizedMetadataRoot(root)).toBe('resource:mac-locales:v1');
   });
 

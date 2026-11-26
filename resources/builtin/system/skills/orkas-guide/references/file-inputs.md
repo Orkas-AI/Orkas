@@ -9,9 +9,10 @@
 - Use a Project Library when the supported source belongs to one ongoing
   Project.
 
-Task files do not sync with their task to another device. When a supported
-file should be reusable or available through cloud sync (commercial edition only), add it to the global
-or Project Library and let Library processing and sync finish.
+Files and tasks stay on the current device in the open-source edition.
+To reuse a supported file in other conversations, add it to the global or
+Project Library and let Library processing finish.
+Commercial cloud sync is described under [Sync and cloud data](settings-data-and-safety.md#sync-and-cloud-data-commercial-edition-only).
 
 Saving a reply opens a location picker whose title names the Project or global
 Library. Its destination line repeats that Library before the selected folder;
@@ -34,6 +35,10 @@ legacy Excel (.xls), common images, video, and audio. ZIP attachments are only f
 **Commander** and explicitly ask Orkas to import that Skill. Library accepts
 text and code files, PDF, modern Word/Excel/PowerPoint, legacy Excel (.xls),
 and common images. Project Library also accepts common video files.
+
+Select a local video with the task's attachment picker to attach up to **2 GiB**.
+For a video pasted or dragged from a browser without a local file, the limit is
+**200 MiB**. If a large video fails to attach, save it to a local file and use the picker.
 
 Legacy Excel input supports reading cell data and a content preview. It does
 not run macros or recalculate formulas; save updated formula results in Excel

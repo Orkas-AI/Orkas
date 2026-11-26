@@ -702,7 +702,7 @@ describe('video_gen › first and last frames', () => {
     ['minimax', 'MiniMax-Hailuo-2.3', { firstFrameUrl: FIRST, lastFrameUrl: LAST }, 'MiniMax Hailuo 2.3 takes a first frame only; remove last_frame.'],
     ['minimax', 'MiniMax-H3', { firstFrameUrl: FIRST, referenceImageUrls: [REFERENCE] }, `MiniMax H3 ${CANNOT_COMBINE}`],
     ['doubao', 'doubao-seedance-2-0-260128', { firstFrameUrl: FIRST, referenceVideoUrls: ['https://video.example/reference.mp4'] }, `Doubao Seedance 2.0 ${CANNOT_COMBINE}`],
-    ['aliyun', 'wan3.0-video', { firstFrameUrl: FIRST, lastFrameUrl: LAST, referenceImageUrls: [REFERENCE] }, `Alibaba Cloud Wan 3.0 ${CANNOT_COMBINE}`],
+    ['aliyun', 'wan3.0-video', { firstFrameUrl: FIRST, lastFrameUrl: LAST, referenceImageUrls: [REFERENCE] }, `Wan 3.0 ${CANNOT_COMBINE}`],
     ['google-cloud', 'veo-3.1-generate-001', { firstFrameUrl: FIRST, referenceImageUrls: [REFERENCE] }, `Google Cloud Veo 3.1 ${CANNOT_COMBINE}`],
     ['vidu', 'viduq3-pro', { firstFrameUrl: FIRST, referenceImageUrls: [REFERENCE] }, `Vidu Q3 Pro ${CANNOT_COMBINE}`],
     ['kling', 'kling-v3-0-turbo', { firstFrameUrl: FIRST, referenceImageUrls: [REFERENCE] }, `Kling 3.0 Turbo ${CANNOT_COMBINE}`],

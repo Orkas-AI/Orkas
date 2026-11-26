@@ -33,12 +33,21 @@ vi.mock('../../../src/main/features/users', () => ({
 vi.mock('../../../src/main/features/agents', () => ({
   listAgentSummaries: vi.fn(async () => [{ agent_id: 'a_owner', name: 'Owner', enabled: true }]),
 }));
-vi.mock('../../../src/main/features/projects', () => ({
-  projectExists: vi.fn(async () => true),
-  getProject: vi.fn(async () => ({ project_id: 'p_112233445566', owner_uid: 'uRUNNOW' })),
-  getBindings: vi.fn(async () => ({ agents: ['a_owner'], skills: [] })),
-  listProjects: vi.fn(async () => []),
-}));
+vi.mock('../../../src/main/features/projects', () => {
+  const getBindings = vi.fn(async (..._args: unknown[]) => ({ agents: ['a_owner'], skills: [] }));
+  // Project availability = added Agents plus built-ins; by default these
+  // fixtures have no built-in, so it follows the added Agents.
+  const availableProjectAgentIds = vi.fn(async (...args: unknown[]) => (await getBindings(...args)).agents);
+  return {
+    projectExists: vi.fn(async () => true),
+    getProject: vi.fn(async () => ({ project_id: 'p_112233445566', owner_uid: 'uRUNNOW' })),
+    getBindings,
+    availableProjectAgentIds,
+    isAgentAvailableInProject: vi.fn(async (uid: string, pid: string, id: string) =>
+      (await availableProjectAgentIds(uid, pid)).includes(id)),
+    listProjects: vi.fn(async () => []),
+  };
+});
 
 import * as chats from '../../../src/main/features/chats';
 import * as groupChat from '../../../src/main/features/group_chat';
@@ -76,6 +85,8 @@ beforeEach(async () => {
   vi.mocked(users.getActiveUserId).mockReturnValue(UID);
   config.setLanguage('en');
   vi.mocked(projects.getBindings).mockResolvedValue({ agents: ['a_owner'], skills: [] } as never);
+  vi.mocked(projects.availableProjectAgentIds).mockImplementation(async (uid: string, pid: string) =>
+    (await projects.getBindings(uid, pid)).agents);
   vi.mocked(agents.listAgentSummaries).mockResolvedValue([{ agent_id: 'a_owner', name: 'Owner', enabled: true }] as never);
   await driver.writeConfig(UID, PID, { enabled: true });
   await driver.writeConfig(UID, '', { enabled: true });
@@ -128,6 +139,10 @@ describe('project_driver_runner › runTaskNow', () => {
     expect(sent.model_text).toContain(content);
     expect(sent.model_text).toContain('Respond in Traditional Chinese (繁體中文)');
     expect(sent.model_text).toContain('unless the original user request explicitly specifies another response language');
+    // Both are the host's runs of a to-do: the turn learns its reply may have
+    // no reader, while attribution stays an ordinary send.
+    expect(sent.host_todo_run).toBe(true);
+    expect(sent).not.toHaveProperty('entry_point');
     expect((await projectTasks.getTask(UID, pid, created.task.id))?.status).toBe('progress');
   });
 
@@ -233,6 +248,18 @@ describe('project_driver_runner › runTaskNow', () => {
     expect((await runner.runTaskNow(UID, PID, task.id)).ok).toBe(true);
     expect(groupChat.setFloor).toHaveBeenCalledExactlyOnceWith(UID, 'c_run', 'a_owner');
     expect(groupChat.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs a to-do owned by a built-in Agent that the project never added', async () => {
+    vi.mocked(projects.getBindings).mockResolvedValue({ agents: [], skills: [] } as never);
+    vi.mocked(projects.availableProjectAgentIds).mockResolvedValue(['a_builtin'] as never);
+    vi.mocked(agents.listAgentSummaries).mockResolvedValue([
+      { agent_id: 'a_builtin', name: 'BuiltinStudio', enabled: true },
+      { agent_id: 'a_outsider', name: 'Outsider', enabled: true },
+    ] as never);
+    const task = await seedTask({ owner: 'BuiltinStudio', ownerId: 'a_builtin' });
+    expect((await runner.runTaskNow(UID, PID, task.id)).ok).toBe(true);
+    expect(groupChat.setFloor).toHaveBeenCalledExactlyOnceWith(UID, 'c_run', 'a_builtin');
   });
 
   it.each(['before_lookup', 'during_lookup'])('does not dispatch an assigned task after an account switch %s', async (phase) => {
@@ -479,15 +506,27 @@ describe('project_driver_runner › runTaskNow', () => {
   });
 
   it('rolls back the empty conversation and leaves status untouched when the send fails', async () => {
-    vi.mocked(groupChat.send).mockResolvedValue({ ok: false, error: 'no_model' } as never);
+    vi.mocked(groupChat.send).mockResolvedValue({ ok: false, error: 'todo_execution_not_admitted' } as never);
     const task = await seedTask({ owner: 'Owner', ownerId: 'a_owner' });
     const res = await runner.runTaskNow(UID, PID, task.id);
 
-    expect(res).toMatchObject({ ok: false, error: 'no_model' });
+    expect(res).toMatchObject({ ok: false, error: 'todo_execution_not_admitted' });
+    expect(groupChat.send).toHaveBeenCalledWith(expect.objectContaining({ confirm_todo_admission: true }));
     expect(chats.deleteConversation).toHaveBeenCalledWith(UID, 'c_run', PID);
     const after = await projectTasks.getTask(UID, PID, task.id);
     expect(after?.status).toBe('todo');
     expect(after?.origin_cid).toBeUndefined();
+  });
+
+  it.each(['manual', 'automatic'])('keeps a possibly admitted %s run reachable without establishing an unverified link', async mode => {
+    const task = await seedTask();
+    vi.mocked(groupChat.send).mockResolvedValueOnce({ ok: true, todo_admission_unverified: true });
+    const result = mode === 'manual' ? await runner.runTaskNow(UID, PID, task.id) : await runner.advance(UID, PID, task);
+    expect(result).toMatchObject({ ok: true, cid: 'c_run' });
+    expect(chats.deleteConversation).not.toHaveBeenCalled();
+    const saved = await projectTasks.getTask(UID, PID, task.id);
+    expect(saved?.status).toBe('progress');
+    expect(saved).not.toHaveProperty('origin_cid');
   });
 
   it.each(['manual', 'automatic'])('%s retry preserves the prior link until send succeeds, including failure and recovery', async (mode) => {

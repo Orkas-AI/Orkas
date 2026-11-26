@@ -909,6 +909,11 @@ function cmdInstall(args) {
       // execution) or `file://`/bare local paths that clone in-scope-bypassing
       // local dirs. Local directory installs are the separate `local` kind.
       if (cls.kind === 'git' && !/^(https:\/\/|ssh:\/\/|git@)/i.test(source)) {
+        const looksLocal = /^(?:[a-z]:|[\\/]|\.\.?(?:[\\/]|$))/i.test(source) || !/[:@]/.test(source);
+        if (looksLocal) {
+          die(76, "Local package directory is unavailable. Check that it exists and is accessible from the command's working directory, or use an absolute path.",
+            { code: 'local_source_unavailable' });
+        }
         die(76,
           'unsupported source: only https:// / ssh:// / git@ git URLs, public GitHub repos, or local directories are allowed',
           { source });

@@ -160,7 +160,7 @@ async function _loadGlobalTodoGroup(project) {
   return {
     project,
     tasks: tasks.tasks,
-    agents: bindings.agentDetails || [],
+    agents: _projectAvailableAgents(bindings),
     driverEnabled: !!driver?.config?.enabled,
     driverConfig: driver?.config,
     driverDevice: driver?.device,
@@ -446,6 +446,7 @@ function _renderGlobalTodos() {
   const scroll = _captureTodoScroll(host);
   const trackScroll = _captureTodoScrollTrack(host);
   _closeProjectDriverHint();
+  _closeTodoAssignPicker(host);
   host.innerHTML = '';
   _syncTodoGroupingButtons();
   const groups = _globalTodoGroups;
@@ -509,7 +510,7 @@ function focusTodo(scope, taskId, opts = {}) {
   if (id) {
     _globalTodoActiveScope = pid;
   }
-  setView('todos', null, opts.entryPoint ? { entryPoint: opts.entryPoint } : {});
+  setView('todos', null, opts);
 }
 
 function _applyGlobalTodoPendingFocus() {
@@ -526,10 +527,7 @@ function _applyGlobalTodoPendingFocus() {
   // Reveal it even when the user had collapsed its column; this does not
   // change the remembered collapse state.
   const body = row.closest('.todo-column-body');
-  if (body && body.hidden) {
-    body.hidden = false;
-    body.parentElement?.querySelector('.todo-collapse')?.setAttribute('aria-expanded', 'true');
-  }
+  if (body?.hidden) _setTodoColumnCollapsed(body, false);
   row.classList.add('is-highlighted');
   row.scrollIntoView({ block: 'center' });
   setTimeout(() => row.classList.remove('is-highlighted'), 2500);

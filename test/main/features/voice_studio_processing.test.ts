@@ -36,8 +36,8 @@ async function setup(parts: Parameters<typeof wav>[0], processing: any[], extra 
   await fs.writeFile(project, JSON.stringify({ schema_version: 2, roles: {}, segments: [{ id: 'recording', path: 'source.wav' }], processing, ...extra }));
   return source;
 }
-async function render() {
-  const result = await audio.execute('render', { project, format: 'wav' });
+async function render(fields = {}) {
+  const result = await audio.execute('render', { project, format: 'wav', ...fields });
   const receipt = JSON.parse(await fs.readFile(path.join(root, result.files.find((f: string) => f.endsWith('receipt.json'))), 'utf8'));
   return { result, receipt, file: path.join(root, result.files[0]) };
 }
@@ -51,12 +51,66 @@ function energy(b: Buffer, start: number, length: number, hz?: number) {
   return hz ? Math.hypot(a, c) / n : Math.sqrt(a / n);
 }
 it('trims only the edges, retaining quiet content, short and long internal pauses and the source', async () => {
-  const source = await setup([{ seconds: .5 }, { seconds: .7, hz: 440, amplitude: .025 }, { seconds: 1.2 }, { seconds: .7, hz: 660 }, { seconds: .5 }], [{ type: 'silence', mode: 'edges', min_silence_sec: .3, padding_sec: .05 }]);
+  const source = await setup(
+    [{ seconds: .5 }, { seconds: .7, hz: 440, amplitude: .025 }, { seconds: 1.2 }, { seconds: .7, hz: 660, amplitude: .1 }, { seconds: .5 }],
+    [{ type: 'silence', mode: 'edges', min_silence_sec: .3, padding_sec: .05 }],
+    { export: { format: 'wav' } },
+  );
   const { result, receipt, file } = await render();
   expect(result.duration_sec).toBeCloseTo(2.7, 1);
   const signal = await pcm(file); expect(energy(signal, .15, .2, 440)).toBeGreaterThan(.005); expect(energy(signal, 2.1, .2, 660)).toBeGreaterThan(.02);
-  expect(receipt.processing[0].time_map[0]).toMatchObject({ input_start_sec: expect.closeTo(.45, 1), output_start_sec: 0 });
-  expect(await fs.readFile(path.join(root, 'source.wav'))).toEqual(source);
+  const [retained] = receipt.processing[0].time_map;
+  expect(retained).toMatchObject({ input_start_sec: expect.closeTo(.45, 1), input_end_sec: expect.closeTo(3.15, 1), output_start_sec: 0 });
+  const sourcePath = path.join(root, 'source.wav');
+  const original = await pcm(sourcePath);
+  const start = Math.round(retained.input_start_sec * 48000) * 4;
+  const end = Math.round(retained.input_end_sec * 48000) * 4;
+  expect(signal.equals(original.subarray(start, end))).toBe(true);
+  expect(receipt.export.normalize_loudness).toBe(false);
+  const replay = await render({ format: undefined });
+  expect((await pcm(replay.file)).equals(signal)).toBe(true);
+  expect(await fs.readFile(sourcePath)).toEqual(source);
+
+  const normalized = await render({ export: { normalize_loudness: true } });
+  const normalizedSignal = await pcm(normalized.file);
+  expect(energy(normalizedSignal, .15, .2, 440) / energy(signal, .15, .2, 440)).toBeGreaterThan(1.1);
+  expect((await render({ export: { target_lufs: -20 } })).receipt.export).toMatchObject({ normalize_loudness: true, target_lufs: -20 });
+  const plan = JSON.parse(await fs.readFile(project, 'utf8'));
+  plan.export = normalized.receipt.export;
+  await fs.writeFile(project, JSON.stringify(plan));
+  const legacy = await render();
+  expect(legacy.receipt.export.normalize_loudness).toBe(true);
+  expect((await pcm(legacy.file)).equals(normalizedSignal)).toBe(true);
+  expect((await pcm((await render({ export: { normalize_loudness: false } })).file)).equals(signal)).toBe(true);
+});
+it('normalizes synthesized narration by default and preserves supplied gain when the project mixes both', async () => {
+  const narration = { id: 'line', role: 'a', text: 'A recorded synthesis fixture.' };
+  const plan = {
+    schema_version: 3,
+    roles: { a: { route_ref: 'fixture', voice_ref: 'fixture', language: 'en' } },
+    segments: [narration], export: { format: 'wav' },
+  };
+  const supplied = [{ id: 'source', path: 'source.wav', volume: .5 }];
+  await setup([{ seconds: 1, hz: 440, amplitude: .04 }], [], plan);
+  const attempt = await audio.execute('begin', { project, segment_id: narration.id });
+  await fs.writeFile(attempt.request.output_path, wav([{ seconds: 1, hz: 660 }]));
+  await audio.execute('record', { project, segment_id: narration.id, key: attempt.key });
+  expect((await render()).receipt.export.normalize_loudness).toBe(true);
+
+  await fs.writeFile(project, JSON.stringify({ ...plan, segments: [...plan.segments, ...supplied] }));
+  const mixed = await render();
+  const original = await pcm(path.join(root, 'source.wav'));
+  expect(energy(await pcm(mixed.file), 1.2, .2, 440) / energy(original, .2, .2, 440)).toBeCloseTo(.5, 3);
+  expect(mixed.receipt.export.normalize_loudness).toBe(false);
+
+  const tracks = [{ id: 'overlay', kind: 'music', path: 'source.wav' }];
+  await fs.writeFile(project, JSON.stringify({ ...plan, tracks, export: { format: 'wav', normalize_loudness: true } }));
+  expect((await render()).receipt.export.normalize_loudness).toBe(true);
+  expect((await render({ export: { normalize_loudness: false } })).receipt.export.normalize_loudness).toBe(false);
+  await fs.writeFile(project, JSON.stringify({ ...plan, music: { path: 'source.wav' } }));
+  expect((await render()).receipt.export.normalize_loudness).toBe(false);
+  await fs.writeFile(project, JSON.stringify({ ...plan, tracks }));
+  expect((await render()).receipt.export.normalize_loudness).toBe(false);
 });
 it('compresses internal long pauses without removing edges or a short natural pause', async () => {
   await setup([{ seconds: .4 }, { seconds: .6, hz: 440 }, { seconds: .2 }, { seconds: .6, hz: 660 }, { seconds: 1.4 }, { seconds: .6, hz: 880 }, { seconds: .4 }], [{ type: 'silence', mode: 'compress', min_silence_sec: .8, keep_sec: .3 }]);

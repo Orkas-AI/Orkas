@@ -94,7 +94,7 @@ continuation window and `reason` for a `no_content` status.
 `title`, `publisher`, `published_at`, `accessed_at`, `source_type`,
 `subquestion`, `claim`, exact `quote`, `confidence`, `limitations`, and optional
 `content_sha256`. Keep quotes at or below 1,600 characters; the compact landscape
-path uses its stricter 300-character limit.
+path uses the stricter limit in `compact-landscape.md`.
 
 Read `caps_plan.json` and only the relevant ledger tail at task start, durable
 resume, or after an actual context compaction before any new request. Within an

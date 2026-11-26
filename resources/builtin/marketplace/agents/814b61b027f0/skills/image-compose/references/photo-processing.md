@@ -6,9 +6,20 @@ created with `write_file`. `--project` names an existing directory;
 source names and a new output path. The returned JSON describes the executed
 operation; no image generation is involved.
 
-For capability discovery, use a request containing `{"op":"capabilities"}`.
-Read its `sharp`, `photo_processing`, and `masked_composite` fields. Optional
-background-removal and upscaling availability does not establish RAW support.
+For capability discovery, use `write_file` to create `asset-capabilities.json`
+in the project root with this content:
+
+```json
+{"op":"capabilities"}
+```
+
+Run from the project root with that same file as `--request`:
+
+```bash
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" image-compose image_asset -- --project . --request asset-capabilities.json
+```
+
+Read `sharp`, `photo_processing`, and `masked_composite` from the returned JSON.
 
 ## Source region before placement
 

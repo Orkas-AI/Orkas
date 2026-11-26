@@ -113,9 +113,12 @@ export interface GenerateImageInput {
    *  validated this against path-sandbox. Extension may be omitted —
    *  it'll be appended based on the returned mime type. */
   outputAbsPath: string;
+  /** Exclusive save after checking a reserved output path. */
+  assertNewOutputPath?: (file: string) => void;
   /** Already-validated absolute paths to reference images for editing /
    *  variations. The picked capability must have `supportsEdit: true`. */
   referenceImagePaths?: string[];
+  assertReferencePath?: (file: string) => void;
   referenceImageUrls?: string[];
   referenceBindings?: ImageReferenceBinding[];
   negativePrompt?: string[];
@@ -211,6 +214,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
       onProgress: input.onProgress,
       usageContext: input.usageContext,
       ...(refPaths.length ? { referenceImagePaths: refPaths } : {}),
+      ...(input.assertReferencePath ? { assertReferencePath: input.assertReferencePath } : {}),
       ...(refUrls.length ? { referenceImageUrls: refUrls } : {}),
     };
     attempted = true;
@@ -257,9 +261,11 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
     finalPath = ensureExtension(input.outputAbsPath, adapterRes.mimeType);
     emitProgress(input.onProgress, 'save_image', 'Saving generated image', { provider: picked.entry.provider });
     throwIfAborted(input.signal);
+    input.assertNewOutputPath?.(finalPath);
     await fs.mkdir(path.dirname(finalPath), { recursive: true });
     throwIfAborted(input.signal);
-    await fs.writeFile(finalPath, adapterRes.buffer);
+    input.assertNewOutputPath?.(finalPath);
+    await fs.writeFile(finalPath, adapterRes.buffer, { flag: input.assertNewOutputPath ? 'wx' : 'w' });
   } catch (err) {
     const msg = (err as Error).message;
     log.error('image write failed', {
@@ -300,6 +306,7 @@ export interface AdapterRequest {
   size: string;
   referenceImages?: Buffer[];
   referenceImagePaths?: string[];
+  assertReferencePath?: (file: string) => void;
   referenceImageUrls?: string[];
   signal?: AbortSignal;
   onProgress?: ImageProgressReporter;
@@ -427,7 +434,7 @@ function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
 
 export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
-  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
+  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress, assertLocalPath: req.assertReferencePath }));
   const overall = composeAbortSignal(
     req.signal,
     ORKAS_IMAGE_TOTAL_TIMEOUT_MS,
@@ -505,7 +512,7 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
 
 export async function callOpenAIImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
-  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
+  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress, assertLocalPath: req.assertReferencePath }));
   const hasRefs = referenceImages.length > 0;
   const url = hasRefs
     ? `${OPENAI_BASE}/v1/images/edits`
@@ -575,7 +582,7 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
   const upstreamModel = req.model === 'gemini-3.1-flash-image-preview' ? 'gemini-3.1-flash-image' : req.model;
   const url = `${GEMINI_BASE}/v1beta/models/${encodeURIComponent(upstreamModel)}:generateContent`;
   const parts: unknown[] = [{ text: req.prompt }];
-  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
+  const referenceImages = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress, assertLocalPath: req.assertReferencePath }));
   if (referenceImages.length) {
     for (const buf of referenceImages) {
       parts.push({
@@ -677,7 +684,7 @@ function bufferToDataUri(buf: Buffer): string {
 export async function callDoubaoImage(req: AdapterRequest): Promise<AdapterResult> {
   throwIfAborted(req.signal);
   const size = normaliseSeedreamSize(req.size, req.model);
-  const refs = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress }));
+  const refs = (req.referenceImages || await loadImageReferenceBuffersWithProgress(req.referenceImageUrls, req.referenceImagePaths, { signal: req.signal, onProgress: req.onProgress, assertLocalPath: req.assertReferencePath }));
   const isEdit = refs.length > 0;
   const bodyObj: Record<string, unknown> = {
     model: req.model,

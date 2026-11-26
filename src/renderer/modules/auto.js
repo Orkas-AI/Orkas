@@ -1132,7 +1132,7 @@ async function _autoClearRecipientIfOutsideProject() {
   if (!pid) return;
   try {
     const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
-    const allowed = new Set((res && res.bindings && res.bindings.agents) || []);
+    const allowed = new Set(projectAvailableAgentIds(res));
     if (!allowed.has(rec.id)) {
       _autoCurrentRecipient = { kind: 'commander' };
       _repaintAutoRecipientChip();

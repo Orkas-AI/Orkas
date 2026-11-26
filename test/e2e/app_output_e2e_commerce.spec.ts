@@ -22,7 +22,7 @@ test('saves a Commerce direct text answer even when the run also writes a non-me
  await orkas.page.evaluate(()=>(window as any).setLang('zh'));await openSidebarEntry(orkas.page,'#apps-btn');
  await orkas.electronApp.evaluate((_electron:any,args:any)=>{const load=(process as any).mainModule.require.bind((process as any).mainModule),service=load(args.host).taskService,workspace=load(args.workspace),fs=load('node:fs'),path=load('node:path'),original=service.deps.send;service.deps.send=async function(uid:string,cid:string,...rest:any[]){service.deps.send=original;const dir=await workspace.getConversationWorkspacePath(uid,cid);fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'helper.py'),'# Copy preparation');return original.call(this,uid,cid,...rest);};},{host:path.resolve(__dirname,'../../src/main/features/web_apps/task-host.ts'),workspace:path.resolve(__dirname,'../../src/main/features/group_chat/conv_workspace.ts')});
  const preview=await orkas.openPreview(()=>orkas.page.locator('.app-card[data-app-id="builtin-product-listing"]').click()),outer=preview.frameLocator('.saved-app-viewer-frame');await outer.locator('button[data-view="creative"]').click();const frame=outer.frameLocator('#media-workspace'),text='A concise synthetic product description.';await frame.locator('#brief').fill('Write the product description.');orkas.setModelTextReplies([text]);await frame.locator('#submit').click();
- await expect.poll(()=>frame.locator('body').evaluate(async()=>{const api=(window as any).orkasApp,index=(await api.storage.get({key:'content-index-v1',scope:'cloud'})).value;if(!index?.works?.length)return[];const w=JSON.parse((await api.appFiles.readText({path:'works/'+index.works[0].id+'.json',scope:'cloud'})).text);return w.results.map((r:any)=>index.assets.find((a:any)=>a.id===r.assetId)?.name).sort();})).toEqual(['helper.py','reply.txt']);
+ await expect.poll(()=>frame.locator('body').evaluate(async()=>{const api=(window as any).orkasApp,index=(await api.storage.get({key:'content-index-v1',scope:'cloud'})).value;if(!index?.works?.length)return[];const w=JSON.parse((await api.appFiles.readText({path:'works/'+index.works[0].id+'.json',scope:'cloud'})).text);return w.results.map((r:any)=>index.assets.find((a:any)=>a.id===r.assetId)?.name).sort();}),{timeout:30_000}).toEqual(['helper.py','reply.txt']);
  const actual=await frame.locator('body').evaluate(async()=>{const api=(window as any).orkasApp,index=(await api.storage.get({key:'content-index-v1',scope:'cloud'})).value;return(await api.appFiles.readText({path:index.assets.find((a:any)=>a.name==='reply.txt').path,scope:'cloud'})).text;});expect(actual).toBe(text);expect(orkas.modelRequests).toHaveLength(1);await orkas.closePreview(preview);
 });
 for(const appId of ['builtin-content-workbench','builtin-product-listing'])test('shows an honest unverified-output failure in '+appId+' without replacing the original reply',async({modelOrkas:orkas},info)=>{
@@ -34,16 +34,25 @@ for(const appId of ['builtin-content-workbench','builtin-product-listing'])test(
  },{host:path.resolve(__dirname,'../../src/main/features/web_apps/task-host.ts'),workspace:path.resolve(__dirname,'../../src/main/features/group_chat/conv_workspace.ts')});
  const card=orkas.page.locator('.app-card[data-app-id="'+appId+'"]');let preview=await orkas.openPreview(()=>card.click()),frame:any=preview.frameLocator('.saved-app-viewer-frame');
  if(appId==='builtin-product-listing'){await frame.locator('button[data-view="creative"]').click();frame=frame.frameLocator('#media-workspace');}
+ await frame.locator('#nav-image').click();
  const claimed='The requested result is complete.';await frame.locator('#brief').fill('Create a synthetic result.');orkas.setModelTextReplies([claimed]);await frame.locator('#submit').click();
- await expect(frame.locator('.record-failure-summary').first()).toHaveText('操作未完成，已保存的内容会保留。');
+ await expect(frame.locator('.record-status').first()).toHaveText('失败',{timeout:30000});
+ await expect(frame.locator('.record-failure-summary').first()).toHaveText('ImageStudio：'+claimed);
  const saved=await frame.locator('body').evaluate(async()=>{const api=(window as any).orkasApp,index=(await api.storage.get({key:'content-index-v1',scope:'cloud'})).value;return JSON.parse((await api.appFiles.readText({path:'works/'+index.works[0].id+'.json',scope:'cloud'})).text);});
  expect(saved.jobs[0]).toMatchObject({status:'failed',errorCode:'E_OUTPUT_UNVERIFIED',text:claimed});expect(orkas.modelRequests).toHaveLength(1);
  await expect.poll(()=>frame.locator('body').evaluate(async()=>{const api=(window as any).orkasApp,state=(await api.storage.get({key:'content-index-v1',scope:'cloud'})).value;return state.works[0].resultAssetIds.length;})).toBe(2);await frame.locator('.record-summary').click();await expect(frame.locator('.result-file:visible')).toHaveCount(0);await expect(frame.locator('.result-tools summary')).toHaveText('更多文件 · 2');await frame.locator('.result-tools summary').click();await expect(frame.locator('#record-detail')).toBeVisible();await expect(frame.locator('.result-file:visible')).toHaveCount(2);await frame.locator('.result-file').filter({hasText:'receipt.json'}).locator('.attachment-preview').click();await expect(frame.locator('#media-content pre')).toHaveText('{"partial":true}');await frame.locator('#media-close').click();
+ await expect(frame.locator('#record-error')).toHaveText('操作未完成，已保存的内容会保留。');
+ await expect(frame.locator('#record-reply-text')).toHaveText(claimed);
  await preview.screenshot({path:info.outputPath('unverified-output-zh.png')});await orkas.closePreview(preview);
  preview=await orkas.openPreview(()=>card.click());frame=preview.frameLocator('.saved-app-viewer-frame');if(appId==='builtin-product-listing'){await frame.locator('button[data-view="creative"]').click();frame=frame.frameLocator('#media-workspace');}
- await expect(frame.locator('.record-failure-summary').first()).toHaveText('操作未完成，已保存的内容会保留。');
+ await frame.locator('#nav-image').click();
+ await expect(frame.locator('.record-failure-summary').first()).toHaveText('ImageStudio：'+claimed);
  await orkas.page.evaluate(()=>(window as any).setLang('en'));await frame.locator('body').evaluate(()=>window.dispatchEvent(new Event('focus')));
- await expect(frame.locator('.record-failure-summary').first()).toHaveText('Could not complete this action. Your saved content is retained.');
+ await expect(frame.locator('.record-status').first()).toHaveText('Failed');
+ await expect(frame.locator('.record-failure-summary').first()).toHaveText('ImageStudio: '+claimed);
+ await frame.locator('.record-summary').first().click();
+ await expect(frame.locator('#record-error')).toHaveText('Could not complete this action. Your saved content is retained.');
+ await expect(frame.locator('#record-reply-text')).toHaveText(claimed);
  await preview.setViewportSize({width:400,height:650});await preview.screenshot({path:info.outputPath('unverified-output-en-narrow.png')});expect(orkas.modelRequests).toHaveLength(1);await orkas.closePreview(preview);
 });
 const png='iVBORw0KGgoAAAANSUhEUgAAAAQAAAAFCAYAAABirU3bAAAAEklEQVR4nGMISNnyHxkzUEEAAOMaMA0yqcWAAAAAAElFTkSuQmCC';

@@ -81,18 +81,22 @@ For unchanged full-canvas single-image packaging of a generated original, bind
 the recorded original as `raster_source` instead; its pixels must equal the
 helper preview. The host verifies generation provenance. Adding text, masks,
 cropping or compositing uses the new preview and does not inherit that exemption.
-Keep this helper preview/receipt for the subsequent PSD operation;
-the native exported delivery PNG has its own output path.
+For every revision, write the helper PNG and PSD to working paths distinct
+from the user's requested delivery paths. Keep the helper preview and receipt.
+Inspect that version, complete any required review, and use native export to
+write the requested final PNG before exporting the requested final PSD.
 
 ### Native project mapping
 
-`image_studio.project_dir` is the directory containing `image-manifest.json`.
-Its `raster_source` and `references[].path` resolve under that directory, not
-beside the layered JSON. Using the same directory for `--project` and
-`project_dir` gives both formats the same path base; placing the native manifest
-in an output subdirectory changes that base. The source document is not a native
-manifest. Bootstrap the native manifest from the router's canonical template,
-then bind `raster_source` to the helper preview.
+Choose the directory containing `image-manifest.json` before rendering. Use it
+for both `--project` and `image_studio.project_dir`, including on revisions.
+Keep the original raster reference, current helper preview and PSD draft inside
+that directory. Bootstrap the manifest from the router's canonical template.
+Set `raster_source` and `references[].path` relative to the manifest directory.
+For example, with `project_dir:"poster-work"`, the file
+`poster-work/out/preview.png` is `raster_source:"out/preview.png"` in the
+manifest. Call `project.inspect` with `project_dir` and let the manifest select
+the raster.
 
 If the locked route is `EDIT`, its original is a raster reference. For an
 existing layered design, render a preserved copy of the original document to
@@ -135,10 +139,10 @@ quantization; editable layer/mask channels remain exact. Results identify
 this does not establish a Photoshop reopen test or visual approval.
 
 The helper returns `delivery_state:"candidate"` and `final_export` for that
-file. Final delivery uses the existing `image_studio` tool with
-`op:"project.export"`, the native `project_dir`, `format:"psd"`,
-`input_path:"out/candidate.psd"` and a new `output_path:"out/design.psd"`
-(both tool paths are workspace-relative). The host keeps the PSD bytes intact,
+file. Call `image_studio` with `op:"project.export"`, the same `project_dir`
+and `format:"psd"`. Pass `final_export.input_path` unchanged as `input_path`.
+Choose a new workspace-relative or absolute `output_path` for the delivered
+file. The host keeps the PSD bytes intact,
 checks its merged pixels against the current evidence and requires the current
 native PNG export. It requires a passing visual review only for authored
 non-generation evidence; a verified generation needs no scores. A missing,
@@ -155,6 +159,9 @@ objects or masks. Existing structured work retains its actual layers.
 
 Outputs never overwrite inputs or existing files. After changing source/assets,
 render to a new PNG path, repeat the native flow, then export a new PSD.
+If publication reports `blocked_candidates`, complete the native flow in the
+current turn. Move any draft occupying a requested delivery path to a working
+path, and publish the successful native exports.
 `E_LAYERED_STALE` means the source or preview changed; the old receipt cannot
 authorize a new export. `E_LAYERED_EXISTS` requires a new output path. A process
 interruption may leave a preview or receipt; retain useful files and choose new

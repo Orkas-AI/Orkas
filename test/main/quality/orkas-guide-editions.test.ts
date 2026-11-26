@@ -54,7 +54,9 @@ it('routes feature selection to the overview and distinguishes work tracking fro
     const overviewRoute = skill.split('\n').find((line) => line.startsWith('|') && line.includes('(references/getting-started.md)'));
     expect(overviewRoute).toMatch(/choose features for ongoing work/i);
     const overview = read('references/getting-started.md');
-    for (const feature of ['Task / conversation', 'Project', 'Goals & rules', 'To-do', 'Auto', 'Agent', 'Skill', 'Connector', 'Library', 'Memory', 'App', 'Model', 'Workspace']) {
+    const en = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'src/renderer/locales/en.json'), 'utf8'));
+    const projectTabs = [en['project.context.goal_tab'], en['project.context.instructions_tab']];
+    for (const feature of ['Task / conversation', 'Project', ...projectTabs, 'To-do', 'Auto', 'Agent', 'Skill', 'Connector', 'Library', 'Memory', 'App', 'Model', 'Workspace']) {
       expect(overview.includes(`| **${feature}** |`), feature).toBe(true);
     }
     const projectGuide = read('references/projects-and-automation.md');
@@ -87,7 +89,9 @@ it('documents same-turn project scope and the public reviewed cleanup path', () 
   const guide = read('references/projects-and-automation.md');
   expect(guide).toContain('later to-do operations in the same reply default to that new Project');
   expect(guide).toContain('explicitly request global to-dos for global work');
-  expect(guide).toContain('Other Projects remain unavailable');
+  expect(guide).toMatch(/another Project is going.*to-dos.*saved goal when \*\*Goal\*\* is available/);
+  expect(guide).toMatch(/When \*\*Goal\*\* is available, Commander can also save a goal and success criteria/);
+  expect(guide).toContain('Open a conversation in that Project to add or update its to-dos');
   const cleanup = guide.split('## Clean up to-dos')[1]?.split('## Schedule')[0] || '';
   for (const fact of ['**To-do > Clean up**', '7/14/30/60/90/180', '30 days', 'linked conversations', 'changed work is skipped', '**Stop**', 'deleted/skipped/failed', 'open-source']) expect(cleanup, fact).toContain(fact);
   expect(cleanup).toContain('Project, last update age, and status');

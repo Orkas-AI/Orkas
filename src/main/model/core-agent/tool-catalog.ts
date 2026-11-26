@@ -7,6 +7,7 @@
  */
 
 import { createLogger } from '../../logger';
+import { projectGoalAndRecapEnabled } from '../../util/project-feature-flags';
 
 const log = createLogger('tool-catalog');
 
@@ -67,6 +68,8 @@ export interface ToolCatalogEntry {
   /** False for Commander-only tools that share a loadable group with tools a
    * named Agent may declare. Defaults to true when the group is eligible. */
   agentAssignable?: boolean;
+  /** Compatibility executor available to existing run_program calls only. */
+  programmaticOnly?: boolean;
   /** Execution permission; loading never grants it. */
   permission?: 'localExec';
   /** Whether run_program may invoke this tool. Absence is the default-deny
@@ -117,7 +120,7 @@ export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
   { id: 'orchestration', title: 'Orchestration', summary: 'Commander delegation, handoff, and anonymous worker controls.', activation: 'host-managed', agentDependency: false },
   { id: 'management', title: 'Management', summary: 'Project, to-do, automation, app support, Skill, and marketplace management controls.', activation: 'loadable', agentDependency: false },
   { id: 'management.app', title: 'App support', summary: 'Navigate supported Orkas screens and inspect sanitized app health.', parent: 'management', activation: 'loadable', agentDependency: false },
-  { id: 'management.projects', title: 'Projects', summary: 'Create or rename a project; move this conversation into or out of one.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.projects', title: 'Projects', summary: 'Create or rename a project, set or close its goal; move this conversation into or out of one.', parent: 'management', activation: 'loadable', agentDependency: false },
   { id: 'management.todos', title: 'To-dos', summary: "Read or update global to-dos outside a project, or the current project's backlog.", parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'management.skills', title: 'Skill management', summary: 'Search available shared Skills or import a user-requested Skill package.', parent: 'management', activation: 'loadable', agentDependency: false },
   { id: 'management.marketplace', title: 'Marketplace management', summary: 'Search the Marketplace and request a confirmed installation.', parent: 'management', activation: 'loadable', agentDependency: false },
@@ -167,7 +170,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'publish_outputs', loadGroups: ['workspace.write.output'], programmatic: { mode: 'allow' }, summary: 'Declare final file deliverables for the turn.' },
   { name: 'library_save', loadGroups: ['workspace.write.output'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Save a produced project file into the durable user Library.' },
   { name: 'apply_patch', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Apply a transactional patch to one or more files.' },
-  { name: 'edit_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Replace exact text in an existing file.' },
+  { name: 'edit_file', loadGroups: ['workspace.write.edit'], programmaticOnly: true, permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Legacy programmatic text replacement.' },
   { name: 'delete_file', loadGroups: ['workspace.write.edit'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Delete one file, requesting confirmation only outside the active workspace scope.' },
   { name: 'workspace_diff', loadGroups: ['workspace.write.edit'], programmatic: { mode: 'allow' }, summary: 'Read observed workspace changes.' },
 
@@ -175,7 +178,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'process_session', loadGroups: ['workspace.execute.command', 'workspace.execute.session'], permission: 'localExec', summary: 'Manage a persistent process session.' },
   { name: 'interactive_cli', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a live user-input CLI session.' },
   { name: 'create_artifact', loadGroups: ['workspace.artifact'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Build an interactive HTML/CSS/JS artifact.' },
-  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Audit local HTML or a current-conversation app at desktop or mobile targets.' },
+  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Preview local HTML or a current-conversation app and report browser observations.' },
 
   { name: 'create_pdf', loadGroups: ['office.pdf'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Create a PDF from Markdown or HTML.' },
   { name: 'edit_pdf', loadGroups: ['office.pdf'], permission: 'localExec', programmatic: { mode: 'allow' }, summary: 'Edit PDF pages, overlays, watermarks, and forms.' },
@@ -212,7 +215,8 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'todo_tasks', loadGroups: ['management.todos'], programmatic: { mode: 'allow' }, summary: "Manage global to-dos or this conversation's project backlog; Commander can also use the project it just created here." },
   // Commander-only: it relocates this conversation, which is an orchestration
   // decision, and `run_program` gets no access to that side effect.
-  { name: 'project_setup', loadGroups: ['management.projects'], agentAssignable: false, summary: "Create or rename a project; move this conversation into or out of one." },
+  { name: 'project_setup', loadGroups: ['management.projects'], agentAssignable: false,
+    summary: `Create or rename projects, ${projectGoalAndRecapEnabled() ? 'manage goals, ' : ''}add existing Agents, or move this conversation.` },
 
   { name: 'dispatch_to', loadGroups: ['orchestration'], summary: 'Delegate visible work and continue the commander turn.' },
   { name: 'hand_off_to', loadGroups: ['orchestration'], summary: 'Transfer terminal ownership to another Agent.' },
@@ -375,8 +379,12 @@ function invalidGroupRefs(
 export function toolNamesForGroups(groups: readonly string[]): string[] {
   const expanded = new Set(expandToolGroups(groups));
   return TOOL_CATALOG
-    .filter((entry) => entry.loadGroups?.some((group) => expanded.has(group)))
+    .filter((entry) => !entry.programmaticOnly && entry.loadGroups?.some((group) => expanded.has(group)))
     .map((entry) => entry.name);
+}
+
+export function isModelToolName(name: string): boolean {
+  return CATALOG_BY_NAME.get(name)?.programmaticOnly !== true;
 }
 
 export function toolNamesForAgentGroups(groups: readonly string[]): string[] {
@@ -406,7 +414,7 @@ export function getLoadableToolGroupsSystemPromptBlock(input: {
   purpose?: 'runtime' | 'agent-runtime' | 'agent-authoring';
 }): string {
   const purpose = input.purpose ?? 'runtime';
-  const available = new Set(input.availableToolNames);
+  const available = new Set(input.availableToolNames.filter(isModelToolName));
   const initiallyActive = new Set(input.initialActiveToolNames ?? []);
   const allowedGroups = input.allowedGroupIds
     ? new Set(input.allowedGroupIds)
@@ -445,6 +453,7 @@ export function getLoadableToolGroupsSystemPromptBlock(input: {
       : 'Use these exact group ids when authoring an Agent\'s built-in tool dependencies. This directory does not change the current session\'s tool surface.',
     '',
   ];
+  const describedTools = new Set<string>();
   for (const group of visible) {
     const directTools = purpose !== 'runtime'
       ? TOOL_CATALOG
@@ -468,13 +477,20 @@ export function getLoadableToolGroupsSystemPromptBlock(input: {
     const indent = '  '.repeat(depth);
     if (purpose === 'runtime') {
       lines.push(`${indent}- \`${group.id}\` — ${group.title}.`);
+      const alsoLoads: string[] = [];
       for (const entry of TOOL_CATALOG) {
         if (available.has(entry.name)
           && !initiallyActive.has(entry.name)
           && entry.loadGroups?.includes(group.id)) {
-          lines.push(`${indent}  - \`${entry.name}\` — ${entry.summary}`);
+          // A tool in several groups is described at its first listing only.
+          if (describedTools.has(entry.name)) alsoLoads.push(`\`${entry.name}\``);
+          else {
+            describedTools.add(entry.name);
+            lines.push(`${indent}  - \`${entry.name}\` — ${entry.summary}`);
+          }
         }
       }
+      if (alsoLoads.length) lines.push(`${indent}  - Also loads ${alsoLoads.join(', ')}.`);
       continue;
     }
     const members = directTools.length ? ` Tools: ${directTools.join(', ')}.` : '';

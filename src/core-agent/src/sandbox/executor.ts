@@ -12,6 +12,7 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import { TextDecoder } from "node:util";
+import { StringDecoder } from "node:string_decoder";
 import { createHash } from "node:crypto";
 import { createLogger } from "../shared/logger.js";
 import { errorCodeForLog } from "../shared/errors.js";
@@ -390,6 +391,51 @@ export function decodeProcessOutput(
   return best;
 }
 
+/** One decoder per pipe: UTF-8 characters may span arbitrary data events.
+ * Windows retains its existing fallback for bytes that are not valid UTF-8. */
+export function createProcessOutputDecoder(
+  platform: NodeJS.Platform = process.platform,
+  env: OutputEncodingEnv = process.env,
+): { write(bytes: Buffer, env?: OutputEncodingEnv): string; end(): string } {
+  if (platform !== "win32") return new StringDecoder("utf8");
+
+  // Preserve the BOM while counting consumed bytes; strip it only at stream start.
+  const fresh = () => new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  let decoder = fresh();
+  let pending = Buffer.alloc(0);
+  let atStart = true;
+  const textAtStart = (text: string) => {
+    if (!text || !atStart) return text;
+    atStart = false;
+    return text.startsWith("\uFEFF") ? text.slice(1) : text;
+  };
+  return {
+    write(bytes, currentEnv = env) {
+      if (!bytes.length) return "";
+      env = currentEnv;
+      const input = pending.length ? Buffer.concat([pending, bytes]) : bytes;
+      let text: string;
+      try {
+        text = decoder.decode(bytes, { stream: true });
+      } catch {
+        decoder = fresh();
+        pending = Buffer.alloc(0);
+        return textAtStart(decodeProcessOutput(input, platform, env));
+      }
+      // A valid UTF-8 stream retains at most three trailing bytes. Copy that
+      // tail so it cannot keep an otherwise consumed pipe buffer alive.
+      pending = Buffer.from(input.subarray(Buffer.byteLength(text, "utf8")));
+      return textAtStart(text);
+    },
+    end() {
+      const tail = pending;
+      pending = Buffer.alloc(0);
+      decoder = fresh();
+      return textAtStart(decodeProcessOutput(tail, platform, env));
+    },
+  };
+}
+
 function buildWindowsCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
   const root = getEnvValue(env, ["SystemRoot", "WINDIR"]) || "C:\\Windows";
   const programFiles = getEnvValue(env, ["ProgramFiles"]) || "C:\\Program Files";
@@ -495,6 +541,8 @@ function windowsHostEnv(env: NodeJS.ProcessEnv): Record<string, string> {
     "COMSPEC",
     "ComSpec",
     "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_ARCHITEW6432",
     "TEMP",
     "TMP",
     "USERPROFILE",

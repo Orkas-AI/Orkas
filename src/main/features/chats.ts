@@ -21,7 +21,8 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
-import { turnIndexRequest } from './conversation-history-client';
+import { historyRequest, turnIndexRequest, type ProducedPathRecord } from './conversation-history-client';
+import { VIDEO_STUDIO_AGENT_ID } from '../model/core-agent/tool-catalog';
 
 import {
   appConversationOwner, appConversationRoot,
@@ -51,8 +52,9 @@ import {
 import { evictSession, deleteSessionFileForUser } from '../model/core-agent/session-store';
 import {
   nowIso, genConversationId, genId12, safeId,
-  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets, readJsonlWindow, appendJsonlAtomic,
+  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPageWithOffsets, readJsonlWindow, appendJsonlAtomic,
 } from '../storage';
+import { indexedJsonlStamp } from '../util/indexed-jsonl';
 import { removeCodingDirectory } from './local_agents/project-directory';
 import { createLogger } from '../logger';
 import { resolveCloudRelPath } from '../util/cloud-path';
@@ -73,7 +75,9 @@ import { versionChatMediaLocalUrlsInText } from '../util/chat-media-url';
 import { isPathAllowed } from '../util/path-sandbox';
 import {
   persistedCodexOutputCitationPaths,
+  resolveCodexOutputCitationPaths,
   sanitizePersistedCodexFileCitations,
+  storedProducedPaths,
 } from './local_agents/public-output';
 import {
   readConversationHistoryWindow,
@@ -240,9 +244,8 @@ export type MessageRecord = GroupMessage;
 
 interface MessageDisplayContext {
   citationWorkingDir?: string;
-  /** Base for resolving a media destination the author wrote relative to its
-   *  own working directory, per `readConversationAuthoringDir`. */
-  mediaBaseDir?: string;
+  legacyLinkBaseDir: string;
+  taskMediaBaseDir: string;
   allowedCitationRoots: string[];
 }
 
@@ -308,24 +311,19 @@ async function _computeMessageDisplayContext(
 
   if (workspaceRoot && path.isAbsolute(workspaceRoot)) allowedCitationRoots.push(workspaceRoot);
 
-  // Same rule the bus applies when it persists the reply, so a stored message
-  // and its re-read display resolve a relative media destination identically.
-  let mediaBaseDir: string | undefined;
-  try {
-    const convWorkspace = await import('./group_chat/conv_workspace');
-    mediaBaseDir = await convWorkspace.readConversationAuthoringDir(userId, cid);
-  } catch (err) {
-    log.warn('resolve media base dir failed', {
-      cid: maskId(cid),
-      error: logErrorSummary(err),
-    });
-  }
+  const appRoot = appConversationRoot(userId, cid);
+  const { resolveConversationWorkspaceChild } = await import('./group_chat/conv_workspace');
+  const taskMediaBaseDir = appRoot
+    ? path.join(appRoot, 'workspace')
+    : workspaceRoot ? resolveConversationWorkspaceChild(workspaceRoot, state.workspace_dir) : '';
+  const codingDir = state.coding_project_dir && path.isAbsolute(state.coding_project_dir)
+    ? state.coding_project_dir
+    : '';
 
   return {
-    citationWorkingDir: state.coding_project_dir && path.isAbsolute(state.coding_project_dir)
-      ? state.coding_project_dir
-      : workspaceRoot,
-    ...(mediaBaseDir ? { mediaBaseDir } : {}),
+    citationWorkingDir: codingDir || workspaceRoot,
+    legacyLinkBaseDir: appRoot ? taskMediaBaseDir : codingDir || taskMediaBaseDir,
+    taskMediaBaseDir,
     allowedCitationRoots,
   };
 }
@@ -336,12 +334,6 @@ function _isAuthorizedLegacyOutputFile(candidate: string, allowedRoots: readonly
   catch { return false; }
 }
 
-function _storedProducedPaths(message: Pick<MessageRecord, 'produced'>): string[] {
-  return Array.isArray(message.produced)
-    ? message.produced.filter((item): item is string => typeof item === 'string' && !!item.trim())
-    : [];
-}
-
 /** Resolve the produced-file paths a stored record presents. `backing` is the
  *  stored list plus any authorized legacy Codex output citation; `display` is
  *  what the renderer footer, the file panel, and file-action authorization
@@ -349,37 +341,43 @@ function _storedProducedPaths(message: Pick<MessageRecord, 'produced'>): string[
  *  Historical rows predate a separate `published` field, so only the cited
  *  files are displayed while the complete list remains sanitizer backing.
  *  Without a trusted citation, the stored footer is preserved verbatim. */
-function _producedPathsForDisplay(
-  message: Pick<MessageRecord, 'from' | 'text' | 'produced'>,
-  context: MessageDisplayContext,
+function _resolveProducedPaths(
+  { stored, cited }: ProducedPathRecord,
+  allowedCitationRoots: readonly string[],
 ): { backing: string[]; display: string[] } {
-  const storedProduced = _storedProducedPaths(message);
-  if (message.from === 'user') return { backing: storedProduced, display: storedProduced };
-  const produced = [...storedProduced];
+  if (!cited.length) return { backing: stored, display: stored };
+  const produced = [...stored];
   const producedKeys = new Set(produced.map((item) => path.resolve(item)));
   const citedOutputs: string[] = [];
-  for (const candidate of persistedCodexOutputCitationPaths(
-    message.text,
-    context.citationWorkingDir,
-  )) {
+  for (const candidate of cited) {
     const resolved = path.resolve(candidate);
     if (!producedKeys.has(resolved)) {
-      if (!_isAuthorizedLegacyOutputFile(resolved, context.allowedCitationRoots)) continue;
+      if (!_isAuthorizedLegacyOutputFile(resolved, allowedCitationRoots)) continue;
       produced.push(resolved);
       producedKeys.add(resolved);
     }
     citedOutputs.push(resolved);
   }
-  return { backing: produced, display: citedOutputs.length ? citedOutputs : storedProduced };
+  return { backing: produced, display: citedOutputs.length ? citedOutputs : stored };
 }
 
 function _messageForDisplay(message: MessageRecord, context: MessageDisplayContext): MessageRecord {
   if (message.from === 'user') return message;
-  const storedProduced = _storedProducedPaths(message);
-  const { backing: produced, display: displayProduced } = _producedPathsForDisplay(message, context);
+  const storedProduced = storedProducedPaths(message.produced);
+  const { backing: produced, display: displayProduced } = _resolveProducedPaths({
+    stored: storedProduced,
+    cited: persistedCodexOutputCitationPaths(message.text, context.citationWorkingDir),
+  }, context.allowedCitationRoots);
+  // Old VideoStudio messages predate send-time binding. VideoStudio authored
+  // them in the task workspace even when a coding Agent had a separate cwd.
+  const mediaBaseDir = message.relative_media_resolved_at_send === true
+    ? ''
+    : message.from === VIDEO_STUDIO_AGENT_ID ? context.taskMediaBaseDir : context.legacyLinkBaseDir;
   const text = versionChatMediaLocalUrlsInText(
     sanitizePersistedCodexFileCitations(message.text, produced, context.citationWorkingDir),
-    context.mediaBaseDir || '',
+    context.legacyLinkBaseDir,
+    undefined,
+    mediaBaseDir,
   );
   const producedUnchanged = displayProduced.length === storedProduced.length
     && displayProduced.every((item, index) => item === storedProduced[index]);
@@ -2660,26 +2658,44 @@ export async function getMessages(userId: string, cid: string, limit = 200): Pro
   return (await getMessagesPage(userId, cid, limit)).history;
 }
 
-/** Produced-file paths from the newest `limit` visible messages, resolved the
- *  way `getMessages` presents them but read raw. The file panel and
- *  file-action authorization consume only these strings; `getMessages` would
- *  first run the renderer projection, which spills every large process output
- *  to a lazy cache file, hashes it, and rewrites each text for display. */
+const _producedReads = new Map<string, Promise<ProducedPathRecord[]>>();
+let _recentProducedRead: { key: string; references: ProducedPathRecord[] } | undefined;
+
+/** The worker projects each visible row to file references before retaining it.
+ * Keep authorization checks here so every caller checks current roots/files. */
 export async function listProducedPaths(userId: string, cid: string, limit = 200): Promise<string[]> {
   const sourceFile = conversationMessageReadFile(userId, cid);
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
-  let records: MessageRecord[] = [];
-  let cursor: number | null | undefined;
-  while (records.length < wanted) {
-    const page = await readJsonlPage<MessageRecord>(sourceFile, wanted - records.length, cursor);
-    records = page.records.filter((message) => !message.deleted_at).concat(records);
-    if (page.nextCursor === null) break;
-    cursor = page.nextCursor;
+  const stamp = await indexedJsonlStamp(sourceFile);
+  if (!stamp) return [];
+  const key = JSON.stringify([userId, sourceFile, stamp, wanted]);
+  let references = _recentProducedRead?.key === key ? _recentProducedRead.references : undefined;
+  if (!references) {
+    let pending = _producedReads.get(key);
+    if (!pending) {
+      pending = historyRequest<ProducedPathRecord[]>({ kind: 'produced-paths', userId, sourceFile, limit: wanted })
+        .then(rows => {
+          // Keep one small immutable projection for periodic refreshes of an
+          // unchanged transcript. Authorization is still recomputed below.
+          let chars = 0;
+          for (const { stored, cited } of rows) {
+            for (const file of stored) chars += file.length;
+            for (const file of cited) chars += file.length;
+          }
+          if (chars <= 64 * 1024 && rows.length <= 2000) _recentProducedRead = { key, references: rows };
+          return rows;
+        }).finally(() => _producedReads.delete(key));
+      _producedReads.set(key, pending);
+    }
+    references = await pending;
   }
-  if (!records.length) return [];
+  if (!references.length) return [];
   const context = await _messageDisplayContext(userId, cid);
   const out: string[] = [];
-  for (const message of records) out.push(..._producedPathsForDisplay(message, context).display);
+  for (const { stored, cited } of references) {
+    const resolved = resolveCodexOutputCitationPaths(cited, context.citationWorkingDir);
+    out.push(..._resolveProducedPaths({ stored, cited: resolved }, context.allowedCitationRoots).display);
+  }
   return out;
 }
 

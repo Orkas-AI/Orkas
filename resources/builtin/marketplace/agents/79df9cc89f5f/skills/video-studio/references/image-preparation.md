@@ -28,18 +28,16 @@ JSON objects of at most 64 KiB; still images are limited to 16,384 pixels per
 dimension and 100 million pixels. Animated/multipage images need a selected
 still first. Outputs are new PNG, JPEG or WebP files; existing files stay intact.
 
-First inspect the original, not the compressed image shown by `read_files`:
+Use `source_dimensions` from `read_files` or inspect the source for its oriented
+original dimensions:
 
 ```json
 {"op":"inspect","input_path":"media/package.jpg"}
 ```
 
-The result gives `width`, `height`, EXIF `orientation`, encoded dimensions and
+Inspection gives `width`, `height`, EXIF `orientation`, encoded dimensions and
 `coordinate_space:"oriented_original_pixels"`. Processing applies EXIF
-orientation before cropping. A displayed preview can have different dimensions;
-convert its observed bounds proportionally to these original dimensions and
-verify them on the source. Do not treat preview pixel coordinates as original
-pixels. Dimensions establish the coordinate system, not the product's bounds.
+orientation before cropping.
 
 Prepare only the region the shot needs, preserving the original:
 
@@ -53,8 +51,12 @@ Prepare only the region the shot needs, preserving the original:
 ```
 
 Replace every dimension with verified values. `source_size` is required for a
-crop and must match `inspect`. Crop offsets start at zero in the oriented
-original, and the whole rectangle must fit. `resize` takes positive integer
+crop and must match the oriented original. Crop offsets start at zero. When you
+choose the bounds on a proportional preview of the whole image, pass the
+`preview_dimensions` reported by `read_files` as `"preview_size":{"width":576,"height":1024}`
+and give the crop in that preview's pixels. The script maps the rectangle to the
+original. With no `preview_size`, give the crop in oriented original pixels.
+`resize` takes positive integer
 width and/or height and `fit`: `inside` (default), `contain`, `cover` or `fill`.
 `inside` preserves proportions; `contain` adds transparent bars when needed;
 `cover` can cut off details and `fill` can distort. Optional `padding` takes

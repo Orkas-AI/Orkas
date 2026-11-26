@@ -4,6 +4,7 @@
  * There is no approval state here: the model edits those files directly, and this
  * tool checks them, renders them and judges the result.
  */
+import { realpathSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -24,16 +25,26 @@ import {
   quoteProductionIntents,
   videoParametersRefusal,
 } from '../../features/video_production_spend';
-import type { VideoStudioResult } from '../../features/video_studio';
+import { transcribeSpeech, type VideoStudioResult } from '../../features/video_studio';
+import { heardClauses } from '../../features/video_phrases';
 import {
   checkVideoTimeline,
   visualReview,
+  capturedPictureKinds,
   loadVideoProject,
+  pictureLooksLikeScreen,
   renderVideoTimeline,
   sheetVideoTimeline,
 } from '../../features/video_timeline_render';
-import { shipVideoFile, writeDeliveredFrameSheet, type VideoVersion } from '../../features/video_timeline_ship';
-import { VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
+import { deliveredFrameSamples, shipVideoFile, writeDeliveredFrameSheet, type HeardLine, type VideoVersion } from '../../features/video_timeline_ship';
+import {
+  REFERENCE_MOTION_CODE,
+  findFollowedReference,
+  writeReferenceComparisonSheet,
+  type ReferenceComparison,
+} from '../../features/video_reference_compare';
+import { bundledFfmpegPaths } from '../../util/bundled-runtime';
+import { getToolCatalogEntry, VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
 import { deriveVideoStudioOutcome } from './video-studio-tool';
 import {
   allowedRoots,
@@ -47,8 +58,10 @@ import {
 } from './video-studio-tool';
 import { deriveVideoTimeline } from '../../features/video_timeline';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { gateOutsideRead } from './outside-read-gate';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
+import { sha256OfFileStream } from '../../util/sha256';
 import { VIDEO_QUOTE_FAILURE_MESSAGE, videoQuoteFailureDetails } from '../../features/video_production_quote_error';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 
@@ -66,19 +79,110 @@ const OPS = [
   ...SHARED_OPS,
 ];
 const MAX_LISTED_VIDEOS = 32;
+
+const REPLY_LINK_NOTE = 'Link the video in your reply with reply_link exactly as given; change only the words in brackets.';
+const MARKDOWN_PATH_ESCAPES: Record<string, string> = {
+  '%': '%25', '(': '%28', ')': '%29', '<': '%3C', '>': '%3E',
+  '#': '%23', '?': '%3F', ':': '%3A', '`': '%60',
+};
+
+/**
+ * A Markdown link to a delivered file, written relative to the folder this conversation's
+ * agents run in, which is the folder the app resolves such links against. The app turns it
+ * into the playable file. 2026-11-20 benchmark: 6 of 34 runs copied the delivered file's long
+ * absolute link wrong (a folder dropped, a 0 added, a character of a Chinese name lost), and
+ * users got a link that opened nothing.
+ */
+export function replyLinkFor(fileAbs: string, workingDirAbs: string): string | null {
+  const inside = (base: string, file: string) => {
+    const rel = path.relative(base, file);
+    return rel && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) ? rel : null;
+  };
+  const real = (value: string) => { try { return realpathSync(value); } catch { return path.resolve(value); } };
+  // A folder reached through a link (/var and /private/var on macOS) names the same file.
+  const relative = inside(path.resolve(workingDirAbs), path.resolve(fileAbs)) ?? inside(real(workingDirAbs), real(fileAbs));
+  if (!relative) return null;
+  const destination = relative.split(path.sep)
+    .map((part) => part.replace(/[%()<>#?:`]/g, (ch) => MARKDOWN_PATH_ESCAPES[ch]).replace(/\s/g, (ch) => encodeURIComponent(ch)))
+    .join('/');
+  // Keep the raw label out of Markdown's inline-code syntax too.
+  const label = path.basename(fileAbs).replace(/[[\]`]/g, '');
+  return `[${label}](${destination})`;
+}
+
+/** What an unknown op says. Live runs on 2026-11-17–19 put another tool's name in op
+ *  (generate_speech, twice), this tool's own name (twice) or an op without its prefix
+ *  (request_budget), and a bare list of ops did not say which mistake it was. */
+function unknownOpMessage(op: string): string {
+  const listed = `op must be one of: ${OPS.join(', ')}`;
+  if (op === 'video_studio') return `op names the operation, not this tool. It is one of: ${OPS.join(', ')}`;
+  if (op && getToolCatalogEntry(op)) return `${op} is a tool of its own, not a video_studio op. Call ${op} with these fields.`;
+  const prefixed = op ? OPS.filter((known) => known.slice(known.indexOf('.') + 1) === op) : [];
+  if (prefixed.length === 1) return `There is no op ${op}; it is ${prefixed[0]}. Run it again with that name.`;
+  return listed;
+}
+/** Delivered versions per video that video.status lists; older ones are counted. */
+const STATUS_VERSIONS_PER_VIDEO = 5;
+
+/** video.status opens every later turn, so it lists, per video, the newest versions with
+ *  what a decision needs and the visual review of the newest one only. versions.json
+ *  keeps every field. */
+function statusVersions(versions: unknown[]): { versions: Array<Record<string, unknown>>; older_versions?: number } {
+  const records = versions.filter((raw): raw is Record<string, unknown> => !!raw && typeof raw === 'object');
+  const byVideo = new Map<unknown, Array<Record<string, unknown>>>();
+  for (const record of records) byVideo.set(record.video_id, [...(byVideo.get(record.video_id) ?? []), record]);
+  const listed = new Set<Record<string, unknown>>();
+  const newest = new Set<Record<string, unknown>>();
+  for (const list of byVideo.values()) {
+    for (const record of list.slice(-STATUS_VERSIONS_PER_VIDEO)) listed.add(record);
+    newest.add(list[list.length - 1]);
+  }
+  const older = records.length - listed.size;
+  return {
+    versions: records.filter((record) => listed.has(record)).map((record) => ({
+      id: record.id,
+      ...(record.video_id !== undefined ? { video_id: record.video_id } : {}),
+      path: record.path,
+      duration_sec: record.duration_sec,
+      shipped_at: record.shipped_at,
+      warnings: record.warnings,
+      ...(record.override ? { override: record.override } : {}),
+      ...(newest.has(record) && record.visual_review ? { visual_review: record.visual_review } : {}),
+    })),
+    ...(older ? { older_versions: older } : {}),
+  };
+}
 const MAX_LISTED_PRODUCTION_CANDIDATES = 200;
 const VIDEO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_VIDEO_ID = 'main';
 /** The frames invite a fix after delivery: the first ship plus at most two repairs, per video. */
 const MAX_DELIVERIES_TO_REWORK = 3;
 const MAX_UPGRADE_NOTES_CHARS = 4000;
-const DELIVERED_FRAMES_LOOK = "These are frames from the published file. Rework is still available this turn. Apply the video-studio Skill's Deliver section to decide whether to repair, report a blocker, or finish.";
-const DELIVERED_FRAMES_LAST_LOOK = "These are frames from the published file. This turn's rework limit has been reached; do not rework again. Apply the video-studio Skill's Deliver section for an honest final status.";
+const DELIVERED_FRAMES = 'These are frames from the published file.';
+const DELIVERED_HEARD_FRAMES = 'These are frames from the published file, each taken as a line of its voice ends, then its last frame; delivered_frames lists the words heard at each.';
+const HEARD_FRAMES_REPAIR = 'Where a line names a step, a result or an event that its frame does not show, fix the cut or the line.';
+const HEARD_FRAMES_REPORT = 'Where a line names a step, a result or an event that its frame does not show, say so in your reply.';
+const REWORK_OPEN = "Rework is still available this turn. Apply the video-studio Skill's Deliver section to decide whether to repair, report a blocker, or finish.";
+const REWORK_SPENT = "This turn's rework limit has been reached; do not rework again. Apply the video-studio Skill's Deliver section for an honest final status.";
+/** A voiced delivery is listened to up to this length; a longer one keeps evenly spaced frames. */
+const HEARD_FRAMES_MAX_SEC = 600;
 /** A production that keeps reference notes follows a reference; its first delivery names what
  *  the video left out of it and how the user could still have it. */
 const REFERENCE_DROPS_MESSAGE = 'This video follows a reference. In your reply, name what reference-notes.md drops and why, and for a presenter or character the user has no footage of, offer to add one from footage they film or as an original generated one, priced when they ask.';
 /** Delivery findings that are defects to repair, not editorial notes. */
-const REPAIR_FINDINGS = new Set(['DELIVERY_SILENT_STRETCH', 'DELIVERY_NARRATION_OVER_SPEECH', 'DELIVERY_CUTS_OFF_BEAT']);
+const REPAIR_FINDINGS = new Set([
+  'DELIVERY_SILENT_STRETCH', 'DELIVERY_NARRATION_OVER_SPEECH', 'DELIVERY_CUTS_OFF_BEAT', 'DELIVERY_NO_CUTS', 'DELIVERY_SHOT_HELD',
+  REFERENCE_MOTION_CODE,
+]);
+/** A video that follows a reference is shown beside it at each delivery, within the same rework. */
+const REFERENCE_SHEET_REPAIR = 'The reference comparison image shows the reference (left) and this video (right) at the same point of each, one row per quarter. Where this video leaves out a part, an end card or on-screen text that the reference has and reference-notes.md does not drop, fix it in this rework; what the notes drop or change is not a defect.';
+const REFERENCE_SHEET_REPORT = 'The reference comparison image shows the reference (left) and this video (right) at the same point of each, one row per quarter. Where this video still leaves out something the reference has and reference-notes.md does not drop, say so in your reply.';
+/** A repair that moves the delivery less than this much closer to the reference's movement
+ *  is not asked for again: the next attempt would most likely change as little. */
+const REFERENCE_MOTION_MIN_GAIN = 0.1;
+function referenceMotionStalled(before: number, now: number): string {
+  return `The movement below the reference did not improve enough since the last delivery (${Math.round(before * 100)}% to ${Math.round(now * 100)}% of the reference's movement), so do not rework it again: name it in your reply as a known difference from the reference.`;
+}
 
 /** What to do about repair findings: fix and ship again while rework remains, else name them. */
 function repairInstruction(warnings: unknown, shipped: number): string | null {
@@ -191,14 +295,39 @@ export function renderResultForModel(result: Record<string, unknown>): Record<st
   };
 }
 
+/** The delivered file's voice, line by line, when it carries one; empty when it does not,
+ *  is too long to listen to here, or cannot be heard. */
+async function heardLines(videoPathAbs: string, version: VideoVersion | undefined, signal: AbortSignal | undefined): Promise<HeardLine[]> {
+  const durationSec = version?.duration_sec ?? 0;
+  if (version?.voiced !== true || !(durationSec > 0) || durationSec > HEARD_FRAMES_MAX_SEC) return [];
+  try {
+    // Frames need times only roughly: the last words are often timed past the end of the file,
+    // where a frame is its last frame, and a word the recognizer could not time is skipped.
+    const result = await transcribeSpeech({ inputAbsPath: videoPathAbs, timestamps: 'word', looseTiming: true, ...(signal ? { signal } : {}) });
+    if (!result.ok) return [];
+    const summary = (result.summary ?? {}) as { words?: unknown; segments?: unknown };
+    const timed = (value: unknown) => (Array.isArray(value) ? value : []).flatMap((item) => {
+      const { text, startSec, endSec } = (item ?? {}) as { text?: unknown; startSec?: unknown; endSec?: unknown };
+      // A punctuation mark can take no time and still end a clause.
+      return typeof text === 'string' && text.trim() && typeof startSec === 'number' && typeof endSec === 'number' && endSec >= startSec
+        ? [{ text: text.trim(), startSec, endSec }] : [];
+    });
+    return heardClauses(timed(summary.words), timed(summary.segments));
+  } catch (err) {
+    log.warn('delivered voice not heard', { error: logErrorSummary(err) });
+    return [];
+  }
+}
+
 async function deliveredFramesVisual(
   videoPathAbs: string,
   version: VideoVersion | undefined,
   signal: AbortSignal | undefined,
-): Promise<{ data: string; mediaType: 'image/png' | 'image/webp' } | null> {
+): Promise<{ image: { data: string; mediaType: 'image/png' | 'image/webp' }; heard: Array<{ frame: number; at_sec: number; heard?: string }> | null } | null> {
   const [width, height] = (version?.canvas ?? '').split('x').map(Number);
   let dir: string | null = null;
   try {
+    const heard = await heardLines(videoPathAbs, version, signal);
     dir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-video-delivered-'));
     const sheet = await writeDeliveredFrameSheet({
       videoPathAbs,
@@ -206,14 +335,70 @@ async function deliveredFramesVisual(
       durationSec: version?.duration_sec ?? 0,
       width: width ?? 0,
       height: height ?? 0,
+      heard,
       ...(signal ? { signal } : {}),
     });
-    return sheet ? await prepareVideoStudioModelVisual(sheet) : null;
+    const image = sheet ? await prepareVideoStudioModelVisual(sheet) : null;
+    if (!image) return null;
+    // The same frames the sheet was made from, numbered as its cells are.
+    return {
+      image,
+      heard: heard.length
+        ? deliveredFrameSamples(version?.duration_sec ?? 0, heard)
+          .map((sample, index) => ({ frame: index + 1, at_sec: sample.atSec, ...(sample.heard ? { heard: sample.heard } : {}) }))
+        : null,
+    };
   } catch (err) {
     log.warn('delivered frames unavailable', { error: logErrorSummary(err) });
     return null;
   } finally {
     if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** The reference and the delivery side by side at the rows delivery measured. Losing it
+ *  loses the picture, never the delivery. */
+async function referenceComparisonVisual(
+  referenceAbs: string,
+  videoAbs: string,
+  comparison: ReferenceComparison,
+  signal: AbortSignal | undefined,
+): Promise<{ data: string; mediaType: 'image/png' | 'image/webp' } | null> {
+  const { ffmpeg } = bundledFfmpegPaths();
+  if (!ffmpeg || !comparison.rows.length) return null;
+  let dir: string | null = null;
+  try {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-video-reference-'));
+    const sheet = await writeReferenceComparisonSheet({
+      ffmpeg,
+      referenceAbs,
+      videoAbs,
+      moments: comparison.rows.map((row) => ({
+        row: row.row,
+        referenceSec: row.reference_at_sec,
+        videoSec: row.video_at_sec,
+        share: (row.row - 0.5) / comparison.rows.length,
+      })),
+      outputDirAbs: dir,
+      ...(signal ? { signal } : {}),
+    });
+    return sheet ? await prepareVideoStudioModelVisual(sheet) : null;
+  } catch (err) {
+    log.warn('reference comparison unavailable', { error: logErrorSummary(err) });
+    return null;
+  } finally {
+    if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** The frozen source a successful reference.inspect returned. */
+function inspectedSource(result: ToolResult): string | null {
+  if (typeof result.content !== 'string') return null;
+  try {
+    const body = JSON.parse(result.content) as { ok?: unknown; source_path?: unknown };
+    return body.ok === true && typeof body.source_path === 'string' && body.source_path ? path.resolve(body.source_path) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -271,18 +456,19 @@ async function productionStatus(input: {
     generation_requests: await productionRequestStatus({ userId: opts.userId, scope }),
     videos,
     asset_count: assets.length,
-    versions,
+    ...statusVersions(versions),
   };
 }
 
-const NOTHING_TO_PRICE = 'planned is empty, so there is nothing to price. If you are not generating anything, you do not need video.request_budget: carry on with what you have.';
+// On 2026-11-07 a run with nothing to generate priced an empty plan, and an answer that the plan
+// had to list something sent it looking for something to list. Live runs on 2026-11-17–19 still
+// priced empty plans 12 times; answered as a failure, one of them stopped there. Nothing to pay
+// for is a result, not a mistake.
+const NOTHING_TO_PRICE = 'There is nothing in the plan to generate, so there is no price to confirm. Carry on with what you have.';
 
-/** One entry of `planned`, in the shape the credit quote reads. */
+/** One entry of `planned`, in the shape the credit quote reads. Empty when nothing in it costs. */
 function plannedIntents(raw: unknown): Array<{ segment_id: string; kind: 'video' | 'image'; prompt: string; ratio?: string; duration?: number; resolution?: string; quality?: string; generate_audio?: boolean; size?: string }> | string {
   if (!Array.isArray(raw)) return 'planned must list what you intend to generate.';
-  // On 2026-11-07 a run with nothing to generate priced an empty plan, and the old answer sent
-  // it looking for something to list.
-  if (!raw.length) return NOTHING_TO_PRICE;
   const out: ReturnType<typeof plannedIntents> = [];
   for (const [index, item] of raw.entries()) {
     const entry = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
@@ -303,7 +489,7 @@ function plannedIntents(raw: unknown): Array<{ segment_id: string; kind: 'video'
       });
     }
   }
-  return out.length ? out : NOTHING_TO_PRICE;
+  return out;
 }
 
 function checkFailure(result: VideoStudioResult): ToolResult {
@@ -354,6 +540,24 @@ async function sharedOp(op: string, input: Record<string, unknown>, shared: Agen
   }
 }
 
+/** What a delivery says when files it may use need credit (confirmed 2026-11-16). */
+function creditMessage(credits: { timeline: boolean }, file: string): string {
+  return credits.timeline
+    ? `This video uses files that need credit. In your reply, give the user these lines to paste into the post's description; they are also saved beside the video as ${file}.`
+    : `This production has files that need credit. In your reply, give the user the lines for those this video uses, to paste into the post's description; all are saved beside the video as ${file}.`;
+}
+
+/** Credit lines for a delivery; a failure to write them never fails the delivery. */
+async function stockCredits(productionDirAbs: string, deliveredAbs: string, videoDirAbs: string | undefined) {
+  try {
+    const stock = await import('../../features/video_timeline_ship');
+    return await stock.writeStockCredits({ productionDirAbs, deliveredAbs, ...(videoDirAbs ? { videoDirAbs } : {}) });
+  } catch (err) {
+    log.warn('delivery credits unavailable', { error: logErrorSummary(err) });
+    return null;
+  }
+}
+
 /** A repaired file saved under a new name is still the same video: `final-fixed`,
  *  `final-v2` and `final-normalized` all count against `final`. Numbered clips
  *  (`clip-01`, `clip-02`) stay apart. */
@@ -380,8 +584,16 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
   // Deliveries this run, per video: the first ship plus at most two repairs each.
   const deliveries = new Map<string, number>();
   const firstDelivery = new Map<string, boolean>();
+  // Reference sources inspected in this run, oldest first: the last is the one a remake follows.
+  const inspectedReferences: string[] = [];
+  // Per video, how close its last delivery came to the reference's movement when it fell short.
+  const referenceMotion = new Map<string, number>();
   // Checks in this run that asked to move words off the product; the check stops asking after three.
   let wordsOnProductAsks = 0;
+  // Checks in this run that pointed out empty or still scenes, and small text; three each.
+  let stillScenesAsks = 0;
+  let smallTextAsks = 0;
+  let screenStepAsks = 0;
   return {
     name: 'video_studio',
     description:
@@ -397,7 +609,7 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
         production_dir: { type: 'string', description: 'Folder holding this production, relative to the workspace. Required by video.* ops, except video.status, which without it lists the productions here.' },
         video_id: { type: 'string', description: 'A folder name under videos/. Required by check, sheet and render; on ship, names the timeline the file came from.' },
         names: { type: 'array', items: { type: 'string' }, maxItems: 32, description: 'video.import: attachment file names, instead of paths. Omit both to import all attachments.' },
-        paths: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32, description: 'video.import: local image, video or audio paths, relative to the workspace or absolute within read scope. Use instead of names; omit both to import conversation attachments.' },
+        paths: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32, description: 'video.import: local image, video or audio paths, relative to the workspace or absolute; a file outside the workspace follows the user\'s access setting and may ask the user first. Use instead of names; omit both to import conversation attachments.' },
         planned: {
           type: 'array',
           description: 'video.request_budget: everything you intend to generate.',
@@ -415,6 +627,7 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
             required: ['kind'],
           },
         },
+        include_preview: { type: 'boolean', description: 'video.check: attach a sheet of sampled scene starts and ends (up to 32 frames). Omit for diagnostics only.' },
         times: { type: 'array', items: { type: 'number', minimum: 0 }, maxItems: 32, description: 'video.sheet: seconds on the video to show. Default: the start and end of every scene.' },
         range: {
           type: 'object',
@@ -422,10 +635,10 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
           properties: { start_sec: { type: 'number' }, end_sec: { type: 'number' } },
           required: ['start_sec', 'end_sec'],
         },
-        output_path: { type: 'string', description: 'video.render: where to write the mp4. Default render/<video_id>.mp4 in the production.' },
+        output_path: { type: 'string', description: 'video.render: absolute or production-relative MP4 path. Workspace-relative paths inside the production also work. Defaults to render/<video_id>.mp4 in the production.' },
         quality: { type: 'string', enum: ['draft', 'standard', 'high'], description: 'video.render: default high. draft is 15fps and fast.' },
-        path: { type: 'string', description: 'video.ship: the file to deliver, from any tool. Relative to the production or the workspace.' },
-        expect_duration_sec: { type: 'number', description: 'video.ship without video_id: the intended length.' },
+        path: { type: 'string', description: 'video.ship: use the actual absolute file path from the producing tool. Relative paths try the production first, then the workspace.' },
+        expect_duration_sec: { type: 'number', description: 'video.ship: requested duration in seconds, if known. A difference is advisory, including when video_id is set.' },
         expect_aspect: { type: 'string', description: 'video.ship without video_id: the intended shape, like 9:16.' },
         expect_audio: { type: 'boolean', description: 'video.ship without video_id: whether it must have sound.' },
         cut_to_beat: { type: 'boolean', description: 'true when the video is cut to its music\'s beat (卡点). Delivery then checks every cut of the delivered file against the soundtrack\'s beats.' },
@@ -439,6 +652,7 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
         sample_times: { type: 'array', items: { type: 'number', minimum: 0 }, minItems: 1, maxItems: 32, description: 'reference.inspect: source seconds; omit to sample each detected shot.' },
         transcript_path: { type: 'string', description: 'speech.transcribe: where to save the transcript JSON.' },
         language: { type: 'string', description: 'speech.transcribe: ASR language or auto. speech.capabilities: narration language to list voices for.' },
+        all_voices: { type: 'boolean', description: 'speech.capabilities: list every eligible voice instead of a sample.' },
         model: { type: 'string', description: 'speech.transcribe: ASR model id or path.' },
         timestamps: { type: 'string', enum: ['segment', 'word'], description: 'speech.transcribe timing detail.' },
       },
@@ -454,8 +668,15 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
           ? 'The installed VideoStudio agent is older than this app and cannot work with it. Do not retry. Tell the user to update VideoStudio in the marketplace, then ask again.'
           : 'The installed VideoStudio agent is newer than this app and cannot work with it. Do not retry. Tell the user to update Orkas, then ask again.');
       }
-      if (!OPS.includes(op)) return refuse(op, 'E_VIDEO_OP_UNKNOWN', `op must be one of: ${OPS.join(', ')}`);
-      if (SHARED_OPS.has(op)) return sharedOp(op, input as Record<string, unknown>, shared, ctx, opts);
+      if (!OPS.includes(op)) return refuse(op, 'E_VIDEO_OP_UNKNOWN', unknownOpMessage(op));
+      if (SHARED_OPS.has(op)) {
+        const result = await sharedOp(op, input as Record<string, unknown>, shared, ctx, opts);
+        if (op === 'reference.inspect') {
+          const source = inspectedSource(result);
+          if (source) inspectedReferences.push(source);
+        }
+        return result;
+      }
       if (op === 'video.status' && !String(input.production_dir ?? '').trim()) {
         const upgrade = await upgradeForStatus(opts, ctx);
         return reply({ ok: true, op, productions: await listProductions(ctx, opts), ...upgrade });
@@ -484,7 +705,14 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
           const sources: string[] = [];
           for (const raw of input.paths as string[]) {
             const source = resolvePath(ctx, opts, raw, roots);
-            if (!isPathAllowed(source, roots)) return refuse(op, 'E_PATH_OUT_OF_SCOPE', 'Import files must be inside the readable workspace or current attachments.');
+            // A file elsewhere on the computer is read as the file tools read it, by the
+            // user's access setting, and copied in, so the video never depends on it.
+            const gate = await gateOutsideRead({
+              userId: opts.userId, ...(opts.cid ? { cid: opts.cid } : {}),
+              ...(opts.agentId ? { agentId: opts.agentId } : {}), ...(opts.agentName ? { agentName: opts.agentName } : {}),
+              roots, abs: source, operation: 'video.import', ctx,
+            });
+            if (gate.ok === false) return refuse(op, gate.code, gate.message);
             const stat = await fs.stat(source).catch(() => null);
             if (!stat?.isFile()) return refuse(op, 'E_VIDEO_IMPORT_INPUT', 'An import source is missing or is not a regular file. Choose an existing media file.');
             if (!sources.includes(source)) sources.push(source);
@@ -502,8 +730,9 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
             log.warn('local media import failed', { error: logErrorSummary(err) });
             return refuse(op, 'E_VIDEO_IMPORT_FAILED', 'A media file could not be imported. Already imported assets remain available; check the source files and retry.', { assets: imported });
           }
+          const screens = await importedScreens(productionDirAbs, imported);
           return reply({ ok: true, op, assets: imported, ...(skipped.length ? { skipped } : {}),
-            ...(imported.length ? {} : { message: 'The selected files contain no supported images, videos or audio.' }) });
+            ...(imported.length ? (screens ? { message: screens } : {}) : { message: 'The selected files contain no supported images, videos or audio.' }) });
         }
         if (!opts.cid) return refuse(op, 'E_VIDEO_IMPORT_NO_CONVERSATION', 'There are no attachments outside a conversation.');
         const { imported, skipped } = await importProductionAttachments({
@@ -512,18 +741,20 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
           ...(Array.isArray(input.names) ? { names: input.names.map(String) } : {}),
           ...signalOpt,
         });
+        const screens = await importedScreens(productionDirAbs, imported);
         return reply({
           ok: true,
           op,
           assets: imported,
           ...(skipped.length ? { skipped } : {}),
-          ...(imported.length ? {} : { message: 'There are no images, videos or audio files attached to this conversation.' }),
+          ...(imported.length ? (screens ? { message: screens } : {}) : { message: 'There are no images, videos or audio files attached to this conversation.' }),
         });
       }
 
       if (op === 'video.request_budget') {
         const intents = plannedIntents(input.planned);
         if (typeof intents === 'string') return refuse(op, 'E_BUDGET_PLAN', intents);
+        if (!intents.length) return reply({ ok: true, op, quoted_credits: 0, message: NOTHING_TO_PRICE });
         let quote;
         try {
           quote = await quoteProductionIntents(intents, ctx.signal, { userId: opts.userId, ...(opts.cid ? { cid: opts.cid } : {}) });
@@ -553,6 +784,11 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
           ...(typeof input.expect_aspect === 'string' ? { aspect: input.expect_aspect } : {}),
           ...(typeof input.expect_audio === 'boolean' ? { hasAudio: input.expect_audio } : {}),
         };
+        // reference-notes.md marks a video made from a reference, as for the first delivery's notes below.
+        const followsNotes = await fs.stat(path.join(productionDirAbs, 'reference-notes.md')).then((stat) => stat.isFile(), () => false);
+        const referenceAbs = followsNotes
+          ? await findFollowedReference({ productionDirAbs, allowedRoots: roots, inspectedThisRun: inspectedReferences, ...signalOpt })
+          : null;
         const result = await shipVideoFile({
           productionDirAbs,
           allowedRoots: roots,
@@ -561,6 +797,7 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
           ...(Object.keys(expect).length ? { expect } : {}),
           ...(accepted.length ? { override: { codes: accepted, reason: String(input.accept_reason || '') } } : {}),
           ...(input.cut_to_beat === true ? { cutToBeat: true } : {}),
+          ...(referenceAbs ? { referenceAbs } : {}),
           finalize: async (fileAbs) => {
             await finalizeProducedFile(fileAbs, {
               userId: opts.userId,
@@ -575,23 +812,51 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
         const delivered = result.version as VideoVersion;
         const deliveredAbs = path.resolve(productionDirAbs, delivered.path);
         await notifyWritten(opts, [deliveredAbs]);
-        await publishVisibleOutputs(opts, [deliveredAbs]);
         const key = deliveryKey(productionDirAbs, input.video_id, videoPathAbs);
         const shipped = (deliveries.get(key) ?? 0) + 1;
         deliveries.set(key, shipped);
-        const visual = await deliveredFramesVisual(deliveredAbs, delivered, ctx.signal);
-        const repair = repairInstruction((result as { warnings?: unknown }).warnings, shipped);
-        const look = visual ? (shipped < MAX_DELIVERIES_TO_REWORK ? DELIVERED_FRAMES_LOOK : DELIVERED_FRAMES_LAST_LOOK) : null;
-        const followsReference = firstDelivery.get(productionDirAbs) === true
-          && await fs.stat(path.join(productionDirAbs, 'reference-notes.md')).then((stat) => stat.isFile(), () => false);
-        const message = [repair, look, followsReference ? REFERENCE_DROPS_MESSAGE : null].filter(Boolean).join(' ');
+        const credits = await stockCredits(productionDirAbs, deliveredAbs, videoDirAbs);
+        if (credits) await notifyWritten(opts, [credits.file]);
+        // The host replaces the visible output selection on each publication.
+        await publishVisibleOutputs(opts, credits ? [deliveredAbs, credits.file] : [deliveredAbs]);
+        const frames = await deliveredFramesVisual(deliveredAbs, delivered, ctx.signal);
+        const visual = frames?.image ?? null;
+        const reworkOpen = shipped < MAX_DELIVERIES_TO_REWORK;
+        const shippedWarnings = (result as { warnings?: unknown }).warnings;
+        const warnings: Array<{ code?: unknown }> = Array.isArray(shippedWarnings) ? shippedWarnings : [];
+        const comparison = (result as { reference_comparison?: ReferenceComparison }).reference_comparison;
+        // A repair that left the movement about where it was is not asked for again, rework or not.
+        const motionShort = warnings.some((warning) => warning?.code === REFERENCE_MOTION_CODE);
+        const motionNow = comparison?.motion_score;
+        const motionBefore = referenceMotion.get(key);
+        const motionStalled = reworkOpen && motionShort && typeof motionNow === 'number' && motionBefore !== undefined
+          && motionNow - motionBefore < REFERENCE_MOTION_MIN_GAIN;
+        if (motionShort && typeof motionNow === 'number') referenceMotion.set(key, motionNow);
+        else referenceMotion.delete(key);
+        const repair = repairInstruction(motionStalled ? warnings.filter((warning) => warning?.code !== REFERENCE_MOTION_CODE) : warnings, shipped);
+        const look = !visual ? null : frames?.heard
+          ? `${DELIVERED_HEARD_FRAMES} ${reworkOpen ? HEARD_FRAMES_REPAIR : HEARD_FRAMES_REPORT} ${reworkOpen ? REWORK_OPEN : REWORK_SPENT}`
+          : `${DELIVERED_FRAMES} ${reworkOpen ? REWORK_OPEN : REWORK_SPENT}`;
+        const compared = referenceAbs && comparison ? await referenceComparisonVisual(referenceAbs, deliveredAbs, comparison, ctx.signal) : null;
+        const comparedNote = compared ? (reworkOpen ? REFERENCE_SHEET_REPAIR : REFERENCE_SHEET_REPORT) : null;
+        const stalledNote = motionStalled ? referenceMotionStalled(motionBefore as number, motionNow as number) : null;
+        const followsReference = firstDelivery.get(productionDirAbs) === true && followsNotes;
+        const creditNote = credits ? creditMessage(credits, path.basename(credits.file)) : null;
+        const replyLink = replyLinkFor(deliveredAbs, defaultRoot(opts, ctx));
+        const message = [repair, look, comparedNote, stalledNote, followsReference ? REFERENCE_DROPS_MESSAGE : null, creditNote,
+          replyLink ? REPLY_LINK_NOTE : null].filter(Boolean).join(' ');
+        const images = [visual, compared].filter((image): image is NonNullable<typeof visual> => !!image);
         return reply(
           {
             ...result,
+            ...(replyLink ? { reply_link: replyLink } : {}),
+            ...(credits ? { credits: credits.lines, credits_file: path.relative(productionDirAbs, credits.file).split(path.sep).join('/') } : {}),
             visual_evidence: { attached: !!visual, role: 'delivered_frames' },
+            ...(compared ? { reference_evidence: { attached: true, role: 'reference_comparison' } } : {}),
+            ...(frames?.heard ? { delivered_frames: frames.heard } : {}),
             ...(message ? { message } : {}),
           },
-          visual ? { images: [visual], imageRetention: 'active_turn' as const } : {},
+          images.length ? { images, imageRetention: 'active_turn' as const } : {},
         );
       }
 
@@ -601,14 +866,42 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
       const paths = { productionDirAbs, videoDirAbs, allowedRoots: roots, segmentCacheDirAbs };
 
       if (op === 'video.check') {
-        const result = await checkVideoTimeline({
+        const checkOptions = {
           ...paths,
           onProgress: progress,
           ...signalOpt,
           wordsOnProductAsked: wordsOnProductAsks,
           onWordsOnProductAsked: () => { wordsOnProductAsks += 1; },
+          stillScenesAsked: stillScenesAsks,
+          onStillScenesAsked: () => { stillScenesAsks += 1; },
+          smallTextAsked: smallTextAsks,
+          onSmallTextAsked: () => { smallTextAsks += 1; },
+          screenStepsAsked: screenStepAsks,
+          onScreenStepsAsked: () => { screenStepAsks += 1; },
+        };
+        if (input.include_preview !== true) return reply(await checkVideoTimeline(checkOptions));
+
+        const previewOutputDirAbs = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-video-check-')).catch((err) => {
+          log.warn('checked frame preview workspace unavailable', { error: logErrorSummary(err) });
+          return undefined;
         });
-        return reply(result as Record<string, unknown>);
+        try {
+          const { contact_sheet: sheet, ...result } = await checkVideoTimeline({ ...checkOptions, previewOutputDirAbs });
+          const visual = result.ok && typeof sheet === 'string' && !ctx.signal?.aborted
+            ? await prepareVideoStudioModelVisual(sheet)
+            : null;
+          return reply(
+            { ...result, visual_evidence: {
+              attached: !!visual, role: 'video_frames',
+              ...(visual ? { coverage: 'scene_start_and_end' } : {}),
+            } },
+            visual ? { images: [visual], imageRetention: 'active_turn' } : {},
+          );
+        } finally {
+          if (previewOutputDirAbs) await fs.rm(previewOutputDirAbs, { recursive: true, force: true }).catch((err) => {
+            log.warn('checked frame preview workspace cleanup failed', { error: logErrorSummary(err) });
+          });
+        }
       }
 
       if (op === 'video.sheet') {
@@ -639,10 +932,34 @@ export function createVideoTimelineTool(opts: VideoStudioToolOpts, shared: Agent
         outputAbsPath,
         quality: input.quality === 'draft' || input.quality === 'standard' ? input.quality : 'high',
         onProgress: progress,
+        requireSound: true,
         ...signalOpt,
       });
       if (result.ok) await notifyWritten(opts, [outputAbsPath]);
       return reply(renderResultForModel(result as Record<string, unknown>));
     },
   };
+}
+
+/** Said when pictures arrive, while the scenes are still to be planned: the ones that look
+ *  like screens of a site or app, and how a step on them is shown. As a question, because a
+ *  flat-lay photograph can look the same. */
+async function importedScreens(productionDirAbs: string, imported: ReadonlyArray<{ asset_id: string; kind: string; path: string }>): Promise<string | null> {
+  const screens: string[] = [];
+  let captured: Map<string, boolean> | null = null;
+  for (const asset of imported) {
+    if (asset.kind !== 'image') continue;
+    const abs = path.resolve(productionDirAbs, asset.path);
+    if (path.relative(productionDirAbs, abs).startsWith('..')) continue;
+    // A crop product.capture saved keeps what the page said it was.
+    captured ??= await capturedPictureKinds(productionDirAbs).catch(() => new Map<string, boolean>());
+    const known = captured.size ? captured.get(await sha256OfFileStream(abs).catch(() => '')) : undefined;
+    if (known ?? await pictureLooksLikeScreen(abs)) screens.push(asset.asset_id);
+  }
+  return screens.length ? importedScreensMessage(screens) : null;
+}
+
+export function importedScreensMessage(assetIds: readonly string[]): string {
+  const many = assetIds.length > 1;
+  return `${assetIds.join(', ')} ${many ? 'look' : 'looks'} like ${many ? 'screens' : 'a screen'} of a site or app. Where the video says what someone does there, plan that step done on the screen with ./assets/vendor/screen-demo.js (timeline.md): the tap or the typing, then the screen it leads to, rather than the screenshot under a caption. A photograph needs none of this.`;
 }

@@ -16,6 +16,7 @@ import { bundledFfmpegPaths } from '../../../src/main/util/bundled-runtime';
 import {
   editVideo,
   narrationRecordPath,
+  REPLACE_DROPS_SOUND_WARNING,
 } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
 
 // Two defects a delivery could not see (2026-11-12 recap runs): narration that ended
@@ -202,7 +203,8 @@ describe.skipIf(!haveFfmpeg || process.platform === 'win32')('narration laid ove
   it('warns when timing prevents overlap analysis without blocking an otherwise valid delivery', async () => {
     const root = production(); const { final } = await narrated(root); fakeWhisper(root);
     const cli = path.join(root, 'whisper-cli');
-    fs.writeFileSync(cli, fs.readFileSync(cli, 'utf8').replace(/2500/g, '7000'));
+    // Timing that cannot be trusted: the line ends before it starts.
+    fs.writeFileSync(cli, fs.readFileSync(cli, 'utf8').replace('from: 500, to: 2500', 'from: 2500, to: 500'));
     expect(await narrationOverSpeechIssues(final, root)).toMatchObject([{ code: 'DELIVERY_NARRATION_UNVERIFIABLE', severity: 'warning' }]);
     const delivered: any = await shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: final,
       expect: { durationSec: 6, aspect: '9:16', hasAudio: true } });
@@ -227,6 +229,28 @@ describe.skipIf(!haveFfmpeg || process.platform === 'win32')('narration laid ove
     expect(normalized.ok, JSON.stringify(normalized)).toBe(true);
     expect(await narrationOverSpeechIssues(final, root)).toEqual([]);
   }, 120000);
+
+  // 2026-11-20 benchmark: a drama recap mixed its narration with `replace` and dropped every
+  // line the characters said, though the recap guide asks for at least one in their own voices.
+  it('warns that replacing a clip\'s own sound drops its dialogue, and says nothing when that sound is kept or is silence', async () => {
+    const root = production();
+    const { final: base } = await narrated(root);
+    const line = path.join(root, 'render', 'line.wav');
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=f=900:r=48000:d=2', line]);
+    const segments = [{ audioAbsPath: line, startSec: 0.5 }];
+    expect(REPLACE_DROPS_SOUND_WARNING).toBe("replace drops the clip's own sound, every line of dialogue with it. A recap keeps at least one line in the characters' own voices: use --on-existing-audio mix --duck for those spans.");
+    const replaced = await editVideo({ op: 'mix', inputAbsPath: base, audioSegments: segments, onExistingAudio: 'replace', outputAbsPath: path.join(root, 'render', 'replaced.mp4') });
+    expect(replaced).toMatchObject({ ok: true, warning: REPLACE_DROPS_SOUND_WARNING });
+    const kept = await editVideo({ op: 'mix', inputAbsPath: base, audioSegments: segments, onExistingAudio: 'mix', duck: true, outputAbsPath: path.join(root, 'render', 'kept.mp4') });
+    expect(kept.ok, JSON.stringify(kept)).toBe(true);
+    expect(kept).not.toHaveProperty('warning');
+    const silentBase = path.join(root, 'render', 'silent-base.mp4');
+    ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=s=320x240:r=25:d=4', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+      '-shortest', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', silentBase]);
+    const quiet = await editVideo({ op: 'mix', inputAbsPath: silentBase, audioSegments: segments, onExistingAudio: 'replace', outputAbsPath: path.join(root, 'render', 'quiet.mp4') });
+    expect(quiet.ok, JSON.stringify(quiet)).toBe(true);
+    expect(quiet).not.toHaveProperty('warning');
+  }, 120_000);
 
   it('records nothing when the clip\'s own sound is replaced', async () => {
     const root = production();

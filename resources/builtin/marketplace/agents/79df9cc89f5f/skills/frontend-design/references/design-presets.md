@@ -111,7 +111,7 @@ check the inspect frame.
 
 ## Rules every preset keeps
 
-- Type floor: nothing on screen below 22px; body copy at least 28px.
+- Type floor: what viewers must read at least 42px on a 1080px short side (about 14px on a phone); small print never below 22px.
 - Casing: keep the approved copy's casing. Presets describe letter-spacing, never
   `text-transform: uppercase`.
 - Frame 0: the cover's headline and hero are visible on the first frame; build

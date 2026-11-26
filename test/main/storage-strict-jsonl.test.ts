@@ -45,6 +45,30 @@ describe('strict JSONL reads for durable projections',() => {
     fs.writeFileSync(file,'\r\n'+JSON.stringify(rows[0])+'\r\n\r\n'+JSON.stringify(rows[1]));
     expect(await readJsonl(file,2,strict)).toEqual(rows);
   });
+  it('keeps projected fields and offsets through split UTF-8, escapes, and malformed skipped values', async () => {
+    const chunk = 256 * 1024;
+    const padTo = (prefix: string, offset: number, fill: string) => (
+      prefix + fill.repeat(offset - Buffer.byteLength(prefix))
+    );
+    const first = padTo('{"process":["', chunk - 1, 'x') + '中",{"id":"nested"}],"id":"first"}';
+    const escaped = padTo('{"process":[],', chunk - 3, ' ') + '"i\\u0064":"last"}';
+    const broken = padTo('{"id":"invalid","process":[', chunk - 2, ' ') + '9e-,true]}';
+    const blank = ' '.repeat(chunk + 1);
+    const prefix = `${first}\r\n${blank}\n${broken}\n`;
+    fs.writeFileSync(file, prefix + escaped);
+    const projection = { fields: new Set(['id']), record: (value: unknown) => value };
+    const options = { strict: true, skipInvalidRecords: true, project: projection };
+
+    const newest = await readJsonlPageWithOffsets(file, 1, undefined, options);
+    expect(newest).toEqual({
+      entries: [{ record: { id: 'last' }, start: Buffer.byteLength(prefix) }],
+      nextCursor: Buffer.byteLength(prefix),
+    });
+    const older = await readJsonlPageWithOffsets(file, 1, newest.nextCursor, options);
+    expect(older).toEqual({ entries: [{ record: { id: 'first' }, start: 0 }], nextCursor: null });
+    await expect(readJsonlPageWithOffsets(file, 1, newest.nextCursor, { strict: true, project: projection }))
+      .rejects.toThrow('JSONL record is invalid');
+  });
   it('validates only the selected tail page and propagates strictness to offset-preserving older pages',async () => {
     fs.writeFileSync(file,'OLDER_PRIVATE_CORRUPTION\n{"id":"latest"}\n');
     const tail=await readJsonlPage(file,1,undefined,strict);

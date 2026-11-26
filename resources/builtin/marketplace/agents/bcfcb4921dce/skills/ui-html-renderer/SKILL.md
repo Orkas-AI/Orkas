@@ -81,12 +81,12 @@ Use semantic HTML where practical. Add lightweight JavaScript only for preview i
 
 For non-trivial data surfaces, implement the relevant states in the artifact rather than describing them outside it:
 
-- Data workflows normally need populated, loading, empty, error, and partial/stale variants.
+- Data surfaces: populated and empty by default; add loading, error, or partial/stale only when the user asks, the existing product shows them, or the brief is about latency or failure.
 - Forms normally need pristine, dirty/touched invalid, submitted-pending, recoverable server error, and success variants. Each explicitly requested outcome must be reachable; a helper whose failure branch is never invoked is not state proof. After validation or server/import failure, focus the first invalid field or an error summary when practical, and always announce the error through an appropriate live/alert role.
 - Tabs and other composite controls need semantic selected state plus their expected keyboard model; tabs include arrow-key navigation, not only click handlers.
 - Disabled, permission-gated, offline, and mobile-collapsed states are required when the brief can reach them.
 
-Keep these states inspectable without turning the product UI into a demo panel. Use the real workflow when practical; otherwise add a compact preview-only state switcher, a `data-ui-state` rendering branch, or a clearly separated state gallery. Every state must have actual DOM/component/rendering evidence and recovery behavior. A bullet list of intended states is not implementation.
+Keep these states inspectable without turning the product UI into a demo panel. Use the real workflow when practical; otherwise add a compact preview-only state switcher, a `data-ui-state` rendering branch, or a clearly separated state gallery for the states in scope, never just to display states nobody asked for. Every state must have actual DOM/component/rendering evidence and recovery behavior. A bullet list of intended states is not implementation.
 
 ## Runtime-Safe Event Wiring
 
@@ -105,7 +105,7 @@ When a UI asks for an original raster illustration, photo, texture, or edited im
 - Route only that asset by capability or role; never depend on a mutable display name.
 - Keep UIDesigner ownership of information architecture, layout, copy, tokens, responsive behavior, accessible fallback, integration slot, and final HTML.
 - Provide a concrete brief with subject/composition, aspect ratio, pixel dimensions that mathematically match that ratio, palette, background/alpha, exclusions, alt intent, relative save path, and crop-safe area.
-- Wire the future relative asset path in the HTML itself (normally `<img src="assets/...">` or `<picture>`) and include an honest placeholder/fallback until the raster exists. Put the ratio-consistent asset brief before long source listings so it remains actionable and auditable.
+- Prewire the future relative asset path in the HTML itself as an inert `data-raster-src="assets/..."` beside an honest local/data placeholder until the raster exists; do not create a broken active `src`. Put the ratio-consistent asset brief before long source listings so it remains actionable and auditable.
 - Do not silently replace the requested raster asset with an inline SVG. SVG is acceptable only as a labeled temporary fallback or when the user asked for vector output.
 
 Reject the handoff before delivery if, for example, the brief says `16:10` but asks for `1800x1200`.
@@ -201,12 +201,6 @@ For reference-driven or brand-driven drafts:
 - Use the contract's token roles and anti-patterns before choosing decorative effects.
 - Include brand or design-system sections only when the task is a brand board, identity board, design system, or handoff. For product screens, keep the first viewport focused on the usable interface.
 
-For reviews:
-
-- Render findings in an HTML review page when no existing app screen is being modified.
-- Prioritize concrete issues and show affected areas, severity, fix direction, and expected outcome.
-- Include screenshots or image assets only as evidence inside the HTML review, not as the whole deliverable.
-
 ## Visual Constraints
 
 Treat these as contextual quality tests, not a house style that makes every artifact look the same:
@@ -229,8 +223,8 @@ When possible:
 - Check the actual requested viewport. Check both desktop and mobile widths only when the user explicitly requests responsive or multi-device behavior.
 - Inspect screenshots for blank areas, overlap, clipped text, broken assets, and unreadable contrast.
 - Interact with tabs, menus, toggles, filters, and primary actions if present.
-- Exercise every critical state branch. For forms, check pristine, dirty/touched invalid, pending, server-error recovery, and success; for data surfaces, check populated, loading, empty, error, and partial/stale.
-- Run the `ui-craft-checks` matrix for HTML default, source/design fidelity, state coverage, accessibility, forms, typography, motion, responsive behavior, live/security, and anti-template tells.
+- Exercise every critical state branch. For forms, check pristine, dirty/touched invalid, pending, server-error recovery, and success; for data surfaces, check populated, empty, and every other implemented state.
+- When `ui-craft-checks` is paired, run its matrix for HTML default, source/design fidelity, state coverage, accessibility, forms, typography, motion, responsive behavior, live/security, and anti-template tells.
 - For standalone output, validate `artifact.json`, confirm its entry exists, check relative local references, and make sure the current file list is package-safe.
 - Run optional axe-core/pa11y, screenshot comparison, Storybook, or DOM/source checks only when already available or explicitly requested; do not install dependencies for verification by default.
 

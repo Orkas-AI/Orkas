@@ -1,6 +1,6 @@
 /** Native request settings are distinct from the desired, locally finished output.
- * Pure and shared by production quotation and every generation entry point. */
-import { isSeedance25Model, videoModelSpec, type VideoModelSpec } from './video_models';
+ * Pure and shared by production quotation, every generation entry point and the VideoStudio canvas. */
+import { VEO_DURATIONS, VIDEO_MODEL_SPECS, isSeedance25Model, videoModelSpec, type VideoModelSpec } from './video_models';
 
 export interface VideoParameterInput {
   duration?: number;
@@ -34,6 +34,31 @@ function numericRatio(value: string): number {
   return width > 0 && height > 0 ? width / height : 16 / 9;
 }
 
+/** The resolution asked for where it is offered, else the lowest offered not below it, else the
+ *  sharpest offered. One with no known height stays as asked. */
+export function fitVideoResolution(asked: string, offered: readonly string[]): string {
+  const desired = asked.toLowerCase();
+  if (offered.includes(desired)) return desired;
+  const height = VIDEO_RESOLUTION_HEIGHTS[desired];
+  if (!height) return asked;
+  const ordered = [...offered].sort((a, b) => VIDEO_RESOLUTION_HEIGHTS[a] - VIDEO_RESOLUTION_HEIGHTS[b]);
+  return ordered.find(value => VIDEO_RESOLUTION_HEIGHTS[value] >= height) ?? ordered[ordered.length - 1];
+}
+
+/** A length within a service's range as the whole second at or above it (at least its minimum;
+ *  Veo's next step), and an automatic length it cannot make as its default. A longer or other
+ *  length stays as asked. `nativeProvider` is the provider whose API makes the video. */
+export function fitVideoDuration(
+  asked: number,
+  range: Pick<VideoModelSpec, 'minDuration' | 'maxDuration' | 'autoDuration'>,
+  nativeProvider: string,
+): number {
+  if (asked === -1 && !range.autoDuration) return Math.max(range.minDuration, 5);
+  if (!(asked > 0 && asked <= range.maxDuration)) return asked;
+  const seconds = Math.max(range.minDuration, Math.ceil(asked));
+  return nativeProvider === 'google-cloud' ? VEO_DURATIONS.find(value => value >= seconds) ?? VEO_DURATIONS[VEO_DURATIONS.length - 1] : seconds;
+}
+
 /** Adjust only representable controls, never discard media or rewrite its meaning.
  * Above-maximum duration remains an explicit request for multiple shots; clamping
  * it would silently lose requested action. Invalid credentials/references remain
@@ -49,22 +74,10 @@ export function fitVideoParameters<T extends VideoParameterInput>(wanted: T, pro
 
   if (typeof wanted.duration === 'number' && Number.isFinite(wanted.duration)) {
     if (nativeProvider === 'google' && wanted.duration <= spec.maxDuration) delete actual.duration;
-    else if (wanted.duration === -1 && !spec.autoDuration) actual.duration = Math.max(spec.minDuration, 5);
-    else if (wanted.duration > 0 && wanted.duration <= spec.maxDuration) {
-      actual.duration = Math.max(spec.minDuration, Math.ceil(wanted.duration));
-      if (nativeProvider === 'google-cloud') actual.duration = [4, 6, 8].find(value => value >= actual.duration!) ?? 8;
-    }
+    else actual.duration = fitVideoDuration(wanted.duration, spec, nativeProvider);
   }
 
-  if (wanted.resolution !== undefined) {
-    const desired = wanted.resolution.toLowerCase();
-    const height = VIDEO_RESOLUTION_HEIGHTS[desired];
-    if (spec.resolutions.includes(desired)) actual.resolution = desired;
-    else if (height) {
-      const ordered = [...spec.resolutions].sort((a, b) => VIDEO_RESOLUTION_HEIGHTS[a] - VIDEO_RESOLUTION_HEIGHTS[b]);
-      actual.resolution = ordered.find(value => VIDEO_RESOLUTION_HEIGHTS[value] >= height) ?? ordered[ordered.length - 1];
-    }
-  }
+  if (wanted.resolution !== undefined) actual.resolution = fitVideoResolution(wanted.resolution, spec.resolutions);
   // High resolution can extend an otherwise admissible short shot, but cannot
   // turn an invalid or overlong request into a shorter paid generation.
   if (nativeProvider === 'google-cloud' && ['1080p', '4k'].includes(actual.resolution || '')

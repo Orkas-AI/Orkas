@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 
 import { afterAll, describe, expect, it } from 'vitest';
 import { PHRASE_VIEW_NOTE } from '../../../src/main/features/video_phrases';
@@ -320,6 +321,100 @@ describe('video media skill scripts', () => {
     }
   }, 60_000);
 
+  // 2026-11-14 baseline: runs passed inline JSON or a path list where a file or JSON was
+  // asked for, or a path from the wrong folder, then reported the tool as broken and stopped.
+  // 2026-11-19: an attachment named "导出带商品图片的 PDF 清单-录屏.mp4" passed unquoted came back as
+  // "unexpected argument: PDF", twice, with nothing saying the shell had split the path.
+  it('names a path the shell split at its spaces and shows it quoted, and lists the options otherwise', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-split-path-'));
+    try {
+      const named = path.join(tmp, '导出带商品图片的 PDF 清单-录屏.mp4');
+      fs.writeFileSync(named, 'not a real video');
+      const split = runSkill('stage-edit', 'edit_video', ['--op', 'probe', '--input', path.join(tmp, '导出带商品图片的'), 'PDF', '清单-录屏.mp4']);
+      expect(split.status).toBe(1);
+      expect(parseJson(split.stderr)).toMatchObject({ code: 'E_ARGS',
+        message: `unexpected argument: PDF. The path after --input has spaces, so the shell split it: quote it, as in --input '${named}', and run it again.` });
+
+      const stray = runSkill('stage-edit', 'edit_video', ['--op', 'probe', '--input', path.join(tmp, '导出带商品图片的'), 'PDF', 'other.mp4']);
+      expect(stray.status).toBe(1);
+      const strayError = parseJson(stray.stderr);
+      expect(strayError.message).toMatch(/^unexpected argument: PDF; accepted options are --aspect /);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // Each message now says what to pass and to run it again.
+  it('says how to fix a call the caller got wrong', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-own-call-'));
+    try {
+      const timing = createRequire(import.meta.url)(path.join(pcDir(), 'resources', 'builtin', 'marketplace', 'agents',
+        '79df9cc89f5f', 'skills', 'video-studio', 'scripts', 'storyboard_timing.js'));
+      const inline = await timing({ args: ['--input', '{"duration_sec":30,"segments":[]}'] });
+      expect(inline).toMatchObject({ ok: false, errorCode: 'E_STORYBOARD_TIMING_INPUT' });
+      expect(inline.message).toContain('Write the JSON to a file in the production');
+      expect(inline.message).toContain('run it again');
+
+      const media = path.join(tmp, 'clip.mp4');
+      fs.writeFileSync(media, 'not a real video');
+      const segments = runSkill('stage-edit', 'edit_video', ['--op', 'mix', '--input', media,
+        '--audio-segments', 'voice/1.mp3,voice/2.mp3', '--output', path.join(tmp, 'out.mp4')]);
+      expect(segments.status).toBe(1);
+      const segmentsError = parseJson(segments.stderr);
+      expect(segmentsError).toMatchObject({ code: 'E_ARGS' });
+      expect(segmentsError.message).toContain('--audio-segments is not valid JSON');
+      expect(segmentsError.message).toContain(`'[{"path": "voice/1.mp3", "start": 0}]'`);
+      expect(segmentsError.message).toContain('run it again');
+
+      const plan = runSkill('stage-edit', 'edit_video', ['--op', 'reframe', '--input', media, '--aspect', '9:16',
+        '--mode', 'crop', '--plan', 'not json', '--output', path.join(tmp, 'tall.mp4')]);
+      expect(plan.status).toBe(1);
+      const planError = parseJson(plan.stderr);
+      expect(planError.message).toContain('--plan is not valid JSON');
+      expect(planError.message).not.toContain('voice/1.mp3');
+
+      const missing = runSkill('stage-edit', 'edit_video', ['--op', 'probe', '--input', 'project/media/nothing-here.mp4']);
+      expect(missing.status).toBe(1);
+      const missingError = parseJson(missing.stderr);
+      expect(missingError).toMatchObject({ code: 'E_INPUT' });
+      expect(missingError.message).toContain('input is not a file');
+      expect(missingError.message).toContain(`Paths are read from ${path.dirname(pcDir())}`);
+      expect(missingError.message).toContain('check the name with ls and run it again');
+
+      // 2026-11-16 baseline: an op the call did not read was ignored, so reframe with a range
+      // reframed the whole podcast and the Agent stopped; a missing transcript, then an op tried
+      // as a script name, read as "the cleanup tool is missing".
+      const ranged = runSkill('stage-edit', 'edit_video', ['--op', 'reframe', '--input', media, '--start', '10.7',
+        '--duration', '11.5', '--aspect', '9:16', '--output', path.join(tmp, 'tall-range.mp4')]);
+      expect(ranged.status).toBe(1);
+      expect(parseJson(ranged.stderr)).toMatchObject({ code: 'E_ARGS', message: 'reframe does not take --start or --duration: it works on the whole input. Cut the part you want with --op trim first, then run reframe on that file.' });
+      const startOnly = parseJson(runSkill('stage-edit', 'edit_video', ['--op', 'burnsubs', '--input', media, '--start', '2',
+        '--subtitles', 'x.srt', '--output', path.join(tmp, 'subs.mp4')]).stderr);
+      expect(startOnly.message).toBe('burnsubs does not take --start: it works on the whole input. Cut the part you want with --op trim first, then run burnsubs on that file.');
+      for (const op of ['extract_frame', 'mix']) {
+        const frame = parseJson(runSkill('stage-edit', 'edit_video', ['--op', op, '--input', media, '--start', '1',
+          '--duration', '2', '--output', path.join(tmp, `${op}.png`)]).stderr);
+        expect(frame.message).toBe(`${op} takes --start but not --duration.`);
+      }
+      const trimmed = lastJson(runSkill('stage-edit', 'edit_video', ['--op', 'trim', '--input', media, '--start', '1',
+        '--duration', '2', '--output', path.join(tmp, 'cut.mp4')]).stderr);
+      expect(trimmed.message).not.toContain('does not take');
+
+      const fillers = runSkill('stage-edit', 'edit_video', ['--op', 'remove_fillers', '--input', media, '--fillers', '嗯,呃',
+        '--output', path.join(tmp, 'clean.mp4')]);
+      expect(fillers.status).toBe(1);
+      expect(parseJson(fillers.stderr).message).toBe('remove_fillers requires --transcript: the video_studio speech.transcribe JSON for this input, made with timestamps "word". Pass its transcript_path and run it again.');
+      const asScript = runSkill('stage-edit', 'remove_fillers', ['--input', media]);
+      expect(asScript.status).toBe(66);
+      expect(parseJson(asScript.stderr)).toMatchObject({
+        error: expect.stringContaining('skill script not found: stage-edit/remove_fillers'),
+        hint: 'stage-edit has these scripts: analyze_media, cut_selection, edit_video. Pass one of these as the script name and its options after --.',
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(!fs.existsSync(realFfmpeg))('lists a track\'s beats and says which cuts of a montage miss them', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-beats-'));
     try {
@@ -370,6 +465,75 @@ describe('video media skill scripts', () => {
     expect(out.ops).toContain('mix');
     expect(out.ops).toContain('normalize_loudness');
     expect(out.ops).toContain('reframe');
+  });
+
+  // 2026-11-17 benchmark: six ~4s guesthouse clips were cut with --start at their places in the
+  // music (0.6, 3.0, 5.4s ...). A start 3.005s into a 4s clip returned a 0.97s piece as a plain
+  // success, the join came out 12.5s instead of 14.4s and its cuts left the beat.
+  describe('trim reports the length it actually cut', () => {
+    const binDir = path.join(pcDir(), 'resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`);
+    const extension = process.platform === 'win32' ? '.exe' : '';
+    const bundled = { ffmpeg: path.join(binDir, `ffmpeg${extension}`), ffprobe: path.join(binDir, `ffprobe${extension}`) };
+    const env = { ORKAS_BUNDLED_FFMPEG: bundled.ffmpeg, ORKAS_BUNDLED_FFPROBE: bundled.ffprobe };
+    const pictureFrames = (file: string) => Number(spawnSync(bundled.ffprobe, ['-v', 'error', '-count_frames',
+      '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', file], { encoding: 'utf8' }).stdout.trim());
+
+    function withFourSecondClip(body: (clip: string, tmp: string) => void) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-trim-length-'));
+      try {
+        const clip = path.join(tmp, 'room.mp4');
+        const made = spawnSync(bundled.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+          '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=4', '-f', 'lavfi', '-i', 'sine=f=300:r=48000:d=4',
+          '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', clip], { encoding: 'utf8', timeout: 20_000 });
+        expect(made.status, made.stderr || String(made.error || '')).toBe(0);
+        body(clip, tmp);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+    const trim = (clip: string, out: string, start: string, duration: string) => {
+      const res = runSkill('stage-edit', 'edit_video', ['--op', 'trim', '--input', clip, '--start', start,
+        '--duration', duration, '--output', out], env);
+      expect(res.status, res.stderr).toBe(0);
+      return lastJson(res.stdout);
+    };
+
+    it.skipIf(!fs.existsSync(bundled.ffmpeg))('says so when the clip ends before the requested length', () => {
+      withFourSecondClip((clip, tmp) => {
+        const out = path.join(tmp, 'short.mp4');
+        const result = trim(clip, out, '3.005', '2.4');
+        expect(result).toMatchObject({ ok: true, op: 'trim', path: out });
+        // 4 − 3.005 leaves at most 0.995s: 29 or 30 frames, never the 72 asked for.
+        expect(pictureFrames(out)).toBeLessThanOrEqual(30);
+        expect(result.duration_sec).toBeGreaterThan(0.9);
+        expect(result.duration_sec).toBeLessThan(1);
+        expect(result.warning).toMatch(/The input is 4\.0\ds long, so from 3\.005s this cut is 0\.9\ds/);
+        expect(result.warning).toContain('not the 2.40s asked for');
+        expect(result.warning).toContain('--start is a time inside the input');
+        expect(result.warning).toMatch(/start at or before 1\.6\ds for the full length/);
+        expect(result.text).toContain(result.warning);
+      });
+    }, 60_000);
+
+    it.skipIf(!fs.existsSync(bundled.ffmpeg))('reports the full length and no warning when the clip holds it', () => {
+      withFourSecondClip((clip, tmp) => {
+        const out = path.join(tmp, 'fits.mp4');
+        const result = trim(clip, out, '1.6', '2.4');
+        expect(pictureFrames(out)).toBe(72);
+        expect(result.duration_sec).toBeCloseTo(2.4, 2);
+        expect(result.warning).toBeUndefined();
+      });
+    }, 60_000);
+
+    it.skipIf(!fs.existsSync(bundled.ffmpeg))('says the clip itself is too short when no start would give the length', () => {
+      withFourSecondClip((clip, tmp) => {
+        const result = trim(clip, path.join(tmp, 'whole.mp4'), '0', '5');
+        expect(result.duration_sec).toBeCloseTo(4, 1);
+        expect(result.warning).toMatch(/The input is only 4\.0\ds long/);
+        expect(result.warning).toContain('not the 5.00s asked for');
+        expect(result.warning).not.toContain('start at or before');
+      });
+    }, 60_000);
   });
 
   it('extracts a real video frame without a Python or uv recognition runtime', async () => {

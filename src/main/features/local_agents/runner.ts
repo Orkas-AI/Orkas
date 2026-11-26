@@ -47,6 +47,9 @@ import { codexBackend } from './backends/codex.js';
 import { openclawBackend } from './backends/openclaw.js';
 import { opencodeBackend } from './backends/opencode.js';
 import { hermesBackend } from './backends/hermes.js';
+import { antigravityBackend, copilotBackend, cursorBackend, dshBackend, kimiBackend, traecliBackend } from './backends/expanded-acp.js';
+import { zcodeBackend } from './backends/zcode.js';
+import { isExpandedLocalCli } from './expanded-cli-types.js';
 import { getLocalCliSupportedFlags } from './runtime_options.js';
 import {
   type LocalActiveRunIngress,
@@ -215,12 +218,19 @@ function resolveIdleTickMs(idleMs: number): number {
   return Math.min(DEFAULT_IDLE_TICK_MS, Math.max(50, Math.floor(idleMs / 3)));
 }
 
-const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
+const BACKENDS: Record<LocalCliType, LocalBackend> = {
   claude: claudeBackend,
   codex: codexBackend,
   openclaw: openclawBackend,
   opencode: opencodeBackend,
   hermes: hermesBackend,
+  kimi: kimiBackend,
+  dsh: dshBackend,
+  traecli: traecliBackend,
+  zcode: zcodeBackend,
+  copilot: copilotBackend,
+  cursor: cursorBackend,
+  antigravity: antigravityBackend,
 };
 
 const MAX_PUBLIC_DIAGNOSTIC_CHARS = 4_096;
@@ -635,11 +645,11 @@ export function redactPrivateLocalAgentEvent(event: LocalEvent, workingDir?: str
     return { ...event, waitingOn };
   }
   if (event.type === 'done') {
+    const { error, nativeError, ...terminal } = event;
+    const detail = typeof nativeError === 'string' ? sanitizePublicCliError(nativeError) : '';
     return {
-      ...event,
-      ...(typeof event.error === 'string'
-        ? { error: sanitizePublicDiagnostic(event.error) }
-        : {}),
+      ...terminal,
+      ...(detail ? { error: detail } : typeof error === 'string' ? { error: sanitizePublicDiagnostic(error) } : {}),
       ...(typeof event.stderrTail === 'string'
         ? { stderrTail: sanitizePublicDiagnosticTail(event.stderrTail) }
         : {}),
@@ -681,6 +691,17 @@ export function buildBridgeSystemPrompt(capabilities: readonly BridgeCapability[
     sentences.push(
       'It reaches the same connected services available to an ordinary Orkas group-chat Agent '
       + '(orkas_list_connector_tools / orkas_call_connector_tool); calls may wait for the user to approve a permission prompt in Orkas.',
+    );
+  }
+  if (granted.has('browser')) {
+    // Desktop CLIs ship their own computer-control tools (Codex Computer Use
+    // drives the user's Chrome as a native app). Web work stays in the task
+    // browser the user can see, so it never takes over the user's own browser.
+    sentences.push(
+      'It controls the Orkas built-in browser (inner_browser): tabs shared with the user in this task. '
+      + 'Use inner_browser for every web page task, such as opening a URL or reading, searching, filling in or checking a website, including signed-in sites. '
+      + 'Do not drive Chrome, Safari or any other web browser through Computer Use, AppleScript or other desktop or browser automation unless the user explicitly asks for their own browser. '
+      + 'Use Computer Use only for native desktop apps that are not web browsers.',
     );
   }
   if (granted.has('kb.read')) {
@@ -1216,7 +1237,7 @@ export interface RunCliAgentResult {
   failureCategory?: CliFailureCategory;
   /** Redacted, bounded last lines the CLI wrote to stderr before failing. */
   stderrExcerpt?: string;
-  cliError?: LocalCliEntry['error'] | 'model_unsupported' | 'parameter_unsupported';
+  cliError?: LocalCliEntry['error'] | 'model_unsupported' | 'parameter_unsupported' | 'tool_restore_failed' | 'tool_setup_failed';
   cliPath?: string;
   cliVersion?: string;
   commanderHandoff?: CommanderHandoffRequest;
@@ -1352,6 +1373,14 @@ export async function stopBackgroundRuns(reason: string, deadlineMs = 5_000): Pr
 
 
 export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
+  if (isExpandedLocalCli(opts.cli)) {
+    const parameter = opts.customArgs?.length ? 'custom arguments' : opts.modelOverride ? 'model' : opts.thinkingLevel ? 'thinking level' : '';
+    if (parameter) {
+      const error = t('cli_agent.parameter_unsupported', { cli: _cliBrandLabel(opts.cli), parameter });
+      opts.onEvent({ type: 'done', status: 'failed', error, cliError: 'parameter_unsupported' });
+      return { runId: '', status: 'failed', error, cliError: 'parameter_unsupported' };
+    }
+  }
   const executionStartedAt = Date.now();
   const backend = BACKENDS[opts.cli];
   const defaultPermissionPolicy = localCliDefaultPermissionPolicy(opts.cli);
@@ -1504,7 +1533,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       failureKind: typeof e.failureKind === 'string' ? e.failureKind : undefined,
       retrySafe: e.retrySafe === true,
       bootstrapTimeout: e.bootstrapTimeout === true,
-      cliError: e.cliError === 'model_unsupported' || e.cliError === 'parameter_unsupported' ? e.cliError : undefined,
+      cliError: e.cliError === 'model_unsupported' || e.cliError === 'parameter_unsupported' || e.cliError === 'tool_restore_failed' || e.cliError === 'tool_setup_failed' ? e.cliError : undefined,
       stderrTail: typeof e.stderrTail === 'string' ? e.stderrTail : undefined,
     };
   };
@@ -1962,9 +1991,14 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     }
     const e = redactPrivateLocalAgentEvent(rawEvent, opts.cwd);
     if (inspectResumeAttempt) {
+      // Adapter-provided detail is display-only. Recovery uses the explicit
+      // protocol signal or the previously supported legacy error shapes.
       if (
-        (e.type === 'stderr-line' && isCliResumeRejectedMessage(e.line))
-        || (e.type === 'done' && isCliResumeRejectedMessage(e.error))
+        (e.type === 'status' && e.status === 'resume-rejected')
+        || (!isExpandedLocalCli(opts.cli) && (
+          (e.type === 'stderr-line' && isCliResumeRejectedMessage(e.line))
+          || (e.type === 'done' && typeof rawEvent.nativeError !== 'string' && isCliResumeRejectedMessage(e.error))
+        ))
       ) {
         resumeRejected = true;
       }
@@ -2455,6 +2489,23 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   };
 }
 
+function _cliBrandLabel(cli: LocalCliType): string {
+  switch (cli) {
+    case 'claude': return 'Claude Code';
+    case 'codex': return 'Codex';
+    case 'openclaw': return 'OpenClaw';
+    case 'opencode': return 'OpenCode';
+    case 'hermes': return 'Hermes';
+    case 'kimi': return 'Kimi Code';
+    case 'dsh': return 'DeepSeek Harness';
+    case 'traecli': return 'TraeCode';
+    case 'zcode': return 'ZCode';
+    case 'copilot': return 'GitHub Copilot';
+    case 'cursor': return 'Cursor';
+    case 'antigravity': return 'Antigravity';
+    default: return cli;
+  }
+}
 async function _missing(opts: RunCliAgentOpts, entry: LocalCliEntry): Promise<RunCliAgentResult> {
   const err = entry.errorDetail || `local CLI '${opts.cli}' is not installed or not on PATH`;
   log.warn('local agent cli missing', {

@@ -11,6 +11,8 @@ const processing = require('./processing.js');
 const transfer = require('./transfer.js');
 const composition = require('./composition.js');
 const wordEdits = require('./word-edits.js');
+const OPERATIONS = ['preflight', 'probe', 'transcribe', 'status', 'begin', 'prepare-record', 'record', 'render', 'extract', 'convert'];
+const USAGE = 'Use the host command template: voice-project audio -- <operation> "<absolute-request.json>". Help: voice-project audio -- --help. Preflight: voice-project audio -- preflight.';
 
 function fail(code, message) { throw Object.assign(new Error(message), { code }); }
 function num(value, fallback, min, max) {
@@ -37,6 +39,13 @@ async function local(root, name, output = false) {
       if (err.code !== 'ENOENT' || !output) throw err;
       ancestor = path.dirname(ancestor);
     }
+  }
+}
+async function source(root, name, field = 'input_path') {
+  try { return await local(root, name); }
+  catch (err) {
+    if (err.code === 'ENOENT') fail('E_SOURCE_NOT_FOUND', `${field} does not name an existing project file. Check that field against the source files; prefer a project-relative path.`);
+    throw err;
   }
 }
 async function json(file, withIdentity = false) {
@@ -210,22 +219,22 @@ function segmentTiming(segments, duration) {
 }
 async function transcribe(root, input, signal) {
   if (input.granularity !== undefined && !['segment', 'word'].includes(input.granularity)) fail('E_INPUT', 'Choose segment or word transcription granularity.');
-  const source = await local(root, input.input_path);
+  const sourceFile = await source(root, input.input_path);
   if (input.granularity === 'word') {
-    const info = await fs.stat(source);
+    const info = await fs.stat(sourceFile);
     if (!info.isFile() || info.size > 8 * 1024 ** 3) fail('E_SIZE', 'Use a regular recording up to 8 GiB for word transcription.');
   }
-  const meta = await probe(source, signal, input.granularity === 'word');
+  const meta = await probe(sourceFile, signal, input.granularity === 'word');
   if (input.granularity === 'word' && meta.audio_streams.length !== 1) fail('E_AUDIO_TRACK', 'Extract the desired audio stream before word transcription.');
   if (input.granularity === 'word' && meta.duration_sec > 14400) fail('E_DURATION', 'Split word transcription into chapters up to four hours.');
-  const sourceHash = await digest(source, signal);
+  const sourceHash = await digest(sourceFile, signal);
   const ffmpeg = await binary('ORKAS_BUNDLED_FFMPEG'), whisper = await binary('ORKAS_WHISPER_CPP'), model = await binary('ORKAS_WHISPER_MODEL');
   const dir = await fs.mkdtemp(path.join(root, 'transcript-'));
   try {
-    await run(ffmpeg, ['-v', 'error', '-nostdin', ...(input.granularity === 'word' ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-ac', '1', '-ar', '16000', path.join(dir, 'input.wav')], signal);
+    await run(ffmpeg, ['-v', 'error', '-nostdin', ...(input.granularity === 'word' ? composition.MEDIA_INPUT : []), '-i', sourceFile, '-vn', '-ac', '1', '-ar', '16000', path.join(dir, 'input.wav')], signal);
     // Bind the decoded input before recognition. Later source edits belong to
     // another version and must neither relabel nor discard this attempt.
-    if (await digest(source, signal) !== sourceHash) fail('E_TRANSCRIPT_STALE', 'The recording changed during transcription; transcribe the preserved current source.');
+    if (await digest(sourceFile, signal) !== sourceHash) fail('E_TRANSCRIPT_STALE', 'The recording changed during transcription; transcribe the preserved current source.');
     // Container duration can follow a longer video track. Validate against the
     // exact decoded audio sent to recognition, not the container's end time.
     const decoded = await probe(path.join(dir, 'input.wav'), signal);
@@ -262,12 +271,39 @@ async function transcribe(root, input, signal) {
     return { ok: true, segments: segments.length, files: ['transcript.txt', 'transcript.srt', 'transcript.json'].map(f => path.relative(root, path.join(dir, f))), empty: segments.length === 0 };
   } catch (err) { await fs.rm(dir, { recursive: true, force: true }); throw err; }
 }
+// Only independent clip preparation runs concurrently. A pair owns its children
+// until both settle, including after one fails; cleanup/lock release cannot race
+// a sibling still writing. Batches also bound speculative work at chapter limits.
+async function preparePair(indices, prepare, signal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
+  let failure;
+  try {
+    const results = await Promise.all(indices.map(async index => {
+      try { return await prepare(index, controller.signal); }
+      catch (err) { failure ??= err; controller.abort(); }
+    }));
+    if (failure) throw failure;
+    return results;
+  } finally { signal?.removeEventListener('abort', abort); }
+}
 async function render(root, plan, state, input, signal) {
   if (!plan.segments.length) fail('E_PLAN', 'Add at least one segment before rendering.');
   if (input.export !== undefined && (!input.export || typeof input.export !== 'object' || Array.isArray(input.export))) fail('E_FORMAT', 'Export settings must be an object.');
   const rows = await rowsFor(root, plan, state, signal);
   if (rows.some(r => r.status !== 'ready')) fail('E_NOT_READY', 'Some speech segments are pending, uncertain or stale. Inspect status and preserve completed recordings.');
-  const options = transfer.settings({ ...plan.export, ...input.export }, true, input.format ?? input.export?.format ?? plan.export?.format);
+  const settings = { ...plan.export, ...input.export };
+  const [source] = rows;
+  if (settings.channels === undefined && rows.length === 1 && typeof plan.segments[0].path === 'string'
+    && !plan.music && !plan.tracks?.length && source.audio_streams.length === 1 && [1, 2].includes(source.channels)) {
+    settings.channels = source.channels;
+  }
+  if (settings.normalize_loudness === undefined && settings.target_lufs === undefined && settings.true_peak_db === undefined) {
+    settings.normalize_loudness = plan.segments.every(s => typeof s.text === 'string') && !plan.music && !plan.tracks?.length;
+  }
+  const options = transfer.settings(settings, true, input.format ?? input.export?.format ?? plan.export?.format);
   const format = options.format;
   // Keep one channel layout throughout the render. An implicit mono -> stereo
   // -> mono round trip attenuates the retained samples even at unity gain.
@@ -293,15 +329,16 @@ async function render(root, plan, state, input, signal) {
   const temp = await fs.mkdtemp(path.join(root, '.voice-render-'));
   const cues = [], generated = [], wordReceipts = []; let cursor = 0;
   try {
-    for (let i = 0; i < rows.length; i++) {
+    const prepare = async (i, current) => {
       const s = plan.segments[i]; let source = await local(root, rows[i].path);
       const meta = rows[i];
+      let cut;
       let start = s.start_sec ?? 0, end = s.end_sec ?? meta.duration_sec;
       if (start >= meta.duration_sec || end > meta.duration_sec + 0.05) fail('E_TRIM', 'A trim lies outside its source audio.');
       if (s.word_edit) {
         if (meta.audio_streams.length !== 1) fail('E_AUDIO_TRACK', 'Extract the desired audio stream before word editing.');
-        const cut = await wordEdits.cut(root, temp, i, source, s, meta.duration_sec, signal, { local, json, digest, run, binary, channels });
-        source = cut.path; start = 0; end = cut.duration; generated.push(cut.name); wordReceipts.push(cut.receipt);
+        cut = await wordEdits.cut(root, temp, i, source, s, meta.duration_sec, current, { local, json, digest, run, binary, channels });
+        source = cut.path; start = 0; end = cut.duration;
       }
       const speed = s.speed ?? 1, duration = (end - start) / speed;
       if (duration <= 0 || cursor + duration + (s.gap_after_sec ?? 0) > 14400) fail('E_DURATION', 'Use positive segments and at most four hours per chapter.');
@@ -315,10 +352,19 @@ async function render(root, plan, state, input, signal) {
       if (s.fade_out_sec) { const fade = Math.min(duration, s.fade_out_sec); filters.push(`afade=t=out:st=${Math.max(0, duration - fade)}:d=${fade}`); }
       if (s.gap_after_sec) filters.push(`apad=pad_dur=${s.gap_after_sec}`);
       const clip = path.join(temp, `${i}.wav`);
-      await run(ffmpeg, ['-v', 'error', '-nostdin', ...(plan.schema_version === 3 ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-af', filters.join(','), '-ar', String(clipRate), '-ac', String(channels), '-c:a', clipCodec, clip], signal);
-      const measured = await probe(clip, signal);
-      if (s.text) cues.push({ start_sec: cursor, end_sec: cursor + duration, text: s.text });
-      cursor += measured.duration_sec;
+      await run(ffmpeg, ['-v', 'error', '-nostdin', ...(plan.schema_version === 3 ? composition.MEDIA_INPUT : []), '-i', source, '-vn', '-af', filters.join(','), '-ar', String(clipRate), '-ac', String(channels), '-c:a', clipCodec, clip], current);
+      return { duration, measured: await probe(clip, current), cut };
+    };
+    for (let offset = 0; offset < rows.length; offset += 2) {
+      const indices = rows.slice(offset, offset + 2).map((_, i) => offset + i);
+      const prepared = await preparePair(indices, prepare, signal);
+      for (const [index, result] of prepared.entries()) {
+        const s = plan.segments[indices[index]];
+        if (cursor + result.duration + (s.gap_after_sec ?? 0) > 14400) fail('E_DURATION', 'Use positive segments and at most four hours per chapter.');
+        if (result.cut) { generated.push(result.cut.name); wordReceipts.push(result.cut.receipt); }
+        if (s.text) cues.push({ start_sec: cursor, end_sec: cursor + result.duration, text: s.text });
+        cursor += result.measured.duration_sec;
+      }
     }
     await fs.writeFile(path.join(temp, 'concat.txt'), rows.map((_, i) => `file '${i}.wav'`).join('\n'));
     await run(ffmpeg, ['-v', 'error', '-nostdin', '-f', 'concat', '-safe', '1', '-i', path.join(temp, 'concat.txt'), '-c:a', 'copy', path.join(temp, 'joined.wav')], signal);
@@ -381,7 +427,11 @@ async function withAudioDeadline(parent, work, message) {
     throw err;
   } finally { clearTimeout(timer); parent?.removeEventListener('abort', abort); }
 }
+function withAbsoluteFiles(root, result) {
+  return { ...result, absolute_files: result.files.map(file => path.join(root, file)) };
+}
 async function execute(operation, request, signal) {
+  if (!OPERATIONS.includes(operation)) fail('E_OPERATION', USAGE);
   if (operation === 'preflight') {
     const ready = {};
     for (const env of ['ORKAS_BUNDLED_FFMPEG', 'ORKAS_BUNDLED_FFPROBE', 'ORKAS_WHISPER_CPP', 'ORKAS_WHISPER_MODEL']) {
@@ -396,28 +446,61 @@ async function execute(operation, request, signal) {
   }
   const projectFile = path.resolve(request.project);
   const root = await fs.realpath(path.dirname(projectFile));
-  const plan = validate(await json(await local(root, path.basename(projectFile))));
-  if (operation === 'probe') return { ok: true, ...await probe(await local(root, request.input_path), signal) };
-  if (operation === 'transcribe') return request.granularity === 'word'
-    ? withAudioDeadline(signal, current => transcribe(root, request, current), 'Word transcription timed out; the original recording was preserved.')
-    : transcribe(root, request, signal);
+  const projectPath = await local(root, path.basename(projectFile));
+  const plan = validate(await json(projectPath));
+  if (operation === 'probe') return { ok: true, ...await probe(await source(root, request.input_path), signal) };
+  if (operation === 'transcribe') {
+    const result = await (request.granularity === 'word'
+      ? withAudioDeadline(signal, current => transcribe(root, request, current), 'Word transcription timed out; the original recording was preserved.')
+      : transcribe(root, request, signal));
+    return withAbsoluteFiles(root, result);
+  }
   const lockPath = await local(root, '.voice-lock', true);
   let lock;
   try { lock = await fs.open(lockPath, 'wx'); } catch (err) { if (err.code === 'EEXIST') fail('E_BUSY', 'Audio project is busy. After a crash, verify no task is active before removing .voice-lock.'); throw err; }
   try {
     if (operation === 'extract' || operation === 'convert') {
       if (signal?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.');
-      try { return await transfer.transfer(root, request, operation, signal, { local, run, binary, digest, atomic }); }
+      try {
+        const result = await transfer.transfer(root, request, operation, signal, { local: source, run, binary, digest, atomic });
+        return withAbsoluteFiles(root, result);
+      }
       catch (err) { if (signal?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.'); throw err; }
     }
     const state = await stateFor(root);
     if (operation === 'status') return { ok: true, segments: await rowsFor(root, plan, state, signal) };
-    if (operation === 'render') return await (plan.schema_version === 3
-      ? withAudioDeadline(signal, current => render(root, plan, state, request, current), 'Audio rendering timed out; sources and completed exports were preserved.')
-      : render(root, plan, state, request, signal));
+    if (operation === 'render') {
+      const result = await (plan.schema_version === 3
+        ? withAudioDeadline(signal, current => render(root, plan, state, request, current), 'Audio rendering timed out; sources and completed exports were preserved.')
+        : render(root, plan, state, request, signal));
+      return { ...withAbsoluteFiles(root, result), project_path: projectPath };
+    }
     const s = plan.segments.find(segment => segment.id === request.segment_id && segment.text !== undefined);
     if (!s) fail('E_SEGMENT', 'Choose a speech segment id from this project.');
     const key = keyFor(plan, s);
+    if (operation === 'prepare-record') {
+      if (signal?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.');
+      const attempt = state.attempts[key];
+      if (attempt?.status !== 'uncertain') fail('E_ATTEMPT_STATE', 'Prepare recovery only for an existing uncertain attempt in the current segment. Inspect status; preserve ready or stale recordings.');
+      const file = await source(root, request.output_path ?? attempt.path, 'output_path');
+      if (!(await fs.stat(file)).isFile()) fail('E_PATH', 'output_path must name a regular project file.');
+      const prepared = { project: path.join(root, path.basename(projectFile)), segment_id: s.id, key, output_path: path.relative(root, file) };
+      const bytes = JSON.stringify(prepared, null, 2) + '\n';
+      const name = `record-${crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16)}.json`;
+      const requestFile = await local(root, name, true);
+      if (signal?.aborted) fail('E_CANCELLED', 'Audio operation cancelled.');
+      // One immutable, bounded request per distinct preparation. Identical calls
+      // reuse it; neither existing user files nor earlier requests are replaced.
+      try { await fs.writeFile(requestFile, bytes, { flag: 'wx' }); }
+      catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+        const same = await json(requestFile).then(saved => JSON.stringify(saved) === JSON.stringify(prepared)).catch(() => false);
+        if (!same) fail('E_REQUEST_CONFLICT', 'The prepared request file already exists with different content. Preserve it and inspect the conflict before preparing recovery.');
+      }
+      // Preparation is not verification or a state transition. record still
+      // checks the current identity and probes/hashes the completed recording.
+      return { ok: true, operation: 'record', request_file: requestFile };
+    }
     if (operation === 'begin') {
       if (state.attempts[key]) fail('E_ATTEMPT_EXISTS', 'This speech already has an attempt. Reuse or recover its recording; do not automatically repeat a potentially billed request.');
       const output = `speech-${key}.wav`;
@@ -434,7 +517,6 @@ async function execute(operation, request, signal) {
       await atomic(await local(root, '.voice-state.json', true), state);
       return { ok: true, key, ...meta };
     }
-    fail('E_OPERATION', 'Use preflight, probe, transcribe, status, begin, record, render, extract or convert.');
   } finally { await lock.close(); await fs.rm(lockPath, { force: true }); }
 }
 async function entry(args) {
@@ -443,7 +525,24 @@ async function entry(args) {
   process.once('SIGTERM', cancel); process.once('SIGINT', cancel);
   try {
     const [operation, requestFile] = args;
-    const request = requestFile ? await json(path.resolve(requestFile)) : {};
+    if (args.length === 1 && operation === '--help'
+      || args.length === 2 && OPERATIONS.includes(operation) && requestFile === '--help') {
+      return { ok: true, usage: USAGE, operations: OPERATIONS,
+        request: 'Write a workspace JSON request file before invoking the script. It must contain an absolute project path; operation-specific fields are documented in this Skill references/.',
+        preflight: 'audio -- preflight checks bundled capabilities without a request file.' };
+    }
+    if (operation !== undefined && !OPERATIONS.includes(operation)) fail('E_OPERATION', USAGE);
+    if (args.length !== (operation === 'preflight' ? 1 : 2) || !operation
+      || operation !== 'preflight' && (typeof requestFile !== 'string' || !requestFile.trim())) fail('E_USAGE', USAGE);
+    let request = {};
+    if (requestFile) {
+      try { request = await json(path.resolve(requestFile)); }
+      catch (error) {
+        if (error.code === 'ENOENT') fail('E_REQUEST', 'The request JSON file was not found. Write it with workspace file tools before invoking the operation.');
+        if (error instanceof SyntaxError) fail('E_REQUEST', 'The request file must contain valid JSON. Correct it before invoking the operation.');
+        throw error;
+      }
+    }
     return await execute(operation, request, abort.signal);
   } catch (err) {
     return { ok: false, code: err.code || 'E_AUDIO', message: /^E_[A-Z_]+$/.test(err.code || '') ? err.message : 'Audio operation failed. Check the project files and available disk space.' };

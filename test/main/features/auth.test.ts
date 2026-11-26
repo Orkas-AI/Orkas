@@ -1234,6 +1234,106 @@ describe('auth › hasConfiguredModel', () => {
 });
 
 describe('auth › listModels', () => {
+  it('preserves saved OpenRouter MiMo 2.5 entries for manual replacement after retirement', async () => {
+    const retired = ['xiaomi/mimo-v2.5', 'xiaomi/mimo-v2.5-pro'];
+    const replacement = 'google/gemini-4-hydrogen';
+    // Seed through the normal save path with the retired ids still resolvable,
+    // then reopen against the installed SDK and its current model catalog.
+    vi.doMock('#core-agent', async importOriginal => {
+      const core = await importOriginal<typeof import('#core-agent')>();
+      return {
+        ...core,
+        getPiModel: (provider: string, model: string) => {
+          if (provider === 'openrouter' && retired.includes(model)) {
+            return { ...core.getPiModel(provider, replacement)!, id: model };
+          }
+          return core.getPiModel(provider, model);
+        },
+      };
+    });
+    const oldAuth = await import('../../../src/main/features/auth');
+    const { profileId } = await oldAuth.addApiKey('openrouter', 'fixture-mimo-key');
+    const saved = [];
+    for (const model of retired) {
+      saved.push(await oldAuth.addEntry({ provider: 'openrouter', model, profileId }));
+    }
+    vi.doUnmock('#core-agent');
+    vi.resetModules();
+    (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+
+    const auth = await import('../../../src/main/features/auth');
+    expect((await auth.listModels('openrouter')).models.filter(row => retired.includes(row.id)))
+      .toEqual([]);
+    const settings = (await auth.listSettingsEntries()).entries;
+    expect(settings).toHaveLength(retired.length);
+    expect(settings).toEqual(expect.arrayContaining(saved.map(({ entryId }, index) =>
+      expect.objectContaining({ entryId, model: retired[index], profileId,
+        profileAvailable: true, modelAvailable: false, selectable: false }))));
+    expect((await auth.listComposerEntries()).entries).toEqual([]);
+    expect(await auth.pickChatEntryGroup()).toEqual([]);
+    await expect(auth.updateEntryModel(saved[0].entryId, replacement))
+      .resolves.toMatchObject({ entryId: saved[0].entryId, model: replacement });
+    expect((await auth.listComposerEntries()).entries).toEqual([
+      expect.objectContaining({ entryId: saved[0].entryId, model: replacement, profileId }),
+    ]);
+  });
+
+  it.each([['google', ''], ['openrouter', 'google/']])(
+    'lists current Gemini choices on %s and reopens saved older models',
+    async (provider, prefix) => {
+      const auth = await import('../../../src/main/features/auth');
+      const key = await auth.addApiKey(provider, 'fixture-gemini-key');
+      const legacyIds = ['gemini-3.7-flash', 'gemini-3.1-pro-preview'];
+      const saved = [];
+      for (const model of legacyIds) {
+        saved.push(await auth.addEntry({ provider, model: prefix + model, profileId: key.profileId }));
+      }
+      const options = (await auth.listModels(provider)).models
+        .filter(model => model.id.startsWith(prefix + 'gemini-')).map(model => model.id);
+      expect(options).toEqual([
+        'gemini-4-neon', 'gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon',
+        'gemini-3.8-flash', 'gemini-3.5-flash-lite',
+      ].map(model => prefix + model));
+
+      const added = await auth.addEntry({ provider, model: prefix + 'gemini-4-neon', profileId: key.profileId });
+      vi.resetModules();
+      (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+      const reopened = await (await import('../../../src/main/features/auth')).listEntries();
+      expect(reopened.entries).toEqual(expect.arrayContaining([
+        ...saved.map(({ entryId }, index) => expect.objectContaining({
+          entryId, model: prefix + legacyIds[index], selectable: true, modelAvailable: true,
+        })),
+        expect.objectContaining({ entryId: added.entryId, model: prefix + 'gemini-4-neon', selectable: true, modelAvailable: true }),
+      ]));
+    },
+  );
+
+  it('keeps the implicit Google connection probe on Flash and tests explicit model ids', async () => {
+    const stream = vi.fn(() => (async function* () { yield { type: 'text_delta', text: 'OK' }; })());
+    vi.doMock('#core-agent', async importOriginal => ({
+      ...await importOriginal<object>(),
+      createPiProvider: () => ({ stream }),
+    }));
+    const auth = await import('../../../src/main/features/auth');
+    const { profileId } = await auth.addApiKey('google', 'fixture-gemini-key');
+    expect(await auth.testConnection('google', undefined, profileId))
+      .toMatchObject({ ok: true, model: 'gemini-3.8-flash' });
+    expect(await auth.testConnection('google', 'gemini-4-argon', profileId))
+      .toMatchObject({ ok: true, model: 'gemini-4-argon' });
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    clientConfig.applyServerPayload({
+      immediate: { model_catalog: { providers: { google: [
+        { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+        { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+      ] } } }, restart: {}, config_hash: 'sha256:google-probe-order',
+    }, '"google-probe-order"');
+    expect((await auth.listModels('google')).models.map(model => model.id))
+      .toEqual(['gemini-4-argon', 'gemini-3.8-flash']);
+    expect(await auth.testConnection('google', undefined, profileId))
+      .toMatchObject({ ok: true, model: 'gemini-4-argon' });
+    expect(stream).toHaveBeenCalledTimes(3);
+  });
+
   it('saves and reopens MiniMax Flash without migrating a hidden M2.7 entry', async () => {
     const auth = await import('../../../src/main/features/auth');
     const key = await auth.addApiKey('minimax-cn', 'fixture-minimax-key');
@@ -1316,9 +1416,11 @@ describe('auth › listModels', () => {
   it('returns the synchronized GPT-6 and GPT-5.6 catalog for OpenAI Codex', async () => {
     const a = await import('../../../src/main/features/auth');
     expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
-      'gpt-6-astra',
+      'gpt-6.2-astra',
+      'gpt-6.2-sol',
       'gpt-6.1-sol',
       'gpt-6.1-terra',
+      'gpt-6-astra',
       'gpt-6-sol',
       'gpt-6-luna',
       'gpt-5.6-sol',
@@ -3312,12 +3414,14 @@ describe('shared native credential and catalog regressions', () => {
     expect(a.hasConfiguredModel()).toEqual({ configured: true });
   });
 
-  it('lists every curated GPT model variant', async () => {
+  it('offers the same GPT model choices across API key, Codex OAuth, and OpenRouter', async () => {
     const a = await import('../../../src/main/features/auth');
     const currentGptVersions = [
-      'gpt-6-astra',
+      'gpt-6.2-astra',
+      'gpt-6.2-sol',
       'gpt-6.1-sol',
       'gpt-6.1-terra',
+      'gpt-6-astra',
       'gpt-6-sol',
       'gpt-6-luna',
       'gpt-5.6-sol',
@@ -3328,6 +3432,8 @@ describe('shared native credential and catalog regressions', () => {
       .toEqual(currentGptVersions);
     expect((await a.listModels('openai-codex')).models.map((model) => model.id))
       .toEqual(currentGptVersions);
+    expect((await a.listModels('openrouter')).models.map((model) => model.id).filter((id) => id.startsWith('openai/gpt-')))
+      .toEqual(currentGptVersions.map((id) => `openai/${id}`));
     expect((await a.listModels('huggingface')).models).toEqual([]);
     expect((await a.listModels('custom-provider')).models).toEqual([]);
   });
@@ -3605,4 +3711,39 @@ describe('native OAuth and runtime resolvability boundaries', () => {
       code: 'MODEL_NOT_AVAILABLE',
     });
   });
+});
+
+describe('public GPT compatibility probes', () => {
+  it.each(['openai', 'openai-codex'])('keeps existing connection probe selection on %s', async (provider) => {
+    const stream = vi.fn(() => (async function* () { yield { type: 'text_delta', text: 'OK' }; })());
+    vi.doMock('#core-agent', async importOriginal => ({
+      ...await importOriginal<object>(),
+      createPiProvider: () => ({ stream }),
+    }));
+    const auth = await import('../../../src/main/features/auth');
+    let profileId: string;
+    if (provider === 'openai-codex') {
+      await writeExpiredOAuthEntry({ providerId: provider, model: 'gpt-6-astra', expires: Date.now() + 60_000 });
+      profileId = 'openai-codex:default';
+    } else {
+      ({ profileId } = await auth.addApiKey(provider, 'fixture-openai-key'));
+    }
+    expect(await auth.testConnection(provider, undefined, profileId))
+      .toMatchObject({ ok: true, model: 'gpt-6-astra' });
+    expect(await auth.testConnection(provider, 'gpt-6.2-astra', profileId))
+      .toMatchObject({ ok: true, model: 'gpt-6.2-astra' });
+
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    clientConfig.applyServerPayload({
+      immediate: { model_catalog: { providers: { [provider]: [
+        { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' },
+        { id: 'gpt-6.2-astra', name: 'GPT-6.2 Astra' },
+      ] } } }, restart: {}, config_hash: 'sha256:gpt-probe-order',
+    }, '"gpt-probe-order"');
+    expect((await auth.listModels(provider)).models.map(model => model.id))
+      .toEqual(['gpt-6.1-sol', 'gpt-6.2-astra']);
+    expect(await auth.testConnection(provider, undefined, profileId))
+      .toMatchObject({ ok: true, model: 'gpt-6.1-sol' });
+  });
+
 });

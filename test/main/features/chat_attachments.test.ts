@@ -368,15 +368,40 @@ describe('chat_attachments › uploadAttachment', () => {
     }
   });
 
-  it('rejects videos exceeding the 200MB cap', async () => {
+  it('rejects videos over 200MB that arrive as bytes', async () => {
     const m = await loadMod();
     // Allocate just over the cap — Buffer.alloc is cheap (sparse zero bytes).
     const oversized = Buffer.alloc(200 * 1024 * 1024 + 1);
     const r = await m.uploadAttachment(UID, CID, 'huge.mp4', oversized);
-    expect(r.ok).toBe(false);
+    expect(r).toMatchObject({ ok: false, error_code: 'file_too_large' });
     // Source file must not land on disk after a rejected upload.
     expect(fs.existsSync(path.join(attDir(), 'huge.mp4'))).toBe(false);
+    // Generated media is already in memory too and keeps the same cap.
+    expect(m.saveGeneratedMediaAttachment(UID, CID, oversized, 'generated.mp4', 'video').ok).toBe(false);
+    expect(fs.existsSync(attDir()) ? fs.readdirSync(attDir()).filter(name => name.endsWith('.mp4')) : []).toEqual([]);
   });
+
+  it('imports a video over 200MB from a path and rejects one over 2GB before copying', async () => {
+    const m = await loadMod();
+    const sparse = (name: string, bytes: number) => {
+      const p = path.join(tmpDir, name);
+      fs.closeSync(fs.openSync(p, 'w'));
+      fs.truncateSync(p, bytes);
+      return p;
+    };
+    const footage = sparse('footage.mp4', 200 * 1024 * 1024 + 1);
+    const imported = await m.importAttachmentFromPath(UID, CID, footage);
+    expect(imported).toMatchObject({ ok: true, info: { name: 'footage.mp4', kind: 'video', bytes: 200 * 1024 * 1024 + 1 } });
+    expect(fs.statSync(path.join(attDir(), 'footage.mp4')).size).toBe(200 * 1024 * 1024 + 1);
+
+    const copy = vi.spyOn(fs.promises, 'copyFile');
+    const tooLong = sparse('too-long.mov', 2 * 1024 * 1024 * 1024 + 1);
+    const rejected = await m.importAttachmentFromPath(UID, CID, tooLong);
+    expect(rejected).toMatchObject({ ok: false, error_code: 'file_too_large' });
+    if (!rejected.ok) expect(rejected.error).toContain('2048');
+    expect(copy).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(attDir(), 'too-long.mov'))).toBe(false);
+  }, 90_000); // Includes a real large-file copy and hashing on Windows.
 
   it.each([
     { label: 'GBK CSV', name: 'orders.csv', bytes: [0xD6, 0xD0, 0xCE, 0xC4, 0x2C, 0x31, 0x0A] },
@@ -1912,8 +1937,9 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
       expect(mod.resolveLocalMediaPath(p)).toMatchObject({ ok: true, kind });
       expect(mod.localMediaMimeFor(p)).toBe(mime);
       // Sparse files exercise admission without allocating large payloads.
+      // Images are decoded whole and keep their cap; audio streams in ranges.
       fs.truncateSync(p, (kind === 'image' ? 20 : 50) * 1024 * 1024 + 1);
-      expect(mod.resolveLocalMediaPath(p).ok).toBe(false);
+      expect(mod.resolveLocalMediaPath(p).ok).toBe(kind !== 'image');
     } finally { fs.rmSync(sandbox, { recursive: true, force: true }); }
   });
 
@@ -2087,7 +2113,7 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it('rejects files over the per-kind size cap', async () => {
+  it('rejects images over the image size cap', async () => {
     const { mod, sandbox } = await setup();
     // Image cap is 20MB. Allocate 1 byte over.
     const p = path.join(sandbox, 'huge.png');
@@ -2096,6 +2122,24 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('too_large');
+    expect(await mod.diagnoseMediaFile(UID, { localPath: p })).toMatchObject({ diagnosis: 'too_large' });
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('shows local video and audio of any size, since they stream in ranges', async () => {
+    // A 275 MB VideoStudio render stayed blank in chat and on the canvas
+    // under the old 200 MB video cap (2026-11-21).
+    const { mod, sandbox } = await setup();
+    for (const [name, bytes, kind] of [
+      ['render.mp4', 3 * 1024 * 1024 * 1024, 'video'],
+      ['voice.wav', 60 * 1024 * 1024, 'audio'],
+    ] as const) {
+      const p = path.join(sandbox, name);
+      fs.closeSync(fs.openSync(p, 'w'));
+      fs.truncateSync(p, bytes);
+      expect(mod.resolveLocalMediaPath(p), name).toMatchObject({ ok: true, kind });
+      expect(await mod.diagnoseMediaFile(UID, { localPath: p }), name).toMatchObject({ diagnosis: 'stat_available' });
+    }
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -2420,6 +2464,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     const delivered = await m.buildAttachmentManifest(UID, CID, ['reference.png']);
     expect(delivered.skipped).toEqual([]);
     expect(delivered.images).toHaveLength(1);
+    expect(delivered.manifest).toContain(`source_dimensions="${width}x${height}" preview_dimensions="${Math.min(width, 1024)}x${Math.min(height, 512)}"`);
     const indexer = await import('../../../src/main/features/file_indexer');
     const reread = await indexer.readImageAsJpeg(UID, path.join(attDir(), 'reference.png'));
     for (const data of [delivered.images[0].data, reread.base64]) {

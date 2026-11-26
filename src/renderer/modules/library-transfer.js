@@ -91,6 +91,7 @@
       'invalid_project',
       'invalid_request',
       'invalid_scope',
+      'invalid_source_encoding',
       'invalid_target',
       'not_found',
       'rollback_failed',
@@ -363,12 +364,14 @@
       const resultValue = failedCount === 0
         ? 'success'
         : (succeededCount > 0 ? 'partial' : 'failure');
-      const firstError = result.results?.find((row) => !row.ok)?.error;
+      const firstFailure = result.results?.find((row) => !row.ok);
+      const firstError = firstFailure?.error;
       const failure = resultValue === 'success' ? {} : _transferFailureDetails(firstError || 'transfer_failed');
 
       if (succeededCount === 0) {
         transferLog.warn('library transfer failed', { mode: request.mode, source_scope: request.source.scope, destination_scope: request.destination.scope, ...failure });
-        showError(_errorLabel(firstError));
+        showError(firstError === 'invalid_source_encoding' && firstFailure.message
+          ? firstFailure.message : _errorLabel(firstError));
         setSubmitting(false);
         return;
       }

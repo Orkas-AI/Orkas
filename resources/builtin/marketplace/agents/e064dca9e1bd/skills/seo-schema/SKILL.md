@@ -21,7 +21,7 @@ Lint existing JSON-LD and generate templates. Pure analysis/templating — no ne
 
 ## Preconditions
 
-- For `validate`: a `seo-crawl` JSON (uses each page's parsed `structured_data`). Python 3.9+ stdlib only.
+- For `validate`: a `seo-crawl` JSON (uses each page's parsed `structured_data`).
 
 ## How to call
 

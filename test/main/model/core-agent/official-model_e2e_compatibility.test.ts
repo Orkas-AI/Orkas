@@ -1,3 +1,9 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { AgentRunner, createConfig, PersistentSession, ProviderRegistry } from '#core-agent';
+import { createPiProvider } from '../../../../src/core-agent/src/providers/pi-provider.js';
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CompletionParams, LLMProvider, StreamEvent } from '#core-agent';
 import { createDeepSeekProvider, createCustomOpenAICompatibleProvider } from '../../../../src/main/model/core-agent/external-providers';
@@ -11,6 +17,20 @@ vi.mock('../../../../src/main/logger', () => ({ createLogger: () => ({
   info: host.info, warn: host.warn, error: host.error, debug: vi.fn(),
 }) }));
 
+const answer = { type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed',
+  content: [{ type: 'output_text', text: 'Saved record 42.', annotations: [] }] };
+function response(items: ReadonlyArray<typeof answer>) {
+  const events = items.flatMap((item, output_index) => [
+    { type: 'response.output_item.added', output_index, item: { ...item, status: 'in_progress', content: [] } },
+    { type: 'response.output_text.delta', output_index, content_index: 0, delta: item.content[0].text },
+    { type: 'response.output_item.done', output_index, item },
+  ]);
+  return new Response([...events, { type: 'response.completed', response: {
+    id: 'resp_fixture', status: 'completed', output: items,
+    usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+  } }].map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''),
+  { headers: { 'content-type': 'text/event-stream' } });
+}
 async function invoke(provider: LLMProvider, mode: 'stream' | 'complete', params: CompletionParams) {
   if (mode === 'complete') return provider.complete(params);
   const events: StreamEvent[] = [];
@@ -66,3 +86,64 @@ it.each(['complete', 'stream'] as const)('preserves DeepSeek thinking choices th
   expect(host.warn).not.toHaveBeenCalled();
 });
 
+
+it('completes active compaction through the configured Responses SDK with SDK cache opt-out and intact authorization', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'public-compaction-'));
+  const wire: Array<{ body: any; headers: Headers; checkpoint: boolean }> = [];
+  vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+    const request = new Request(input, init);
+    const raw = await request.text();
+    const body = JSON.parse(raw);
+    const headers = request.headers;
+    const checkpoint = JSON.stringify(body.input).includes('You are a context compaction engine.');
+    wire.push({ body, headers, checkpoint });
+    if (headers.get('authorization') !== 'Bearer sk-fixture') return new Response(null, { status: 401 });
+    if (checkpoint && (
+      !body.prompt_cache_options || body.prompt_cache_options.mode !== 'explicit' ||
+      Object.keys(body.prompt_cache_options).length !== 1 ||
+      /"(?:prompt_cache_key|prompt_cache_retention|cache_control)"/.test(raw)
+    )) {
+      return new Response(null, { status: 400 });
+    }
+    const item = checkpoint ? { ...answer, content: [{ ...answer.content[0], text: 'CHECKPOINT_SAVED' }] } : answer;
+    return response([item]);
+  }));
+  try {
+    const contextWindow = 110_000;
+    const session = new PersistentSession({ sessionFile: path.join(root, 'session.jsonl') });
+    session.beginUserTurn([{ type: 'text', text: 'Compare the results.' }]);
+    for (let i = 0; i < 8; i++) {
+      session.addAssistantMessage([{ type: 'tool_use', id: `call_${i}|fc_${i}`, name: 'read_fixture', input: {} }]);
+      session.addToolResult(`call_${i}|fc_${i}`, `${i === 7 ? 'LATEST_RESULT' : `OLD_RESULT_${i}`}\n${'sample '.repeat(6500)}`);
+    }
+    const providers = new ProviderRegistry();
+    const modelId = 'gpt-6.1-sol';
+    const model = getBuiltinModel('openai', modelId)!;
+    const provider = createPiProvider({
+      provider: 'openai',
+      apiKey: 'sk-fixture',
+      userCacheKey: 'public-cache-fixture',
+      customModel: { ...model, contextWindow, baseUrl: 'https://fixture.invalid/v1' },
+    });
+    providers.registerFactory('openai', () => provider);
+    const runner = new AgentRunner({ providers, session, disableTools: true, evolution: { enabled: false },
+      config: createConfig({
+        agent: { defaultProvider: 'openai', defaultModel: modelId, maxRetries: 0 },
+        models: { catalog: { [modelId]: { provider: 'openai', model: modelId, contextWindow, maxOutputTokens: 8_192 } } },
+      }),
+    });
+    const result = await runner.run({ message: 'Compare the results.', resumeActiveTurn: true, cacheRetention: 'long' });
+    expect(result.meta.error).toBeUndefined();
+    expect(result.text).toBe('Saved record 42.');
+    expect(wire.map(call => call.checkpoint)).toEqual([true, false]);
+    expect(wire.map(call => call.headers.get('authorization'))).toEqual(['Bearer sk-fixture', 'Bearer sk-fixture']);
+    expect(wire[0].body).toMatchObject({ prompt_cache_options: { mode: 'explicit' } });
+    expect(wire[0].body.prompt_cache_key).toBeUndefined();
+    expect(wire[0].body.prompt_cache_retention).toBeUndefined();
+    expect(wire[1].body.prompt_cache_options?.mode).toBeUndefined();
+    expect(wire[1].body.prompt_cache_key).toBeDefined();
+    expect(JSON.stringify(wire[1].body.input)).toContain('CHECKPOINT_SAVED');
+    expect(JSON.stringify(wire[1].body.input)).toContain('LATEST_RESULT');
+    expect(host.warn).not.toHaveBeenCalled();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

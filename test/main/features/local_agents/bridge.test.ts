@@ -138,7 +138,8 @@ afterEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
-  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  // Use the asynchronous retry path for temporary native files on Windows.
+  await fs.promises.rm(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 async function startTestBridge(opts: {
@@ -555,9 +556,7 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(creation.ok).toBe(true);
       const created = creation.result;
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'first\nfull detail' });
-      // The conversation's first open project to-do links back to it; later
-      // edits and completion keep that link.
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ origin_cid: 'c1' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
       const duplicate = await read({ action: 'create', content: 'first\nfull detail' });
       expect(duplicate.result).toMatchObject({ alreadyExists: true, task: { id: created.task.id, content: 'first\nfull detail' } });
       if (!created.ok) throw new Error('task fixture failed');
@@ -614,10 +613,10 @@ describe('local_agents/bridge › auth + skills', () => {
       expect((await tasks.getTask('other-account', foreignAccount.project.project_id, privateTask.task.id))?.status).toBe('todo');
       expect((await read({ action: 'complete', task_id: created.task.id })).ok).toBe(true);
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'done' });
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ origin_cid: 'c1' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
       expect((await read({ action: 'update', task_id: created.task.id, content: 'Edited in CLI\nUpdated detail', owner: '' })).ok).toBe(true);
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'Edited in CLI\nUpdated detail', status: 'done' });
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ origin_cid: 'c1' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
       expect(await tasks.listTasks(TEST_UID, '')).toEqual([]);
       await projects.deleteProject(TEST_UID, pid);
       expect((await read({ action: 'list' })).ok).toBe(false);
@@ -698,7 +697,7 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(created.ok).toBe(true);
       const tid = created.result.task.id;
       expect(await tasks.getTask(TEST_UID, pid, tid)).toMatchObject({ owner_agent: 'Backend Dev', owner_agent_id: 'aaa111bbb222' });
-      expect(await tasks.getTask(TEST_UID, pid, tid)).toMatchObject({ origin_cid: 'c1' });
+      expect(await tasks.getTask(TEST_UID, pid, tid)).not.toHaveProperty('origin_cid');
       expect((await call({ action: 'update', task_id: tid, owner: 'Reviewer', content: 'Must not apply' })).ok).toBe(false);
       expect((await tasks.getTask(TEST_UID, pid, tid))?.content).toBe('Assigned work');
       expect((await call({ action: 'update', task_id: tid, owner: '' })).ok).toBe(true);
@@ -971,7 +970,7 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(createdTask.ok).toBe(true);
       const tasks = await import('../../../../src/main/features/project_tasks');
       expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).toMatchObject({ content: 'Current project work' });
-      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).toMatchObject({ origin_cid: 'c1' });
+      expect(await tasks.getTask(TEST_UID, pid, createdTask.result.task.id)).not.toHaveProperty('origin_cid');
       expect((await call('todo_tasks', { action: 'create', content: 'Wrong scope', project: 'other' })).ok).toBe(false);
       expect((await call('memory.agent', { action: 'remove', target: 'project', old_text: 'Updated decision.' })).result.ok).toBe(true);
       expect((await call('memory.agent', { action: 'remove', target: 'project', old_text: 'Second decision.' })).result.ok).toBe(true);
@@ -1034,6 +1033,23 @@ describe('local_agents/bridge › auth + skills', () => {
       const memory = await import('../../../../src/main/features/memory');
       expect(memory.listAgentEntries(TEST_UID, 'a1').entries).toEqual(['remember only for a1']);
       expect(memory.listAgentEntries(TEST_UID, 'another-agent').entries).toEqual([]);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('removes only the CLI Agent’s own saved memory and refuses a different scope', async () => {
+    const bridge = await startTestBridge();
+    const call = async (params: Record<string, unknown>) => (await rpcOnce(bridge.socketPath, {
+      id: 1, token: bridge.token, method: 'memory.agent', params,
+    })).reply as any;
+    try {
+      expect((await call({ action: 'add', content: 'Lesson one.' })).result.ok).toBe(true);
+      expect((await call({ action: 'remove', old_text: 'Lesson one.' })).result.ok).toBe(true);
+      expect((await call({ action: 'remove', old_text: 'Lesson one.' })).result).toMatchObject({ ok: false });
+      expect((await call({ action: 'add', target: 'user', content: 'must not persist' })).ok).toBe(false);
+      const observed = await call({ action: 'list' });
+      expect(observed.result.entries).toEqual([]);
     } finally {
       await bridge.close();
     }
@@ -1142,6 +1158,28 @@ describe('local_agents/bridge › auth + skills', () => {
       instance.created_at = 1; scoped[0].tools = [];
       expect(await rpc('connectors.call', { action: 'read', output_ref: expanded.result.output_ref })).toMatchObject({ ok: false, error: expect.stringContaining('no longer available') });
       expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+    } finally { await bridge.close(); }
+  });
+
+  it.each([true, false])('keeps external approval facts in the CLI result with text=%s', async withText => {
+    const visible = [{ instance: { id: 'service', display_name: 'Service' }, tools: [{ name: 'list', input_schema: {} }] }];
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue(visible as any);
+    bridgeConnectorMock.callTool.mockResolvedValue({
+      content: withText ? [{ type: 'text', text: 'Review required' }] : [],
+      structuredContent: { status: 'waiting_approval', proposal_id: 'proposal-synthetic-41' },
+    } as any);
+    const bridge = await startTestBridge();
+    try {
+      const { reply } = await rpcOnce(bridge.socketPath, {
+        id: 1, token: bridge.token, method: 'connectors.call',
+        params: { connector_id: 'service', tool_name: 'list' },
+      });
+      expect(bridgeConnectorMock.callTool).toHaveBeenCalledTimes(1);
+      expect(reply).toMatchObject({ ok: true, result: { text: expect.any(String) } });
+      const result = (reply as { result: { text: string; isError?: boolean } }).result;
+      expect(result.isError).not.toBe(true);
+      if (withText) expect(result.text).toContain('Review required');
+      expect(result.text).toMatch(/waiting_approval[\s\S]*proposal-synthetic-41/);
     } finally { await bridge.close(); }
   });
 
@@ -1830,7 +1868,7 @@ describe('local_agents/bridge › current conversation history', () => {
         id: 41,
         token: bridge.token,
         method: 'chat_history',
-        params: { action: 'read', scope: 'current', read: { page: { mode: 'before', index: 1, count: 20 } } },
+        params: { action: 'read', scope: 'current', read: { page: { mode: 'before', index: 1, count: 20 }, cursor: 0 } },
       });
       expect((paged.reply as any).ok).toBe(true);
       expect((paged.reply as any).result.text).toContain('PUBLIC_PRIOR_CONTEXT');
@@ -1839,6 +1877,8 @@ describe('local_agents/bridge › current conversation history', () => {
       for (const [id, params, expected] of [
         [42, { action: 'read', scope: 'all', read: { page: { mode: 'latest', count: 20 } } }, { code: 'invalid_arguments', invalid_fields: ['scope'] }],
         [43, { action: 'read', scope: 'all', cid: 'c1' }, { code: 'unsupported_fields' }],
+        [44, { action: 'read', scope: 'current', read: { cursor: 0 }, cursor: 1 }, { code: 'conflicting_fields',
+          fields: ['cursor'], argument_group: 'read' }],
       ] as const) {
         const denied = await rpcOnce(bridge.socketPath, { id, token: bridge.token, method: 'chat_history', params });
         expect((denied.reply as any).ok).toBe(false);

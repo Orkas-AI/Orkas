@@ -256,6 +256,29 @@ describe('kb-tools › library(search)', () => {
     expect(r.content).toMatch(/still being processed|processing=1/);
   });
 
+  it('reads the scoped project Library when another project has a document with the same name', async () => {
+    const projects = await import('../../../../src/main/features/projects');
+    const files = await import('../../../../src/main/features/project_files');
+    const indexer = await import('../../../../src/main/features/project_library_indexer');
+    const contents = ['Solar signed readout S-17.', 'Wind signed readout W-31.'];
+    const ids: string[] = [];
+    for (const [i, name] of ['Solar', 'Wind'].entries()) {
+      const created = await projects.createProject(TEST_UID, name);
+      if (!created.ok) throw new Error('Project fixture could not be created');
+      const pid = created.project.project_id;
+      ids.push(pid);
+      expect((await files.uploadProjectFile(TEST_UID, pid, 'readout.md', Buffer.from(contents[i]))).ok).toBe(true);
+    }
+    await indexer.drain(TEST_UID);
+    const library = await createLibrary(ids[0]);
+    const receipt = await library.execute({ action: 'read', scope: 'project', path: 'readout.md' }, ctxFor());
+    expect(receipt.isError).not.toBe(true);
+    expect(receipt.content).toContain(contents[0]);
+    expect(receipt.content).not.toContain(contents[1]);
+    const global = await (await createLibrary()).execute({ action: 'read', scope: 'global', path: 'readout.md' }, ctxFor());
+    expect(global.isError).toBe(true);
+  });
+
   it('searches project and global Library scopes inside a project', async () => {
     await seedFiles();
     const projects = await import('../../../../src/main/features/projects');

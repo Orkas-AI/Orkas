@@ -13,6 +13,8 @@ import { enhancementCases, enhancementInputs, inspectEnhancement, enhancementChe
 import { processingCases, processingInputs, inspectProcessing, processingChecks } from './voice-processing-fixtures.js';
 import {deliveryCases,deliveryInputs,inspectDelivery,deliveryChecks,startLocalDeliveryBoundary} from './voice-delivery-fixtures.js';
 import {compositionCases,compositionInputs,inspectComposition,compositionChecks} from './voice-composition-fixtures.js';
+import { revisionCase, revisionInputs, inspectRevision, revisionChecks } from './voice-revision-fixture.js';
+import { publishedVoiceCandidates, scopedPublishedVoiceFiles } from './voice-output-evidence.js';
 import type { ProjectReplayEvidence } from './voice-project-replay.js';
 const require = createRequire(import.meta.url);
 export const speechFixtureFile = fileURLToPath(new URL('../../../test/fixtures/voice/jfk.wav', import.meta.url));
@@ -37,6 +39,9 @@ export async function prepareVoiceProvider(id: string, root?:string, userId?:str
 }
 const hash = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');
 export const isVoiceCase = (id: string) => (VOICE_CASE_IDS as readonly string[]).includes(id) || id === 'voice-revise-pauses-follow-up' || id === 'voice-recorded-rumble-zh-undo';
+export const voiceAcceptsLinkedAudio = (id: string) => deliveryCases.includes(id)
+  || recordedCases.includes(id)
+  || ['voice-recorded-rumble-zh-undo', 'voice-revise-cached', 'voice-preserve-pauses', 'voice-trim-edges', 'voice-all-silent'].includes(id);
 export function voiceTone(seconds: number, hz = 440): Buffer {
   const n = Math.round(seconds * 16000), b = Buffer.alloc(44 + n * 2);
   b.write('RIFF'); b.writeUInt32LE(b.length - 8, 4); b.write('WAVEfmt ', 8); b.writeUInt32LE(16, 16);
@@ -48,6 +53,7 @@ export function voiceTone(seconds: number, hz = 440): Buffer {
 // Independent pre-existing project fixture; never calls the implementation under test.
 export function voiceInputs(id: string): Record<string, Buffer | string> {
   if (!isVoiceCase(id)) return {};
+  if (id === revisionCase) return revisionInputs();
   if (compositionCases.includes(id)) return compositionInputs(id);
   if (deliveryCases.includes(id)) return deliveryInputs(id);
   if (recordedCases.includes(id) || id === 'voice-recorded-rumble-zh-undo') return recordedInputs(id);
@@ -94,14 +100,15 @@ export function seedVoiceFixture(id: string, root: string): string | null {
   }
   return root;
 }
-export interface VoiceEvidence { sourcesPreserved: boolean; previousPreserved: boolean; projectValid: boolean; projectReplay?: ProjectReplayEvidence; recordingsPreserved: boolean; recovered: boolean; exportCount: number; deliveredAudioCount?: number; decoded: boolean; contentMatched: boolean; transcriptCount: number; narrationPersisted?: boolean; narrationSubtitles?: boolean; transcript?: { wer: number; timed: boolean; sourceMatched: boolean; consistent: boolean; sourceBinding?: 'output-digest'|'preserved-input-and-content' }; recorded?: RecordedMeasures; enhancement?: EnhancementMeasurements; enhancementSource?: EnhancementMeasurements; enhancementUnits?: string; speech?: { local: boolean; requests: number; fulfilled: boolean }; duration?: number; composition?: Record<string, number>; }
+export interface VoiceEvidence { sourcesPreserved: boolean; previousPreserved: boolean; projectValid: boolean; projectReplay?: ProjectReplayEvidence; recordingsPreserved: boolean; recovered: boolean; exportCount: number; deliveredAudioCount?: number; decoded: boolean; contentMatched: boolean; transcriptCount: number; narrationPersisted?: boolean; narrationSubtitles?: boolean; transcript?: { wer: number; timed: boolean; sourceMatched: boolean; consistent: boolean; sourceBinding?: 'output-digest'|'preserved-input-and-content' }; recorded?: RecordedMeasures; enhancement?: EnhancementMeasurements; enhancementSource?: EnhancementMeasurements; enhancementUnits?: string; speech?: { local: boolean; requests: number; fulfilled: boolean; billingRoute?: 'configured-own-account-fixture' }; duration?: number; composition?: Record<string, number>; deliveryMedia?: { codec: string; sampleRate: number; channels: number; bitDepth?: number; sourceSamplesMatch?: boolean }; allSilentSource?: boolean; levelsPreserved?: boolean; }
 export function inspectVoiceFixture(id: string, root: string, published?:readonly string[]): VoiceEvidence | undefined {
   if (!isVoiceCase(id)) return undefined;
+  if (id === revisionCase) return inspectRevision(root,published);
   if (compositionCases.includes(id)) return inspectComposition(id,root,published);
-  if (deliveryCases.includes(id)) return inspectDelivery(id,root);
+  if (deliveryCases.includes(id)) return inspectDelivery(id, root, published);
   if (recordedCases.includes(id) || id === 'voice-recorded-rumble-zh-undo') return inspectRecorded(id, root,published);
   if (enhancementCases.includes(id)) return inspectEnhancement(id, root);
-  if (processingCases.includes(id)) return inspectProcessing(id, root);
+  if (processingCases.includes(id)) return inspectProcessing(id, root, published);
   const inputBase = path.join(root, 'audio'), inputs = voiceInputs(id);
   let base = inputBase;
   // New productions may use a topic-named project; only revision tasks bind the existing project.
@@ -147,6 +154,13 @@ export function inspectVoiceFixture(id: string, root: string, published?:readonl
   };
   visit(base);
   const result: VoiceEvidence = { sourcesPreserved: Object.keys(inputs).filter(n => n.startsWith('sources/')).every(same), previousPreserved: same('export-previous/audio.wav'), projectValid, recordingsPreserved: Object.keys(inputs).filter(n => n.startsWith('speech-')).every(same), recovered, exportCount: exports.length, decoded: false, contentMatched: false, transcriptCount };
+  const audio = id === 'voice-revise-cached' && published !== undefined
+    ? scopedPublishedVoiceFiles(root, published).filter(file => {
+      const relative = path.relative(base, file).split(path.sep).join('/');
+      return /\.wav$/i.test(file) && !Object.hasOwn(inputs, relative) && !recordedPaths.has(relative);
+    })
+    : exports;
+  if (audio !== exports) result.deliveredAudioCount = audio.length;
   if (narrationCase(id)) {
     result.narrationPersisted = false;
     result.narrationSubtitles = false;
@@ -170,12 +184,29 @@ export function inspectVoiceFixture(id: string, root: string, published?:readonl
       });
     } catch {}
   }
-  if (id === 'voice-transcribe-speech' && texts.length === 1 && srts.length === 1) {
+  if (id === 'voice-transcribe-speech') {
     try {
-      const text = fs.readFileSync(texts[0], 'utf8'), srt = fs.readFileSync(srts[0], 'utf8');
-      if(transcripts.length>1)return result;
-      const hasDigest=transcripts.length===1;
-      const t = hasDigest ? JSON.parse(fs.readFileSync(transcripts[0], 'utf8')) : { text, segments: srtSegments(srt) };
+      // Judge the host-delivered pair. Retained drafts are not additional final
+      // transcripts; byte-equivalent copies must not invalidate valid delivery.
+      const unique = (files: string[]): string[] => {
+        if (files.length > 32) return [];
+        const found = new Map<string, string>();
+        for (const file of files) {
+          if (fs.statSync(file).size > 65536) return [];
+          const bytes = fs.readFileSync(file, 'utf8').trim();
+          if (!found.has(bytes)) found.set(bytes, file);
+        }
+        return [...found.values()];
+      };
+      const deliveredTexts = unique(publishedVoiceCandidates(texts, published));
+      const deliveredSrts = unique(publishedVoiceCandidates(srts, published));
+      if (deliveredTexts.length !== 1 || deliveredSrts.length !== 1) return result;
+      const text = fs.readFileSync(deliveredTexts[0], 'utf8'), srt = fs.readFileSync(deliveredSrts[0], 'utf8');
+      // A sidecar binds its own subtitle export, not unrelated retained drafts.
+      const sidecars = transcripts.filter(file => path.dirname(file) === path.dirname(deliveredSrts[0]));
+      if (sidecars.length > 1) return result;
+      const hasDigest = sidecars.length === 1;
+      const t = hasDigest ? JSON.parse(fs.readFileSync(sidecars[0], 'utf8')) : { text, segments: srtSegments(srt) };
       const measured=inspectTranscript(t,text,srt,hash(inputs['sources/meeting.wav']));
       // TXT/SRT delivery is valid without a JSON receipt. Report its actual
       // evidence basis instead of fabricating a source digest in the output.
@@ -183,10 +214,10 @@ export function inspectVoiceFixture(id: string, root: string, published?:readonl
         sourceBinding:hasDigest?'output-digest':'preserved-input-and-content'};
     } catch { /* Missing or malformed transcript remains a failing observation. */ }
   }
-  if (exports.length === 1) {
+  if (audio.length === 1) {
     try {
       const { bundledRuntimeEnv } = require('../../../src/main/util/bundled-runtime.ts');
-      const env = bundledRuntimeEnv(), file = exports[0];
+      const env = bundledRuntimeEnv(), file = audio[0];
       const opts = { encoding: 'utf8' as const, timeout: 60000, maxBuffer: 1024 * 1024 };
       const p = JSON.parse(execFileSync(env.ORKAS_BUNDLED_FFPROBE, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', file], opts));
       execFileSync(env.ORKAS_BUNDLED_FFMPEG, ['-v', 'error', '-nostdin', '-i', file, '-f', 'null', '-'], opts);
@@ -210,6 +241,7 @@ export function inspectVoiceFixture(id: string, root: string, published?:readonl
 }
 export function voiceChecks(id: string, trace: ProductionRegressionTrace) {
   if (!isVoiceCase(id)) return [];
+  if (id === revisionCase) return revisionChecks(trace);
   if (compositionCases.includes(id)) return compositionChecks(id,trace);
   if (deliveryCases.includes(id)) return deliveryChecks(id,trace);
   if (recordedCases.includes(id) || id === 'voice-recorded-rumble-zh-undo') return recordedChecks(id, trace);
@@ -222,7 +254,7 @@ export function voiceChecks(id: string, trace: ProductionRegressionTrace) {
     check('preservation', !!e?.sourcesPreserved && e.previousPreserved && e.recordingsPreserved && e.projectValid),
     check('no-synthesis', narrationCase(id) ? !!e?.speech?.fulfilled && trace.toolCalls.filter(c => c.name === 'generate_speech' && c.op !== 'capabilities' && c.isError === false).length === e.speech.requests : !trace.toolCalls.some(c => c.name === 'generate_speech' && c.op !== 'capabilities')),
     check('observed-execution', trace.toolCalls.some(c => c.isError === false && ['read_files', 'bash'].includes(c.name))),
-    check('outcome', id === 'voice-transcribe-speech' ? !!e?.transcript && e.transcript.wer <= 0.15 && e.transcript.timed && e.transcript.sourceMatched && e.transcript.consistent : id === 'voice-missing-source' ? e?.exportCount === 0 && e.transcriptCount === 0 : !!e?.decoded && e.contentMatched && e.exportCount === 1 && Math.abs((e.duration ?? -1) - expected) < 0.08),
+    check('outcome', id === 'voice-transcribe-speech' ? !!e?.transcript && e.transcript.wer <= 0.15 && e.transcript.timed && e.transcript.sourceMatched && e.transcript.consistent : id === 'voice-missing-source' ? e?.exportCount === 0 && e.transcriptCount === 0 : !!e?.decoded && e.contentMatched && (e.deliveredAudioCount ?? e.exportCount) === 1 && Math.abs((e.duration ?? -1) - expected) < 0.08),
     ...(narrationCase(id) ? [check('narration-persisted', !!e?.narrationPersisted), check('narration-subtitles', !!e?.narrationSubtitles)] : []),
     ...(id === 'voice-recover-recording' ? [check('recording-recovered', !!e?.recovered)] : []),
   ];

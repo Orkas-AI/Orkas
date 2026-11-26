@@ -203,18 +203,28 @@ describe('Codex cache affinity without shared conversation state', () => {
     expect(headers.map(h => h.get('x-client-request-id'))).toEqual(['chat-a', 'chat-b', 'chat-a']);
   });
 
-  it('does not add affinity to calls without a session or caching explicitly disabled', async () => {
+  it('omits disabled cache affinity while preserving authenticated Codex turn routing', async () => {
     const headers: Headers[] = [];
     const bodies: any[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input, init) => {
-      headers.push(new Headers(init?.headers)); bodies.push(await wirePayload(input, init)); return response();
+      headers.push(new Headers(init?.headers));
+      bodies.push(await wirePayload(input, init));
+      const result = response();
+      result.headers.set('x-codex-turn-state', 'fixture-route');
+      return result;
     }));
     const config = { provider: 'openai-codex', model: 'gpt-6.1-sol', apiKey: token('a'), userCacheKey: 'opaque-user-a' };
     const p = createPiProvider(config);
+    const turn = { ...request('chat-a'), providerTurnContext: {} };
     await p.complete({ ...request('unused'), sessionId: undefined });
-    await p.complete({ ...request('disabled'), cacheRetention: 'none' });
-    expect(headers.map(h => h.get('session-id'))).toEqual([null, null]);
-    expect(bodies.map(body => body.prompt_cache_key)).toEqual([undefined, undefined]);
+    await p.complete(turn);
+    for await (const event of p.stream({ ...turn, cacheRetention: 'none' })) {
+      if (event.type === 'error') throw event.error;
+    }
+    expect(headers.map(h => h.get('session-id'))).toEqual([null, 'opaque-user-a', null]);
+    expect(bodies.map(body => body.prompt_cache_key)).toEqual([undefined, 'opaque-user-a', undefined]);
+    expect(headers[2].get('authorization')).toBe(`Bearer ${config.apiKey}`);
+    expect(headers[2].get('x-codex-turn-state')).toBe('fixture-route');
   });
 
   it.each((['complete', 'stream'] as const).flatMap(method => (['static', 'dynamic'] as const).map(source => [method, source] as const)))

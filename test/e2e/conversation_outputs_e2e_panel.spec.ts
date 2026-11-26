@@ -79,6 +79,51 @@ function wavBytes(): Buffer {
 
 test.describe.configure({ timeout: 120_000 });
 
+test('reopens a VideoStudio preview from the task workspace in a mixed Agent conversation', async ({ orkas }) => {
+  const page = orkas.page!;
+  const { conversation: { conversation_id: cid } } = await orkas.invoke<any>('conversations.create', {
+    title: 'Mixed Agent video task',
+  });
+  const taskRoot = path.join(orkas.workspaceRoot, 'task-files');
+  const taskDir = path.join(taskRoot, 'promo');
+  const codingDir = path.join(orkas.workspaceRoot, 'code');
+  mkdirSync(taskDir, { recursive: true });
+  mkdirSync(codingDir, { recursive: true });
+  writeFileSync(path.join(taskDir, 'main-v6.mp4'), readFileSync(path.join(__dirname, 'fixtures/content-workbench-preview.mp4')));
+  writeFileSync(path.join(codingDir, 'main-v6.mp4'), 'unrelated file with the same name');
+
+  const { uid, videoStudioId } = await orkas.electronApp!.evaluate(async (_electron, input) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const uid = require(`${input.root}/features/users.ts`).getActiveUserId();
+    const workspace = require(`${input.root}/features/user_workspace.ts`);
+    if (!workspace.setWorkspacePath(uid, input.taskRoot).ok) throw new Error('Could not set task workspace');
+    await require(`${input.root}/features/group_chat/state.ts`).setWorkspaceDirOnce(uid, input.cid, 'promo');
+    require(`${input.root}/features/local_agents/project-directory.ts`).writeCodingDirectory(uid, input.cid, input.codingDir, true);
+    const { VIDEO_STUDIO_AGENT_ID } = require(`${input.root}/model/core-agent/tool-catalog.ts`);
+    return { uid, videoStudioId: VIDEO_STUDIO_AGENT_ID };
+  }, { root: path.resolve(__dirname, '../../src/main'), cid, taskRoot, codingDir });
+  const history = path.join(orkas.workspaceRoot, uid, 'cloud', 'chats', `${cid}.jsonl`);
+  appendFileSync(history, JSON.stringify({
+    id: 'legacy-video-reply', ts: '2026-11-26T15:34:26', from: videoStudioId, to: ['user'],
+    text: 'A revised cut is pending. [Original v6](main-v6.mp4) is still available.',
+  }) + '\n');
+
+  await page.evaluate(async id => {
+    await (window as any).loadConversations();
+    await (window as any).setView('conversation', id);
+  }, cid);
+  const reply = page.locator('#chat-history .chat-message[data-msg-id="legacy-video-reply"]');
+  const video = reply.locator('video');
+  const expectPlayable = async () => {
+    await expect(video).toHaveCount(1);
+    await expect.poll(() => video.evaluate((el: HTMLVideoElement) => el.videoWidth)).toBeGreaterThan(0);
+    await expect(reply.locator('.chat-md-video-load-failure, .chat-md-video-missing')).toHaveCount(0);
+  };
+  await expectPlayable();
+  await page.reload();
+  await expectPlayable();
+});
+
 test('task attachments include early uploads beyond the history page and survive composer clearing', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
   const cid = (await orkas.invoke<any>('conversations.create', { title: 'Complete attachment inventory' })).conversation.conversation_id;
@@ -197,6 +242,33 @@ test('task inventory keeps new files and attachments across full and partial ref
     await expect(panel.locator('.ci-attach-row')).toHaveCount(3);
     await panel.screenshot({ path: testInfo.outputPath(`inventory-race-${locale}.png`) });
   }
+});
+
+test('opens a confirmed attachment when task detail history is unavailable', async ({ orkas }) => {
+  const page = orkas.page!;
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Attachment recovery' })).conversation.conversation_id;
+  const attachment = { cid, name: 'brief.txt', data: Buffer.from('Saved brief contents').toString('base64') };
+  expect(await orkas.invoke('conversations.attachments.upload', attachment)).toMatchObject({ ok: true });
+  await page.evaluate(async id => {
+    const win = window as any;
+    await win.loadConversations();
+    await win.setView('conversation', id);
+    const originalFetch = win.apiFetch;
+    win.apiFetch = (url: string, ...args: unknown[]) => url.includes('/history?limit=10')
+      ? Promise.resolve({ json: async () => ({ ok: false, error: 'History unavailable' }) })
+      : originalFetch(url, ...args);
+  }, cid);
+
+  await page.locator('#conversation-info-toggle').click();
+  const panel = page.locator('#conversation-info-panel');
+  await expect(panel.locator('.conversation-info-empty.is-error')).toBeVisible();
+  await panel.locator('[data-info-tab="attachments"]').click();
+  const row = panel.getByRole('button', { name: /brief\.txt/ });
+  await expect(row).toBeVisible();
+  await expect(page.locator('#conversation-info-tab-count-attachments')).toHaveText('1');
+  const preview = await orkas.openPreview(() => row.click());
+  await expect(preview.locator('body')).toContainText('Saved brief contents');
+  await orkas.closePreview(preview);
 });
 
 test('task details remembers open and closed panels and each selected tab across navigation', async ({ orkas }) => {

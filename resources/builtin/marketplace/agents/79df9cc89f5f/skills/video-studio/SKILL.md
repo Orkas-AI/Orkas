@@ -19,14 +19,16 @@ Use the same craft and timing guidance when scripting a finished video, then con
 
 ## Finished video
 
-One finished-video request becomes one finished video. Work straight through and hand back a file the user can post. Do not present a plan, a preview or a draft for approval on the way. The user reacts to the finished video, and changing it is cheap.
+One finished-video request becomes one finished video. Work straight through and hand back a file the user can post. Do not present a plan, a preview or a draft for approval on the way: the user reacts to the finished video, and changing a short one is cheap. A finished video over about 2 minutes is the exception, whether you make it or edit the user's footage: first finish one representative part of 30 to 60 seconds with everything the whole will have (look, captions, music, inserted pictures, pace), ship it, say in one line how the rest follows, and make the whole once the user agrees. If it must follow a script you write word for word, show that script first instead. A script the user gave is theirs: make it as written, without showing it back.
 
 ## The two tools
 
-- **ffmpeg** (`edit_video`, see `stage-edit`): cut, join, reframe, remove silence, mix, burn subtitles, overlay a logo. Seconds of work.
-- **Page render** (`video.render`): a timeline plus an HTML page, captured frame by frame. Text, price cards, motion, split screen, footage under graphics. About 1.5 seconds per second of video.
+Choose the path before setting up production.
 
-For designed text, price cards or motion, use the page. For plain subtitles on existing footage, use `burnsubs` in `stage-edit`; use its other ffmpeg operations for cutting, joining and mixing. They combine freely: put a trimmed clip in a page, or render a title card and `concat` it onto a long cut. All of it ends at `video.ship`, whichever tool made the file.
+- **Direct edit** (`edit_video`). Read [stage-edit](@skill/stage-edit). For subtitles on existing footage, follow its `burnsubs` procedure, including for timed product names or prices at fixed positions. Use its other ffmpeg operations to cut, join, reframe or mix existing footage. Check and deliver the exported file with `video.ship` as described in [Deliver](#5-deliver).
+- **Page render** (`video.render`). For designed text, price cards, motion or split screen, build a timeline and HTML page. Follow Make, Check and Deliver. You can use a trimmed clip in a page or join a rendered title card to a direct edit.
+
+For a fixed-picture dub or a repair of an existing dub, follow the [dubbing guidance](@skill/stage-edit/references/transcript-and-screen-grounded-editing.md) and use its captioned mix.
 
 ## 1. Brief
 
@@ -45,15 +47,17 @@ lamp-ad/
   assets.json              every file you use
   product.json             name, facts, images
   media/                   the user's attachments
-  videos/main/manifest.json
-  videos/main/index.html
+  videos/main/manifest.json    page route
+  videos/main/index.html       page route
 ```
 
 If the user attached files, run `video.import` first, before anything else: it copies them into `media/`, adds them to `assets.json` and returns their ids and sizes. Use those from then on; you never need an attachment's own path.
 
+When the request works on the user's own footage, such as a video they say they uploaded to cut, adapt or subtitle, and no video came with it (a task brief whose `sources` list is empty brings none), ask for it before doing anything else: say in one sentence that the footage did not arrive and ask them to add it again. Do not write the script, record narration or test the edit on stand-in footage while you wait.
+
 Write facts to `product.json` as you find them, with where they came from. Never put a claim on screen that came from nowhere. See [references/ads.md](references/ads.md).
 
-Develop the script with the craft and timing guidance above. A one-step edit still goes directly to [stage-edit](@skill/stage-edit).
+Develop a script when the brief needs one, using the craft and timing guidance above.
 
 For each product shot, decide whether the available footage shows the required scene or action. Reuse suitable real footage. When required product motion, use sequences or new scenes are missing, plan 1–2 generated shots and run `video.request_budget` before writing the timeline, unless the user ruled out spending. Page animation supplies text, graphics and supporting motion; a zoom or transition on a still image does not replace a required product action. Software can show its real screens instead. See [references/generation.md](references/generation.md). This checks configured service availability, not prices or balances. Confirm the planned external calls once before sending them; service accounts bill directly. For declined or unavailable generation, follow Material fallback below.
 
@@ -63,7 +67,7 @@ preparation path in [references/image-preparation.md](references/image-preparati
 
 ## Material fallback
 
-After declined, unavailable or exhausted generation, continue with existing material only when it satisfies the requested shots or the user has accepted a specific alternative. Otherwise state the missing scene/action, preserved work and available alternatives, and obtain the user's decision before producing a substituted version. Static-image zooms cannot silently replace required product motion or establish completion. Once an alternative is accepted, continue against that revised request without asking for the same decision again. Script/storyboard-only work still stops at its requested document without generating media.
+After declined, unavailable or exhausted generation, continue with existing material, including free stock, only when it satisfies the requested shots or the user has accepted a specific alternative. Otherwise state the missing scene/action, preserved work and available alternatives, and obtain the user's decision before producing a substituted version. Static-image zooms cannot silently replace required product motion or establish completion. Once an alternative is accepted, continue against that revised request without asking for the same decision again. Script/storyboard-only work still stops at its requested document without generating media.
 
 ## 3. Make
 
@@ -77,9 +81,11 @@ Write the page so one scene can change without touching the others. Use `data-sl
 
 ## 4. Check
 
-1. `video.check` reports structure, missing files and layout problems from the real page. Fix errors. `ok` means the operation succeeded; `visual_review` contains advisory findings from sampled page frames. Judge them against the frames, fix warranted issues and disclose anything kept. A stale or unavailable review is not a clean result; after a change, check the affected video again.
-2. `video.sheet` shows frames without rendering. Review them against the user's brief and the applicable `video-craft` review, including the commercial content review for sales work. Fix what you see, and check again only what you changed.
-3. Batch this pass's confirmed fixes and verify the changed result with checks and sampled frames before `video.render` writes the mp4. Use `video.sheet` for intermediate visual review rather than rendering after each small edit. Rendered scenes are cached, so a re-render only redoes what changed.
+Run these checks on a page timeline, including the page portion of a mixed edit.
+
+1. Run `video.check` with `include_preview: true` when that option is available. Fix errors. `ok` means the operation succeeded; `visual_review` contains advisory findings from sampled page frames. A stale or unavailable review is not a clean result.
+2. When `visual_evidence.attached` is true, the sheet already shows the first and last frame of each labeled scene (up to 16 scenes). Use it to review those frames, including when the user asks for scene starts and ends. Call `video.sheet` only if you need frames and have no preview, or use `times` or `range` for frames the current preview did not cover. Assess the frames against the user's brief and the applicable `video-craft` review, including the commercial content review for sales work. Fix warranted issues and disclose anything kept.
+3. Batch this pass's confirmed fixes, then check and review the changed result before `video.render` writes the mp4. For an intermediate visual-only review, use `video.sheet`. Rendered scenes are cached, so a re-render only redoes what changed.
 
 If a render reports `E_SEGMENT_ASSEMBLY_INCOMPLETE`, call it again unchanged; it finishes what is missing.
 
@@ -87,19 +93,24 @@ Do not repeat a check with current evidence on unchanged files, and do not re-re
 
 ## 5. Deliver
 
-`{ "op": "video.ship", "production_dir": "lamp-ad", "video_id": "main", "path": "render/main.mp4" }`. Pass `video_id` when the video has a timeline. For a video made only with ffmpeg, pass `expect_duration_sec`, `expect_aspect` and `expect_audio` so it has something to compare against. It publishes a version and returns frames from the final file. Compare those frames with the current request before replying.
+Call `video.ship` with the production directory and the exact `path` returned by `video.render` or `edit_video`. When resuming with an existing file, use its verified actual path. Pass `video_id` when the video has a timeline. For a video made only with ffmpeg, pass `expect_aspect` and `expect_audio`. It publishes a version and returns frames from the final file. Compare those frames with the current request before replying. Name in the reply only changes the delivered frames show; a change you cannot see there did not reach the video.
 
-For unmet requirements that you can repair with available tools and authority, repair the video, verify the changed result and ship again. Do not leave those repairs as suggestions for another turn. If missing user input or permission, a runtime blocker or the existing rework limit prevents completion, report the work as incomplete: name the unmet requirement, concrete blocker, retained work and what is needed to continue.
+When the tool describes `expect_duration_sec` as advisory, pass the user's requested length if known for either path. Use the brief and revisions to decide whether to keep or recut an off-target version. If you keep it, explain the length choice. With an older tool, pass the intended cut length for ffmpeg-only delivery.
+
+For other unmet requirements that you can repair with available tools and authority, repair the video, verify the changed result and ship again. Do not leave those repairs as suggestions for another turn. If missing user input or permission, a runtime blocker or the existing rework limit prevents completion, report the work as incomplete: name the unmet requirement, concrete blocker, retained work and what is needed to continue. An error from your own call is not a blocker: a path that does not exist, JSON that does not parse, an unknown op or option, or a page-timeline op on a video made with ffmpeg. Read the message, correct the call and carry on. Neither is work still to do: when the next step is one you can take with your tools, such as cutting more footage, syncing the narration or writing the timeline, take it in this turn instead of replying with it.
 
 Blocking findings: fix them and ship again. If you cannot, or the user wants the file as it is, say what is wrong and let them choose; pass their answer as `accept_findings` and `accept_reason` only after they have chosen.
 
+Use check results to guide edits. Report routine results only when asked, distinguishing the page preview from the delivered file.
+
 When the request is satisfied, reply in the user's language and lead with the video:
 
-- the video link;
+- the video link, as `reply_link` from delivery;
 - the choices you made for them, in a line or two, and any assumptions;
 - known limitations or deviations the user accepted;
-- what a check flagged that you kept rather than fixed, such as long still or empty stretches, and why, in plain words;
+- any remaining finding that affects use or needs a user decision, in plain words;
 - external service calls made, without inventing their prices or balances;
+- free footage, photos or audio used, by source, and the credit lines delivery gave you, if any;
 - up to three optional enhancements, only after the current request is satisfied ("换个开头", "做 16:9 版", "换成另一款商品").
 
 Never mention operations, finding codes or file formats unless they asked.
@@ -109,10 +120,10 @@ Never mention operations, finding codes or file formats unless they asked.
 Ask only for the following inputs or approvals; execution blockers and rework limits follow Deliver above.
 
 - A paid image or video attempt lacks the user's authorization for its planned external calls. Do not ask again for an unchanged, undispatched request already authorized.
-- You need something only the user has.
+- You need something only the user has. The words spoken in a recording are not that: caption them from the transcript, which is not inventing them, and name in your reply any you were unsure of.
 - A generated shot is still wrong after 2 retries.
 - They asked to see a plan first.
-- Rework would be expensive: a finished video over about 2 minutes, or one that must follow a script exactly. Then show the script first.
+- A finished video would run over about 2 minutes: ship its representative part first, or the script you wrote for it when it must follow that script word for word (Finished video above). Never stop to show the user a script they gave.
 
 When you stop, say what you need, what you have kept, and what happens next. Before ending a turn on a question, include `<plan-interaction status="open" />` in the reply.
 
@@ -128,5 +139,7 @@ Change only what was asked. Do not re-read this skill. Pick the cheapest level:
 | Rethink | New concept or structure | Tell the user first, then do it |
 
 A change stays in the same video, and each delivery keeps the last one as an earlier version. Only a version to keep alongside, such as another ratio, language or test variant, gets a copy: `videos/main` to `videos/<new id>`, changing what differs. Assets are shared.
+
+For a visual change confined to one scene, edit its own elements in `index.html` so the other scenes can reuse their renders. For example, set the price element's font size on that element. Change shared styles or scripts when the requested effect is shared.
 
 A later turn may start without your memory of this one, including the folder name. `video.status` with no folder lists the productions here; with a folder it gives the videos, versions and local generation requests. `assets.json` lists the files.

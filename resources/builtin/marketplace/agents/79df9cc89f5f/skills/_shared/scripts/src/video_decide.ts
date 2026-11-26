@@ -208,6 +208,31 @@ export interface PhraseLine {
   text: string;
   /** Measured pause before the next line, or null after the last one. */
   pauseAfterSec: number | null;
+  /** A short excerpt bounded by silence, for checking audio with no aligned word. */
+  review?: Span;
+}
+
+function untranscribedPhrases(words: Word[], quiet: Span[]): Array<Word & { review: Span }> {
+  const candidates: Array<Word & { review: Span }> = [];
+  let wordIndex = 0;
+  let lastWordEnd = 0;
+  for (let i = 1; i < quiet.length; i++) {
+    const before = quiet[i - 1], after = quiet[i];
+    const startSec = before.endSec, endSec = after.startSec;
+    const length = endSec - startSec;
+    // Inspect only short isolated sounds. A candidate does not classify that sound as speech or filler.
+    if (length < 0.08 || length > 1) continue;
+    while (wordIndex < words.length && words[wordIndex].startSec < endSec) {
+      lastWordEnd = Math.max(lastWordEnd, words[wordIndex++].endSec);
+    }
+    if (lastWordEnd > startSec) continue;
+    const padding = (pause: Span) => Math.min(0.45, (pause.endSec - pause.startSec) * 0.8);
+    candidates.push({
+      text: '', startSec, endSec,
+      review: { startSec: round3(startSec - padding(before)), endSec: round3(endSec + padding(after)) },
+    });
+  }
+  return candidates;
 }
 
 const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -230,7 +255,9 @@ function joinTokens(left: string, right: string): string {
  * then a pause of `breakSec` or more starts a new line and shorter pauses of at
  * least PHRASE_MIN_PAUSE_SEC are shown inline as `(0.31s)`. Pure.
  */
-export function packTranscriptPhrases(words: Word[], silences: Span[], opts: { breakSec?: number; segments?: boolean } = {}): PhraseLine[] {
+export function packTranscriptPhrases(words: Word[], silences: Span[], opts: {
+  breakSec?: number; segments?: boolean; includeUntranscribed?: boolean;
+} = {}): PhraseLine[] {
   const breakSec = isNum(opts.breakSec) && opts.breakSec > 0 ? opts.breakSec : PHRASE_BREAK_SEC;
   const quiet = silences
     .filter((s) => isNum(s.startSec) && isNum(s.endSec) && s.endSec - s.startSec >= PHRASE_MIN_PAUSE_SEC)
@@ -268,6 +295,8 @@ export function packTranscriptPhrases(words: Word[], silences: Span[], opts: { b
     }
   }
   fixed.sort((a, b) => a.startSec - b.startSec);
+  const timed: Array<Word & { review?: Span }> = opts.includeUntranscribed
+    ? [...fixed, ...untranscribedPhrases(fixed, quiet)].sort((a, b) => a.startSec - b.startSec) : fixed;
   // With pauses measured, the pause between two words is the silence measured
   // between them, and a line ends where the sound stops and the next starts where
   // it resumes. With none measured (speech over music), word gaps are all there is.
@@ -287,19 +316,19 @@ export function packTranscriptPhrases(words: Word[], silences: Span[], opts: { b
   const lines: PhraseLine[] = [];
   let current: PhraseLine | null = null;
   let previousEnd = 0;
-  for (const w of fixed) {
+  for (const w of timed) {
     const gap = current ? pauseBetween(previousEnd, Math.max(previousEnd, w.startSec)) : { sec: 0, quiet: null };
-    if (!current || gap.sec >= breakSec) {
+    if (!current || w.review || current.review || gap.sec >= breakSec) {
       let startSec = w.startSec;
       if (current) {
-        if (gap.quiet) {
+        if (gap.quiet && !current.review && !w.review) {
           current.endSec = Math.max(current.endSec, Math.min(gap.quiet.startSec, w.startSec));
           startSec = Math.min(w.startSec, Math.max(gap.quiet.endSec, current.endSec));
         }
-        current.pauseAfterSec = round3(gap.quiet ? startSec - current.endSec : gap.sec);
+        current.pauseAfterSec = round3(gap.quiet || current.review || w.review ? startSec - current.endSec : gap.sec);
         lines.push(current);
       }
-      current = { startSec, endSec: w.endSec, text: w.text, pauseAfterSec: null };
+      current = { startSec, endSec: w.endSec, text: w.text, pauseAfterSec: null, ...(w.review ? { review: w.review } : {}) };
     } else {
       const marked = gap.sec >= PHRASE_MIN_PAUSE_SEC ? `${current.text} (${gap.sec.toFixed(2)}s)` : current.text;
       current.text = gap.sec >= PHRASE_MIN_PAUSE_SEC ? `${marked} ${w.text}` : joinTokens(current.text, w.text);

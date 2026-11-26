@@ -93,7 +93,7 @@ function writeMarketplaceSkill(id: string, name: string, body = '# body'): void 
 function markImportDraft(id: string, source: 'url' | 'dir' = 'dir'): void {
   fs.writeFileSync(
     path.join(customSkillsDir(), id, '_meta.json'),
-    JSON.stringify({ _import: { draft: true, source } }, null, 2),
+    JSON.stringify({ _import: { draft: true, source, created_at: '2026-11-20T00:00:00.000Z' } }, null, 2),
     'utf8',
   );
 }
@@ -2404,11 +2404,121 @@ describe('skills › deleteCustomSkill', () => {
 });
 
 describe('skills › discardImportDraftIfPristine', () => {
-  it('deletes an untouched placeholder (only SKILL.md, empty body)', async () => {
+  it('keeps an ordinary empty custom Skill', async () => {
     const s = await loadSkills();
-    await s.createCustomSkill('draft1', 'desc'); // writes boilerplate, empty body
-    expect(await s.discardImportDraftIfPristine('draft1')).toBe(true);
-    expect(fs.existsSync(path.join(customSkillsDir(), 'draft1'))).toBe(false);
+    await s.createCustomSkill('draft1', 'desc');
+    expect(await s.discardImportDraftIfPristine('draft1')).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'draft1'))).toBe(true);
+  });
+
+  it.each(['package', 'unfinished'] as const)('recycles a %s import draft after the edit chat settles and restores its conversation', async (outcome) => {
+    const s = await loadSkills();
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    const draft = await s.createFromUrl('pending-import', 'desc', 'https://example.com/skills');
+    expect(draft.ok).toBe(true);
+    streamImpl.current = async function* () {
+      if (outcome === 'package') {
+        yield { type: 'final', text: 'Package result. <skill-as-package name="fixture"/>' };
+      } else {
+        yield { type: 'delta', phase: 'commentary', text: 'Still reading the source.' };
+      }
+    };
+    const controller = new AbortController();
+    const events = s.streamSendToSkillChat(TEST_UID, 'pending-import', 'Import this Skill', { abortSignal: controller.signal });
+    const first = await events.next();
+    expect(first.done).toBe(false);
+    if (outcome === 'package') expect(first.value.event.stream).toBe('skill_as_package');
+    else expect(first.value.type).toBe('delta');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'pending-import'))).toBe(true);
+    const cleanup = s.discardImportDraftIfPristine('pending-import');
+    const duplicate = s.discardImportDraftIfPristine('pending-import');
+    expect(await recycle.listRecycleBatches(TEST_UID)).toHaveLength(0);
+
+    if (outcome === 'package') {
+      for await (const _event of events) { /* drain the package result */ }
+    } else {
+      controller.abort();
+      await events.return();
+    }
+    expect(await cleanup).toBe(true);
+    expect(await duplicate).toBe(true);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'pending-import'))).toBe(false);
+    const [batch, extra] = await recycle.listRecycleBatches(TEST_UID);
+    expect(extra).toBeUndefined();
+    const restored = await recycle.restoreRecycleBatch(TEST_UID, batch.id);
+    expect(restored.failed_paths).toEqual([]);
+    expect((await s.getSkillChatMessages(TEST_UID, 'pending-import')).map(message => message.content))
+      .toEqual(['Import this Skill', outcome === 'package' ? 'Package result.' : '(reply interrupted)']);
+  });
+
+  it('keeps a draft when an active edit writes Skill content before cleanup', async () => {
+    const s = await loadSkills();
+    await s.createFromUrl('pending-import', 'desc', 'https://example.com/skills');
+    streamImpl.current = async function* () {
+      yield { type: 'delta', phase: 'commentary', text: 'Writing the Skill.' };
+      expect(await s.writeCustomSkillFile('pending-import', 'notes.md', 'Useful content')).toBe(true);
+      yield { type: 'final', text: 'Saved.' };
+    };
+    const events = s.streamSendToSkillChat(TEST_UID, 'pending-import', 'Import this Skill');
+    expect((await events.next()).done).toBe(false);
+    const cleanup = s.discardImportDraftIfPristine('pending-import');
+    for await (const _event of events) { /* drain the edit and its transcript */ }
+    expect(await cleanup).toBe(false);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'pending-import', 'notes.md'), 'utf8')).toBe('Useful content');
+  });
+
+  it('keeps a draft edited through metadata even when its body stays empty', async () => {
+    const s = await loadSkills();
+    await s.createFromUrl('edited-import', 'desc', 'https://example.com/skills');
+    await s.updateCustomSkill('edited-import', { description: 'Keep this description' });
+    expect(await s.discardImportDraftIfPristine('edited-import')).toBe(false);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'edited-import', 'SKILL.md'), 'utf8')).toContain('Keep this description');
+  });
+
+  it('keeps a draft edited during archiving without listing it as deleted in the recycle bin', async () => {
+    const s = await loadSkills();
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    await s.createFromUrl('earlier-draft', 'desc', 'https://example.com/earlier');
+    expect(await s.discardImportDraftIfPristine('earlier-draft')).toBe(true);
+    const [earlier] = await recycle.listRecycleBatches(TEST_UID);
+    await s.createFromUrl('edited-import', 'desc', 'https://example.com/skills');
+    const archiveSkill = recycle.createAppRecycleBatchForSkill;
+    const archive = vi.spyOn(recycle, 'createAppRecycleBatchForSkill').mockImplementationOnce(async (...args) => {
+      const batch = await archiveSkill(...args);
+      expect(batch?.items.length).toBeGreaterThan(0);
+      expect(await s.writeCustomSkillFile('edited-import', 'notes.md', 'Keep this work')).toBe(true);
+      return batch;
+    });
+
+    try {
+      expect(await s.discardImportDraftIfPristine('edited-import')).toBe(false);
+    } finally {
+      archive.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'edited-import', 'notes.md'), 'utf8')).toBe('Keep this work');
+    expect((await recycle.listRecycleBatches(TEST_UID)).map(batch => batch.id)).toEqual([earlier.id]);
+  });
+
+  it('keeps a draft if archiving its edit history fails', async () => {
+    const s = await loadSkills();
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    await s.createFromUrl('draft-archive-failure', 'desc', 'https://example.com/skills');
+    const archive = vi.spyOn(recycle, 'createAppRecycleBatchForSkill').mockRejectedValueOnce(new Error('archive unavailable'));
+    try {
+      await expect(s.discardImportDraftIfPristine('draft-archive-failure')).rejects.toThrow('archive unavailable');
+      expect(await s.getCustomSkill('draft-archive-failure')).toBeTruthy();
+    } finally {
+      archive.mockRestore();
+    }
+    expect(await s.discardImportDraftIfPristine('draft-archive-failure')).toBe(true);
+  });
+
+  it('rejects cleanup requested by a different account', async () => {
+    const s = await loadSkills();
+    await s.createFromUrl('draft-account', 'desc', 'https://example.com/skills');
+    expect(await s.discardImportDraftIfPristine('draft-account', 'other')).toBe(false);
+    expect(await s.getCustomSkill('draft-account')).toBeTruthy();
   });
 
   it('keeps a skill that was authored (non-empty body)', async () => {
@@ -3154,7 +3264,9 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       };
 
       const events: any[] = [];
-      for await (const ev of s.streamSendToSkillChat('u1', 'alpha-skill', '整理已导入的技能')) {
+      for await (const ev of s.streamSendToSkillChat('u1', 'alpha-skill', '整理已导入的技能', {
+        importMetadataId: imported.importMetadataId,
+      })) {
         events.push(ev);
       }
 
@@ -3184,13 +3296,13 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
         path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha-skill', 'chat.json'),
         'utf8',
       ));
-      expect(chatMeta.import_meta_targets).toBeUndefined();
+      expect(chatMeta.import_metadata).toBeUndefined();
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }
   });
 
-  it('clears direct-import metadata-only state after model errors', async () => {
+  it.each(['model error', 'abort', 'reply without a usable update'] as const)('recovers the original import metadata operation after %s', async (failure) => {
     const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-import-'));
     try {
       const src = path.join(srcParent, 'alpha-skill');
@@ -3203,30 +3315,145 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
         '',
         '# Alpha Body',
       ].join('\n'));
+      fs.writeFileSync(path.join(src, 'notes.md'), 'Original reference\n');
 
       const s = await loadSkills();
       const imported = await s.createFromDir(null, null, src);
       expect(imported.ok).toBe(true);
+      const installed = path.join(customSkillsDir(), 'alpha-skill');
+      const entry = fs.readFileSync(path.join(installed, 'SKILL.md'));
+      const reference = fs.readFileSync(path.join(installed, 'notes.md'));
+      const abort = new AbortController();
 
       streamImpl.current = async function* () {
-        yield { type: 'error', text: 'model unavailable' };
+        if (failure === 'model error') yield { type: 'error', text: 'model unavailable' };
+        else if (failure === 'abort') abort.abort();
+        else yield { type: 'final', text: '<skill-reply>Update complete.</skill-reply>' };
       };
 
       const events: any[] = [];
-      for await (const ev of s.streamSendToSkillChat('u1', 'alpha-skill', '整理已导入的技能')) {
+      for await (const ev of s.streamSendToSkillChat('u1', 'alpha-skill', '整理已导入的技能', {
+        importMetadataId: imported.importMetadataId, abortSignal: abort.signal,
+      })) {
         events.push(ev);
       }
+      if (failure === 'model error') expect(events.find((e) => e.type === 'error')?.text).toBe('model unavailable');
+      if (failure === 'reply without a usable update') {
+        expect(events.some((e) => e.type === 'error')).toBe(true);
+        expect(events.some((e) => e.type === 'final')).toBe(false);
+      }
 
-      expect(events.find((e) => e.type === 'error')?.text).toBe('model unavailable');
-      const chatMeta = JSON.parse(fs.readFileSync(
-        path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha-skill', 'chat.json'),
-        'utf8',
-      ));
-      expect(chatMeta.import_meta_targets).toBeUndefined();
-      expect(chatMeta.import_meta_created_at).toBeUndefined();
-      expect(chatMeta.session_id).toBe('skill-alpha-skill');
+      vi.resetModules();
+      (await import('../../../src/main/features/users')).activateUser(TEST_UID);
+      const reopened = await loadSkills();
+      const [user, assistant] = await reopened.getSkillChatMessages(TEST_UID, 'alpha-skill');
+      expect(assistant.failed).toBe(true);
+      streamImpl.current = async function* () {
+        yield { type: 'final', text: [
+          '<skill-meta><category>office</category></skill-meta>',
+          '<<<skill-file path=SKILL.md', '---', 'name: alpha-skill', 'description: Rewrite', '---', '# Wrong body', '>>>',
+          '<<<skill-file path=notes.md', 'Wrong reference', '>>>',
+        ].join('\n') };
+      };
+      events.length = 0;
+      for await (const ev of reopened.streamSendToSkillChat(TEST_UID, 'alpha-skill', user.content, {
+        importMetadataId: user.import_metadata_id,
+      })) events.push(ev);
+      expect(events.find((e) => e.type === 'final')?.written).toEqual([]);
+      expect(fs.readFileSync(path.join(installed, 'SKILL.md'))).toEqual(entry);
+      expect(fs.readFileSync(path.join(installed, 'notes.md'))).toEqual(reference);
+      expect((await reopened.getCustomSkill('alpha-skill'))?.category).toBe('office');
+
+      const unexpectedModel = vi.fn(async function* () { yield { type: 'final', text: 'unexpected' }; });
+      streamImpl.current = unexpectedModel;
+      events.length = 0;
+      for await (const ev of reopened.streamSendToSkillChat(TEST_UID, 'alpha-skill', user.content, {
+        importMetadataId: user.import_metadata_id,
+      })) events.push(ev);
+      expect(events.some((ev) => ev.type === 'error')).toBe(true);
+      expect(unexpectedModel).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps regular edits available while an import is pending and preserves a newer manual category', async () => {
+    const src = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-import-'));
+    try {
+      fs.writeFileSync(path.join(src, 'SKILL.md'), '---\nname: manual-skill\ndescription: Imported skill\n---\n\n# Original body\n');
+      const s = await loadSkills();
+      const imported = await s.createFromDir(null, null, src);
+      expect(imported).toMatchObject({ ok: true });
+      streamImpl.current = async function* () {
+        yield { type: 'final', text: '<<<skill-file path=notes.md\nAn ordinary edit\n>>>' };
+      };
+      for await (const _ of s.streamSendToSkillChat(TEST_UID, 'manual-skill', 'Edit this skill')) { /* drain */ }
+      expect(fs.readFileSync(path.join(customSkillsDir(), 'manual-skill', 'notes.md'), 'utf8')).toContain('An ordinary edit');
+
+      streamImpl.current = async function* () {
+        await s.updateCustomSkill('manual-skill', { category: 'education' });
+        yield { type: 'final', text: '<skill-meta><category>office</category></skill-meta>' };
+      };
+      const events: any[] = [];
+      for await (const ev of s.streamSendToSkillChat(TEST_UID, 'manual-skill', 'Edit this skill', {
+        importMetadataId: imported.importMetadataId,
+      })) events.push(ev);
+      expect(events.some((ev) => ev.type === 'error')).toBe(true);
+      expect((await s.getCustomSkill('manual-skill'))?.category).toBe('education');
+
+      streamImpl.current = async function* () {
+        yield { type: 'final', text: '<<<skill-file path=SKILL.md\n---\nname: manual-skill\ndescription: Imported skill\n---\n\n# Ordinary edit\n>>>' };
+      };
+      for await (const _ of s.streamSendToSkillChat(TEST_UID, 'manual-skill', 'Edit this skill')) { /* drain */ }
+      expect(fs.readFileSync(path.join(customSkillsDir(), 'manual-skill', 'SKILL.md'), 'utf8')).toContain('# Ordinary edit');
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+  });
+
+  it('retains the successful part of an import batch and protects recreated and unrelated Skills', async () => {
+    const src = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-import-'));
+    try {
+      for (const id of ['alpha', 'beta', 'gamma']) {
+        fs.mkdirSync(path.join(src, id));
+        fs.writeFileSync(path.join(src, id, 'SKILL.md'), `---\nname: ${id}\ndescription: Imported skill\n---\n# Original body\n`);
+      }
+      const s = await loadSkills();
+      const imported = await s.createFromDir(null, null, src);
+      expect(imported).toMatchObject({ ok: true });
+      const first = imported.skill!.id;
+      expect(first).toBe('alpha');
+      // Same ID and bytes, but a different installed directory.
+      const beta = path.join(customSkillsDir(), 'beta');
+      const displaced = path.join(tmpDir, 'displaced-beta');
+      fs.renameSync(beta, displaced);
+      fs.cpSync(displaced, beta, { recursive: true });
+      writeCustomSkill('unrelated');
+      const betaSidecar = fs.readFileSync(path.join(beta, '_meta.json'));
+      const model = vi.fn(async function* () {
+        yield { type: 'final', text: ['alpha', 'beta', 'unrelated'].map((id) =>
+          `<skill><skill_id>${id}</skill_id><category>office</category></skill>`).join('\n') };
+      });
+      streamImpl.current = model;
+      const run = async (id: string, importMetadataId: unknown) => {
+        const events: any[] = [];
+        for await (const ev of s.streamSendToSkillChat(TEST_UID, id, 'Check imported skills', { importMetadataId })) events.push(ev);
+        return events;
+      };
+      expect((await run(first, null)).some((ev) => ev.type === 'error')).toBe(true);
+      expect((await run('unrelated', imported.importMetadataId)).some((ev) => ev.type === 'error')).toBe(true);
+      expect(model).not.toHaveBeenCalled();
+      const result = (await run(first, imported.importMetadataId)).find((ev) => ev.type === 'final');
+      expect(result?.text).toContain('alpha');
+      expect(result?.text).toContain('beta');
+      expect(result?.text).toContain('gamma');
+      expect((await s.getCustomSkill(first))?.category).toBe('office');
+      expect(fs.readFileSync(path.join(beta, '_meta.json'))).toEqual(betaSidecar);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'unrelated', '_meta.json'))).toBe(false);
+      expect((await run(first, imported.importMetadataId)).some((ev) => ev.type === 'error')).toBe(true);
+      expect(model).toHaveBeenCalledTimes(1);
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
     }
   });
 

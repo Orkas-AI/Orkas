@@ -256,6 +256,33 @@ describe('rendered Office preview', () => {
     },
   );
 
+  it('recovers layout on an explicit reopen after a transient resident failure without changing the saved workbook', async () => {
+    const source = previewCases[1].buffer();
+    const sourcePath = path.join(tempDir, 'reopen-after-resident-busy.xlsx');
+    fs.writeFileSync(sourcePath, source);
+    engine.runOfficeCli.mockResolvedValueOnce({ code: 2, stdout: '', stderr: 'resident main pipe busy' });
+
+    const failed = await officeFileToPreviewHtml('spreadsheet', 'reopen.xlsx', sourcePath, source);
+    expect(failed.layoutRendered).toBeUndefined();
+    expect(failed.html).toContain('office-preview office-spreadsheet');
+    expect(fs.readFileSync(sourcePath)).toEqual(source);
+
+    const [reopened, duplicate] = await Promise.all([
+      officeFileToPreviewHtml('spreadsheet', 'reopen.xlsx', sourcePath, source),
+      officeFileToPreviewHtml('spreadsheet', 'reopen.xlsx', sourcePath, source),
+    ]);
+    expect(reopened.layoutRendered).toBe(true);
+    expect(reopened.html).toContain('Revenue dashboard');
+    expect(duplicate).toBe(reopened);
+    expect(await officeFileToPreviewHtml('spreadsheet', 'reopen.xlsx', sourcePath, source)).toBe(reopened);
+    expect(fs.readFileSync(sourcePath)).toEqual(source);
+    const control = previewCases[0].buffer();
+    const controlPath = path.join(tempDir, 'independent-reopen-control.docx');
+    fs.writeFileSync(controlPath, control);
+    expect((await officeFileToPreviewHtml('word', 'control.docx', controlPath, control)).layoutRendered).toBe(true);
+    expect(fs.readFileSync(controlPath)).toEqual(control);
+  });
+
   it('falls back and closes the temporary copy when the layout renderer fails', async () => {
     const source = previewCases[1].buffer();
     const sourcePath = path.join(tempDir, 'failed.xlsx');

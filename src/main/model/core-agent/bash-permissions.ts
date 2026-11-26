@@ -47,7 +47,10 @@ const WAITING_HEARTBEAT_MS = 25_000;
 /** Renderer dialog command preview cap — the user must see what will run, but
  *  an unbounded command would bloat the push payload. */
 const COMMAND_PREVIEW_MAX = 800;
+const PATH_DIAGNOSTIC_COUNT_MAX = 100;
 // ── Pending requests ─────────────────────────────────────────────────────────
+
+export type BashPathAnalysisGap = 'expansion' | 'working_directory' | 'symlink_parent' | 'home_directory' | 'ambiguous_operand';
 
 export interface BashPermissionFact {
   kind: 'risk' | 'read' | 'write' | 'remove';
@@ -56,6 +59,13 @@ export interface BashPermissionFact {
   reason?: RiskCategory;
   unresolved?: boolean;
   detail?: string;
+  analysisGap?: BashPathAnalysisGap;
+}
+
+interface BashPermissionPathDiagnostics {
+  operation: 'input_redirect' | 'output_redirect' | 'read' | 'write' | 'remove' | 'mixed' | 'unknown';
+  cause: BashPathAnalysisGap | 'assignment_expansion' | 'mixed' | 'unknown';
+  count: number;
 }
 
 export interface BashPermissionInfo {
@@ -75,6 +85,8 @@ export interface BashPermissionInfo {
   reasons: RiskCategory[];
   /** A path could not be determined before execution; approval is one-time. */
   unresolved_paths?: boolean;
+  /** Closed parser diagnostics for the existing approval funnel events. */
+  path_diagnostics?: BashPermissionPathDiagnostics;
   /** Why this is being asked at all in a mode that otherwise skips prompts:
    *  the step cannot be reviewed or undone once it runs. Empty/absent for an
    *  ordinary sensitive operation. */
@@ -97,10 +109,20 @@ interface Pending {
   canAllowRun: boolean;
   folderRead?: LocationOnlyRead;
   resolve: (d: BashDecision) => void;
+  resolutionListeners: Set<() => void>;
   heartbeat?: NodeJS.Timeout;
 }
 
 const _pending = new Map<string, Pending>();
+
+export function watchBashPermission(
+  requestId: string, uid: string, cid: string, onResolved: () => void,
+): (() => void) | undefined {
+  const pending = _pending.get(requestId);
+  if (!pending || pending.uid !== uid || pending.cid !== cid) return;
+  pending.resolutionListeners.add(onResolved);
+  return () => { pending.resolutionListeners.delete(onResolved); };
+}
 type RunGrant = { uid: string; cid: string; agentId: string; reasons: Set<RiskCategory> };
 const _runGrants = new Map<string, RunGrant>();
 // 2026-09-21: 58 approvals for the images in two Desktop folders. One grant
@@ -110,21 +132,24 @@ const _folderReadGrants = new Map<string, FolderReadGrant>();
 
 /** Summary and preview have separate bounded purposes. Prioritize uncertainty
  * and actual risk evidence, not the first lines of a possibly long script. */
-function boundedPermissionFacts(input: readonly BashPermissionFact[]): Pick<BashPermissionInfo, 'key_facts' | 'facts_omitted'> {
-  if (!input.length) return {};
+function boundedPermissionFacts(input: readonly BashPermissionFact[], unresolvedPaths?: boolean):
+  Pick<BashPermissionInfo, 'key_facts' | 'facts_omitted' | 'path_diagnostics'> {
   const clip = (value: string, limit: number) => {
     const text = value.replace(/[\x00-\x1f\x7f]/g, ' ');
     return text.length <= limit ? text : `${text.slice(0, Math.floor(limit / 2))}…${text.slice(-Math.floor(limit / 2) + 1)}`;
   };
   const unique = [...new Map(input.map(fact => [JSON.stringify(fact), fact])).values()];
+  const pathDiagnostics = unresolvedPaths ? summarizeUnresolvedPaths(unique) : undefined;
+  if (!unique.length) return pathDiagnostics ? { path_diagnostics: pathDiagnostics } : {};
   const rank = (fact: BashPermissionFact) => fact.unresolved ? 0 : fact.kind === 'risk' ? 1 : fact.kind === 'read' ? 3 : 2;
   unique.sort((a, b) => rank(a) - rank(b));
   const facts: BashPermissionFact[] = [];
   let budget = 800;
   for (const fact of unique) {
     if (facts.length >= 6) break;
+    const { analysisGap: _analysisGap, ...displayFact } = fact;
     const bounded = {
-      ...fact,
+      ...displayFact,
       operation: clip(fact.operation, 48),
       ...(fact.target ? { target: clip(fact.target, 180) } : {}),
       ...(fact.detail ? { detail: clip(fact.detail, 160) } : {}),
@@ -134,7 +159,28 @@ function boundedPermissionFacts(input: readonly BashPermissionFact[]): Pick<Bash
     budget -= cost;
     facts.push(bounded);
   }
-  return { key_facts: facts, ...(unique.length > facts.length ? { facts_omitted: unique.length - facts.length } : {}) };
+  return { key_facts: facts,
+    ...(unique.length > facts.length ? { facts_omitted: unique.length - facts.length } : {}),
+    ...(pathDiagnostics ? { path_diagnostics: pathDiagnostics } : {}),
+  };
+}
+
+function summarizeUnresolvedPaths(facts: readonly BashPermissionFact[]): BashPermissionPathDiagnostics {
+  const operations = new Set<BashPermissionPathDiagnostics['operation']>();
+  const causes = new Set<BashPermissionPathDiagnostics['cause']>();
+  let count = 0;
+  for (const fact of facts) {
+    if (!fact.unresolved || fact.kind === 'risk') continue;
+    count++;
+    operations.add(fact.kind === 'write' && fact.operation === 'redirection' ? 'output_redirect'
+      : fact.kind === 'read' && fact.operation === 'input redirection' ? 'input_redirect' : fact.kind);
+    causes.add(fact.analysisGap === 'expansion' && fact.detail ? 'assignment_expansion' : fact.analysisGap ?? 'unknown');
+  }
+  return {
+    operation: operations.size > 1 ? 'mixed' : operations.values().next().value ?? 'unknown',
+    cause: causes.size > 1 ? 'mixed' : causes.values().next().value ?? 'unknown',
+    count: Math.min(PATH_DIAGNOSTIC_COUNT_MAX, count),
+  };
 }
 
 function runGrantKey(uid: string, cid: string, agentId: string): string {
@@ -251,7 +297,7 @@ export async function requestBashDecision(opts: {
     agent_id: opts.agentId,
     agent_name: opts.agentName || opts.agentId,
     command,
-    ...boundedPermissionFacts(opts.keyFacts ?? []),
+    ...boundedPermissionFacts(opts.keyFacts ?? [], opts.unresolvedPaths),
     ...(opts.workingDirectory ? { working_directory: opts.workingDirectory.length <= 240 ? opts.workingDirectory : `${opts.workingDirectory.slice(0, 120)}…${opts.workingDirectory.slice(-119)}` } : {}),
     ...(opts.operation ? { operation: opts.operation } : {}),
     ...(opts.subject ? { subject: opts.subject } : {}),
@@ -288,7 +334,15 @@ export async function requestBashDecision(opts: {
       reasons,
       canAllowRun: taskGrantEligible,
       ...(folderRead ? { folderRead } : {}),
-      resolve,
+      resolutionListeners: new Set(),
+      resolve(decision) {
+        resolve(decision);
+        for (const listener of pending.resolutionListeners) {
+          try { listener(); }
+          catch { log.warn('bash permission resolution listener failed'); }
+        }
+        pending.resolutionListeners.clear();
+      },
     };
     _pending.set(requestId, pending);
     if (!_broadcast('bash:permission', info)) {

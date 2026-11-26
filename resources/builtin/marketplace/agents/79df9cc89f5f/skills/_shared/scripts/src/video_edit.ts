@@ -169,7 +169,17 @@ export interface EditParams {
    *  (multi-adelay = per-line placement, so plan.json's per-line `start_sec`
    *  actually lands on its scene). Takes precedence over audioAbsPath/start
    *  when non-empty. */
-  audioSegments?: Array<{ audioAbsPath: string; startSec?: number; endSec?: number }>;
+  audioSegments?: Array<{
+    audioAbsPath: string;
+    startSec?: number;
+    endSec?: number;
+    /** A caption opts into fixed-picture dubbing. Source times address the voice file. */
+    caption?: string;
+    sourceStartSec?: number;
+    sourceEndSec?: number;
+  }>;
+  /** Captioned mix: fit existing speech to picture windows and measured adjacent pauses. */
+  fitDub?: boolean;
   /** mix: what to do when the BASE video already carries an audio track.
    *  - 'reject' (DEFAULT): fail — prevents silently stacking a SECOND narration
    *    onto a base that already has one (e.g. a compose render that baked it in;
@@ -222,9 +232,15 @@ export interface EditParams {
   signal?: AbortSignal;
 }
 
+type DubFitIssue = { segment: number; reason: 'unmeasured' | 'no_speech' | 'too_long' | 'overlap';
+  required_sec?: number; available_sec?: number };
+
 export type EditResult =
-  | { ok: true; op: EditOp; path?: string; bytes?: number; probe?: unknown; loudness?: LoudnessResult; coverage?: CoverageReport; decision?: DecisionEvidence; reframe?: ReframeReport }
-  | { ok: false; errorCode: string; message: string };
+  | { ok: true; op: EditOp; path?: string; bytes?: number; probe?: unknown; loudness?: LoudnessResult; coverage?: CoverageReport; decision?: DecisionEvidence; reframe?: ReframeReport;
+      caption_cues?: Array<{ start_sec: number; end_sec: number; text: string }>;
+      /** trim: the picture's measured length, and why it is shorter than asked when it is. */
+      duration_sec?: number; warning?: string }
+  | { ok: false; errorCode: string; message: string; dub_fit_issues?: DubFitIssue[] };
 
 /** Platform-standard canvases for the aspect ratios people post at. A known
  *  ratio always lands on the same size, so a batch of reframes matches: the
@@ -405,6 +421,43 @@ export async function mapWithConcurrencyLimit<T, R>(
     }
   }));
   return results;
+}
+
+/** A cut whose frame rate is unknown may differ from its request by this much. */
+const TRIM_SHORTFALL_TOLERANCE_SEC = 0.05;
+
+/** What to tell the caller when a trim came out shorter than asked, or null. A start
+ *  past the point that leaves the full length still cuts to the end of the input, but
+ *  it is said: on 2026-11-17 six ~4s clips were cut at their places in the music
+ *  (start 3.005s and on), three came back short as a plain success, and the joined
+ *  montage was 12.5s instead of 14.4s with its cuts off the beat. Pure. */
+/** 2026-11-20 benchmark: a drama recap mixed its narration with `replace`, which dropped every
+ *  line the characters said, though the recap guide asks for at least one in their own voices. */
+export const REPLACE_DROPS_SOUND_WARNING = "replace drops the clip's own sound, every line of dialogue with it. A recap keeps at least one line in the characters' own voices: use --on-existing-audio mix --duck for those spans.";
+/** Seconds of sound a base must carry before replacing it is worth a word. */
+const REPLACE_WARNING_MIN_SOUND_SEC = 0.3;
+
+export function trimShortfallWarning(input: {
+  /** The input's picture length, or 0 when unknown. */
+  inputSec: number;
+  startSec: number;
+  requestedSec: number;
+  cutSec: number;
+  toleranceSec: number;
+}): string | null {
+  const { inputSec, startSec, requestedSec, cutSec, toleranceSec } = input;
+  if (!(cutSec < requestedSec - toleranceSec)) return null;
+  const got = `this cut is ${cutSec.toFixed(2)}s, not the ${requestedSec.toFixed(2)}s asked for`;
+  if (!(Number.isFinite(inputSec) && inputSec > 0)) return `The input's picture stops early: ${got}.`;
+  if (inputSec < requestedSec - toleranceSec) {
+    return `The input is only ${inputSec.toFixed(2)}s long, so ${got}. Use a longer clip, or plan this shot as ${cutSec.toFixed(2)}s.`;
+  }
+  if (startSec > inputSec - requestedSec + toleranceSec) {
+    return `The input is ${inputSec.toFixed(2)}s long, so from ${startSec}s ${got}. `
+      + '--start is a time inside the input, not a place in the finished video; '
+      + `start at or before ${(inputSec - requestedSec).toFixed(2)}s for the full length.`;
+  }
+  return `The input is ${inputSec.toFixed(2)}s long but ${got}: its picture stops or skips before then. Probe it with --op probe before using this cut.`;
 }
 
 export function validateTrimRequest(inputDurationSec: number, startSec: number, durationSec: number): EditResult | null {
@@ -857,8 +910,19 @@ function fail(errorCode: string, message: string): EditResult {
  *  over roughly the lowest 380 px; 60 puts it 415 px up, at any vertical size. */
 export const VERTICAL_CAPTION_MARGIN_V = 60;
 
-/** `force_style` for `burnsubs`: the caption font, plus the raised margin on a
- *  vertical frame. An .ass file keeps the margins its author set. Pure. */
+/** Script units per frame height that libass lays plain captions out on. */
+const CAPTION_SCRIPT_HEIGHT = 288;
+/** libass's caption size for a plain caption file, in script units. */
+const DEFAULT_CAPTION_FONT_SIZE = 16;
+/** Caption size on a vertical frame, in script units: about 73 px on 1920, the size short-video
+ *  apps caption at. The default (107 px) fit about ten Chinese characters across 1080 px, and a
+ *  longer line ran off both edges (2026-11-23, two of five vertical captioned deliveries). */
+export const VERTICAL_CAPTION_FONT_SIZE = 11;
+
+const isVerticalFrame = (displaySize: { width: number; height: number } | null) => !!displaySize && displaySize.height > displaySize.width;
+
+/** `force_style` for `burnsubs`: the caption font, plus a smaller size and the raised margin on
+ *  a vertical frame. An .ass file keeps the size and margins its author set. Pure. */
 export function burnsubsForceStyle(
   fontName: string,
   displaySize: { width: number; height: number } | null,
@@ -867,8 +931,95 @@ export function burnsubsForceStyle(
   const parts: string[] = [];
   if (fontName) parts.push(`FontName=${fontName}`);
   const authored = /\.(ass|ssa)$/i.test(subtitlesPath);
-  if (!authored && displaySize && displaySize.height > displaySize.width) parts.push(`MarginV=${VERTICAL_CAPTION_MARGIN_V}`);
+  if (!authored && isVerticalFrame(displaySize)) parts.push(`FontSize=${VERTICAL_CAPTION_FONT_SIZE}`, `MarginV=${VERTICAL_CAPTION_MARGIN_V}`);
   return parts.length ? `:force_style='${parts.join(',')}'` : '';
+}
+
+const WIDE_CHAR = /[\u1100-\u115f\u2e80-\u303e\u3040-\u30ff\u3100-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]/u;
+/** Punctuation a line may end after; closing marks never start one. */
+const BREAK_AFTER = /[\s，。、；：！？,.;:!?）)」』】》]/u;
+const NO_LINE_START = /[，。、；：！？,.;:!?）)」』】》]/u;
+
+// Keep inline markup together. Integer fifths of an em keep long lines and boundary comparisons exact.
+const CAPTION_TOKEN = /<[^<>\r\n]+>|\{\\[^{}\r\n]*\}|[\s\S]/gu;
+function tokenWidth(token: string): number {
+  if (token.length > 1 && (token.startsWith('<') || token.startsWith('{'))) return 0;
+  return WIDE_CHAR.test(token) ? 5 : 3;
+}
+
+export function captionEm(text: string): number {
+  return (text.match(CAPTION_TOKEN) || []).reduce((sum, token) => sum + tokenWidth(token), 0) / 5;
+}
+
+/** How wide a burned caption line may be, in em, on a frame: its width less 5% each side, over
+ *  the caption size there. Pure. */
+export function captionLineEm(displaySize: { width: number; height: number }, fontSize: number): number {
+  const px = fontSize * displaySize.height / CAPTION_SCRIPT_HEIGHT;
+  return Math.max(4, Math.floor(displaySize.width * 0.9 / px));
+}
+
+/** One caption line broken into lines no wider than `maxEm`, in even parts, each break at
+ *  punctuation or a space near its place when there is one, else between two wide characters,
+ *  else where the width runs out. Pure. */
+export function breakCaptionLine(line: string, maxEm: number): string[] {
+  const tokens = line.match(CAPTION_TOKEN) || [];
+  const widths = tokens.map(tokenWidth);
+  let remaining = widths.reduce((sum, width) => sum + width, 0);
+  const limit = Math.max(5, maxEm * 5);
+  const out: string[] = [];
+  let start = 0;
+  while (remaining > limit) {
+    const target = remaining / Math.ceil(remaining / limit);
+    let width = 0;
+    let best = -1;
+    let bestScore = Infinity;
+    let lastFit = start;
+    for (let i = start; i + 1 < tokens.length; i++) {
+      width += widths[i];
+      if (width > limit) break;
+      if (!widths[i]) continue;
+      lastFit = i;
+      const next = tokens[i + 1];
+      const atPunctuation = BREAK_AFTER.test(tokens[i]) || /^\s$/u.test(next);
+      const betweenWide = WIDE_CHAR.test(tokens[i]) && WIDE_CHAR.test(next);
+      if ((!atPunctuation && !betweenWide) || NO_LINE_START.test(next)) continue;
+      const score = Math.abs(width - target) - (atPunctuation ? target * 0.35 : 0);
+      if (score < bestScore) { bestScore = score; best = i; }
+    }
+    const end = (best >= 0 ? best : lastFit) + 1;
+    out.push(tokens.slice(start, end).join('').trimEnd());
+    while (start < end) remaining -= widths[start++];
+    while (start < tokens.length && /^\s$/u.test(tokens[start])) remaining -= widths[start++];
+  }
+  out.push(tokens.slice(start).join(''));
+  return out.filter(Boolean);
+}
+
+/** Wrap only dialogue inside a timed SRT/VTT cue, retaining headers, identifiers and line endings. */
+export function wrapCaptionText(text: string, maxEm: number): string {
+  const lines = text.split(/(\r\n|\n|\r)/);
+  const webvtt = /^\uFEFF?WEBVTT\b/.test(lines[0]);
+  let blockStart = true;
+  let metadata = false;
+  let dialogue = false;
+  for (let i = 0; i < lines.length; i += 2) {
+    const line = lines[i];
+    if (!line.trim()) {
+      blockStart = true;
+      metadata = false;
+      dialogue = false;
+      continue;
+    }
+    if (blockStart && webvtt) metadata = i === 0 || /^(?:NOTE(?:[ \t]|$)|(?:STYLE|REGION)$)/.test(line.trim());
+    blockStart = false;
+    if (metadata) continue;
+    if (dialogue) {
+      if (captionEm(line) > maxEm) lines[i] = breakCaptionLine(line, maxEm).join(lines[i + 1] || lines[i - 1] || '\n');
+    } else {
+      dialogue = /^\s*(?:\d+:)?\d{2}:\d{2}[.,]\d{3}\s+-->\s+(?:\d+:)?\d{2}:\d{2}[.,]\d{3}(?:\s|$)/.test(line);
+    }
+  }
+  return lines.join('');
 }
 
 /** A translated version once went out with the original captions still showing under the
@@ -907,8 +1058,24 @@ export function captionFontForText(text: string, platform: NodeJS.Platform): str
  *  layout for the link between Parsed_aresample_1 and format_out_0_1", the
  *  exact failure that blocked the 2026-08-05 delivery. Stereo is the delivery
  *  standard and a mono→stereo upmix is lossless channel duplication. */
-export function normalizeLoudnessAudioFilter(): string {
-  return `loudnorm=I=${MIX_LOUDNORM.I}:TP=${MIX_LOUDNORM.TP}:LRA=${MIX_LOUDNORM.LRA},aresample=${MIX_OUTPUT_SR},aformat=channel_layouts=stereo`;
+export function normalizeLoudnessAudioFilter(measured?: string | null): string {
+  return `loudnorm=I=${MIX_LOUDNORM.I}:TP=${MIX_LOUDNORM.TP}:LRA=${MIX_LOUDNORM.LRA}${measured ? `:${measured}` : ''},aresample=${MIX_OUTPUT_SR},aformat=channel_layouts=stereo`;
+}
+
+/** Second-pass loudnorm options from the JSON a measuring pass printed, or null when the
+ *  measurement is missing or not finite (silence reads -inf). One pass falls short on a quiet
+ *  mix with louder moments: delivery asked to normalize a -18.4 LUFS ad and one pass left it at
+ *  -16.6, still outside the delivery's 2 LU (2026-11-17). Pure. */
+export function loudnormMeasuredOptions(stderr: string): string | null {
+  const objects = String(stderr).match(/\{[^{}]*"input_i"[^{}]*\}/g);
+  if (!objects?.length) return null;
+  let measured: Record<string, unknown>;
+  try { measured = JSON.parse(objects[objects.length - 1]) as Record<string, unknown>; } catch { return null; }
+  const keys = ['input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset'] as const;
+  const values = keys.map((key) => Number(measured[key]));
+  if (!values.every((value) => Number.isFinite(value))) return null;
+  const [i, tp, lra, thresh, offset] = values;
+  return `measured_I=${i}:measured_TP=${tp}:measured_LRA=${lra}:measured_thresh=${thresh}:offset=${offset}:linear=true`;
 }
 
 /** Would `overlay` erase the base instead of compositing over it?
@@ -1437,7 +1604,177 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
   return result;
 }
 
-async function runEdit(p: EditParams): Promise<EditResult> {
+function validCover({ top, bottom }: NonNullable<EditParams['cover']>): boolean {
+  return Number.isFinite(top) && Number.isFinite(bottom) && top >= 0 && bottom <= 1
+    && bottom > top && bottom - top <= 0.5;
+}
+
+function subtitleTime(seconds: number): string {
+  const ms = Math.round(seconds * 1000);
+  const fields = [Math.floor(ms / 3600000), Math.floor(ms / 60000) % 60, Math.floor(ms / 1000) % 60];
+  return fields.map(value => String(value).padStart(2, '0')).join(':') + ',' + String(ms % 1000).padStart(3, '0');
+}
+
+/** Use the mixer's millisecond grid and leave room for later lines before placing earlier ones. */
+function fitDubWindows(
+  lines: NonNullable<EditParams['audioSegments']>, measures: SilenceMeasureResult[], source?: SilenceTiming,
+): { windows: Span[] } | { issues: DubFitIssue[] } {
+  const issues: DubFitIssue[] = [];
+  const bounds = lines.map((line, index) => {
+    const start = line.startSec!;
+    const end = line.endSec!;
+    // The two measurements of a phrase edge can differ by a transcript tick.
+    const quietBefore = source?.silences.find(gap => gap.startSec < start && gap.endSec >= start - 0.02);
+    const quietAfter = source?.silences.find(gap => gap.endSec > end && gap.startSec <= end + 0.02);
+    const previous = lines[index - 1], next = lines[index + 1];
+    const allowedStart = previous && quietBefore ? Math.max(previous.endSec!, quietBefore.startSec) : start;
+    const allowedEnd = next
+      ? (quietAfter ? Math.min(next.startSec!, quietAfter.endSec) : end)
+      : (source && source.trailingSilenceSec > 0 && source.voicedEndSec > start
+        ? Math.min(end, source.voicedEndSec) : end);
+    const earliest = Math.ceil(allowedStart * 1000 - 1e-6);
+    const deadline = Math.floor(allowedEnd * 1000 + 1e-6);
+    const measure = measures[index];
+    const length = measure.ok ? Math.ceil(measure.timing.voicedEndSec * 1000 - 1e-6) : 0;
+    if (!measure.ok) issues.push({ segment: index + 1, reason: 'unmeasured' });
+    else if (measure.timing.voicedDurationSec <= 0) issues.push({ segment: index + 1, reason: 'no_speech' });
+    else if (earliest + length > deadline) issues.push({
+      segment: index + 1, reason: 'too_long', required_sec: length / 1000, available_sec: (deadline - earliest) / 1000,
+    });
+    return { earliest, deadline, length, preferred: Math.round(start * 1000) };
+  });
+  if (issues.length) return { issues };
+
+  const latest = new Array<number>(lines.length);
+  let nextStart = Infinity;
+  for (let index = bounds.length - 1; index >= 0; index--) {
+    const bound = bounds[index];
+    nextStart = Math.min(bound.deadline, nextStart) - bound.length;
+    if (nextStart < bound.earliest) return { issues: [
+      { segment: index + 1, reason: 'overlap' }, { segment: index + 2, reason: 'overlap' },
+    ] };
+    latest[index] = nextStart;
+  }
+
+  let previousEnd = 0;
+  return { windows: bounds.map((bound, index) => {
+    const wanted = index === bounds.length - 1 ? latest[index] : bound.preferred;
+    const start = Math.max(previousEnd, bound.earliest, Math.min(wanted, latest[index]));
+    previousEnd = start + bound.length;
+    return { startSec: start / 1000, endSec: previousEnd / 1000 };
+  }) };
+}
+
+async function runCaptionedDub(p: EditParams, bins: NonNullable<ReturnType<typeof resolveBins>>): Promise<EditResult> {
+  const video = p.inputAbsPath!;
+  const output = p.outputAbsPath!;
+  const duration = await probeVideoDurationSec(bins.ffprobe, video, p.signal);
+  if (duration === null) return fail('E_EDIT_VOICE_WINDOW', 'Cannot measure the source picture duration.');
+  if (p.onExistingAudio !== 'replace' || p.duck || p.audioAbsPath || p.start !== undefined) {
+    return fail('E_EDIT_ARG', 'A captioned dub replaces the source audio and uses only its ordered audio segments.');
+  }
+  if (p.cover && !validCover(p.cover)) {
+    return fail('E_EDIT_ARG', 'Cover must be the old subtitle band from top to bottom, as picture-height fractions at most 0.5 apart.');
+  }
+  const lines = p.audioSegments!;
+  let previousEnd = 0;
+  for (const [i, line] of lines.entries()) {
+    if (!line?.audioAbsPath || typeof line.caption !== 'string' || !line.caption.trim()) {
+      return fail('E_EDIT_ARG', `Dub segment ${i + 1} requires an audio file and caption text.`);
+    }
+    const start = finiteNum(line.startSec);
+    const end = finiteNum(line.endSec);
+    if (start === undefined || end === undefined || start < previousEnd || end <= start || end > duration) {
+      return fail('E_EDIT_VOICE_WINDOW', `Dub segment ${i + 1} needs an ordered picture window within ${duration}s.`);
+    }
+    previousEnd = end;
+    if (line.sourceStartSec === undefined && line.sourceEndSec === undefined) continue;
+    const from = finiteNum(line.sourceStartSec);
+    const to = finiteNum(line.sourceEndSec);
+    if (from === undefined || to === undefined || from < 0 || to <= from) {
+      return fail('E_EDIT_ARG', `Dub segment ${i + 1} requires a valid source_start and source_end pair.`);
+    }
+  }
+  const ranged = [...new Set(lines.filter(line => line.sourceStartSec !== undefined).map(line => line.audioAbsPath))];
+  const durations = await mapWithConcurrencyLimit(ranged, MIX_COVERAGE_CONCURRENCY, file => probeDurationSec(bins.ffprobe, file, p.signal));
+  const sourceDurations = new Map(ranged.map((file, i) => [file, durations[i]]));
+  for (const [i, line] of lines.entries()) {
+    if (line.sourceEndSec !== undefined && line.sourceEndSec > sourceDurations.get(line.audioAbsPath)!) {
+      return fail('E_EDIT_VOICE_WINDOW', `Dub segment ${i + 1} ends outside its voice file.`);
+    }
+  }
+
+  const directory = await fs.mkdtemp(path.join(path.dirname(output), '.dub-'));
+  try {
+    const slices = await mapWithConcurrencyLimit(lines, MIX_COVERAGE_CONCURRENCY, async (line, i) => {
+      if (line.sourceStartSec === undefined) return line.audioAbsPath;
+      const clip = path.join(directory, `line-${i}.wav`);
+      const seconds = line.sourceEndSec! - line.sourceStartSec;
+      const r = await run(bins.ffmpeg, withFfmpegProgress([
+        '-nostdin', '-y', '-ss', String(line.sourceStartSec), '-i', line.audioAbsPath,
+        '-t', String(seconds), '-map', '0:a:0', '-c:a', 'pcm_s16le', clip,
+      ]), p.signal, { op: 'mix', phase: 'edit', durationSec: seconds });
+      return r.code === 0 ? clip : null;
+    });
+    const missing = slices.indexOf(null);
+    if (missing !== -1) return fail('E_EDIT_VOICE_WINDOW', `Could not read the selected audio in dub segment ${missing + 1}.`);
+    let measurements: SilenceMeasureResult[] | undefined;
+    let windows: Span[] = lines.map(line => ({ startSec: line.startSec!, endSec: line.endSec! }));
+    if (p.fitDub) {
+      const signal = p.signal ? { signal: p.signal } : undefined;
+      const source = await measureSilenceCoverage(video, signal);
+      measurements = await mapWithConcurrencyLimit(slices, MIX_COVERAGE_CONCURRENCY, file => measureSilenceCoverage(file!, signal));
+      if (p.signal?.aborted) return fail('E_EDIT_ABORTED', 'Dubbing was cancelled before mixing.');
+      const fit = fitDubWindows(lines, measurements, source.ok && source.timing.voicedDurationSec > 0 ? source.timing : undefined);
+      if ('issues' in fit) return {
+        ok: false, errorCode: 'E_EDIT_VOICE_WINDOW',
+        message: 'Existing dub needs attention on the listed segments. No new video was written.',
+        dub_fit_issues: fit.issues,
+      };
+      windows = fit.windows;
+    }
+    const mixPlacement = { duration, voicedSpans: [] as Span[], measurements };
+    const mixed = path.join(directory, 'mix.mp4');
+    const mix = await runEdit({
+      op: 'mix', inputAbsPath: video, outputAbsPath: mixed, signal: p.signal, onExistingAudio: 'replace',
+      audioSegments: slices.map((audioAbsPath, i) => ({ audioAbsPath: audioAbsPath!, ...windows[i] })),
+    }, mixPlacement);
+    if (!mix.ok) return mix;
+    const cues = mixPlacement.voicedSpans.map((span, i) => ({
+      start_sec: Math.round(span.startSec * 1000) / 1000,
+      end_sec: Math.round(span.endSec * 1000) / 1000,
+      text: lines[i].caption!.replace(/\s+/g, ' ').trim(),
+    }));
+    const subtitles = path.join(directory, 'captions.srt');
+    await fs.writeFile(subtitles, cues.map((cue, i) =>
+      `${i + 1}\n${subtitleTime(cue.start_sec)} --> ${subtitleTime(cue.end_sec)}\n${cue.text}\n`).join('\n'));
+    const captioned = path.join(directory, `captioned${path.extname(output) || '.mp4'}`);
+    const burn = await runEdit({
+      op: 'burnsubs', inputAbsPath: mixed, subtitlesAbsPath: subtitles, cover: p.cover,
+      outputAbsPath: captioned, signal: p.signal,
+    }, mixPlacement);
+    if (!burn.ok) return burn;
+    const actualDuration = await probeVideoDurationSec(bins.ffprobe, captioned, p.signal);
+    if (actualDuration === null || Math.abs(actualDuration - duration) > 0.001) {
+      return fail('E_EDIT_VOICE_WINDOW', 'The captioned dub did not preserve the source picture duration.');
+    }
+    if (p.signal?.aborted) return fail('E_EDIT_ABORTED', 'Dubbing was cancelled before delivery.');
+    try {
+      await fs.link(captioned, output);
+    } catch (error) {
+      if (!['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      await fs.copyFile(captioned, output, fsSync.constants.COPYFILE_EXCL);
+    }
+    return { ok: true, op: 'mix', path: output, bytes: burn.bytes, duration_sec: actualDuration,
+      coverage: mix.coverage, caption_cues: cues };
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function runEdit(p: EditParams, dubPlacement?: {
+  duration: number; voicedSpans: Span[]; measurements?: SilenceMeasureResult[];
+}): Promise<EditResult> {
   const bins = resolveBins();
   if (!bins) return fail('E_EDIT_FFMPEG_MISSING', 'Bundled ffmpeg/ffprobe not found.');
 
@@ -1496,14 +1833,41 @@ async function runEdit(p: EditParams): Promise<EditResult> {
     if (r.code !== 0) return ffmpegFailure('trim', r, p.outputAbsPath);
     const checked = await validateTrimOutput(bins.ffprobe, p.outputAbsPath, p.signal);
     if (checked.ok === false) return fail(checked.errorCode, checked.message);
-    return { ok: true, op: 'trim', path: p.outputAbsPath, bytes: checked.bytes };
+    const cutSec = await probeVideoDurationSec(bins.ffprobe, p.outputAbsPath, p.signal) ?? checked.durationSec;
+    const requestedSec = spec ? frames / spec.fps : duration;
+    const toleranceSec = spec ? 0.5 / spec.fps : TRIM_SHORTFALL_TOLERANCE_SEC;
+    const warning = cutSec < requestedSec - toleranceSec
+      ? trimShortfallWarning({
+        // The picture's own length: AAC sound often runs a few milliseconds past it.
+        inputSec: await probeVideoDurationSec(bins.ffprobe, p.inputAbsPath, p.signal) ?? inputDurationSec,
+        startSec: start,
+        requestedSec,
+        cutSec,
+        toleranceSec,
+      })
+      : null;
+    return {
+      ok: true,
+      op: 'trim',
+      path: p.outputAbsPath,
+      bytes: checked.bytes,
+      duration_sec: Math.round(cutSec * 1000) / 1000,
+      ...(warning ? { warning } : {}),
+    };
   }
 
   if (p.op === 'normalize_loudness') {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'normalize_loudness requires input_path');
     const base = await probeBasic(bins.ffprobe, p.inputAbsPath, p.signal);
     if (!base.hasAudio) return fail('E_EDIT_NO_AUDIO', 'normalize_loudness requires an input with an audio stream.');
-    const ln = normalizeLoudnessAudioFilter();
+    // Measure first, so the normalization applies to this audio and lands on the target.
+    const measuring = await run(bins.ffmpeg, [
+      '-hide_banner', '-nostats', '-i', p.inputAbsPath, '-map', '0:a:0',
+      '-af', `loudnorm=I=${MIX_LOUDNORM.I}:TP=${MIX_LOUDNORM.TP}:LRA=${MIX_LOUDNORM.LRA}:print_format=json`,
+      '-f', 'null', '-',
+    ], p.signal);
+    if (p.signal?.aborted) return fail('E_EDIT_ABORTED', 'normalize_loudness was cancelled.');
+    const ln = normalizeLoudnessAudioFilter(measuring.code === 0 ? loudnormMeasuredOptions(measuring.stderr) : null);
     const r = await run(bins.ffmpeg, withFfmpegProgress([
       '-y', '-i', p.inputAbsPath,
       '-map', '0:v?', '-map', '0:a:0',
@@ -1672,31 +2036,53 @@ async function runEdit(p: EditParams): Promise<EditResult> {
   if (p.op === 'burnsubs') {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'burnsubs requires input_path');
     if (!p.subtitlesAbsPath) return fail('E_EDIT_ARG', 'burnsubs requires subtitles_path (.srt/.ass)');
-    const subEsc = escapeFfmpegFilterValue(p.subtitlesAbsPath);
-    const subtitleText = await fs.readFile(p.subtitlesAbsPath, 'utf8').catch(() => '');
+    // Other encodings stay with FFmpeg's subtitle decoder when a lossless UTF-8 copy is unavailable.
+    const subtitleText = await fs.readFile(p.subtitlesAbsPath)
+      .then((bytes) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes))
+      .catch(() => '');
     const fontName = captionFontForText(subtitleText, process.platform);
     const displaySize = await probeDisplaySize(bins.ffprobe, p.inputAbsPath, p.signal);
     let styleSuffix = burnsubsForceStyle(fontName, displaySize, p.subtitlesAbsPath);
+    // A plain caption file is burned from a copy whose long lines are broken to the frame's width;
+    // the user's file is left as it is. An .ass file keeps its author's layout.
+    const plainCaptions = /\.(srt|vtt)$/i.test(p.subtitlesAbsPath);
+    const wrapped = plainCaptions && displaySize
+      ? wrapCaptionText(subtitleText, captionLineEm(displaySize, isVerticalFrame(displaySize) ? VERTICAL_CAPTION_FONT_SIZE : DEFAULT_CAPTION_FONT_SIZE))
+      : subtitleText;
     let coverFilter = '';
     if (p.cover) {
       const { top, bottom } = p.cover;
-      if (!(Number.isFinite(top) && Number.isFinite(bottom) && top >= 0 && bottom <= 1 && bottom - top > 0 && bottom - top <= 0.5)) {
+      if (!validCover({ top, bottom })) {
         return fail('E_EDIT_ARG', 'cover takes the band of the old captions as two fractions of the picture height from the top, top then bottom, at most half the height apart (for example 0.78,0.88).');
       }
       const band = coverBandFilter(p.cover);
       coverFilter = `${band.filter},`;
       // Plain captions sit in the band; an .ass file keeps its own placement.
       if (!/\.(ass|ssa)$/i.test(p.subtitlesAbsPath)) {
-        styleSuffix = `:force_style='${[fontName ? `FontName=${fontName}` : '', 'Alignment=2', `MarginV=${band.marginV}`].filter(Boolean).join(',')}'`;
+        styleSuffix = `:force_style='${[fontName ? `FontName=${fontName}` : '', isVerticalFrame(displaySize) ? `FontSize=${VERTICAL_CAPTION_FONT_SIZE}` : '',
+          'Alignment=2', `MarginV=${band.marginV}`].filter(Boolean).join(',')}'`;
       }
     }
     const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
-    const r = await run(bins.ffmpeg, withFfmpegProgress([
-      '-y', '-i', p.inputAbsPath, '-vf', `${coverFilter}subtitles=filename=${subEsc}${styleSuffix}`,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'copy', '-movflags', '+faststart', p.outputAbsPath,
-    ]), p.signal, { op: 'burnsubs', phase: 'edit', durationSec });
-    if (r.code !== 0) return ffmpegFailure('burnsubs', r, p.outputAbsPath);
-    return { ok: true, op: 'burnsubs', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
+    let wrappedDir: string | undefined;
+    try {
+      let subtitlesFile = p.subtitlesAbsPath;
+      if (wrapped !== subtitleText) {
+        wrappedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-captions-'));
+        subtitlesFile = path.join(wrappedDir, `captions${path.extname(p.subtitlesAbsPath).toLowerCase() || '.srt'}`);
+        await fs.writeFile(subtitlesFile, wrapped, 'utf8');
+      }
+      const subtitlesArg = escapeFfmpegFilterValue(subtitlesFile);
+      const r = await run(bins.ffmpeg, withFfmpegProgress([
+        '-y', '-i', p.inputAbsPath, '-vf', `${coverFilter}subtitles=filename=${subtitlesArg}${styleSuffix}`,
+        ...(dubPlacement ? ['-fps_mode', 'passthrough'] : []),
+        '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'copy', '-movflags', '+faststart', p.outputAbsPath,
+      ]), p.signal, { op: 'burnsubs', phase: 'edit', durationSec });
+      if (r.code !== 0) return ffmpegFailure('burnsubs', r, p.outputAbsPath);
+      return { ok: true, op: 'burnsubs', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
+    } finally {
+      if (wrappedDir) await fs.rm(wrappedDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   if (p.op === 'overlay') {
@@ -1894,6 +2280,10 @@ async function runEdit(p: EditParams): Promise<EditResult> {
 
   if (p.op === 'mix') {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'mix requires input_path (the base video)');
+    if (p.audioSegments?.some(line => line && (line.caption !== undefined || line.sourceStartSec !== undefined || line.sourceEndSec !== undefined))) {
+      return runCaptionedDub(p, bins);
+    }
+    if (p.fitDub) return fail('E_EDIT_ARG', 'fit-dub requires captioned audio segments.');
     // Per-line segments take precedence; otherwise the single audio_path + start.
     const segs: Array<{ audioAbsPath: string; startSec: number; endSec?: number }> =
       (p.audioSegments && p.audioSegments.length)
@@ -1905,19 +2295,23 @@ async function runEdit(p: EditParams): Promise<EditResult> {
 
     const mode = p.onExistingAudio ?? 'reject';
     const base = await probeBasic(bins.ffprobe, p.inputAbsPath, p.signal);
+    const pictureDuration = dubPlacement?.duration ?? base.durationSec;
     const pictureLocked = segs.some(s => s.endSec !== undefined);
     let windowMeasurements: SilenceMeasureResult[] | undefined;
     if (pictureLocked) {
       if (p.audioSegments!.some(s => s.startSec !== undefined && (!Number.isFinite(s.startSec) || s.startSec < 0))
         || segs.some((s, i) => !Number.isFinite(s.endSec) || !(s.endSec! > s.startSec)
-        || s.endSec! > base.durationSec || (i > 0 && s.startSec < segs[i - 1].endSec!))) {
+        || s.endSec! > pictureDuration || (i > 0 && s.startSec < segs[i - 1].endSec!))) {
         return fail('E_EDIT_VOICE_WINDOW', 'Every fixed picture window must have a finite end, fit the source and follow the previous window.');
       }
-      windowMeasurements = await mapWithConcurrencyLimit(segs, MIX_COVERAGE_CONCURRENCY, s =>
+      windowMeasurements = dubPlacement?.measurements ?? await mapWithConcurrencyLimit(segs, MIX_COVERAGE_CONCURRENCY, s =>
         measureSilenceCoverage(s.audioAbsPath, p.signal ? { signal: p.signal } : {}));
       for (let i = 0; i < segs.length; i++) {
         const measured = windowMeasurements[i];
         if (!measured.ok) return fail('E_EDIT_VOICE_WINDOW', `Speech timing for segment ${i + 1} is unavailable; no mix was written.`);
+        if (dubPlacement && measured.timing.voicedDurationSec <= 0) {
+          return fail('E_EDIT_VOICE_WINDOW', `Dub segment ${i + 1} has no audible speech.`);
+        }
         if (segs[i].startSec + measured.timing.voicedEndSec > segs[i].endSec! + 0.001) {
           return fail('E_EDIT_VOICE_WINDOW', `Speech in segment ${i + 1} exceeds its declared picture window; no mix was written.`);
         }
@@ -1951,7 +2345,7 @@ async function runEdit(p: EditParams): Promise<EditResult> {
       segmentStartSec: segs.map((s) => s.startSec),
       baseHasAudio: base.hasAudio,
       mode: mode === 'replace' ? 'replace' : 'mix',
-      padWholeDurSec: base.durationSec > 0 ? base.durationSec : null,
+      padWholeDurSec: pictureDuration > 0 ? pictureDuration : null,
       loudnorm: ln,
       duck: p.duck === true,
     });
@@ -1966,7 +2360,7 @@ async function runEdit(p: EditParams): Promise<EditResult> {
       '-c:v', 'copy', '-c:a', 'aac', '-ar', String(sr),
       '-metadata', `comment=${markedComment}`,
       '-shortest', '-movflags', '+faststart', p.outputAbsPath,
-    ]), p.signal, { op: 'mix', phase: 'edit', durationSec: base.durationSec });
+    ]), p.signal, { op: 'mix', phase: 'edit', durationSec: pictureDuration });
     if (r.code !== 0) return ffmpegFailure('mix', r, p.outputAbsPath);
     // Coverage: silencedetect each SOURCE segment and combine the placed voiced
     // spans on the clip timeline — deterministic and unaffected by the -shortest
@@ -1996,7 +2390,7 @@ async function runEdit(p: EditParams): Promise<EditResult> {
     }
     if (measuredAll && placedEnds.length) {
       coverage = assessVoiceoverCoverage({
-        referenceDurationSec: base.durationSec,
+        referenceDurationSec: pictureDuration,
         offsetSec: 0,
         audioDurationSec: Math.max(...placedAudioEnds),
         voicedStartSec: Math.min(...placedStarts),
@@ -2039,7 +2433,14 @@ async function runEdit(p: EditParams): Promise<EditResult> {
         + ' or extend the video to cover it. Do not raise the speech speed to fit — a rushed read still misses its scene.',
       );
     }
-    return { ok: true, op: 'mix', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath), ...(coverage ? { coverage } : {}) };
+    // Replacing a base that carries sound drops what it says; a silent base loses nothing.
+    let replaceWarning: string | null = null;
+    if (dubPlacement) dubPlacement.voicedSpans = placedSpans;
+    if (base.hasAudio && mode === 'replace' && !dubPlacement) {
+      const baseSound = await measureSilenceCoverage(p.inputAbsPath, p.signal ? { signal: p.signal } : {});
+      if (baseSound.ok && baseSound.timing.voicedDurationSec >= REPLACE_WARNING_MIN_SOUND_SEC) replaceWarning = REPLACE_DROPS_SOUND_WARNING;
+    }
+    return { ok: true, op: 'mix', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath), ...(coverage ? { coverage } : {}), ...(replaceWarning ? { warning: replaceWarning } : {}) };
   }
 
   return fail('E_EDIT_ARG', `unknown op: ${String(p.op)}`);

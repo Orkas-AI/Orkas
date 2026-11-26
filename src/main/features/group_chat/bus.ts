@@ -80,7 +80,7 @@ import {
   takeOrchestrationLedgerForAgent, takeOrchestrationLedgerForForm, clearOrchestrationLedger,
   beginAgentHandoff, rollbackAgentHandoff, clearOrchestrationForCancellation,
   setOrchestrationLedgerIfFree, claimFloorForWaitingTask, releaseWaitingFloor, waitingFloorBinding,
-  boundOrchestrationGoal,
+  boundOrchestrationGoal, normalizeOrchestrationRequestHistory, type OrchestrationRequestEntry,
 } from './state';
 import type { StateFile } from './state';
 import { maxToolLoopsForActorKind } from './actor-budgets';
@@ -100,7 +100,7 @@ import {
   resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
   extractHandbackFromFinal,
-  extractPlanInteractionFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
+  extractPlanInteractionFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission, encodeSubmission,
   type HandbackReason, type PlanInteractionStatus,
 } from './router';
 import * as skillsFeat from '../skills';
@@ -123,7 +123,6 @@ import * as agentsFeat from '../agents';
 import {
   planUserDispatch,
   buildAssignmentContext,
-  type DispatchPlanResult,
   type PlannerCandidate,
 } from './dispatch_planner';
 import * as runtimeContentPublish from '../runtime_content_publish';
@@ -133,6 +132,7 @@ import type { AgentRunStatus } from '../agent_runtime_stats';
 import { isAgentEnabled, readDisabledSets } from '../component_enabled';
 import { finalizeProducedFile, recordProducedFile } from '../produced_output_hooks';
 import { selectVisibleProducedFiles } from '../produced_files';
+import { readProducedFileVersion } from '../../model/core-agent/task-file-ownership';
 import { excludeUnchangedInputs } from '../produced_input_guard';
 import { buildHostTurnLanguageDirective, buildLanguageDirective, normalizeLang, t, type Lang } from '../../i18n';
 import { resolveLanguageForUser } from '../config';
@@ -169,9 +169,13 @@ import {
 } from '../../model/core-agent/skill-registry';
 import { AGENT_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
 import * as connectorActionConfirm from '../connectors/action_confirm';
+import * as connectorInstallConfirm from '../connectors/install_confirm';
 import * as bashPermissions from '../../model/core-agent/bash-permissions';
 import { OWN_KEY_RESULT_PREFIX } from '../video_production_spend';
-import { toolExecutionFactKind } from '../../model/core-agent/tool-catalog';
+import { IMAGE_STUDIO_AGENT_ID, toolExecutionFactKind } from '../../model/core-agent/tool-catalog';
+import {
+  ImageStudioNativePngDelivery, partitionImageStudioLayeredOutputs, requestsImageStudioNativePng,
+} from '../image_studio_delivery';
 import {
   buildInputChannelProtocol,
   buildOutputFormatHint,
@@ -840,6 +844,7 @@ export interface ActiveTurn {
 interface QueueItem {
   /** Memory-only search count shared by this user message and its descendants. */
   tavilySearchTurn?: TavilySearchTurn;
+  orchestrationRequestHistory?: OrchestrationRequestEntry[];
   /** Goal of this specific host continuation, never inferred from its text. */
   orchestrationGoal?: string;
   /** Target actor of this turn — who runs it. G8d: top-level turns funnel
@@ -852,6 +857,7 @@ interface QueueItem {
    * instead of actor id so a later turn cannot re-adopt an older bubble. */
   turnId: string;
   msgId: string;
+  imageStudioNativePng?: true;
   fromActorId: string;
   /** Host-authorized delivery into the currently active turn. Ordinary user
    * messages omit this and remain in the durable worker FIFO; the renderer's
@@ -901,6 +907,10 @@ interface QueueItem {
    * the Files view, but their intermediate agent bubble must not show a file
    * footer. Direct turns and `hand_off_to` are final-delivery turns. */
   outputDelivery?: 'final' | 'process';
+  /** The host sent this message to run a to-do (auto-advance or "run now").
+   *  Only tells the turn its reply may have no reader; entry-point
+   *  attribution and routing are unchanged. */
+  hostTodoRun?: boolean;
   /** Conversation task-board row naming this top-level execution
    * (task_board.ts). Absent on nested runs and on steer items — a steer
    * message folds into the live turn instead of becoming its own task; a
@@ -1163,6 +1173,7 @@ interface CidState {
     produced: string[];
     form?: ChatFormPayload;
     errText?: string;
+    stopReason?: HostStopReason;
   }>;
   /** Monotonic clock ordering queued messages against Agents parking on a
    * question to the user (board timestamps are whole seconds). In memory
@@ -1199,18 +1210,12 @@ interface CidState {
    *  between the commander's narration and the agent's first token. Anonymous
    *  workers (kind:'worker') are NOT mirrored: their stream is suppressed. */
   nestedTurns: Map<string, ActiveTurn & { order: number }>;
-  /** Absolute paths written by any actor in THIS conversation since the
-   *  bus was loaded. Feeds the write-tools' uniquify `isMine` predicate
-   *  so refining a file across turns overwrites in place — the LLM's
-   *  mental model stays in lockstep with disk. Files the user pre-created
-   *  are NOT in this set and still get `-N` suffixed, protecting work the
-   *  model didn't author. In-memory only; an app restart resets it (a
-   *  fresh process can't tell its own prior writes from the user's
-   *  anyway). */
-  producedPaths: Set<string>;
+  /** In-memory versions of host-produced conversation files eligible for refinement. */
+  producedPaths: Map<string, string>;
   /** User message ids that already caused a direct-agent handback. Multiple
    *  agents may receive one @-message, but commander must resume it once. */
   directHandbackOrigins: Set<string>;
+  settledRunId?: string;
   /** One user-triggered run spans every top-level turn until the whole
    * conversation bus becomes quiescent. It is intentionally content-free:
    * terminal listeners may feed OS notifications and must never receive
@@ -1349,7 +1354,7 @@ function getOrInitCid(uid: string, cid: string): CidState {
       backgroundWrites: new Set(),
       nextTurnOrder: 0,
       nestedTurns: new Map(),
-      producedPaths: new Set(),
+      producedPaths: new Map(),
       directHandbackOrigins: new Set(),
     };
     _cids.set(k, s);
@@ -1498,6 +1503,7 @@ function _emitTaskRunTerminal(state: CidState, status: TaskTerminalStatus): void
   // Clear synchronously before notifying. Concurrent status reconciliations
   // can now observe the run as finished and cannot emit it twice.
   state.taskRun = undefined;
+  state.settledRunId = run.runId;
   finishBrowserTaskRun(state.uid, state.cid, run.runId);
   // "Allow for this task" is deliberately run-scoped. Clear both grants and
   // any now-stale prompts at the same quiescent boundary that emits the task
@@ -1732,17 +1738,21 @@ export function activeConversationCount(uid: string): number {
   return count;
 }
 
-export function runtimeSnapshot(uid: string, cid: string): { processing: boolean; inFlight: string[]; activeTurns: ActiveTurn[] } {
+export function runtimeSnapshot(uid: string, cid: string): {
+  processing: boolean; inFlight: string[]; activeTurns: ActiveTurn[]; settledRunId?: string;
+} {
   const s = _cids.get(cidKey(uid, cid));
   if (!s) return { processing: false, inFlight: [], activeTurns: [] };
   const inFlight: string[] = [];
   for (const [, w] of s.executions) {
     if (w.running) inFlight.push(w.actor.id);
   }
+  const processing = !isQuiescent(uid, cid);
   return {
-    processing: !isQuiescent(uid, cid),
+    processing,
     inFlight,
     activeTurns: activeTurnsForState(s),
+    ...(!processing && !s.taskRun && s.settledRunId ? { settledRunId: s.settledRunId } : {}),
   };
 }
 
@@ -2227,12 +2237,20 @@ async function buildGroupHistoryForTurn(params: {
 // ── enqueue ──────────────────────────────────────────────────────────────
 
 export interface EnqueueParams {
+  orchestrationRequestHistory?: OrchestrationRequestEntry[];
+  /** Host-restored execution contract; never accepted from a renderer send. */
+  taskInstruction?: string;
+  assignmentContext?: string;
+  predecessorContext?: string;
+  completedPredecessorTaskIds?: string[];
   /** Trusted internal source metadata; public sends do not accept this field. */
   orchestrationGoal?: string;
   uid: string;
   cid: string;
   fromActorId: string;
   text: string;
+  /** Host-only working directory of the execution that authored this reply. */
+  replyMediaBaseDir?: string;
   /** Await host feature facts before publishing any recipient work. This
    * does not own runtime admission, sessions, or model lifecycle events. */
   beforeDispatch?: (run: { runId: string }) => Promise<void>;
@@ -2243,6 +2261,9 @@ export interface EnqueueParams {
    * from ordinary queued sends: ordinary sends queue by default, while
    * the explicit queue "Send now" action may opt into native/CoreAgent steer. */
   steerActiveTurn?: boolean;
+  /** Host-only: the message runs a to-do on the host's initiative. */
+  hostTodoRun?: boolean;
+  confirmTodoAdmission?: boolean;
   /** Renderer-generated id for a user send; persisted verbatim so the
    * optimistic bubble can be claimed by identity. See GroupMessage. */
   client_msg_id?: string;
@@ -2259,6 +2280,10 @@ export interface EnqueueParams {
    * session even though ordinary CLI messages do. */
   failedTurnRetryMode?: 'resume' | 'restart';
   retrySourceMessageId?: string;
+  /** Board provenance for an explicit retry of a delegated task. */
+  retryOfTaskId?: string;
+  /** Restore an explicitly selected ImageStudio export on a failed-turn retry. */
+  imageStudioNativePng?: true;
   /** Host-computed count of possibly non-idempotent operations whose outcome
    * is unknown. Diagnostic-only; never persisted into message content. */
   retryUncertainOperationCount?: number;
@@ -2345,6 +2370,8 @@ export interface EnqueueParams {
   /** Reject a result delivery whose admission crossed whole-task Stop. */
   dispatchEpoch?: number;
 }
+
+export const FAILED_TURN_RETRY_ACTOR_UNAVAILABLE = 'E_FAILED_TURN_RETRY_ACTOR_UNAVAILABLE';
 
 /**
  * Persist a group message + dispatch to recipient queues. Returns the
@@ -2440,6 +2467,7 @@ async function _enqueueBody(
   // Resolve the project before parsing names: an unavailable Agent is plain
   // text, not a segment that can be discarded after routing.
   let projectAgentIds: Set<string> | null = null;
+  let projectRecipientScopeUnavailable = false;
   try {
     const { getConversation } = await import('../chats');
     const conv = await getConversation(uid, cid);
@@ -2447,12 +2475,22 @@ async function _enqueueBody(
       const { resolveProjectScope } = await import('../projects');
       const scope = await resolveProjectScope(uid, conv.project_id);
       if (scope) projectAgentIds = new Set(scope.agents);
+      else projectRecipientScopeUnavailable = true;
     }
   } catch (err) {
+    projectRecipientScopeUnavailable = true;
     log.warn('project recipient scope unavailable', { cid: maskId(cid), error: logErrorSummary(err) });
   }
   const eligibleRecipient = (id: string) => RESERVED_IDS.has(id)
     || ((!projectAgentIds || projectAgentIds.has(id)) && isAgentEnabled(uid, id));
+
+  // Retry belongs to the original actor. Recheck admission after queueing
+  // and before the general send path can fall back to Commander.
+  const retryActor = params.failedTurnRetryMode ? params.forceTo?.[0] : undefined;
+  if (retryActor && !RESERVED_IDS.has(retryActor)
+    && (projectRecipientScopeUnavailable || !eligibleRecipient(retryActor))) {
+    throw Object.assign(new Error(t('errors.task_restore_unavailable')), { code: FAILED_TURN_RETRY_ACTOR_UNAVAILABLE });
+  }
 
   // The conversation floor: a no-`@` USER message routes here (the agent the
   // commander handed off to, or the one the user picked on the chip), else
@@ -2575,6 +2613,11 @@ async function _enqueueBody(
   if (routeMentionOnly) {
     throw Object.assign(new Error('empty message'), { code: 'E_EMPTY_MESSAGE' });
   }
+  const imageStudioNativePng = fromActorId === USER_ID && to.length === 1 && to[0] === IMAGE_STUDIO_AGENT_ID
+    && (params.imageStudioNativePng || requestsImageStudioNativePng(text));
+  // Keep an explicit export in its own actor turn, including when another
+  // ImageStudio request is currently running.
+  if (imageStudioNativePng && params.steerActiveTurn) params = { ...params, steerActiveTurn: false };
   // Only an accepted user request starts a run or clears the stopped state.
   // Worker replies, including abort cleanup, must never clear user Stop.
   if (fromActorId === USER_ID) {
@@ -2732,18 +2775,18 @@ async function _enqueueBody(
   // Generated-media tools return revisioned URLs, but assistant prose can
   // retype the same path and drop (or preserve an older) `?v=` token. Enforce
   // freshness at the one persistence boundary shared by normal replies,
-  // commander segments, and terminal replies. The conversation workspace is
-  // also where an agent's relative media destination is rooted, so it is
-  // resolved here — the renderer has no base directory of its own. Never
-  // rewrite user-authored text: a user may be quoting a URL or an older
-  // revision intentionally.
+  // commander segments, and terminal replies. Resolve relative media against
+  // the authoring turn's directory when supplied. Keep the legacy directory
+  // for document links and host messages without an execution directory.
+  // User-authored links are kept verbatim.
   // Every Markdown destination the rewrite can touch contains `](`; without
   // one there is nothing to resolve, so the state and conversation reads are
   // skipped for the bubbles that carry no link or image at all.
-  let mediaBaseDir = '';
-  if (fromKind !== 'user' && rewrittenText.includes('](')) {
+  let legacyLinkBaseDir = '';
+  const hasAssistantLink = fromKind !== 'user' && rewrittenText.includes('](');
+  if (hasAssistantLink) {
     const { readConversationAuthoringDir } = await import('./conv_workspace');
-    mediaBaseDir = await readConversationAuthoringDir(uid, cid).catch((err) => {
+    legacyLinkBaseDir = await readConversationAuthoringDir(uid, cid).catch((err) => {
       log.warn('resolve media base dir failed', {
         cid: maskId(cid),
         error: logErrorSummary(err),
@@ -2753,7 +2796,7 @@ async function _enqueueBody(
   }
   const persistedText = fromKind === 'user'
     ? rewrittenText
-    : versionChatMediaLocalUrlsInText(rewrittenText, mediaBaseDir);
+    : versionChatMediaLocalUrlsInText(rewrittenText, legacyLinkBaseDir, undefined, params.replyMediaBaseDir);
 
   const msgId = genId12();
   const ts = nowIso();
@@ -2766,6 +2809,8 @@ async function _enqueueBody(
     ...(unknown.length ? { unknown_mentions: unknown } : {}),
     ...(mentions.length ? { mentions } : {}),
     text: persistedText,
+    ...(hasAssistantLink && params.replyMediaBaseDir ? { relative_media_resolved_at_send: true as const } : {}),
+    ...(imageStudioNativePng ? { image_studio_native_png: true as const } : {}),
     ...(displayText !== undefined ? { display_text: displayText } : {}),
     ...(params.failure_kind ? { failure_kind: params.failure_kind } : {}),
     ...(params.failure_code ? { failure_code: params.failure_code } : {}),
@@ -2791,6 +2836,9 @@ async function _enqueueBody(
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.orchestrationGoal !== undefined
       ? { orchestration_goal: boundOrchestrationGoal(params.orchestrationGoal) } : {}),
+    ...(params.orchestrationRequestHistory ? {
+      orchestration_request_history: normalizeOrchestrationRequestHistory(params.orchestrationRequestHistory),
+    } : {}),
     ...(params.commanderRetryContinuation ? {
       commander_retry: {
         source_tool: 'dispatch_to' as const,
@@ -2920,19 +2968,21 @@ async function _enqueueBody(
             && (!t.resume?.form_id || t.resume.form_id === formSubmission.form_id));
           if (waiting) { // resume: no new row; claim flips it to running
             boardTaskId = waiting.task_id;
+            msg.task_id = waiting.task_id;
             continuedAssignment = waiting.assignment_context;
           }
         } catch (err) {
           log.warn(`form-resume task lookup failed cid=${cid}: ${(err as Error).message}`);
         }
-      } else if (fromActorId === USER_ID && !formSubmission && actor.kind === 'agent') {
+      } else if (fromActorId === USER_ID && !formSubmission && actor.kind === 'agent' && !params.retryOfTaskId) {
         // A plain reply to an Agent that stopped to ask the user continues
         // that same task, so its dependents and its Commander resume stay
-        // attached instead of being cancelled as a superseded row.
+        // attached. An explicit delegated retry owns a new attempt row.
         try {
           const waiting = await _waitingReplyTask(state, uid, cid, actor.id);
           if (waiting) {
             boardTaskId = waiting.task_id;
+            msg.task_id = waiting.task_id;
             continuedAssignment = waiting.assignment_context;
             pendingFormId = waiting.resume?.form_id;
           }
@@ -2945,14 +2995,17 @@ async function _enqueueBody(
           const created = await taskBoard.createTask(uid, cid, {
             admissionPending: true,
             assignee: actor.id,
-            instruction: persistedText,
+            instruction: params.taskInstruction ?? persistedText,
             createdBy: params.terminalHandoff
               ? 'commander'
               : (fromActorId === USER_ID ? 'user' : 'system'),
             ...(params.parentTaskId ? { parentTaskId: params.parentTaskId } : {}),
+            ...(params.retryOfTaskId ? { retryOfTaskId: params.retryOfTaskId } : {}),
             ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
             sourceMsgId: msgId,
             turnId,
+            ...(params.assignmentContext ? { assignmentContext: params.assignmentContext } : {}),
+            ...(params.completedPredecessorTaskIds?.length ? { after: params.completedPredecessorTaskIds } : {}),
           });
           boardTaskId = created.task_id;
           emit(state, { type: 'task_created', cid, task: created });
@@ -2975,9 +3028,11 @@ async function _enqueueBody(
       turnId,
       msgId,
       fromActorId,
+      ...(msg.image_studio_native_png ? { imageStudioNativePng: true as const } : {}),
       tavilySearchTurn: currentTavilySearchTurn(uid, cid),
       enqueueSeq: ++state.waitClock,
       ...(params.steerActiveTurn ? { steerActiveTurn: true } : {}),
+      ...(params.hostTodoRun && fromActorId === USER_ID ? { hostTodoRun: true } : {}),
       ...(deferBubble ? { deferredBubble: { persist: persistUserBubble } } : {}),
       ...(boardTaskId ? { taskId: boardTaskId } : {}),
       sourceText: persistedText,
@@ -2985,7 +3040,9 @@ async function _enqueueBody(
       sourceRecipients: msg.to.slice(),
       llmPayload: composeLlmTurnPayload(uid, fromActorId, msg),
       ...(msg.orchestration_goal !== undefined ? { orchestrationGoal: msg.orchestration_goal } : {}),
-      ...(continuedAssignment ? { assignmentContext: continuedAssignment } : {}),
+      ...(msg.orchestration_request_history ? { orchestrationRequestHistory: msg.orchestration_request_history } : {}),
+      ...((continuedAssignment || params.assignmentContext) ? { assignmentContext: continuedAssignment || params.assignmentContext } : {}),
+      ...(params.predecessorContext ? { predecessorContext: params.predecessorContext } : {}),
       ...(pendingFormId ? { pendingFormId } : {}),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
       ...(msg.references && msg.references.length ? { references: msg.references.slice() } : {}),
@@ -3108,6 +3165,7 @@ async function _enqueueBody(
     return { ...msg, persisted: bubblePersisted } as GroupMessage;
   }
 
+  if (params.confirmTodoAdmission) await _admissionSettled(state);
   return msg;
 }
 
@@ -3258,6 +3316,7 @@ function _referenceContextForModel(uid: string, references: readonly ChatMessage
 }
 
 type NestedDispatchSourceContext = {
+  orchestrationRequestHistory?: OrchestrationRequestEntry[];
   orchestrationGoal?: string;
   originMessageId?: string;
   references?: ChatMessageReference[];
@@ -3409,6 +3468,18 @@ function _orchestrationGoal(item: QueueItem | undefined, payload: string): strin
   return boundOrchestrationGoal(item?.orchestrationGoal ?? (_unwrapLlmTurnPayload(payload) ?? payload));
 }
 
+function _orchestrationRequestEntry(item: QueueItem): OrchestrationRequestEntry {
+  const text = item.orchestrationGoal ?? (_unwrapLlmTurnPayload(item.llmPayload) ?? item.llmPayload);
+  const bounded = boundOrchestrationGoal(text);
+  return { source_message_id: item.msgId, text: bounded,
+    ...(bounded.length < text.length ? { text_truncated: true } : {}) };
+}
+
+function _orchestrationRequestData(history: OrchestrationRequestEntry[] | undefined) {
+  const messages = normalizeOrchestrationRequestHistory(history);
+  return messages ? { request_history: { messages } } : {};
+}
+
 function _buildOrchestrationStateBlock(ledger: NonNullable<StateFile['orchestration_ledger']> | undefined): string {
   if (!ledger) return '';
   return [
@@ -3433,6 +3504,7 @@ function _buildOrchestrationStateBlock(ledger: NonNullable<StateFile['orchestrat
       owner_agent_name: ledger.owner_agent_name || '',
       form_id: ledger.form_id || '',
       user_goal: ledger.user_goal,
+      ..._orchestrationRequestData(ledger.request_history),
       handoff_message: ledger.handoff_message,
       resume_instruction: ledger.resume_instruction,
       created_at: ledger.created_at,
@@ -3450,6 +3522,7 @@ function _buildOrchestrationResumeModelText(
   handbackReason?: HandbackReason | 'legacy_unspecified',
   terminal?: {
     status: TaskTerminalStatus;
+    stop_reason?: HostStopReason;
     failure?: TaskFailureDiagnostic;
   },
 ): string {
@@ -3465,6 +3538,7 @@ function _buildOrchestrationResumeModelText(
       owner_agent_name: ledger.owner_agent_name || '',
       form_id: ledger.form_id || '',
       user_goal: ledger.user_goal,
+      ..._orchestrationRequestData(ledger.request_history),
       handoff_message: ledger.handoff_message,
       resume_instruction: ledger.resume_instruction,
       ...(handbackReason ? { handback_reason: handbackReason } : {}),
@@ -3496,6 +3570,7 @@ async function _setFormWaitLedgerFromWorkerResult(params: {
   ownerAgentId: string;
   ownerAgentName?: string;
   userGoal: string;
+  requestHistory?: OrchestrationRequestEntry[];
   agentTask: string;
   resume?: string;
   sourceTool: 'dispatch_to' | 'run_worker' | 'hand_off_to';
@@ -3525,6 +3600,7 @@ async function _setFormWaitLedgerFromWorkerResult(params: {
     ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
     form_id: blockedForm.form_id,
     user_goal: _clipForOrchestration(params.userGoal),
+    ...(params.requestHistory ? { request_history: params.requestHistory } : {}),
     handoff_message: _clipForOrchestration(params.agentTask),
     resume_instruction: params.resume && params.resume.trim()
       ? params.resume.trim()
@@ -3540,6 +3616,7 @@ async function _setFormWaitLedgerFromWorkerResult(params: {
         form_id: blockedForm.form_id,
         source_tool: params.sourceTool,
         user_goal: _clipForOrchestration(params.userGoal),
+        ...(params.requestHistory ? { request_history: params.requestHistory } : {}),
         handoff_message: _clipForOrchestration(params.agentTask),
         resume_instruction: params.resume && params.resume.trim()
           ? params.resume.trim()
@@ -3564,6 +3641,7 @@ async function _setUserWaitResumeFromWorkerResult(params: {
   ownerAgentId: string;
   ownerAgentName?: string;
   userGoal: string;
+  requestHistory?: OrchestrationRequestEntry[];
   agentTask: string;
   resume?: string;
 }): Promise<boolean> {
@@ -3577,6 +3655,7 @@ async function _setUserWaitResumeFromWorkerResult(params: {
       await taskBoard.setTaskResume(params.uid, params.cid, params.result.taskId, {
         source_tool: 'dispatch_to',
         user_goal: userGoal,
+        ...(params.requestHistory ? { request_history: params.requestHistory } : {}),
         handoff_message: handoffMessage,
         resume_instruction: resumeInstruction,
       });
@@ -3591,6 +3670,7 @@ async function _setUserWaitResumeFromWorkerResult(params: {
     owner_agent_id: params.ownerAgentId,
     ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
     user_goal: userGoal,
+    ...(params.requestHistory ? { request_history: params.requestHistory } : {}),
     handoff_message: handoffMessage,
     resume_instruction: resumeInstruction,
   });
@@ -3716,6 +3796,7 @@ async function _enqueueOrchestrationResumeFromAgent(params: {
   taskId?: string;
   terminal?: {
     status: TaskTerminalStatus;
+    stop_reason?: HostStopReason;
     failure?: TaskFailureDiagnostic;
   };
 }): Promise<void> {
@@ -3752,6 +3833,7 @@ async function _enqueueOrchestrationResumeFromAgent(params: {
       params.terminal,
     ),
     orchestrationGoal: params.ledger.user_goal,
+    ...(params.ledger.request_history ? { orchestrationRequestHistory: params.ledger.request_history } : {}),
     forceTo: [COMMANDER_ID],
     dispatch: true,
   });
@@ -3764,6 +3846,13 @@ async function _enqueueOrchestrationResumeFromAgent(params: {
 const AGENT_MUTATION_FEEDBACK_TAG = '<agent-mutation-feedback>';
 
 type AgentMutationAction = 'create' | 'edit';
+type SavedProjectAgentBinding = {
+  agent_id: string;
+  name: string;
+  creation: 'saved';
+  binding: 'added' | 'failed' | 'unconfirmed';
+  reason?: import('../projects').ProjectError | 'binding_interrupted';
+};
 type AgentMutationRejectionCode =
   | 'operation_required'
   | 'operation_conflict'
@@ -4352,10 +4441,15 @@ async function _dispatchPlannedUserSend(
   state: CidState,
   input: Parameters<typeof _planAndQueueUserSend>[1],
 ): Promise<string[]> {
+  const controller = new AbortController();
+  (state.planningControllers ??= new Set()).add(controller);
+  const signal = input.params.dispatchSignal
+    ? AbortSignal.any([controller.signal, input.params.dispatchSignal]) : controller.signal;
   _beginDispatchPlanning(state, input.msgId, input.msg.text);
   try {
-    return await _planAndQueueUserSend(state, input);
+    return await _planAndQueueUserSend(state, input, signal);
   } finally {
+    state.planningControllers?.delete(controller);
     _endDispatchPlanning(state, input.msgId);
   }
 }
@@ -4372,10 +4466,10 @@ async function _planAndQueueUserSend(state: CidState, input: {
   candidates: readonly string[];
   roster: readonly Actor[];
   registryActors: ReadonlyMap<string, Actor>;
-}): Promise<string[]> {
+}, signal: AbortSignal): Promise<string[]> {
   const { uid, cid, msg, msgId, fromActorId, params } = input;
   const epoch = state.abortEpoch;
-  const stopped = () => state.terminating || state.abortEpoch !== epoch || params.dispatchSignal?.aborted;
+  const stopped = () => state.terminating || state.abortEpoch !== epoch || signal.aborted;
   const commander: Actor = input.roster.find((a) => a.id === COMMANDER_ID)
     || { kind: 'commander', id: COMMANDER_ID, name: COMMANDER_ID, joined_at: nowIso() };
   const actorFor = (id: string): Actor | undefined => (id === COMMANDER_ID
@@ -4408,28 +4502,16 @@ async function _planAndQueueUserSend(state: CidState, input: {
   });
 
   if (stopped()) return [];
-  const controller = new AbortController();
-  (state.planningControllers ??= new Set()).add(controller);
-  let planned: DispatchPlanResult;
-  try {
-    planned = await planUserDispatch({
-      uid, cid, turnId: genId12(),
-      text: input.text,
-      candidates,
-      // Explicit UI quotes are part of this request's context even when the
-      // authored body contains only recipients. Keep the same bounded, inert
-      // representation each assigned actor receives; quoted mentions never
-      // expand the planner's candidate set.
-      recentHistory: [
-        await _recentHistoryForPlanner(uid, cid, msgId),
-        _referenceContextForModel(uid, msg.references),
-      ].filter(Boolean).join('\n\n'),
-      signal: params.dispatchSignal ? AbortSignal.any([controller.signal, params.dispatchSignal]) : controller.signal,
-    });
-  } finally {
-    state.planningControllers?.delete(controller);
-  }
-  const result = planned;
+  const recentHistory = await _recentHistoryForPlanner(uid, cid, msgId);
+  if (stopped()) return [];
+  const result = await planUserDispatch({
+    uid, cid, turnId: genId12(),
+    text: input.text,
+    candidates,
+    // Keep the same bounded quote context each assigned actor receives.
+    recentHistory: [recentHistory, _referenceContextForModel(uid, msg.references)].filter(Boolean).join('\n\n'),
+    signal,
+  });
   if (stopped() || (result.ok === false && result.reason === 'aborted')) {
     log.info(`planned dispatch dropped after stop cid=${cid} msg=${maskId(msgId)}`);
     return [];
@@ -4553,6 +4635,7 @@ async function _planAndQueueUserSend(state: CidState, input: {
         ? (continued.assignment_context ? { assignmentContext: continued.assignment_context } : {})
         : { assignmentContext }),
       sourceText: instruction,
+      ...(assignmentContext ? { orchestrationGoal: boundOrchestrationGoal(instruction) } : {}),
       sourceRecipients: sourceRecipients.slice(),
       llmPayload: _readdressLlmTurnPayload(composeLlmTurnPayload(uid, fromActorId, msg), [actor.id]),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
@@ -4623,7 +4706,7 @@ async function _planAndQueueUserSend(state: CidState, input: {
 
 /** Consume-time context placed before a turn's input: a planned dispatch's
  * split note, then the dependency hand-off. Empty for ordinary turns. */
-function _turnInputPrelude(item: QueueItem): string {
+function _turnInputPrelude(item: Pick<QueueItem, 'assignmentContext' | 'predecessorContext'>): string {
   return [item.assignmentContext, item.predecessorContext].filter(Boolean).join('\n\n');
 }
 
@@ -4640,17 +4723,25 @@ function _turnInputPrelude(item: QueueItem): string {
  * the board file is durable before the settling event fires, so rows and
  * their result_msg_id are readable here. */
 async function _dependencyResultContext(state: CidState, item: QueueItem): Promise<string> {
-  const rows = await taskBoard.listTasks(state.uid, state.cid);
+  return taskDependencyResultContext(state.uid, state.cid, item.afterTaskIds || [], item.skippedAfterTaskIds || []);
+}
+
+/** The same persisted receipts feed first admission and an explicit retry. */
+export async function taskDependencyResultContext(
+  uid: string, cid: string, after: readonly string[], skipped: readonly string[] = [],
+  canonicalMessages?: GroupMessage[],
+): Promise<string> {
+  const rows = await taskBoard.listTasks(uid, cid);
   // Read helper, not raw layout.messageFile: legacy-layout conversations
   // resolve through its fallback (2026-08-24 review finding GC-2).
-  const messages = await readJsonl<GroupMessage>(conversationMessageReadFile(state.uid, state.cid));
+  const messages = canonicalMessages ?? await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
   let names = new Map<string, string>();
   try {
-    const members = await readMembers(state.uid, state.cid);
+    const members = await readMembers(uid, cid);
     names = new Map(members.actors.map((a) => [a.id, a.name || a.id]));
   } catch { /* raw ids stay readable */ }
   const blocks: string[] = [];
-  for (const id of item.afterTaskIds || []) {
+  for (const id of after) {
     const prev = rows.find((t) => t.task_id === id);
     if (!prev || prev.status !== 'done' || !prev.result_msg_id) continue;
     const resultMsg = messages.find((m) => m.id === prev.result_msg_id);
@@ -4666,11 +4757,11 @@ async function _dependencyResultContext(state: CidState, item: QueueItem): Promi
       '</predecessor-task-result>',
     ].join('\n'));
   }
-  if (item.skippedAfterTaskIds?.length) {
+  if (skipped.length) {
     blocks.push([
       '<missing-predecessor-results>',
       'These earlier tasks from the same user request ended without a result, and the user chose to start your task anyway. Do not invent their output; if it matters, say what is missing.',
-      ...item.skippedAfterTaskIds.map((id) => {
+      ...skipped.map((id) => {
         const row = rows.find((t) => t.task_id === id);
         const who = row ? (names.get(row.assignee) || row.assignee) : id;
         return `- ${buildMention(who)} (${row?.status || 'missing'})`;
@@ -4895,6 +4986,7 @@ function _startExecution(
             turn_id: item.turnId,
             source_message_id: item.msgId,
             ...(item.orchestrationGoal !== undefined ? { orchestrationGoal: item.orchestrationGoal } : {}),
+            ...(item.orchestrationRequestHistory ? { orchestrationRequestHistory: item.orchestrationRequestHistory } : {}),
             ...(item.taskId ? { task_id: item.taskId } : {}),
           });
           visibleTerminalDelivered = true;
@@ -5163,6 +5255,10 @@ async function _prepareRichSteer(
         w.queue.splice(index, 1);
         if (opts.currentUserMessage) opts.currentUserMessage.text = item.llmPayload;
         if (actor.kind === 'commander' && w.item) {
+          // Append once at the actual acknowledgement, not preparation. The
+          // durable/prompt boundary normalizes the inline history in one pass.
+          (w.item.orchestrationRequestHistory ||= [_orchestrationRequestEntry(w.item)])
+            .push(_orchestrationRequestEntry(item));
           w.item.orchestrationGoal = _orchestrationGoal(item, item.llmPayload);
         }
       }
@@ -5401,6 +5497,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         produced: result.produced ? result.produced.slice() : [],
         ...(result.outcome.kind === 'persist' && result.outcome.form ? { form: result.outcome.form } : {}),
         ...(result.errText ? { errText: result.errText } : {}),
+        ...(result.stopReason ? { stopReason: result.stopReason } : {}),
       });
     }
     // Before finishTask fires an awaiting dispatch tool: a delegation check in
@@ -5488,6 +5585,7 @@ type ActorTurnResult =
       errText?: string;
       aborted?: boolean;
       terminalStatus: TaskTerminalStatus;
+      stopReason?: HostStopReason;
       failure?: TaskFailureDiagnostic;
       /** This turn already woke Commander through an explicit handback or a
        * form redemption; post-turn completion must not resume it again. */
@@ -5497,6 +5595,30 @@ type ActorTurnResult =
       /** The Agent ended its routed interaction with an explicit handback. */
       handedBack?: boolean;
     };
+
+type HostStopReason = 'tool_loop_limit' | 'repetitive_tool_calls';
+
+/** Only terminal runtime evidence can supply a stop reason. Advisory signals
+ * and child prose are not termination evidence; legacy/unknown stops stay unknown. */
+function hostStopReason(data: Record<string, unknown> | undefined): HostStopReason | undefined {
+  if (data?.terminal_status !== 'stopped' || !Array.isArray(data.convergence_signals)) return undefined;
+  const signals = data.convergence_signals;
+  const reasons = (['tool_loop_limit', 'repetitive_tool_calls'] as const)
+    .filter(reason => signals.includes(reason));
+  return reasons.length === 1 ? reasons[0] : undefined;
+}
+
+function actorTerminal(result: ActorTurnResult): {
+  status: TaskTerminalStatus;
+  stop_reason?: HostStopReason;
+  failure?: TaskFailureDiagnostic;
+} {
+  return {
+    status: result.terminalStatus,
+    ...(result.kind === 'completed' && result.stopReason ? { stop_reason: result.stopReason } : {}),
+    ...(result.failure ? { failure: result.failure } : {}),
+  };
+}
 
 /** Who answers next after an Agent turn. An Agent that stops to ask the user
  * in prose takes a free floor, so the user's reply is the user's own turn to
@@ -5521,7 +5643,7 @@ async function _settleAgentTurnFloor(
     return;
   }
   // A dispatch child reports to the Commander turn that is awaiting it.
-  if ((!failed && result.terminalStatus !== 'completed') || item.commanderSubtask) return;
+  if ((!failed && result.terminalStatus !== 'completed' && result.terminalStatus !== 'stopped') || item.commanderSubtask) return;
   // An interactive Agent's ordinary turn end is not completion: live runs
   // showed VideoStudio asking for confirmation without the open marker, and
   // releasing the floor then sent the user's answer back through Commander.
@@ -5559,6 +5681,7 @@ async function _settleAgentTurnFloor(
         owner_agent_id: actor.id,
         ...(actor.name ? { owner_agent_name: actor.name } : {}),
         user_goal: meta.user_goal || '',
+        ...(meta.request_history ? { request_history: meta.request_history } : {}),
         handoff_message: meta.handoff_message || '',
         resume_instruction: meta.resume_instruction,
         created_at: now,
@@ -5578,8 +5701,8 @@ async function _settleAgentTurnFloor(
         taskId,
         agentResult: failed
           ? buildWorkerErrorPayload(actor.name || actor.id, text || 'Agent execution failed before producing a completed result.', { produced })
-          : buildWorkerResultPayload(actor.name || actor.id, text, produced),
-        terminal: { status: result.terminalStatus, ...(result.failure ? { failure: result.failure } : {}) },
+          : buildWorkerResultPayload(actor.name || actor.id, text, produced, undefined, undefined, actorTerminal(result)),
+        terminal: actorTerminal(result),
       });
       resumed = true;
     }
@@ -5633,7 +5756,7 @@ async function _resumeCommanderAfterScheduledHandoff(
   if (!item.terminalHandoff || actor.kind !== 'agent') return;
   if (result.terminalStatus === 'cancelled' || result.terminalStatus === 'waiting_input') return;
 
-  let shouldResume = result.terminalStatus === 'failed';
+  let shouldResume = result.terminalStatus === 'failed' || result.terminalStatus === 'stopped';
   if (!shouldResume) {
     try {
       const agent = await agentsFeat.getAgent(actor.id);
@@ -5652,13 +5775,15 @@ async function _resumeCommanderAfterScheduledHandoff(
   if (!ledger || ledger.source_tool !== 'hand_off_to') return;
   const actorName = actor.name || actor.id;
   let agentResult: string;
-  if (result.kind === 'completed' && result.terminalStatus === 'completed') {
+  if (result.kind === 'completed' && result.terminalStatus !== 'failed') {
     const form = result.outcome.kind === 'persist' ? result.outcome.form : undefined;
     agentResult = buildWorkerResultPayload(
       actorName,
       result.text,
       result.produced,
       form,
+      undefined,
+      actorTerminal(result),
     );
   } else {
     const partial = result.kind === 'completed' ? result.text : '';
@@ -5680,10 +5805,7 @@ async function _resumeCommanderAfterScheduledHandoff(
     ledger,
     taskId: item.taskId,
     agentResult,
-    terminal: {
-      status: result.terminalStatus,
-      ...(result.failure ? { failure: result.failure } : {}),
-    },
+    terminal: actorTerminal(result),
   });
 }
 
@@ -5716,6 +5838,7 @@ async function _resumeCommanderAfterRetriedDispatch(
       ...(actor.name ? { owner_agent_name: actor.name } : {}),
       form_id: form.form_id,
       user_goal: _clipForOrchestration(continuation.userGoal),
+      ...(item.orchestrationRequestHistory ? { request_history: item.orchestrationRequestHistory } : {}),
       handoff_message: _clipForOrchestration(continuation.agentTask),
       resume_instruction: _clipForOrchestration(continuation.resumeInstruction)
         || _defaultResumeInstructionForRetriedDispatch(actor.name || actor.id),
@@ -5734,6 +5857,7 @@ async function _resumeCommanderAfterRetriedDispatch(
     owner_agent_id: actor.id,
     ...(actor.name ? { owner_agent_name: actor.name } : {}),
     user_goal: _clipForOrchestration(continuation.userGoal),
+    ...(item.orchestrationRequestHistory ? { request_history: item.orchestrationRequestHistory } : {}),
     handoff_message: _clipForOrchestration(continuation.agentTask),
     resume_instruction: _clipForOrchestration(continuation.resumeInstruction)
       || _defaultResumeInstructionForRetriedDispatch(actor.name || actor.id),
@@ -5748,6 +5872,8 @@ async function _resumeCommanderAfterRetriedDispatch(
       result.text,
       result.produced,
       form,
+      undefined,
+      actorTerminal(result),
     );
   } else {
     const partial = result.kind === 'completed' ? result.text : '';
@@ -5765,10 +5891,7 @@ async function _resumeCommanderAfterRetriedDispatch(
     ledger,
     taskId: item.taskId,
     agentResult,
-    terminal: {
-      status: result.terminalStatus,
-      ...(result.failure ? { failure: result.failure } : {}),
-    },
+    terminal: actorTerminal(result),
   });
 }
 
@@ -5835,6 +5958,7 @@ async function runActorTurnWithDisplay(
   // there's no migration story.
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
+  let replyMediaBaseDir: string | undefined = workingDir;
   // Project membership is decided at conv create time and frozen, so we
   // can resolve it once per turn and thread it through to every workspace
   // consumer below (CLI cwd fallback, streamChatWithModel, etc.) without
@@ -6249,6 +6373,9 @@ async function runActorTurnWithDisplay(
   // conversation-scoped `state.producedPaths` is what uniquify consults
   // for ownership; we keep this Set per turn purely for UI surfacing.
   const turnProduced = new Set<string>();
+  const turnShellCandidates = new Map<string, string>();
+  const publishedObservedVersions = new Map<string, string>();
+  const finalizationVersions = new Map<string, string>();
   // Explicit user-visible output declaration from `publish_outputs` or native
   // runtime tools. Kept separate from ownership: supporting files remain in
   // `turnProduced` and the workspace, but only this exact set is prominent
@@ -6281,7 +6408,7 @@ async function runActorTurnWithDisplay(
   const preExistingPaths = new Set<string>();
   // Speech carries billing as host metadata; image/video use their trusted result prefix.
   const ownAccountFiles = new Set<string>();
-  const onFileWritten = async (absPath: string, info?: { preExisting?: boolean; billedToOwnAccount?: boolean }) => {
+  const onFileWritten = async (absPath: string, info?: { preExisting?: boolean; billedToOwnAccount?: boolean; observed?: boolean }) => {
     // Registration only. Files can still be inputs to later tools in this
     // turn (generated shots -> composed video, source HTML -> exported PDF,
     // etc.), so mutating them here would bake presentation-only changes into
@@ -6292,42 +6419,96 @@ async function runActorTurnWithDisplay(
     // Only the first write decides ownership: a later edit_file pass over a
     // file this conversation created must not reclassify our own output as
     // the user's.
-    if (info?.preExisting && !state.producedPaths.has(normalized)) {
+    if (info?.observed || (info?.preExisting && !state.producedPaths.has(normalized))) {
       preExistingPaths.add(normalized);
     }
     turnProduced.add(normalized);
-    state.producedPaths.add(normalized);
+    if (!info?.observed && !preExistingPaths.has(normalized)) {
+      const version = readProducedFileVersion(normalized);
+      if (version && !info?.preExisting) state.producedPaths.set(normalized, version);
+      const expected = version ?? readProducedFileVersion(normalized, true);
+      if (expected !== undefined) finalizationVersions.set(normalized, expected);
+      else finalizationVersions.delete(normalized);
+    }
     if (!preExistingPaths.has(normalized)) {
       const { recordGeneratedAttachment } = await import('../chat_attachments');
       recordGeneratedAttachment(uid, cid, normalized);
     }
     if (isPathInVersionControlledTree(normalized)) sourceTreePaths.add(normalized);
-    if (isPathAllowed(normalized, managedRoots) && !sourceTreePaths.has(normalized)) {
+    if (!info?.observed && isPathAllowed(normalized, managedRoots) && !sourceTreePaths.has(normalized)) {
       await recordProducedFile(normalized, { userId: uid, cid, source: 'group_chat.file_written' }, info);
     }
   };
-  // Refinement-vs-collision signal for write tools' uniquify: any path the
-  // model has produced in this conversation (this turn or earlier) is
-  // "ours" → overwrite in place. Files the user pre-created remain foreign
-  // and still get `-2 / -3 / ...` suffixed via `util/uniquify-path`.
-  const hasProducedPath = (absPath: string) => state.producedPaths.has(path.resolve(absPath));
-  const onOutputsPublished = async (absPaths: string[]): Promise<string[]> => {
+  const hasProducedPath = (absPath: string) => {
+    const normalized = path.resolve(absPath);
+    const version = state.producedPaths.get(normalized);
+    return version !== undefined && version === readProducedFileVersion(normalized);
+  };
+  const onShellFileObserved = (absPath: string, version: string) => {
+    const normalized = path.resolve(absPath);
+    if (turnShellCandidates.has(normalized) || turnShellCandidates.size < 5000) turnShellCandidates.set(normalized, version);
+  };
+  const currentPublishedFiles = (paths: readonly string[], observedVersions: ReadonlyMap<string, string>) =>
+    paths.filter(absPath => {
+      const version = observedVersions.get(absPath);
+      return version === undefined || version === readProducedFileVersion(absPath);
+    });
+  const imageStudioDelivery = actor.id === IMAGE_STUDIO_AGENT_ID && workingDir;
+  const imageStudioNativePngDelivery = imageStudioDelivery && item.imageStudioNativePng
+    ? new ImageStudioNativePngDelivery() : undefined;
+  const imageStudioDeliveryText = (text: string) => imageStudioNativePngDelivery
+    ? versionChatMediaLocalUrlsInText(text, workingDir, file => {
+        const normalized = path.resolve(file);
+        return (!turnProduced.has(normalized) && !turnShellCandidates.has(normalized))
+          || imageStudioNativePngDelivery.permits(normalized);
+      })
+    : text;
+  const eligibleImageStudioPaths = async (paths: string[], workspace: string) =>
+    (await partitionImageStudioLayeredOutputs(uid, cid,
+      imageStudioNativePngDelivery ? paths.filter(file => imageStudioNativePngDelivery.permits(file)) : paths,
+      workspace)).eligible;
+  const onOutputsPublished = async (absPaths: string[], nativeObservedVersions?: ReadonlyMap<string, string>): Promise<string[]> => {
     const accepted: string[] = [];
+    const observedVersions = new Map<string, string>();
     for (const raw of absPaths) {
       const absPath = path.resolve(raw);
-      if (!turnProduced.has(absPath) || !isExistingProducedFile(absPath)) continue;
+      const nativeVersion = nativeObservedVersions?.get(absPath);
+      if (turnProduced.has(absPath)) {
+        if (!isExistingProducedFile(absPath)) continue;
+        if (nativeVersion !== undefined) {
+          if (nativeVersion !== readProducedFileVersion(absPath)) continue;
+          observedVersions.set(absPath, nativeVersion);
+        }
+      } else {
+        const version = turnShellCandidates.get(absPath);
+        if (version === undefined || !isPathAllowed(absPath, managedRoots)
+          || version !== readProducedFileVersion(absPath)) continue;
+        observedVersions.set(absPath, version);
+      }
       accepted.push(absPath);
     }
     // This is a resource-display selector, not a task-result validator. Each
     // call replaces the prior selection with its eligible subset, including
     // an empty subset, without changing the model's text or turn status.
+    const eligible = imageStudioDelivery
+      ? currentPublishedFiles(await eligibleImageStudioPaths(accepted, imageStudioDelivery), observedVersions) : accepted;
     outputsPublicationDeclared = true;
     turnPublished.clear();
-    for (const absPath of accepted) turnPublished.add(absPath);
-    return accepted;
+    publishedObservedVersions.clear();
+    for (const absPath of eligible) {
+      turnPublished.add(absPath);
+      const version = observedVersions.get(absPath);
+      if (version !== undefined) publishedObservedVersions.set(absPath, version);
+    }
+    return eligible;
   };
   const finalizeVisibleProducedFiles = async (paths: readonly string[], source: string) => {
-    const scopedPaths = paths.filter(absPath => isPathAllowed(absPath, managedRoots));
+    const versions = new Map<string, string>();
+    for (const absPath of paths) {
+      const expected = finalizationVersions.get(absPath);
+      if (expected !== undefined && isPathAllowed(absPath, managedRoots)) versions.set(absPath, expected);
+    }
+    const scopedPaths = [...versions.keys()];
     if (!scopedPaths.length) return;
     let finalizable: string[];
     try {
@@ -6346,6 +6527,9 @@ async function runActorTurnWithDisplay(
       return;
     }
     for (const absPath of finalizable) {
+      const expected = versions.get(absPath);
+      if (!isPathAllowed(absPath, managedRoots) || expected !== readProducedFileVersion(absPath, true)) continue;
+      const ownedVersion = state.producedPaths.get(absPath);
       try {
         await finalizeProducedFile(absPath, {
           userId: uid,
@@ -6353,6 +6537,10 @@ async function runActorTurnWithDisplay(
           ...(turnProjectId ? { projectId: turnProjectId } : {}),
           source,
         });
+        if (ownedVersion === expected && state.producedPaths.get(absPath) === ownedVersion) {
+          const version = readProducedFileVersion(absPath);
+          if (version) state.producedPaths.set(absPath, version);
+        }
       } catch (err) {
         log.warn('final produced-file processing failed', {
           cid,
@@ -6364,7 +6552,7 @@ async function runActorTurnWithDisplay(
     }
   };
   const filesEligibleForFinalization = (paths: readonly string[]): string[] => (
-    paths.filter((absPath) => !sourceTreePaths.has(absPath) && !preExistingPaths.has(absPath))
+    paths.filter((absPath) => turnProduced.has(absPath) && !sourceTreePaths.has(absPath) && !preExistingPaths.has(absPath))
   );
   const registerFinalOutputResources = async (paths: readonly string[]) => {
     if (!paths.length) return;
@@ -6402,12 +6590,15 @@ async function runActorTurnWithDisplay(
     });
   };
   let finalText = '';
+  let continueAfterProjectBinding: ((message: string) => Promise<string | undefined>) | undefined;
+  let projectBindingContinuationHandled = false;
   // Mirror of every text delta we forwarded to the renderer this turn. It is
   // the fallback for mid-stream failures and tells abort settlement whether a
   // status row is needed, without promoting the partial text to a final answer.
   let streamingText = '';
   let unphasedTextWasStreamed = false;
   let cliDisplayText = '';
+  let cliDisplayPending = false;
   const nativeDisplaySegments: GroupMessage[] = [];
   if (actor.kind !== 'worker') {
     state.liveDisplays ||= new Map();
@@ -6418,7 +6609,7 @@ async function runActorTurnWithDisplay(
         ts: localIsoAt(turnStartedAt), turn_id: item.turnId, seg: segState.seg,
         source_message_id: item.msgId,
         text: cliAgent ? cliDisplayText : streamingText.slice(segState.segStart),
-        ...(cliAgent?.runtime?.kind === 'cli' && cliAgent.runtime.cli === 'claude'
+        ...(cliDisplayPending || (cliAgent?.runtime?.kind === 'cli' && cliAgent.runtime.cli === 'claude')
           ? { display_phase: 'pending' as const } : {}),
         process: processItems.slice(segState.processStart),
         ...(turnArtifacts.length ? { artifacts: turnArtifacts.map(a => ({ ...a, agent_id: actor.id })) } : {}),
@@ -6527,29 +6718,41 @@ async function runActorTurnWithDisplay(
     // the end-of-turn selector can see the complete production chain.
     const segCandidates = existingProducedFiles(turnProduced);
     const hasExplicitSegmentOutputs = outputsPublicationDeclared;
+    const segmentObservedVersions = new Map(publishedObservedVersions);
+    const segDeliveryCandidates = hasExplicitSegmentOutputs
+      ? Array.from(new Set([...segCandidates, ...currentPublishedFiles(existingProducedFiles(turnPublished), segmentObservedVersions)])) : [];
     const segProduced = hasExplicitSegmentOutputs
-      ? selectVisibleProducedFiles(segCandidates, turnPublished)
+      ? selectVisibleProducedFiles(imageStudioDelivery ? await eligibleImageStudioPaths(segDeliveryCandidates, imageStudioDelivery) : segDeliveryCandidates, turnPublished)
       : [];
+    const visibleText = imageStudioDeliveryText(text);
+    const segFinalizable = filesEligibleForFinalization(segProduced);
     if (hasExplicitSegmentOutputs) {
       // The explicit declaration is the complete output set for this closed
       // phase. Drain both final and supporting candidates; later writes start
       // a fresh phase and can safely reuse the same paths.
       for (const p of segCandidates) turnProduced.delete(p);
-      for (const p of segCandidates) turnPublished.delete(p);
+      turnPublished.clear();
+      publishedObservedVersions.clear();
+      turnShellCandidates.clear();
       outputsPublicationDeclared = false;
     }
     await finalizeVisibleProducedFiles(
-      filesEligibleForFinalization(segProduced),
+      segFinalizable,
       'group_chat.segment_final',
     );
+    if (hasExplicitSegmentOutputs) {
+      for (const p of segCandidates) finalizationVersions.delete(p);
+    }
+    const segDeliverables = currentPublishedFiles(segProduced, segmentObservedVersions);
     await enqueue({
-      uid, cid, fromActorId: actor.id, text,
+      uid, cid, fromActorId: actor.id, text: visibleText,
+      replyMediaBaseDir: workingDir,
       forceTo: [USER_ID], turn_id: item.turnId, seg: segIndex,
       ...(segProcessItems.length ? { process: segProcessItems } : {}),
-      ...(segProduced.length ? { produced: segProduced } : {}),
+      ...(segDeliverables.length ? { produced: segDeliverables } : {}),
     });
     segState.processStart = processEnd;
-    await registerFinalOutputResources(segProduced);
+    await registerFinalOutputResources(segDeliverables);
     // Finalizing the narrated segment consumes its live placeholder. Without
     // an explicit boundary here, a replayed process event can immediately
     // recreate that placeholder before the dispatch tool either resumes
@@ -6662,6 +6865,9 @@ async function runActorTurnWithDisplay(
         }
       }
     }
+    replyMediaBaseDir = projectDirectoryIssue && projectDirectoryIssue.kind !== 'available'
+      ? undefined
+      : cliWorkingDir;
     try {
       const historyBoundaryId = item.failedTurnRetryMode === 'restart' && item.retrySourceMessageId
         ? item.retrySourceMessageId
@@ -6766,8 +6972,10 @@ async function runActorTurnWithDisplay(
         onProcess: data => {
           if (data.type === 'delta' && data.phase !== 'commentary' && typeof data.text === 'string') {
             cliDisplayText += data.text;
+            cliDisplayPending = data.phase === 'pending';
           } else if (data.type === 'commentary-finalized') {
             cliDisplayText = '';
+            cliDisplayPending = false;
           }
           // Mirror the LLM path: count every event for activity. Commentary
           // deltas are merged only while adjacent, so a tool/status event
@@ -6818,8 +7026,12 @@ async function runActorTurnWithDisplay(
           }, processItems);
         },
       });
-      for (const p of cliOut.produced || []) await onFileWritten(p);
-      if (cliOut.published !== undefined) await onOutputsPublished(cliOut.published);
+      for (const p of cliOut.produced || []) {
+        const version = cliOut.observedOutputs?.get(p);
+        if (version !== undefined && (!cliOut.published?.includes(p) || version !== readProducedFileVersion(p))) continue;
+        await onFileWritten(p, version !== undefined ? { observed: true } : undefined);
+      }
+      if (cliOut.published !== undefined) await onOutputsPublished(cliOut.published, cliOut.observedOutputs);
       finalText = cliOut.text;
       streamingText = cliOut.text;
       cliCommanderHandoff = cliOut.commanderHandoff || null;
@@ -6864,17 +7076,22 @@ async function runActorTurnWithDisplay(
     // exists. Only a failure with no visible content retries; once text is
     // on screen a silent re-run would duplicate it, so that case keeps the
     // honest failure bubble + partial salvage + manual retry.
-    const runModelAttempt = async (channelAttempt: number): Promise<void> => {
+    const actorMaxToolLoops = maxToolLoopsForActorKind(actor.kind);
+    const remainingToolLoops = () => actorMaxToolLoops == null ? undefined : actorMaxToolLoops
+      - (typeof agentRunTimingData?.tool_loops === 'number' ? agentRunTimingData.tool_loops : 0);
+    const runModelAttempt = async (channelAttempt: number, projectBindingReceipt?: string): Promise<void> => {
     try {
-      const actorMaxToolLoops = maxToolLoopsForActorKind(actor.kind);
+      const maxToolLoops = projectBindingReceipt ? remainingToolLoops() : actorMaxToolLoops;
       for await (const ev of streamChatWithModel({
         userId: uid,
+        message: projectBindingReceipt ?? messageText,
         currentUserMessage,
-        message: messageText,
         sessionId,
         systemPrompt,
         workingDir,
-        ...(conversationHistory ? { conversationHistory } : {}),
+        // The provisional model response and its tool results are still in
+        // this session. Rebasing before the receipt would discard that work.
+        ...(conversationHistory && !projectBindingReceipt ? { conversationHistory } : {}),
         agentName: actor.name || actor.id,
         ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
         cid,
@@ -6883,12 +7100,15 @@ async function runActorTurnWithDisplay(
         turnId: item.turnId,
         historyBoundaryMessageId: item.msgId,
         outputDelivery: item.outputDelivery || 'final',
+        ...(item.hostTodoRun ? { hostTodoRun: true } : {}),
         // A channel retry continues the SAME persisted turn: without resume
         // the second runner run would double-commit the turn's user message.
         ...(item.resumeActiveTurn || channelAttempt > 0 ? { resumeActiveTurn: true } : {}),
         ...(turnProjectId ? { projectId: turnProjectId } : {}),
         onFileWritten,
+        onShellFileObserved,
         onOutputsPublished,
+        ...(imageStudioNativePngDelivery ? { imageStudioNativePngDelivery } : {}),
         hasProducedPath,
         onArtifactCreated,
         ...(isCommander ? {
@@ -6912,17 +7132,13 @@ async function runActorTurnWithDisplay(
         onTodoTaskDeleted: (taskId: string, projectId: string) => unstageSavedTask(w, item.turnId, 'todo', taskId, projectId),
         onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
         onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
-        // Top-level group turns (commander / member) keep their large cached
-        // prefix warm across a dispatch cycle: a nested agent run (VideoStudio
-        // render, DeepResearcher) routinely exceeds the 5-min 'short' TTL, after
-        // which the handback turn would re-write the whole prefix at full input
-        // + cache-write price. 'long' (1h) costs 2x on write but amortizes across
-        // the orchestration session. Nested one-shot workers stay 'short' — they
-        // don't recur, so the longer TTL is pure write-cost overhead.
+        // Group turns may reuse their prefix after a long dispatch. One-shot
+        // workers prefer short retention. The selected provider and credential
+        // determine the effective cache policy after fallback.
         cacheRetention: item.nested ? 'short' : 'long',
         abortSignal: w.abortController.signal,
         executionDeadlineAt,
-        ...(actorMaxToolLoops != null ? { maxToolLoops: actorMaxToolLoops } : {}),
+        ...(maxToolLoops != null ? { maxToolLoops } : {}),
         // `nested: true` skips globalSlots. Scheduled commander sub-tasks
         // (P3 dispatch_to-as-task) must skip it too: their parent commander
         // turn HOLDS a global slot while awaiting the child's terminal, so
@@ -6955,8 +7171,8 @@ async function runActorTurnWithDisplay(
           ...agentRoots,
           ...referenceAttachmentRoots,
         ],
-        ...(turnImages.length ? { images: turnImages } : {}),
-        ...(turnHistoryResources.length ? { historyResources: turnHistoryResources } : {}),
+        ...(!projectBindingReceipt && turnImages.length ? { images: turnImages } : {}),
+        ...(!projectBindingReceipt && turnHistoryResources.length ? { historyResources: turnHistoryResources } : {}),
         attachmentMetadata: turnAttachmentMetadata,
         ...(extraTools.length ? { extraTools } : {}),
         ...(skillList !== undefined ? { skillList } : {}),
@@ -7081,7 +7297,9 @@ async function runActorTurnWithDisplay(
     // text into settlement so the executor knows the turn was visible and any
     // complete structured side effects can still be extracted; the abort
     // post-processor replaces this partial text with the interrupted status.
-    if (!finalText && streamingText) {
+    // A binding continuation must finish with its own answer. The existing
+    // stream also contains the draft that preceded the binding receipt.
+    if (!projectBindingReceipt && !finalText && streamingText) {
       finalText = streamingText;
     }
     w.abortController = null;
@@ -7158,6 +7376,37 @@ async function runActorTurnWithDisplay(
       await emitStateChanged(state);
       await runModelAttempt(1);
     }
+    continueAfterProjectBinding = async (message) => {
+      const stopped = () => w.stopRequested || state.shuttingDown || state.terminating || getActiveUserId() !== uid;
+      aborted ||= stopped();
+      if (aborted || errText || terminalHandoffCompleted || Date.now() >= executionDeadlineAt
+          || (remainingToolLoops() ?? 1) <= 0) return;
+      if (streamingText.length > segState.segStart) {
+        // The draft preceded the write receipt. A subsequent dispatch must
+        // never flush it as a completed, confirmed segment.
+        segState.segStart = streamingText.length;
+        segState.seg += 1;
+        segState.segmentStartedAt = Date.now();
+        emit(state, { type: 'segment_boundary', cid, actor: actor.id, turn_id: item.turnId });
+      }
+      finalText = '';
+      const controller = new AbortController();
+      w.abortController = controller;
+      w.currentTurnSteerable = !item.nested;
+      await emitStateChanged(state);
+      if (stopped() || controller.signal.aborted) {
+        aborted = true;
+        w.abortController = null;
+        w.currentTurnSteerable = false;
+        await emitStateChanged(state);
+        return;
+      }
+      await runModelAttempt(0, message);
+      aborted ||= stopped();
+      if (!aborted && !errText) {
+        return terminalHandoffCompleted ? '' : finalText.trim() || undefined;
+      }
+    };
   } // end LLM branch (paired with `if (cliAgent) { ... } else {` above)
 
   // Exit never parses partial prose into new side effects or starts another
@@ -7175,6 +7424,8 @@ async function runActorTurnWithDisplay(
   // Form / <agent> container extraction stays in bus because they're pure
   // text → structured-data parsing. Decisions (silent / done / blocked /
   // failed) live in plan_executor.onTurnFinished.
+  const runtimeStopped = agentRunTimingData?.terminal_status === 'stopped';
+  const stopReason = hostStopReason(agentRunTimingData);
   let form: ChatFormPayload | undefined;
   let planInteraction: PlanInteractionStatus | undefined;
   let resumeAfterHandback: {
@@ -7299,7 +7550,7 @@ async function runActorTurnWithDisplay(
     // A handback marker salvaged from an aborted partial response must not move
     // the conversation floor or consume/wake orchestration state. User Stop is
     // the terminal control path for that turn.
-    if (handbackRequested && !form && !aborted && !errText && !turnFailureKind && !askingUserThisTurn) {
+    if (handbackRequested && !form && !runtimeStopped && !aborted && !errText && !turnFailureKind && !askingUserThisTurn) {
       explicitHandback = hb.handback;
       try {
         const floorState = await readState(uid, cid);
@@ -7410,6 +7661,7 @@ async function runActorTurnWithDisplay(
                   ...(actor.name ? { owner_agent_name: actor.name } : {}),
                   ...(meta.form_id ? { form_id: meta.form_id } : {}),
                   user_goal: meta.user_goal || '',
+                  ...(meta.request_history ? { request_history: meta.request_history } : {}),
                   handoff_message: meta.handoff_message || '',
                   resume_instruction: meta.resume_instruction,
                   created_at: nowIso(),
@@ -7470,6 +7722,8 @@ async function runActorTurnWithDisplay(
     // markup left in workingText is stripped on display by the renderer's
     // _stripSurvivingStructuralBlocks, so the aborted bubble stays clean.
     const commanderMutationNotices: string[] = [];
+    const projectBindingReceipts: SavedProjectAgentBinding[] = [];
+    let projectAgentBindingIssue = false;
     let platformAgentEditRejections = 0;
     const appendCommanderMutationNotice = (notice: string): void => {
       commanderMutationNotices.push(notice);
@@ -7602,12 +7856,28 @@ async function runActorTurnWithDisplay(
               // can't @-mention it from the same conv — observed bug shape
               // when the project's bindings predate the new agent.
               if (turnProjectId) {
+                const projectsFeatBind = await import('../projects');
+                let binding: SavedProjectAgentBinding['binding'];
+                let reason: SavedProjectAgentBinding['reason'];
                 try {
-                  const projectsFeatBind = await import('../projects');
-                  await projectsFeatBind.addAgentBinding(uid, turnProjectId, ag.agent_id);
-                  log.info(`auto-bound agent ${ag.agent_id} to project ${turnProjectId} after commander creation`);
+                  const added = await projectsFeatBind.addAgentBinding(uid, turnProjectId, ag.agent_id);
+                  binding = added.ok ? 'added' : 'failed';
+                  if (added.ok === false) reason = added.error;
                 } catch (err) {
-                  log.warn(`auto-bind agent failed cid=${cid} pid=${turnProjectId} aid=${ag.agent_id}: ${(err as Error).message}`);
+                  binding = await projectsFeatBind.isProjectAgentBound(uid, turnProjectId, ag.agent_id)
+                    ? 'added' : 'unconfirmed';
+                  if (binding === 'unconfirmed') reason = 'binding_interrupted';
+                  log.warn('auto-bind Agent write interrupted', { binding, ...logErrorSummary(err) });
+                }
+                projectBindingReceipts.push({
+                  agent_id: ag.agent_id, name: ag.name, creation: 'saved', binding, ...(reason ? { reason } : {}),
+                });
+                if (binding !== 'added') {
+                  projectAgentBindingIssue = true;
+                  const key = binding === 'failed'
+                    ? 'chat.agent_created_project_binding_failed'
+                    : 'chat.agent_created_project_binding_unconfirmed';
+                  appendCommanderMutationNotice(escapeHtmlForBubble(t(key, { name: ag.name }, turnLanguage)));
                 }
               }
             } else {
@@ -7771,11 +8041,37 @@ async function runActorTurnWithDisplay(
       workingText = commanderMutationNotices.join('\n\n');
     }
 
+    if (projectBindingReceipts.length && continueAfterProjectBinding) {
+      const receipt = JSON.stringify({
+        kind: 'project_agent_binding', project_id: turnProjectId, agents: projectBindingReceipts,
+        ...(agentMutationRejections.length ? { rejections: agentMutationRejections.map(({ action, code }) => ({ action, code })) } : {}),
+        ...(createdSkills.length ? { saved_skills: createdSkills } : {}),
+        ...(skillMutationFailed ? { skill_mutation_failed: true } : {}),
+      }).replace(/[<>&]/g, character => ({ '<': '\\u003c', '>': '\\u003e', '&': '\\u0026' })[character]!);
+      const continued = await continueAfterProjectBinding(`Host receipt for continuing the current request:\n${receipt}`);
+      if (state.shuttingDown || state.shutdownArchives?.has(item.turnId)) {
+        const persistedMsg = await archiveInterruptedTurn(state, item.turnId);
+        return { kind: 'completed', text: persistedMsg?.text || '', produced: [],
+          outcome: { kind: 'silent' }, persistedMsg, aborted: true, terminalStatus: 'cancelled' };
+      }
+      if (continued !== undefined) {
+        // The host receipt authorizes continuation with normal tools. The
+        // reply's authoring containers have already crossed their one write
+        // boundary and cannot be reapplied from the continuation draft.
+        const continuedText = extractSkillContainers(extractAgentFieldBlocks(continued).cleanText).cleanText;
+        if (continuedText || terminalHandoffCompleted) {
+          workingText = continuedText;
+          projectBindingContinuationHandled = true;
+          projectAgentBindingIssue = false;
+        }
+      }
+    }
+
     // Rejected mutation prose is host-owned. The model may have claimed
     // success before its container was validated; replacing that prose avoids
     // presenting a false success next to a failure notice. Persistence chips
     // still carry any blocks that really did succeed in a partial batch.
-    if (agentMutationRejections.length) {
+    if (agentMutationRejections.length && !projectBindingContinuationHandled) {
       const isCorrection = item.llmPayload.includes(AGENT_MUTATION_FEEDBACK_TAG);
       const willRetry = !isCorrection && agentMutationRejections.some((entry) => entry.retryable);
       const partial = appliedAgentMutationCount > 0;
@@ -7797,14 +8093,20 @@ async function runActorTurnWithDisplay(
         ...(platformAgentEditRejections === agentMutationRejections.length ? [] : [summary]),
         ...commanderMutationNotices,
       ].join('\n\n');
+    } else if (projectAgentBindingIssue) {
+      // The creation card records the saved Agent. Use the host binding
+      // outcome before stating it is available as a project member.
+      workingText = commanderMutationNotices.join('\n\n');
     }
   }
 
   const turnFinalCandidates = existingProducedFiles(turnProduced, (stalePath) => {
     state.producedPaths.delete(stalePath);
   });
+  const finalDeliveryCandidates = outputsPublicationDeclared
+    ? Array.from(new Set([...turnFinalCandidates, ...currentPublishedFiles(existingProducedFiles(turnPublished), publishedObservedVersions)])) : turnFinalCandidates;
   const produced = selectVisibleProducedFiles(
-    turnFinalCandidates,
+    imageStudioDelivery ? await eligibleImageStudioPaths(finalDeliveryCandidates, imageStudioDelivery) : finalDeliveryCandidates,
     outputsPublicationDeclared ? turnPublished : undefined,
   );
   // An open plan interaction or input form is usually a review/approval gate,
@@ -7821,15 +8123,25 @@ async function runActorTurnWithDisplay(
   const pendingFormWait = !!item.pendingFormId && !explicitHandback;
   const isNonFinalStage = pendingFormWait || item.outputDelivery === 'process' || planInteraction === 'open' || !!form || runtimeWaitingForInput;
   const visibleProduced = isNonFinalStage && !outputsPublicationDeclared ? [] : produced;
+  if (imageStudioNativePngDelivery && !isNonFinalStage && !aborted && !errText && !turnFailureKind
+      && !visibleProduced.some(file => imageStudioNativePngDelivery.isVerified(file))) {
+    turnFailureKind = 'operation';
+    turnFailureCode = 'image_studio_native_png_missing';
+    errText = t('image_studio.native_png_missing', undefined, turnLanguage);
+  }
 
   // ── Single hand-off to plan_executor ─────────────────────────────────
   // It decides only whether the bus should persist a user-visible bubble
   // (and what it carries). Bus is pure I/O: it executes the returned outcome.
+  // Give the failure formatter only the text not already saved before dispatch.
+  const failedSegment = segState.flushedAny && !aborted && !!(errText || turnFailureKind);
+  const turnReplyText = failedSegment ? streamingText.slice(segState.segStart) : workingText;
+  const commanderResuming = Boolean(resumeAfterHandback || directHandbackAfterTurn);
   let outcome: planExecutor.TurnOutcome = { kind: 'silent' };
   try {
     outcome = await planExecutor.onTurnFinished(uid, cid, {
       actor: { id: actor.id, kind: actor.kind === 'commander' ? 'commander' : 'agent' },
-      finalText: workingText,
+      finalText: turnReplyText,
       errText,
       ...(errText && errDetail ? { errDetail } : {}),
       aborted,
@@ -7843,6 +8155,7 @@ async function runActorTurnWithDisplay(
       ...(createdSkills.length ? { createdSkills } : {}),
       activityEvents,
       ...(terminalHandoffCompleted ? { terminalDelivery: true } : {}),
+      ...(commanderResuming ? { commanderResuming: true } : {}),
     });
   } catch (err) {
     log.warn(`plan_executor.onTurnFinished threw cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
@@ -7851,7 +8164,7 @@ async function runActorTurnWithDisplay(
     // fallback: the target agent already answered, so an empty/no-side-effect
     // commander tail must not reappear merely because the decider threw.
     const terminalEmptyTail = terminalHandoffCompleted
-      && !workingText.trim()
+      && !turnReplyText.trim()
       && !form
       && visibleProduced.length === 0
       && createdAgents.length === 0
@@ -7860,7 +8173,7 @@ async function runActorTurnWithDisplay(
       ? { kind: 'silent' }
       : {
           kind: 'persist',
-          text: workingText || '(no reply)',
+          text: turnReplyText || '(no reply)',
           ...(form ? { form } : {}),
           ...(visibleProduced.length ? { produced: visibleProduced } : {}),
           ...(createdAgents.length ? { createdAgents } : {}),
@@ -7926,9 +8239,9 @@ async function runActorTurnWithDisplay(
   // boundaries, the pre-dispatch reasoning is already persisted as its own
   // `seg` bubbles. The end-of-turn message must carry ONLY the final segment
   // (text streamed since the last flush) — else reload duplicates earlier
-  // segments. If that tail is empty and nothing else needs surfacing, go silent
-  // so no empty commander bubble is persisted.
-  if (segState.flushedAny && outcome.kind === 'persist') {
+  // segments. An empty tail with no other output can be silent. A failed
+  // segment already contains its formatted error and must survive that check.
+  if (segState.flushedAny && !failedSegment && outcome.kind === 'persist') {
     const tail = streamingText.slice(segState.segStart);
     const tailProcessItems = processItems.slice(segState.processStart);
     const hasSide = !!(
@@ -7969,14 +8282,16 @@ async function runActorTurnWithDisplay(
     }
   }
 
-  // Compaction is normally worth preserving even when a model turn has no
-  // prose. It must not, however, resurrect a terminal hand-off tail: the
+  // Preserve compaction and any tool activity preceding an accepted Agent
+  // handback even when it has no prose. Do not resurrect a terminal hand-off tail: the
   // delegate already delivered the answer, and any pre-dispatch compaction is
   // owned by the segment persisted above rather than by this empty tail.
-  if (outcome.kind === 'silent'
-      && !terminalHandoffCompleted
-      && processItemsContainContextCompaction(processItems.slice(segState.processStart))) {
-    outcome = { kind: 'persist', text: '' };
+  if (outcome.kind === 'silent' && !terminalHandoffCompleted) {
+    const tailProcessItems = processItems.slice(segState.processStart);
+    if (processItemsContainContextCompaction(tailProcessItems)
+        || (commanderResuming && tailProcessItems.some(processItemToolName))) {
+      outcome = { kind: 'persist', text: '' };
+    }
   }
 
   // G8b ephemeral worker: produces NO user-visible bubble. Its entire output
@@ -7991,7 +8306,6 @@ async function runActorTurnWithDisplay(
   // never a model-authored success/failure claim. Waiting and cancellation are
   // neutral outcomes; explicit stream/CLI/host-operation failures are errors.
   const outcomeFailureKind = outcome.kind === 'persist' ? outcome.failureKind : undefined;
-  const runtimeStopped = String(agentRunTimingData?.terminal_status || '') === 'stopped';
   const actorRunStatus: AgentRunStatus = aborted
     ? 'cancelled'
     : (errText || turnFailureKind || outcomeFailureKind)
@@ -8039,6 +8353,12 @@ async function runActorTurnWithDisplay(
       filesToFinalize,
       reviewGateOpen ? 'group_chat.review_video' : 'group_chat.turn_final',
     );
+    if (outcome.produced && publishedObservedVersions.size) {
+      outcome.produced = currentPublishedFiles(outcome.produced, publishedObservedVersions);
+    }
+    if (outcome.produced && imageStudioNativePngDelivery) {
+      outcome.produced = outcome.produced.filter(file => imageStudioNativePngDelivery.permits(file));
+    }
     // A notice describes retained attachments; it never changes status, routing or publication.
     let deliveryNotice = '';
     if ((aborted || errText || turnFailureKind || outcomeFailureKind) && outcome.produced?.length) {
@@ -8046,12 +8366,14 @@ async function runActorTurnWithDisplay(
         const { interruptedVideoDeliveryNotice } = await import('../video_delivery_notice');
         deliveryNotice = await interruptedVideoDeliveryNotice({ produced: outcome.produced, allowedRoots: managedRoots, lang: turnLanguage });
       } catch { log.warn('delivery notice unavailable'); }
+      if (publishedObservedVersions.size) outcome.produced = currentPublishedFiles(outcome.produced, publishedObservedVersions);
     }
     const tailProcessItems = processItems.slice(segState.processStart);
     persistedMsg = await enqueue({
       uid, cid,
       fromActorId: actor.id,
-      text: deliveryNotice ? `${outcome.text}\n\n${deliveryNotice}` : outcome.text,
+      replyMediaBaseDir,
+      text: imageStudioDeliveryText(deliveryNotice ? `${outcome.text}\n\n${deliveryNotice}` : outcome.text),
       // An abort settlement belongs to the user only. Process commentary or
       // status text must not enqueue fresh agent/commander work after Stop.
       ...(aborted ? { forceTo: [USER_ID] } : {}),
@@ -8092,6 +8414,7 @@ async function runActorTurnWithDisplay(
       turn_id: item.turnId,
       source_message_id: item.msgId,
       ...(item.orchestrationGoal !== undefined ? { orchestrationGoal: item.orchestrationGoal } : {}),
+            ...(item.orchestrationRequestHistory ? { orchestrationRequestHistory: item.orchestrationRequestHistory } : {}),
       // The parsed prose marker must survive visible-reply classification;
       // otherwise task-run aggregation mistakes this waiting reply for success.
       ...(reviewGateOpen ? { waitingForInput: true } : {}),
@@ -8129,6 +8452,7 @@ async function runActorTurnWithDisplay(
   if (retryableAgentMutationRejections.length
       && isCommander
       && !aborted
+      && !projectBindingContinuationHandled
       && !item.llmPayload.includes(AGENT_MUTATION_FEEDBACK_TAG)) {
     try {
       await enqueue({
@@ -8220,8 +8544,12 @@ async function runActorTurnWithDisplay(
       fromActorName: actor.name,
       ledger: resumeAfterForm.ledger,
       taskId: item.taskId,
-      agentResult: resumeAfterForm.agentResult,
+      agentResult: actorRunStatus === 'stopped'
+        ? buildWorkerResultPayload(actor.name || actor.id, resumeAfterForm.agentResult, turnFinalCandidates, undefined, undefined,
+          { status: 'stopped', ...(stopReason ? { stop_reason: stopReason } : {}) })
+        : resumeAfterForm.agentResult,
       handbackReason: resumeAfterForm.handbackReason,
+      ...(actorRunStatus === 'stopped' ? { terminal: { status: 'stopped' as const, ...(stopReason ? { stop_reason: stopReason } : {}) } } : {}),
     });
   }
   if (directHandbackAfterTurn && actor.kind === 'agent') {
@@ -8313,16 +8641,20 @@ async function runActorTurnWithDisplay(
   return {
     kind: 'completed',
     text: workingText,
-    // Handback needs all real outputs; footer filtering is presentation only.
-    produced: turnFinalCandidates,
+    // The persisted bubble uses the delivery-aware `outcome.produced`
+    // selection above. Nested dispatch handback is different: Commander must
+    // receive every extant path created by the worker, including process files
+    // deliberately hidden from the worker's own bubble.
+    produced: currentPublishedFiles(finalDeliveryCandidates, publishedObservedVersions),
     outcome,
     persistedMsg,
     // Commander's handback keeps the user-only detail: it names the fix.
     errText: errText ? [errText, errDetail].filter(Boolean).join(' ') : undefined,
     aborted,
     terminalStatus,
+    ...(terminalStatus === 'stopped' && stopReason ? { stopReason } : {}),
     ...(failure ? { failure } : {}),
-    ...(!aborted && (resumeAfterHandback || resumeAfterForm || directHandbackAfterTurn)
+    ...(!aborted && (commanderResuming || resumeAfterForm)
       ? { orchestrationResumed: true }
       : {}),
     ...(handbackReleasedFloor ? { floorReleased: true } : {}),
@@ -8359,6 +8691,11 @@ async function buildCommanderSystemPrompt(
     } catch { return 'No external package CLIs installed.'; }
   })();
   const stateFile = await readState(uid, cid).catch(() => null);
+  let shellHint = '';
+  if (process.platform === 'win32') {
+    const { describeBashShell } = await import('../../model/core-agent/local-tools');
+    shellHint = `Host command shell: ${describeBashShell(process.platform).interpreter}.`;
+  }
   const main = prompts.load('chat_commander', {
     agents_index: allAgentsList,
     orchestration_state: _buildOrchestrationStateBlock(stateFile?.orchestration_ledger),
@@ -8369,9 +8706,7 @@ async function buildCommanderSystemPrompt(
       : '',
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
-    shell_hint: process.platform === 'win32'
-      ? 'On native Windows, command execution runs in PowerShell by default. Use `$env:NAME`, `;`, and PowerShell-native pipelines; do not use POSIX `&&`, heredocs, `head`, `mktemp`, or `/dev/null`. Invoke quoted executables with `&`, for example `& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" ...`.'
-      : '',
+    shell_hint: shellHint,
     env_summary: envSummary,
     output_format_hint: buildOutputFormatHint('auto'),
   });
@@ -8521,7 +8856,8 @@ async function buildAgentInGroupSystemPrompt(
         ? ''
         : prompts.load('chat_rich_output_rules', {}),
     ],
-    languageDirective: buildLanguageDirective(language),
+    // Execution Agents never author Agent/Skill descriptions; Commander and the editors keep those rules.
+    languageDirective: buildLanguageDirective(language, { descriptionFields: false }),
     runtimeDatetimeBlock: buildRuntimeDatetimeBlock(),
   });
 }
@@ -8657,33 +8993,72 @@ function _toolJson(data: unknown): { content: string } {
   return { content: JSON.stringify(data) };
 }
 
-/** Resolve one name / ID with an optional display-mention prefix. Both named
- * dispatch tools share this lookup; callers still reject reserved actors. */
-async function resolveDispatchTarget(cid: string, toRaw: string): Promise<string | null> {
+type DispatchTargetResolution = { id: string; name: string } | { error: string };
+
+/** Resolve and authorize a named target before either tool persists a dispatch. */
+async function resolveDispatchTarget(
+  uid: string, cid: string, toRaw: string, turnProjectId?: string,
+): Promise<DispatchTargetResolution> {
   const target = toRaw.startsWith('@') ? toRaw.slice(1) : toRaw;
   const key = target.toLowerCase().replace(/\s+/g, '');
-  if (key === 'commander' || key === '指挥官') return COMMANDER_ID;
-  if (key === 'user' || key === '用户') return USER_ID;
+  if (key === 'commander' || key === '指挥官') return { id: COMMANDER_ID, name: target };
+  if (key === 'user' || key === '用户') return { id: USER_ID, name: target };
+
+  const scopeError = { error: 'Could not verify the current project for Agent delegation. Try again when the project is available.' };
+  if (getActiveUserId() !== uid) return scopeError;
+  let allowedIds: Set<string> | null = null;
   try {
-    const all = await agentsFeat.listAgents();
-    const matches = all
-      .filter((a) => a.enabled !== false)
-      .filter((a) => !!a.name && a.name.toLowerCase().replace(/\s+/g, '') === key)
-      .sort((a, b) => {
-        const byRank = agentsFeat.agentPriorityRank(a) - agentsFeat.agentPriorityRank(b);
-        return byRank || a.agent_id.localeCompare(b.agent_id);
-      });
-    if (matches[0]) return matches[0].agent_id;
+    const projectId = turnProjectId || (await (await import('../chats')).getConversationMetadata(uid, cid))?.project_id;
+    if (projectId) {
+      const projects = await import('../projects');
+      const project = await projects.getProject(uid, projectId);
+      if (!project || getActiveUserId() !== uid) return scopeError;
+      // Bindings can change after the conversation's Agent list was assembled.
+      const scope = await projects.resolveProjectScope(uid, projectId);
+      if (!scope) return scopeError;
+      allowedIds = new Set(scope.agents);
+    }
   } catch (err) {
-    log.warn(`resolveDispatchTarget listAgents failed cid=${cid}: ${(err as Error).message}`);
+    log.warn('dispatch project scope unavailable', { error: logErrorSummary(err, { closed: true }) });
+    return scopeError;
   }
-  if (safeId(target)) {
-    try {
-      const ag = await agentsFeat.getAgent(target);
-      if (ag && (ag as any).enabled !== false) return target;
-    } catch { /* ignore */ }
+  if (getActiveUserId() !== uid) return scopeError;
+
+  const inScope = (id: string) => !allowedIds || allowedIds.has(id);
+  const finish = async (id: string, agent: agentsFeat.Agent | null, known: boolean): Promise<DispatchTargetResolution> => {
+    if (getActiveUserId() !== uid) return scopeError;
+    if (agent && agent.agent_id === id && agent.enabled !== false && inScope(id)) {
+      return { id, name: agent.name || id };
+    }
+    if (allowedIds && known) {
+      return { error: 'The requested Agent is unavailable in this project. Choose an enabled Agent from the project list, or retry after the requested Agent is available.' };
+    }
+    return { error: await _unknownDispatchTargetError(uid, toRaw) };
+  };
+
+  // A real ID takes precedence in project delegation, including when it is
+  // unavailable. A different Agent with that display name cannot stand in for it.
+  const validId = safeId(target);
+  if (allowedIds && validId) {
+    const agent = await agentsFeat.getAgent(target);
+    if (agent) return finish(target, agent, true);
   }
-  return null;
+
+  let matches: agentsFeat.AgentSummary[] = [];
+  try {
+    const global = await agentsFeat.listAgentSummaries();
+    matches = global.filter((agent) => !!agent.name && agent.name.toLowerCase().replace(/\s+/g, '') === key);
+  } catch (err) {
+    log.warn('dispatch Agent catalog unavailable', { error: logErrorSummary(err, { closed: true }) });
+    if (allowedIds) return { error: 'Could not read the Agent list for this project. Try again when the list is available.' };
+  }
+  const preferred = matches.filter((agent) => agent.enabled !== false && inScope(agent.agent_id)).sort((a, b) => {
+    const byRank = agentsFeat.agentPriorityRank(a) - agentsFeat.agentPriorityRank(b);
+    return byRank || a.agent_id.localeCompare(b.agent_id);
+  })[0];
+  if (preferred) return finish(preferred.agent_id, await agentsFeat.getAgent(preferred.agent_id), true);
+  const agent = !allowedIds && validId ? await agentsFeat.getAgent(target) : null;
+  return finish(target, agent, matches.length > 0);
 }
 
 /** Dispatch tools whose RESULT is a worker/agent's full reply (the handback). */
@@ -8718,6 +9093,7 @@ function buildWorkerResultPayload(
   produced?: string[],
   form?: ChatFormPayload,
   waitingForUserAgentId?: string,
+  terminal?: { status: TaskTerminalStatus; stop_reason?: HostStopReason },
 ): string {
   const files = produced && produced.length
     ? `\n<files>\n${produced.join('\n')}\n</files>` : '';
@@ -8726,8 +9102,11 @@ function buildWorkerResultPayload(
     : waitingForUserAgentId
       ? `\n<blocked-on-user agent_id="${escapeXmlAttr(waitingForUserAgentId)}" />`
       : '';
+  const stopped = terminal?.status === 'stopped'
+    ? ` status="stopped"${terminal.stop_reason ? ` stop_reason="${terminal.stop_reason}"` : ''}`
+    : '';
   return [
-    `<worker-result from="${escapeXmlAttr(workerName)}">`,
+    `<worker-result from="${escapeXmlAttr(workerName)}"${stopped}>`,
     text && text.trim() ? text : '(no textual reply)',
     `${blocked}${files}</worker-result>`,
   ].join('\n');
@@ -8857,6 +9236,7 @@ async function runNestedDispatch(
     } : {}),
     ...(sourceContext?.orchestrationGoal !== undefined
       ? { orchestration_goal: boundOrchestrationGoal(sourceContext.orchestrationGoal) } : {}),
+    ...(sourceContext?.orchestrationRequestHistory ? { orchestration_request_history: normalizeOrchestrationRequestHistory(sourceContext.orchestrationRequestHistory) } : {}),
     ...(sourceContext?.originMessageId
       ? { source_message_id: sourceContext.originMessageId }
       : {}),
@@ -8971,7 +9351,7 @@ async function runNestedDispatch(
         ? `${r.errText}\n\nPartial result:\n${r.text}`
         : r.errText;
       return {
-        payload: buildWorkerErrorPayload(actor.name || actor.id, partial),
+        payload: buildWorkerErrorPayload(actor.name || actor.id, partial, { produced: r.produced }),
         aborted: false,
       };
     }
@@ -8979,7 +9359,7 @@ async function runNestedDispatch(
     const produced = r.produced;
     const form = r.outcome.kind === 'persist' ? r.outcome.form : undefined;
     return {
-      payload: buildWorkerResultPayload(actor.name || actor.id, text, produced, form),
+      payload: buildWorkerResultPayload(actor.name || actor.id, text, produced, form, undefined, actorTerminal(r)),
       aborted: false,
       ...(form ? { form } : {}),
     };
@@ -9059,6 +9439,7 @@ async function runScheduledDispatch(
     } : {}),
     ...(opts.sourceContext?.orchestrationGoal !== undefined
       ? { orchestration_goal: boundOrchestrationGoal(opts.sourceContext.orchestrationGoal) } : {}),
+    ...(opts.sourceContext?.orchestrationRequestHistory ? { orchestration_request_history: normalizeOrchestrationRequestHistory(opts.sourceContext.orchestrationRequestHistory) } : {}),
     ...(opts.sourceContext?.originMessageId
       ? { source_message_id: opts.sourceContext.originMessageId }
       : {}),
@@ -9178,20 +9559,24 @@ async function runScheduledDispatch(
   if (status === 'cancelled') {
     return { payload: buildWorkerAbortPayload(name, stashed?.text || resultMsg?.text), aborted: true, taskId };
   }
+  const text = stashed ? stashed.text : (resultMsg?.text || '');
+  const produced = stashed ? stashed.produced : resultMsg?.produced;
   if (status === 'failed') {
-    const errText = stashed?.errText || stashed?.text || resultMsg?.text || 'Worker failed without an error message.';
+    const errText = stashed?.errText;
+    const message = errText && text.trim() && text !== errText
+      ? `${errText}\n\nPartial result:\n${text}`
+      : errText || text || 'Worker failed without an error message.';
     return {
-      payload: buildWorkerErrorPayload(name, errText),
+      payload: buildWorkerErrorPayload(name, message, { produced }),
       aborted: false,
       taskId,
     };
   }
   const form = stashed?.form ?? resultMsg?.form;
-  const text = stashed ? stashed.text : (resultMsg?.text || '');
-  const produced = stashed?.produced?.length ? stashed.produced : resultMsg?.produced;
   const waitingForUser = status === 'waiting_input' && !form;
   return {
-    payload: buildWorkerResultPayload(name, text, produced, form, waitingForUser ? actor.id : undefined),
+    payload: buildWorkerResultPayload(name, text, produced, form, waitingForUser ? actor.id : undefined,
+      status === 'stopped' ? { status, ...(stashed?.stopReason ? { stop_reason: stashed.stopReason } : {}) } : undefined),
     aborted: false,
     taskId,
     ...(form ? { form } : {}),
@@ -9910,14 +10295,9 @@ async function buildCommanderExtraTools(
       if (!message) {
         return { content: JSON.stringify({ ok: false, error: '`message` is required' }), isError: true };
       }
-      // Resolve `to` → actor id via the shared name-map resolver.
-      const resolvedId = await resolveDispatchTarget(cid, toRaw);
-      if (!resolvedId) {
-        return {
-          content: JSON.stringify({ ok: false, error: await _unknownDispatchTargetError(uid, toRaw) }),
-          isError: true,
-        };
-      }
+      const target = await resolveDispatchTarget(uid, cid, toRaw, currentProjectId);
+      if ('error' in target) return _toolError(target.error);
+      const { id: resolvedId, name: dispatchName } = target;
       if (resolvedId === COMMANDER_ID || resolvedId === USER_ID) {
         return _toolError('dispatch_to target must be an agent (not commander / user)');
       }
@@ -9927,12 +10307,9 @@ async function buildCommanderExtraTools(
       // individually cancellable — and hand its FULL settled result back as
       // this tool's result; the agent persists its own visible bubble and the
       // commander then synthesises. The commander stays in the loop.
-      const dispatchAgent = await agentsFeat.getAgent(resolvedId);
-      const waitingRefusal = await _waitingAgentDelegationRefusal(
-        state, resolvedId, dispatchAgent?.name || resolvedId, w.item,
-      );
+      const waitingRefusal = await _waitingAgentDelegationRefusal(state, resolvedId, dispatchName, w.item);
       if (waitingRefusal) return _toolError(waitingRefusal);
-      const dispatchActor: Actor = { kind: 'agent', id: resolvedId, name: dispatchAgent?.name || resolvedId, joined_at: nowIso() };
+      const dispatchActor: Actor = { kind: 'agent', id: resolvedId, name: dispatchName, joined_at: nowIso() };
       // Flush the commander's pre-dispatch reasoning as its own bubble first, so
       // this visible agent's reply lands AFTER it and the synthesis opens a fresh
       // bubble (commander loop bubbles).
@@ -9940,6 +10317,7 @@ async function buildCommanderExtraTools(
       const parentSignal = asynchronous ? (w.abortController?.signal || ctx?.signal) : ctx?.signal;
       const abortEpoch = state.abortEpoch;
       const userGoal = _orchestrationGoal(w.item, currentTurnPayload);
+      const requestHistory = w.item?.orchestrationRequestHistory;
       const executeDispatch = async (onScheduled?: (taskId: string) => void) => {
         const dispatchResult = await runScheduledDispatch(
           state, parentSignal, dispatchActor, message, {
@@ -9950,8 +10328,8 @@ async function buildCommanderExtraTools(
             sourceContext: {
               ...namedDispatchSourceContext,
               orchestrationGoal: userGoal,
-              commanderRetryResumeInstruction: resume
-                || _defaultResumeInstructionForRetriedDispatch(dispatchAgent?.name || resolvedId),
+          ...(requestHistory ? { orchestrationRequestHistory: requestHistory } : {}),
+              commanderRetryResumeInstruction: resume || _defaultResumeInstructionForRetriedDispatch(dispatchName),
             },
             ...(w.item?.taskId ? { parentTaskId: w.item.taskId } : {}),
           },
@@ -9962,8 +10340,9 @@ async function buildCommanderExtraTools(
             uid, cid,
             result: dispatchResult,
             ownerAgentId: resolvedId,
-            ownerAgentName: dispatchAgent?.name || resolvedId,
+            ownerAgentName: dispatchName,
             userGoal,
+            ...(requestHistory ? { requestHistory } : {}),
             agentTask: message,
             resume,
             sourceTool: 'dispatch_to',
@@ -9977,8 +10356,9 @@ async function buildCommanderExtraTools(
             uid, cid,
             result: dispatchResult,
             ownerAgentId: resolvedId,
-            ownerAgentName: dispatchAgent?.name || resolvedId,
+            ownerAgentName: dispatchName,
             userGoal,
+            ...(requestHistory ? { requestHistory } : {}),
             agentTask: message,
             resume,
           });
@@ -10009,9 +10389,10 @@ async function buildCommanderExtraTools(
           });
         await enqueue({
           uid, cid, fromActorId: resolvedId, forceTo: [COMMANDER_ID], dispatch: true,
-          text: `Dispatch result from @${dispatchAgent?.name || resolvedId}.`,
+          text: `Dispatch result from @${dispatchName}.`,
           model_text: `<dispatch-result task_id="${escapeXmlAttr(result.taskId || '')}">\n${delivery.content}\n</dispatch-result>`,
           orchestrationGoal: userGoal,
+          ...(requestHistory ? { orchestrationRequestHistory: requestHistory } : {}),
           dispatchSignal: parentSignal, dispatchEpoch: abortEpoch,
         });
       });
@@ -10063,18 +10444,17 @@ async function buildCommanderExtraTools(
       const resume = String(input?.resume || '').trim();
       if (!toRaw) return _toolError('`to` is required');
       if (!message) return _toolError('`message` is required');
-      const resolvedId = await resolveDispatchTarget(cid, toRaw);
-      if (!resolvedId) return _toolError(await _unknownDispatchTargetError(uid, toRaw));
+      const target = await resolveDispatchTarget(uid, cid, toRaw, currentProjectId);
+      if ('error' in target) return _toolError(target.error);
+      const { id: resolvedId, name: handoffName } = target;
       if (resolvedId === COMMANDER_ID || resolvedId === USER_ID) {
         return _toolError('hand_off_to target must be an agent (not commander / user)');
       }
       const backlog = await resolveBacklogTask(input?.todo_task_id);
       if (backlog.error) return _toolError(backlog.error);
-      const handoffAgent = await agentsFeat.getAgent(resolvedId);
       const userGoal = _orchestrationGoal(w.item, currentTurnPayload);
-      const waitingRefusal = await _waitingAgentDelegationRefusal(
-        state, resolvedId, handoffAgent?.name || resolvedId, w.item,
-      );
+      const requestHistory = w.item?.orchestrationRequestHistory;
+      const waitingRefusal = await _waitingAgentDelegationRefusal(state, resolvedId, handoffName, w.item);
       if (waitingRefusal) return _toolError(waitingRefusal);
       // Flush the commander's pre-hand-off narration as its own bubble first.
       await onVisibleDispatch?.();
@@ -10093,10 +10473,11 @@ async function buildCommanderExtraTools(
           && !RESERVED_IDS.has(task.assignee) && task.assignee !== resolvedId);
         admission = await beginAgentHandoff(uid, cid, {
           ownerAgentId: resolvedId,
-          ownerAgentName: handoffAgent?.name || resolvedId,
+          ownerAgentName: handoffName,
           claimFloor: (w.item?.sourceRecipients.length || 0) === 1 && !otherWaitingAgent,
           expectedChoiceRevision: w.item?.floorChoiceRevision ?? 0,
           userGoal,
+          ...(requestHistory ? { requestHistory } : {}),
           handoffMessage: message,
           ...(resume ? { resumeInstruction: resume } : {}),
         });
@@ -10110,6 +10491,7 @@ async function buildCommanderExtraTools(
           dispatch: true,
           terminalHandoff: true,
           orchestrationGoal: userGoal,
+          ...(requestHistory ? { orchestrationRequestHistory: requestHistory } : {}),
           dispatchSignal: ctx?.signal,
           ...(w.item?.taskId ? { parentTaskId: w.item.taskId } : {}),
           ...(currentTurnAttachments?.length ? { attachments: currentTurnAttachments.slice() } : {}),
@@ -10421,17 +10803,38 @@ export async function resumeAfterFailedShutdown(): Promise<void> {
 
 // ── Abort ────────────────────────────────────────────────────────────────
 
-export async function abort(uid: string, cid: string, options?: { waitForSettlement?: boolean }): Promise<void> {
+function _stopDispatchPlanning(state: CidState): void {
+  for (const controller of state.planningControllers || []) controller.abort();
+  for (const msgId of [...(state.planningMessages?.keys() || [])]) _endDispatchPlanning(state, msgId);
+}
+
+function _cancelConversationApprovals(cid: string): void {
+  connectorInstallConfirm.cancelForCid(cid);
+  connectorActionConfirm.cancelForCid(cid);
+  bashPermissions.cancelForCid(cid);
+}
+
+export async function abort(uid: string, cid: string, options?: {
+  waitForSettlement?: boolean; keepQueue?: boolean;
+}): Promise<void> {
   const state = _cids.get(cidKey(uid, cid));
+  if (options?.keepQueue) {
+    if (!state) return;
+    const running = [...state.executions.entries()];
+    _stopDispatchPlanning(state);
+    // Cancel existing approvals before a queued successor can ask for its own.
+    if (running.length) _cancelConversationApprovals(cid);
+    await Promise.all(running.map(([turnId, worker]) => _stopRunningTask(state, turnId, worker)));
+    return;
+  }
   let cleared = 0;
   let aborted = 0;
   let abortedModelSessions = 0;
   if (state) {
     state.abortEpoch += 1;
-    for (const controller of state.planningControllers || []) controller.abort();
     // Stop tears the renderer's streams down first, and its board re-reads
     // right away: settle the arranging state now, not when planning unwinds.
-    for (const msgId of [...(state.planningMessages?.keys() || [])]) _endDispatchPlanning(state, msgId);
+    _stopDispatchPlanning(state);
     _recordTaskRunOutcome(state, 'cancelled');
     // Queued board rows will never run — cancel them now. Each RUNNING
     // task's terminal comes from its own turn observing the abort
@@ -10472,22 +10875,7 @@ export async function abort(uid: string, cid: string, options?: { waitForSettlem
   } catch (err) {
     log.warn(`abort model-session fallback failed cid=${cid}: ${(err as Error).message}`);
   }
-  // Abandon any pending custom-connector install confirmation for this
-  // conversation — the agent that requested it is being stopped.
-  try {
-    const installConfirm = await import('../connectors/install_confirm');
-    installConfirm.cancelForCid(cid);
-  } catch { /* feature stripped / not loaded */ }
-  try {
-    const actionConfirm = await import('../connectors/action_confirm');
-    actionConfirm.cancelForCid(cid);
-  } catch { /* feature stripped / not loaded */ }
-  // Abandon any pending bash risk-permission prompt for this conversation and
-  // drop its run-scoped grants — the agent that requested it is being stopped.
-  try {
-    const bashPermissions = await import('../../model/core-agent/bash-permissions');
-    bashPermissions.cancelForCid(cid);
-  } catch { /* not loaded */ }
+  _cancelConversationApprovals(cid);
   await setStatus(uid, cid, state?.shuttingDown ? 'idle' : 'aborted');
   try {
     await clearOrchestrationForCancellation(uid, cid);
@@ -10579,8 +10967,14 @@ export async function editConversationTask(
     else delete msg.model_text;
     delete msg.display_text;
     delete msg.orchestration_goal;
+    delete msg.orchestration_request_history;
     delete msg.unknown_mentions;
     delete msg.mentions;
+    if (item.actor.id === IMAGE_STUDIO_AGENT_ID && requestsImageStudioNativePng(instruction)) {
+      msg.image_studio_native_png = true;
+    } else {
+      delete msg.image_studio_native_png;
+    }
     msg.use_selections = _normalizeUseSelections(msg.use_selections);
     const mentions = parseMentions(instruction);
     if (mentions.length) msg.mentions = mentions;
@@ -10589,9 +10983,11 @@ export async function editConversationTask(
     item.msgId = msg.id;
     item.sourceText = instruction;
     item.sourceMessage = msg;
+    item.imageStudioNativePng = msg.image_studio_native_png;
     item.sharedSourceMessage = false;
     item.llmPayload = payload;
     delete item.orchestrationGoal;
+    delete item.orchestrationRequestHistory;
     item.attachments = msg.attachments?.slice();
     item.references = msg.references?.slice();
     item.useSelections = _normalizeUseSelections(msg.use_selections);
@@ -10623,7 +11019,7 @@ export async function sendConversationTaskNow(
   const item = state.queue.find((candidate) => candidate.taskId === taskId);
   if (!item) return { ok: false, error: 'not_queued' };
   if (item.composerEditing) return { ok: false, error: 'edit_in_progress' };
-  if (item.fromActorId !== USER_ID || item.nested || item.commanderSubtask || item.terminalHandoff) {
+  if (item.fromActorId !== USER_ID || item.nested || item.commanderSubtask || item.terminalHandoff || item.imageStudioNativePng) {
     return { ok: false, error: 'not_sendable' };
   }
   const live = _executionForActor(state, item.actor.id);
@@ -10710,6 +11106,24 @@ async function _releaseCancelledTaskFloor(
   }
 }
 
+async function _stopRunningTask(state: CidState, turnId: string, w: WorkerState): Promise<void> {
+  if (w.stopRequested) return;
+  w.stopRequested = true;
+  try { w.abortController?.abort(); } catch { /* ignore */ }
+  const { uid, cid } = state;
+  try {
+    const { abortActiveSession } = await import('../../model/client');
+    // The same actor may already have claimed a queued successor while this
+    // import settled. Only abort the model session while this turn owns it.
+    if (state.executions.get(turnId) === w && typeof abortActiveSession === 'function') {
+      abortActiveSession(actorSessionId(cid, w.actor), uid);
+    }
+  } catch (err) {
+    log.warn(`task cancel session abort failed cid=${cid}: ${(err as Error).message}`);
+  }
+  if (w.item?.taskId) await _releaseCancelledTaskFloor(uid, cid, w.item.taskId, w.actor.id, state, w.item);
+}
+
 /** Cancel one board task without touching the rest of the conversation.
  *
  * - queued: remove its pending item, mark the board row cancelled, clear the
@@ -10742,22 +11156,9 @@ export async function cancelConversationTask(
       _scheduleAdmissions(state);
       return { ok: true, scope: 'queued' };
     }
-    for (const [, w] of state.executions) {
+    for (const [turnId, w] of state.executions) {
       if (w.item?.taskId !== taskId) continue;
-      w.stopRequested = true;
-      try { w.abortController?.abort(); } catch { /* ignore */ }
-      // Belt-and-suspenders for the same production gap the conversation
-      // abort covers: the live model session may hold the only real handle.
-      try {
-        const model = await import('../../model/client');
-        const abortSession = (model as {
-          abortActiveSession?: (sessionId: string, userId?: string) => number;
-        }).abortActiveSession;
-        if (typeof abortSession === 'function') abortSession(actorSessionId(cid, w.actor), uid);
-      } catch (err) {
-        log.warn(`task cancel session abort failed cid=${cid}: ${(err as Error).message}`);
-      }
-      await _releaseCancelledTaskFloor(uid, cid, taskId, w.actor.id, state, w.item);
+      await _stopRunningTask(state, turnId, w);
       log.info(`task cancel user=${uid} cid=${cid} task=${maskId(taskId)} scope=running actor=${maskId(w.actor.id)}`);
       return { ok: true, scope: 'running' };
     }
@@ -11132,6 +11533,7 @@ async function _runCliAgentTurn(opts: {
   aborted?: boolean;
   produced?: string[];
   published?: string[];
+  observedOutputs?: ReadonlyMap<string, string>;
   commanderHandoff?: import('../local_agents/bridge').CommanderHandoffRequest;
   failureKind?: GroupMessageFailureKind;
   failureCode?: string;
@@ -11167,7 +11569,8 @@ async function _runCliAgentTurn(opts: {
   const storedBinding = await cliSessions.getBinding(
     opts.uid, opts.cid, opts.agent.agent_id, runtime.cli,
   );
-  const contextPlan = await _buildCliContextPlan(
+  let contextPlan: CliContextPlan;
+  try { contextPlan = await _buildCliContextPlan(
     opts.uid,
     opts.cid,
     opts.agent,
@@ -11176,7 +11579,11 @@ async function _runCliAgentTurn(opts: {
     opts.language,
     storedBinding?.historySyncedThroughMessageId,
     opts.projectId,
-  );
+  ); } catch (error) {
+    if ((error as { code?: string })?.code !== 'E_FORM_TASK_UNAVAILABLE') throw error;
+    const message = t('errors.task_restore_unavailable');
+    return { text: message, error: message, failureKind: 'dependency', failureCode: 'form_task_unavailable' };
+  }
   const cwdFingerprint = fingerprintCliContext(path.resolve(opts.workingDir));
   const cliCapabilities = localCliCapabilities(runtime.cli);
   const permissionPolicy = runtime.permission_policy
@@ -11271,7 +11678,7 @@ async function _runCliAgentTurn(opts: {
     : null;
   const runner = await import('../local_agents/runner');
 
-  const textState = createPhasedTextState();
+  let textState = createPhasedTextState();
   let claudeMessageId = '';
   let claudeMessageText = '';
   /** Wall-clock moment the current native message's first token arrived. */
@@ -11302,6 +11709,7 @@ async function _runCliAgentTurn(opts: {
   let backendSessionId: string | undefined;
   let resolvedCliModel = '';
   const produced = new Set<string>();
+  const observedOutputs = new Map<string, string>();
   // Native shell commands (scripts, screenshots, exports) write files without
   // a Write/Edit tool event. An explicit declaration may adopt such a file
   // only when it was created during this run, never an existing workspace file.
@@ -11351,9 +11759,15 @@ async function _runCliAgentTurn(opts: {
     onAutoTaskDeleted: opts.onAutoTaskDeleted,
     onTodoTaskDeleted: opts.onTodoTaskDeleted,
     onOutputsPublished: (paths) => {
-      declaredOutputs = paths.filter((p) => (produced.has(p) && isExistingProducedFile(p))
-        || isFileCreatedAfterFence(p, cliCreationFence));
-      for (const p of declaredOutputs) produced.add(p);
+      declaredOutputs = paths.filter((p) => {
+        if (produced.has(p) && !observedOutputs.has(p) && isExistingProducedFile(p)) return true;
+        if (!isFileCreatedAfterFence(p, cliCreationFence)) return false;
+        const version = readProducedFileVersion(p);
+        if (version === undefined) return false;
+        observedOutputs.set(p, version);
+        produced.add(p);
+        return true;
+      });
       return [...declaredOutputs];
     },
     onEvent: e => {
@@ -11421,7 +11835,7 @@ async function _runCliAgentTurn(opts: {
                 });
               }
               if (streamText) {
-                const presentationPhase = phased.phase;
+                const presentationPhase = sourcePhase === 'pending' ? sourcePhase : phased.phase;
                 opts.onProcess({
                   type: 'delta',
                   text: streamText,
@@ -11429,6 +11843,12 @@ async function _runCliAgentTurn(opts: {
                 });
               }
             }
+          }
+          break;
+        case 'commentary-finalized':
+          if (typeof e.text === 'string' && e.text) {
+            textState = createPhasedTextState();
+            if (!slashCommandName) opts.onProcess({ type: 'commentary-finalized', text: e.text });
           }
           break;
         case 'thinking':
@@ -11452,21 +11872,26 @@ async function _runCliAgentTurn(opts: {
           }
           break;
         case 'tool-event':
-          if ((e as any).phase === 'use') {
-            const callId = String((e as any).callId || '');
-            const paths = extractWritablePathsFromCliTool(e as any, opts.workingDir);
+          if (e.phase === 'use') {
+            const callId = String(e.callId || '');
+            const paths = extractWritablePathsFromCliTool(e, opts.workingDir);
             if (callId && paths.length) pendingToolPaths.set(callId, paths);
-          } else if ((e as any).phase === 'result') {
-            const callId = String((e as any).callId || '');
-            // Session replay and some CLIs may deliver only the terminal tool
-            // event. Prefer paths correlated from the live `use` event, but
-            // also extract the result's own safe write/edit input so these
-            // files still enter conversation ownership.
-            const paths = [
-              ...(callId ? pendingToolPaths.get(callId) || [] : []),
-              ...extractWritablePathsFromCliTool(e as any, opts.workingDir),
-            ];
-            for (const p of paths) produced.add(p);
+          } else if (e.phase === 'result') {
+            const callId = String(e.callId || '');
+            if (!e.isError && !e.error) {
+              // Some CLIs deliver only the terminal event. Accept its safe
+              // write inputs as well as paths correlated from the live call.
+              const paths = [
+                ...(callId ? pendingToolPaths.get(callId) || [] : []),
+                ...extractWritablePathsFromCliTool(e, opts.workingDir),
+              ];
+              for (const p of paths) {
+                observedOutputs.delete(p);
+                produced.add(p);
+              }
+            }
+            // A failed call retires its tentative paths. Earlier write and
+            // publication evidence (including observed versions) still applies.
             if (callId) pendingToolPaths.delete(callId);
           }
           opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
@@ -11483,6 +11908,7 @@ async function _runCliAgentTurn(opts: {
                 : [],
             );
             for (const p of paths) {
+              observedOutputs.delete(p);
               produced.add(p);
               if (conversationMedia) inlineGeneratedImages.add(p);
             }
@@ -11655,6 +12081,7 @@ async function _runCliAgentTurn(opts: {
         : {}),
     });
   }
+  const producedFiles = { produced: Array.from(produced), observedOutputs };
   if (result.status === 'missing_cli') {
     const vars = {
       name: opts.agent.name || runtime.cli,
@@ -11673,7 +12100,7 @@ async function _runCliAgentTurn(opts: {
       text: '',
       error: msg,
       aborted: false,
-      produced: Array.from(produced),
+      ...producedFiles,
       failureKind: 'dependency',
       failureCode: result.cliError || 'missing_cli',
       failurePhase: 'preflight',
@@ -11702,12 +12129,13 @@ async function _runCliAgentTurn(opts: {
     return {
       text: publicText,
       aborted: true,
-      produced: Array.from(produced),
+      ...producedFiles,
       published: publishedOutputs,
     };
   }
-  if (result.cliError === 'model_unsupported' || result.cliError === 'parameter_unsupported') {
-    return { text: '', error: result.error, produced: Array.from(produced),
+  if (result.cliError === 'model_unsupported' || result.cliError === 'parameter_unsupported'
+    || result.cliError === 'tool_restore_failed' || result.cliError === 'tool_setup_failed') {
+    return { text: '', error: result.error, ...producedFiles,
       failureKind: 'dependency', failureCode: result.cliError, failurePhase: 'preflight' };
   }
   if (result.status === 'failed' || result.status === 'timeout') {
@@ -11724,7 +12152,7 @@ async function _runCliAgentTurn(opts: {
     return {
       text: publicText,
       error: detail,
-      produced: Array.from(produced),
+      ...producedFiles,
       published: publishedOutputs,
       failureKind: 'runtime',
       failurePhase: 'tool',
@@ -11737,14 +12165,14 @@ async function _runCliAgentTurn(opts: {
   if (slashCommandName && _looksLikeNoOutput(finalText)) {
     return {
       text: t('cli_agent.slash_no_output', { cmd: slashCommandName }),
-      produced: Array.from(produced),
+      ...producedFiles,
       published: publishedOutputs,
       ...(result.commanderHandoff ? { commanderHandoff: result.commanderHandoff } : {}),
     };
   }
   return {
     text: finalText,
-    produced: Array.from(produced),
+    ...producedFiles,
     published: publishedOutputs,
     historySyncEligible: !contextPlan.passthrough,
     ...(result.commanderHandoff ? { commanderHandoff: result.commanderHandoff } : {}),
@@ -11831,11 +12259,47 @@ function extractWritablePathsFromCliTool(e: Record<string, unknown>, workingDir:
   return normalizeCliProducedPaths(candidates.filter((p): p is string => typeof p === 'string'), workingDir);
 }
 
-function _resolveCliTaskBody(
-  item: QueueItem,
+/** Walk backward once, retaining only the exact form/source chain. Large
+ * unrelated conversations never become a second in-memory transcript. */
+async function _readCliFormSourceRows(uid: string, cid: string, agentId: string, formId: string): Promise<GroupMessage[]> {
+  const rows: GroupMessage[] = [];
+  const seenForms = new Set<string>();
+  let wantedForm = formId;
+  let wantedMessage = '';
+  let before: number | null | undefined;
+  for (;;) {
+    const page = await readJsonlPage<GroupMessage>(conversationMessageReadFile(uid, cid), CLI_CANONICAL_TAIL_PAGE, before);
+    for (let index = page.records.length - 1; index >= 0; index--) {
+      const row = page.records[index];
+      if (wantedForm && row.form?.form_id === wantedForm && row.form.agent_id === agentId && row.from === agentId) {
+        if (row.deleted_at || !row.source_message_id || seenForms.has(wantedForm)) return [];
+        seenForms.add(wantedForm);
+        rows.push(row);
+        wantedMessage = row.source_message_id;
+        wantedForm = '';
+      } else if (wantedMessage && row.id === wantedMessage) {
+        if (row.deleted_at || !row.to?.includes(agentId)) return [];
+        rows.push(row);
+        const prior = decodeSubmission(row.model_text || row.text || '');
+        if (!prior) return rows.reverse();
+        if (prior.agent_id !== agentId || seenForms.has(prior.form_id)) return [];
+        wantedForm = prior.form_id;
+        wantedMessage = '';
+      }
+    }
+    if (!page.records.length || page.nextCursor === null) return [];
+    before = page.nextCursor;
+  }
+}
+
+async function _resolveCliTaskBody(
+  item: Pick<QueueItem, 'llmPayload' | 'taskId' | 'assignmentContext' | 'predecessorContext'>,
   history: GroupMessage[],
   agent: Pick<import('../agents').Agent, 'name' | 'agent_id'>,
-): string {
+  uid: string,
+  cid: string,
+  reloadSource = true,
+): Promise<string> {
   const submission = decodeSubmission(item.llmPayload);
   if (!submission) {
     const unwrapped = _unwrapLlmTurnPayload(item.llmPayload) ?? item.llmPayload;
@@ -11849,25 +12313,78 @@ function _resolveCliTaskBody(
     return prelude ? `${prelude}\n\n${body}` : body;
   }
 
-  let originalTask = '';
-  for (let i = history.length - 1; i >= 0; i--) {
-    const message = history[i];
-    const text = (message.text || '').trim();
-    if (message.from !== 'user' || !text) continue;
-    if (decodeSubmission(text)) continue;
-    originalTask = text;
-    break;
+  const unavailable = () => Object.assign(new Error('The form task is unavailable; send the task again to continue.'),
+    { code: 'E_FORM_TASK_UNAVAILABLE' });
+  if (submission.agent_id !== agent.agent_id) throw unavailable();
+  // Resolve only the form's causal chain. Its source can itself be a prior
+  // submission when another required input was requested in the same task.
+  const resolve = (rows: GroupMessage[]) => {
+    const byId = new Map(rows.map(row => [row.id, row]));
+    const positions = new Map(rows.map((row, index) => [row.id, index]));
+    const forms = new Map(rows.filter(row => !row.deleted_at && row.from === agent.agent_id
+      && row.form?.agent_id === agent.agent_id).map(row => [row.form!.form_id, row]));
+    const question = forms.get(submission.form_id);
+    let sourceQuestion = question;
+    let source = question?.source_message_id ? byId.get(question.source_message_id) : undefined;
+    const answers: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    while (source && !source.deleted_at && !seen.has(source.id)) {
+      seen.add(source.id);
+      if ((positions.get(source.id) ?? Infinity) >= (positions.get(sourceQuestion?.id || '') ?? -1)) return undefined;
+      if (!source.to?.includes(agent.agent_id)) return undefined;
+      const earlier = decodeSubmission(source.model_text || source.text || '');
+      if (!earlier) return { question: question!, source, values: Object.assign({}, ...answers.reverse(), submission.values) };
+      if (earlier.agent_id !== agent.agent_id) return undefined;
+      answers.push(earlier.values);
+      const parent = forms.get(earlier.form_id);
+      if (!parent?.source_message_id || (question?.task_id && parent.task_id && parent.task_id !== question.task_id)) return undefined;
+      if ((positions.get(parent.id) ?? Infinity) >= (positions.get(source.id) ?? -1)) return undefined;
+      sourceQuestion = parent;
+      source = byId.get(parent.source_message_id);
+    }
+    return undefined;
+  };
+  let resolved = resolve(history);
+  if (!resolved && reloadSource) {
+    // CLI recovery normally reads a bounded tail. An old, exactly identified
+    // form can need its earlier source; page once, never guess a nearby task.
+    resolved = resolve(await _readCliFormSourceRows(uid, cid, agent.agent_id, submission.form_id));
   }
-  const rawTask = originalTask || _unwrapLlmTurnPayload(item.llmPayload) || item.llmPayload;
+  if (!resolved) throw unavailable();
+  const { question, source, values } = resolved;
+  if (!String(source.model_text || source.text || '').trim()) throw unavailable();
+  let rawTask = source.model_text || source.text;
+  let assignment = item.assignmentContext;
+  if (question.task_id || item.taskId) {
+    const row = (await taskBoard.listTasks(uid, cid)).find(task => task.task_id === (question.task_id || item.taskId));
+    // Legacy forms can still recover from their exact canonical source. A new
+    // submission-only board row is not evidence of the original task's scope.
+    if (question.task_id || (row && !decodeSubmission(row.instruction))) {
+      if (!row || row.assignee !== agent.agent_id || !['waiting_input', 'running'].includes(row.status)
+        || (row.resume?.form_id && row.resume.form_id !== submission.form_id)
+        || (row.source_msg_id !== source.id && source.task_id !== row.task_id)) throw unavailable();
+      rawTask = row.assignment_context || row.instruction !== source.text ? row.instruction : rawTask;
+      assignment = row.assignment_context || assignment;
+    }
+  }
   const task = _stripLeadingRecipientMention(rawTask.trim(), agent.name || '', agent.agent_id).trim();
-  const lines: string[] = [task];
-  const extraValues = Object.entries(submission.values)
+  const lines: string[] = [assignment, item.predecessorContext, task].filter((s): s is string => !!s);
+  const extraValues = Object.entries(values)
     .filter(([key]) => key !== 'project_dir')
     .map(([key, value]) => `- ${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
   if (extraValues.length) {
     lines.push('', '## Confirmed parameters', ...extraValues);
   }
   return lines.join('\n');
+}
+
+/** The form commit and CLI invocation share the same source/owner check.
+ * The facade already has canonical rows, so validation never rereads them. */
+export async function assertCliFormTaskSource(
+  uid: string, cid: string, agent: Pick<import('../agents').Agent, 'name' | 'agent_id'>,
+  form: ChatFormPayload, rows: GroupMessage[],
+): Promise<void> {
+  await _resolveCliTaskBody({ llmPayload: encodeSubmission(form, {}) }, rows, agent, uid, cid, false);
 }
 
 async function _buildCliContextPlan(
@@ -11935,9 +12452,12 @@ async function _buildCliContextPlan(
   }
   if (projectId) {
     const projectsFeat = await import('../projects');
+    const goalFeat = await import('../project_goal');
     projectContext = [
       projectsFeat.formatProjectContextCoreForPrompt(),
       projectsFeat.formatProjectInstructionsForSystemPrompt(uid, projectId),
+      // Like an in-process named Agent, a CLI Agent gets the goal's facts only.
+      goalFeat.formatProjectGoalForSystemPrompt(uid, projectId, { usage: false }),
     ].filter((block) => block && block.trim()).join('\n\n');
     turnContext.push(
       // Every bridge-capable CLI receives project-memory writes in a project
@@ -11946,7 +12466,7 @@ async function _buildCliContextPlan(
     );
   }
 
-  const taskBody = _resolveCliTaskBody(item, canonicalRows, agent);
+  const taskBody = await _resolveCliTaskBody(item, canonicalRows, agent, uid, cid);
   const attDir = chatAttachmentDirForConversation(uid, cid);
   const turnAttachments = (item.attachments || []).map((name) => path.join(attDir, name));
 

@@ -153,23 +153,68 @@ export function copyLocalEntryExclusiveSync(source: string, target: string, dire
 
 export interface LocalEntryRevision {
   root: string;
-  entries: Array<{ relative: string; stamp: string }>;
+  entries: Array<{ relative: string; stamp: string; digest?: string }>;
 }
+
+export type BeforeLocalEntryDelete = () => boolean | Promise<() => boolean>;
 
 const MAX_REVISION_ENTRIES = 10_000;
 const MAX_REVISION_PATH_BYTES = 1024 * 1024;
+const REVISION_READ_BYTES = 128 * 1024;
 
 function revisionStamp(stat: fs.BigIntStats): string | undefined {
   if (!stat.isFile() && !stat.isDirectory()) return undefined;
   return [stat.isDirectory() ? 'dir' : 'file', stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
 }
 
-/** Metadata only: native saves replace the inode or change its timestamps.
- * Include every directory so additions/removals are detected too. Refuse an
- * unavailable or oversized snapshot before a move can remove any source. */
+async function revisionDigest(absolute: string, stat: fs.BigIntStats, stamp: string,
+  buffer: Buffer, deadline: number): Promise<string> {
+  const handle = await fsp.open(absolute, 'r');
+  try {
+    if (revisionStamp(await handle.stat({ bigint: true })) !== stamp) throw new Error('revision changed');
+    const hash = crypto.createHash('sha256');
+    const size = Number(stat.size);
+    for (let offset = 0; offset < size;) {
+      if (performance.now() > deadline) throw new Error('revision budget exceeded');
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - offset), offset);
+      if (!bytesRead) throw new Error('revision changed');
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    if (performance.now() > deadline || revisionStamp(await fsp.lstat(absolute, { bigint: true })) !== stamp) {
+      throw new Error('revision changed');
+    }
+    return hash.digest('hex');
+  } finally { await handle.close(); }
+}
+
+function revisionDigestSync(absolute: string, stat: fs.BigIntStats, stamp: string,
+  buffer: Buffer, deadline: number): string {
+  const fd = fs.openSync(absolute, 'r');
+  try {
+    if (revisionStamp(fs.fstatSync(fd, { bigint: true })) !== stamp) throw new Error('revision changed');
+    const hash = crypto.createHash('sha256');
+    const size = Number(stat.size);
+    for (let offset = 0; offset < size;) {
+      if (performance.now() > deadline) throw new Error('revision budget exceeded');
+      const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - offset), offset);
+      if (!bytesRead) throw new Error('revision changed');
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    if (performance.now() > deadline || revisionStamp(fs.lstatSync(absolute, { bigint: true })) !== stamp) {
+      throw new Error('revision changed');
+    }
+    return hash.digest('hex');
+  } finally { fs.closeSync(fd); }
+}
+
+/** Same-size writes can leave the entire stat stamp unchanged. Capture file
+ * contents and every directory so a move can also detect those edits. */
 export async function captureLocalEntryRevision(root: string): Promise<LocalEntryRevision | undefined> {
   const entries: LocalEntryRevision['entries'] = [];
   const deadline = performance.now() + 5000;
+  const buffer = Buffer.allocUnsafe(REVISION_READ_BYTES);
   let pathBytes = 0;
   async function visit(absolute: string, relative: string, depth: number): Promise<void> {
     pathBytes += Buffer.byteLength(relative);
@@ -178,8 +223,10 @@ export async function captureLocalEntryRevision(root: string): Promise<LocalEntr
     const stat = await fsp.lstat(absolute, { bigint: true });
     const stamp = revisionStamp(stat);
     if (!stamp) throw new Error('unsupported revision source');
-    entries.push({ relative, stamp });
-    if (stat.isDirectory()) {
+    if (stat.isFile()) {
+      entries.push({ relative, stamp, digest: await revisionDigest(absolute, stat, stamp, buffer, deadline) });
+    } else {
+      entries.push({ relative, stamp });
       const directory = await fsp.opendir(absolute);
       for await (const child of directory) {
         await visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
@@ -190,10 +237,13 @@ export async function captureLocalEntryRevision(root: string): Promise<LocalEntr
   catch { return undefined; }
 }
 
-/** Capture the owned copy before indexing can yield to another edit. */
-export function captureLocalEntryRevisionSync(root: string): LocalEntryRevision | undefined {
+/** Capture the owned copy before indexing can yield to another edit. A copy's
+ * bytes must match the original evidence when the removal guard reads them. */
+export function captureLocalEntryRevisionSync(root: string, copiedFrom?: LocalEntryRevision): LocalEntryRevision | undefined {
   const entries: LocalEntryRevision['entries'] = [];
   const deadline = performance.now() + 100;
+  const expected = copiedFrom && new Map(copiedFrom.entries.map(entry => [entry.relative, entry]));
+  let buffer: Buffer | undefined;
   let pathBytes = 0;
   function visit(absolute: string, relative: string, depth: number): void {
     pathBytes += Buffer.byteLength(relative);
@@ -202,8 +252,14 @@ export function captureLocalEntryRevisionSync(root: string): LocalEntryRevision 
     const stat = fs.lstatSync(absolute, { bigint: true });
     const stamp = revisionStamp(stat);
     if (!stamp) throw new Error('unsupported revision source');
-    entries.push({ relative, stamp });
-    if (stat.isDirectory()) {
+    const original = expected?.get(relative);
+    if (expected && (!original || (original.digest !== undefined) !== stat.isFile())) throw new Error('copy changed');
+    if (stat.isFile()) {
+      const digest = original?.digest ?? revisionDigestSync(absolute, stat, stamp,
+        buffer ??= Buffer.allocUnsafe(REVISION_READ_BYTES), deadline);
+      entries.push({ relative, stamp, digest });
+    } else {
+      entries.push({ relative, stamp });
       const directory = fs.opendirSync(absolute);
       try {
         let child: fs.Dirent | null;
@@ -213,20 +269,57 @@ export function captureLocalEntryRevisionSync(root: string): LocalEntryRevision 
       } finally { directory.closeSync(); }
     }
   }
-  try { visit(root, '', 0); return { root, entries }; }
+  try {
+    visit(root, '', 0);
+    return !expected || expected.size === entries.length ? { root, entries } : undefined;
+  }
   catch { return undefined; }
 }
 
 /** Called at the actual synchronous removal boundary, after async validation.
  * Bound main-thread work; uncertain state must retain both recoverable copies. */
 export function localEntryRevisionMatches(
-  revision: LocalEntryRevision | undefined, deadline = performance.now() + 100,
+  revision: LocalEntryRevision | undefined, deadline = performance.now() + 100, verifyContents = true,
 ): boolean {
   if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return false;
   try {
-    return revision.entries.every(({ relative, stamp }) => performance.now() <= deadline
-      && revisionStamp(fs.lstatSync(path.join(revision.root, relative), { bigint: true })) === stamp);
+    let buffer: Buffer | undefined;
+    return revision.entries.every(({ relative, stamp, digest }) => {
+      if (performance.now() > deadline) return false;
+      const absolute = path.join(revision.root, relative);
+      const stat = fs.lstatSync(absolute, { bigint: true });
+      if (revisionStamp(stat) !== stamp) return false;
+      return !verifyContents || stat.isDirectory() || (digest !== undefined && revisionDigestSync(absolute, stat, stamp,
+        buffer ??= Buffer.allocUnsafe(REVISION_READ_BYTES), deadline) === digest);
+    });
   } catch { return false; }
+}
+
+/** Finish disk reads asynchronously for large moves, then let the owning
+ * delete path recheck both path stamps immediately before removal. */
+export async function prepareLocalEntryDelete(
+  revisions: readonly (LocalEntryRevision | undefined)[],
+): Promise<() => boolean> {
+  const deadline = performance.now() + 5000;
+  const buffer = Buffer.allocUnsafe(REVISION_READ_BYTES);
+  try {
+    for (const revision of revisions) {
+      if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return () => false;
+      for (const { relative, stamp, digest } of revision.entries) {
+        if (performance.now() > deadline) return () => false;
+        const absolute = path.join(revision.root, relative);
+        const stat = await fsp.lstat(absolute, { bigint: true });
+        if (revisionStamp(stat) !== stamp) return () => false;
+        if (stat.isFile() && (!digest || await revisionDigest(absolute, stat, stamp, buffer, deadline) !== digest)) {
+          return () => false;
+        }
+      }
+    }
+    return () => {
+      const stampDeadline = performance.now() + 100;
+      return revisions.every(revision => localEntryRevisionMatches(revision, stampDeadline, false));
+    };
+  } catch { return () => false; }
 }
 
 export async function isUtf8File(absPath: string): Promise<boolean> {

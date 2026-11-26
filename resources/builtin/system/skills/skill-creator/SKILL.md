@@ -5,7 +5,7 @@ description: "Create, edit or faithfully import explicitly requested custom Skil
 
 # skill-creator
 
-Create, edit, or faithfully import a custom Skill through host-owned metadata tags, `<<<skill-file>>>` whole-file blocks, or the native package importer. Do not mutate the Skill directory with generic file or shell tools.
+Create, edit, or faithfully import a custom Skill through host-owned metadata tags, `<<<skill-file>>>` whole-file blocks, or the native package importer.
 
 ## Read only the reference needed for this request
 
@@ -24,7 +24,7 @@ Do not read unrelated references. A category-only edit needs only `metadata.md`;
 
 ## Non-negotiable protocol
 
-- **Use host-owned mutation paths only.** Use `import_skill_package` for an explicitly supplied local Skill directory/ZIP when available, metadata tags for metadata-only changes, and `<<<skill-file>>>` for changed file content. Never use `edit_file`, `write_file`, or shell redirects under the Skill directory.
+- **Use host-owned mutation paths only.** Use `import_skill_package` for an explicitly supplied local Skill directory/ZIP when available, metadata tags for metadata-only changes, and `<<<skill-file>>>` for changed file content. Do not modify the Skill directory directly with file tools, shell commands, or scripts.
 - **Whole-file replacement.** Every `<<<skill-file>>>` block replaces one complete relative file. Read an existing file before changing it; a partial body erases omitted content.
 - **Protocol completeness beats prose depth.** Close every file block with `>>>` on its own line and close the outer `</skill>` before user-visible prose. If response space is tight, shorten the Skill body; never truncate or omit a protocol delimiter.
 - **No protocol files.** Do not dump `<skill>`, `<skill-meta>`, or file blocks into the workspace. The host parses them inline.

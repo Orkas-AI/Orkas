@@ -288,14 +288,29 @@ describe('Library move source revision', () => {
     const { captureLocalEntryRevision, captureLocalEntryRevisionSync, localEntryRevisionMatches } = await import('../../../src/main/util/file-import');
     const capture = mode === 'sync' ? captureLocalEntryRevisionSync : captureLocalEntryRevision;
     const source = path.join(root, 'folder');
+    const note = path.join(source, 'nested', 'notes.md');
     fs.mkdirSync(path.join(source, 'nested'), { recursive: true });
-    fs.writeFileSync(path.join(source, 'nested', 'notes.md'), 'Original');
+    fs.writeFileSync(note, 'Original');
     const snapshot = await capture(source);
     expect(snapshot).toBeDefined();
     expect(localEntryRevisionMatches(snapshot)).toBe(true);
     expect(localEntryRevisionMatches(snapshot, performance.now() - 1)).toBe(false);
-    fs.writeFileSync(path.join(source, 'nested', 'notes.md'), 'Modified');
-    expect(localEntryRevisionMatches(snapshot)).toBe(false);
+    const nodeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const metadata = nodeFs.lstatSync(note, { bigint: true });
+    const lstat = nodeFs.lstatSync;
+    const fstat = nodeFs.fstatSync;
+    fs.writeFileSync(note, 'Modified');
+    // Keep identity, size and reported times identical across the write.
+    const pathStat = vi.spyOn(nodeFs, 'lstatSync').mockImplementation(((file: fs.PathLike, options?: fs.StatOptions) =>
+      file === note && options?.bigint ? metadata : lstat(file, options)) as typeof lstat);
+    const handleStat = vi.spyOn(nodeFs, 'fstatSync').mockImplementation(((fd: number, options?: fs.StatOptions) => {
+      const real = fstat(fd, options);
+      return options?.bigint && real.ino === metadata.ino && real.dev === metadata.dev ? metadata : real;
+    }) as typeof fstat);
+    syncBuiltinESMExports();
+    try { expect(localEntryRevisionMatches(snapshot)).toBe(false); }
+    finally { pathStat.mockRestore(); handleStat.mockRestore(); syncBuiltinESMExports(); }
     const next = await capture(source);
     fs.writeFileSync(path.join(source, 'nested', 'added.md'), 'New child');
     expect(localEntryRevisionMatches(next)).toBe(false);
@@ -335,34 +350,34 @@ describe('Library move source revision', () => {
     const retained = path.join(source, 'retained.md');
     fs.writeFileSync(retained, 'Retained');
     const directoryStat = fs.lstatSync(source, { bigint: true });
-    const fileStat = fs.lstatSync(retained, { bigint: true });
-    // Model the metadata population, not thousands of native files whose
+    // Model thousands of empty child directories rather than native entries whose
     // Windows deletion can exceed the hook deadline. Adjacent cases retain
     // real filesystem revision/replacement evidence. Freeze only this clock
     // so a time-budget refusal cannot impersonate the entry-budget oracle.
-    const names = Array.from({ length: children }, (_, index) => index === 0 ? 'retained.md' : `${index}.md`);
+    const names = Array.from({ length: children }, (_, index) => `folder-${index}`);
     let reads = 0;
     const metadata = (file: fs.PathLike) => {
       reads++;
       if (String(file) !== source && path.dirname(String(file)) !== source) throw new Error('Unexpected revision fixture path');
-      return String(file) === source ? directoryStat : fileStat;
+      return directoryStat;
     };
     let asyncClosed = 0;
     let syncClosed = 0;
     const spies = [
       vi.spyOn(nodeFs, 'lstatSync').mockImplementation(metadata as typeof nodeFs.lstatSync),
       vi.spyOn(nodeFsp, 'lstat').mockImplementation(async file => metadata(file)),
-      vi.spyOn(nodeFsp, 'opendir').mockImplementation(async () => ({
+      vi.spyOn(nodeFsp, 'opendir').mockImplementation(async file => ({
         async *[Symbol.asyncIterator]() {
+          if (file !== source) return;
           try { for (const name of names) yield { name }; }
           finally { asyncClosed++; }
         },
       }) as unknown as fs.Dir),
-      vi.spyOn(nodeFs, 'opendirSync').mockImplementation(() => {
+      vi.spyOn(nodeFs, 'opendirSync').mockImplementation(file => {
         let index = 0;
         return {
-          readSync: () => index < names.length ? { name: names[index++] } : null,
-          closeSync: () => { syncClosed++; },
+          readSync: () => file === source && index < names.length ? { name: names[index++] } : null,
+          closeSync: () => { if (file === source) syncClosed++; },
         } as unknown as fs.Dir;
       }),
       vi.spyOn(performance, 'now').mockReturnValue(0),

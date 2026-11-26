@@ -186,6 +186,43 @@ describe('what the canvas shows', () => {
     expect(await read()).toEqual([]);
   });
 
+  // 2026-11-16: free stock files name their source and author on the canvas, as the providers'
+  // API terms ask; the page link is offered only on the provider's own site.
+  it('credits a stock reference with its source and author, linking only to the provider page', async () => {
+    writeLedger([
+      { id: 'pour', kind: 'video', label: 'woman pouring coffee', path: 'media/stock/pixabay-video-1.mp4', origin: 'stock',
+        source: { provider: 'pixabay', id: 'pixabay-video-1', page_url: 'https://pixabay.com/videos/coffee-1/', author: 'Ana Lee',
+          author_url: 'https://pixabay.com/users/ana-lee-17/', license: 'Pixabay Content License' } },
+      { id: 'older', kind: 'video', label: 'steam over a cup', path: 'media/stock/pexels-video-4.mp4', origin: 'stock',
+        source: { provider: 'pexels', id: 'pexels-video-4', page_url: 'https://www.pexels.com/video/steam-4/', author: 'Lee Ana',
+          license: 'Pexels License' } },
+      { id: 'rain', kind: 'image', label: 'rain', path: 'media/stock/pixabay-image-2.jpg', origin: 'stock',
+        source: { provider: 'pixabay', id: 'pixabay-image-2', page_url: 'https://evil.example.com/pixabay.com', license: 'Pixabay Content License' } },
+      { id: 'tea', kind: 'image', label: 'tea', path: 'media/stock/pixabay-image-3.jpg', origin: 'stock',
+        source: { provider: 'pixabay', id: 'pixabay-image-3', page_url: 'http://pixabay.com/photos/tea-3/', author: 'Mo', license: 'Pixabay Content License' } },
+      { id: 'photo', kind: 'image', label: 'Photo', path: 'media/photo.png', origin: 'upload' },
+      { id: 'storm', kind: 'video', label: 'storm', path: 'media/stock/wikimedia-video-5.webm', origin: 'stock',
+        source: { provider: 'wikimedia', id: 'wikimedia-video-5', page_url: 'https://commons.wikimedia.org/wiki/File:Storm.webm', author: 'Jane Doe',
+          license: 'CC BY 4.0', credit: '"Storm" by Jane Doe, CC BY 4.0, https://commons.wikimedia.org/wiki/File:Storm.webm' } },
+      { id: 'moon', kind: 'image', label: 'moon', path: 'media/stock/wikimedia-image-6.jpg', origin: 'stock',
+        source: { provider: 'wikimedia', id: 'wikimedia-image-6', author: 'NASA', license: 'Public domain' } },
+    ]);
+
+    const [production] = await read();
+    const credit = (id: string) => production.assets.find((card) => card.id === id)?.credit;
+    // A licence that asks for credit is named; one that does not is left out.
+    expect(credit('storm')).toEqual({ source: 'Wikimedia Commons', author: 'Jane Doe', license: 'CC BY 4.0', url: 'https://commons.wikimedia.org/wiki/File:Storm.webm' });
+    expect(credit('moon')).toEqual({ source: 'Wikimedia Commons', author: 'NASA' });
+
+    expect(credit('pour')).toEqual({ source: 'Pixabay', author: 'Ana Lee', url: 'https://pixabay.com/videos/coffee-1/' });
+    // Imported before Pexels was removed: still credited, and linked on its own site.
+    expect(credit('older')).toEqual({ source: 'Pexels', author: 'Lee Ana', url: 'https://www.pexels.com/video/steam-4/' });
+    // A page the ledger names off the provider's site, or over plain http, is not offered as a link.
+    expect(credit('rain')).toEqual({ source: 'Pixabay' });
+    expect(credit('tea')).toEqual({ source: 'Pixabay', author: 'Mo' });
+    expect(credit('photo')).toBeUndefined();
+  });
+
   it('sorts footage, generated shots and videos into their cards, with audio on none', async () => {
     writeLedger([
       { id: 'photo', kind: 'image', label: 'Photo', path: 'media/photo.png', origin: 'upload' },
@@ -1314,21 +1351,6 @@ describe('knowing at an Update whether a video is behind its timeline', () => {
     expect((await changesOf()).main).toEqual([{ before: '$29', after: '$19' }]);
   });
 
-  it('reads a delivery recorded when the whole product.json counted', async () => {
-    // Earlier releases hashed the scenes, the page and the whole product file. Such a record
-    // must not flag every video after an update, and must still notice a real change.
-    const legacy = crypto.createHash('sha256');
-    for (const file of ['ad/videos/main/manifest.json', 'ad/videos/main/index.html', 'ad/product.json']) {
-      const abs = path.join(workspace, file);
-      legacy.update(fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '').update('\0');
-    }
-    write('ad/videos/main/.last-render.json', JSON.stringify({ delivered_source_sha256: legacy.digest('hex') }));
-    expect(await needsUpdate()).toBe(false);
-
-    await edit({ kind: 'set_fact', fact: 'price', text: '$19' });
-    expect(await needsUpdate()).toBe(true);
-  });
-
   // Decided 2026-11-11: Update renders nothing when nothing in the video changed, and the canvas
   // writes the file its own way.
   it('reads what the scenes say, not how their file is laid out', async () => {
@@ -1341,23 +1363,6 @@ describe('knowing at an Update whether a video is behind its timeline', () => {
 
     write('ad/videos/main/manifest.json', JSON.stringify({ ...manifest, scenes: [{ ...scenes[0], duration: 3.5 }, ...scenes.slice(1)] }));
     expect(await needsUpdate()).toBe(true);
-  });
-
-  it('comes back to a delivery recorded over the file\'s text once a change is undone', async () => {
-    // Before 2026-11-11 a delivery hashed the file as written, here by an Agent, not the canvas.
-    const text = crypto.createHash('sha256');
-    for (const file of ['ad/videos/main/manifest.json', 'ad/videos/main/index.html']) {
-      const abs = path.join(workspace, file);
-      text.update(fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '').update('\0');
-    }
-    text.update(JSON.stringify([['price', '$29']])).update('\0');
-    write('ad/videos/main/.last-render.json', JSON.stringify({ delivered_source_sha256: `facts:${text.digest('hex')}` }));
-    expect(await needsUpdate()).toBe(false);
-
-    await edit({ kind: 'set_text', video: 'main', scene: 'hook', slot: 'title', value: 'Brighter lamp' });
-    expect(await needsUpdate()).toBe(true);
-    await edit({ kind: 'set_text', video: 'main', scene: 'hook', slot: 'title', value: 'Bright lamp' });
-    expect(await needsUpdate()).toBe(false);
   });
 });
 

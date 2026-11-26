@@ -566,6 +566,28 @@ describe('getConnectorPromptBlock', () => {
 // ── list_connector_tools ────────────────────────────────────────────────
 
 describe('list_connector_tools', () => {
+  it('distinguishes disabled actions from an empty connector cache when recommending recovery', async () => {
+    const connector = makeInstance({ id: 'notion', tools: NOTION_TOOLS, enabled_subtools: [] });
+    fixtures.instances = [connector];
+    const [list] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
+
+    const disabled = await runTool(list, { connector_id: 'notion' });
+    expect(disabled.content).not.toContain('### search');
+    expect(disabled.content).toContain('settings');
+    expect(disabled.content).not.toContain('refresh');
+    expect(JSON.parse((await runTool(list, { query: 'search pages' })).content).tools).toEqual([]);
+
+    connector.enabled_subtools = null;
+    connector.tools_cache = [];
+    const noCache = await runTool(list, { connector_id: 'notion' });
+    expect(noCache.content).toContain('refresh');
+
+    connector.tools_cache = NOTION_TOOLS;
+    expect((await runTool(list, { connector_id: 'notion' })).content).toContain('### search');
+
+    expect(disabled.content).not.toBe(noCache.content);
+  });
+
   it('keeps catalog-excluded, blocked and disconnected actions out of global search', async () => {
     const action = (name: string, description: string): ToolSchema => ({ name, description, input_schema: { type: 'object' } });
     fixtures.instances = [
@@ -578,6 +600,9 @@ describe('list_connector_tools', () => {
       expect(JSON.parse((await runTool(list, { query })).content).tools).toEqual([]);
     }
     expect(JSON.parse((await runTool(list, { query: 'refund money' })).content).tools[0].name).toBe('create_refund');
+    const unavailable = await runTool(list, { connector_id: 'gmail' });
+    expect(unavailable.content).toContain('currently has no available actions');
+    expect(unavailable.content).not.toMatch(/blockedsecretmarker|refresh/);
   });
 
   it('searches a large single connector directly, then honors action withdrawal without rebuilding the runner', async () => {
@@ -1579,6 +1604,22 @@ describe('stringifyMcpResult (via call_connector_tool)', () => {
     expect(r.content).toBe('first\nsecond');
   });
 
+  it.each([true, false])('keeps external approval facts in the native result with text=%s', async withText => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const invoke = vi.fn(async () => ({
+      content: withText ? [{ type: 'text', text: 'Review required' }] : [],
+      structuredContent: { status: 'waiting_approval', proposal_id: 'proposal-synthetic-41' },
+    }));
+    fixtures.callTool = invoke;
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    const receipt = await runTool(call, { connector_id: 'notion', tool_name: 'search', args: { query: 'fixture' } });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(receipt.isError).not.toBe(true);
+    if (withText) expect(receipt.content).toContain('Review required');
+    expect(receipt.content).toMatch(/waiting_approval[\s\S]*proposal-synthetic-41/);
+  });
+
   it('returns plain strings verbatim', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     fixtures.callTool = async () => 'just a string';
@@ -1588,13 +1629,130 @@ describe('stringifyMcpResult (via call_connector_tool)', () => {
     expect(r.content).toBe('just a string');
   });
 
-  it('JSON-serialises non-text MCP shapes (image / structured data)', async () => {
+  it('reports a malformed image without injecting its payload into text', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     fixtures.callTool = async () => ({ content: [{ type: 'image', data: 'b64...' }] });
     const { createConnectorMetaTools } = await loadModule();
     const [, call] = await createConnectorMetaTools({ userId: UID });
     const r = await runTool(call, { connector_id: 'notion', tool_name: 'search', args: { query: 'x' } });
-    expect(r.content).toContain('"type":"image"');
+    expect(r.content).toContain('Connector images omitted');
+    expect(r.content).not.toContain('b64...');
+    expect(r.images).toBeUndefined();
+  });
+});
+
+// Synthetic one-pixel PNG. No original Connector payload or provider call is used.
+const previewImage = {
+  type: 'image',
+  mimeType: 'image/png',
+  data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNY4CAAAAJ0APE3i/j7AAAAAElFTkSuQmCC',
+};
+
+describe('sampling connector image result boundary', () => {
+  it.each([true, false])('can expose an actual preview for a visual turn with preceding text=%s', async (includeText) => {
+    fixtures.actionApproved = true;
+    const serviceCall = vi.fn(async () => ({
+      content: [
+        ...(includeText ? [{ type: 'text', text: 'One keyframe at 1.25 seconds' }] : []),
+        previewImage,
+      ],
+    }));
+    fixtures.callTool = serviceCall;
+    fixtures.instances = [makeInstance({
+      id: 'sample-visual-connector',
+      tools: [{ name: 'read_keyframe', description: 'Read a keyframe', input_schema: { type: 'object', properties: {} } }],
+    })];
+    const { createConnectorMetaTools } = await loadModule();
+    const { Session } = await import('../../../../src/core-agent/src/agent/session');
+    const [, call] = await createConnectorMetaTools({ userId: UID, cid: 'preview-conversation' });
+    const argumentsForCall = { connector_id: 'sample-visual-connector', tool_name: 'read_keyframe', args: {} };
+    const outcome = await runTool(call, argumentsForCall);
+    const session = new Session();
+    session.addUserMessage('Inspect the actual thumbnail at 1.25 seconds');
+    session.addAssistantMessage([{ type: 'tool_use', id: 'preview-call', name: call.name, input: argumentsForCall }]);
+    session.addToolResult('preview-call', outcome.content, outcome.images, outcome.isError, undefined, outcome.imageRetention);
+    const toolReply = session.getMessagesForModel().flatMap((message) => message.content)
+      .find((part) => part.type === 'tool_result' && part.toolUseId === 'preview-call');
+
+    expect(serviceCall).toHaveBeenCalledTimes(1);
+    expect(fixtures.actionConfirmCalls).toHaveLength(1);
+    expect(outcome.isError).toBeFalsy();
+    expect(toolReply?.type).toBe('tool_result');
+    if (toolReply?.type !== 'tool_result') throw new Error('Missing real Session tool result');
+    if (includeText) expect(toolReply.content).toContain('One keyframe at 1.25 seconds');
+    expect.soft(toolReply.images).toEqual([{
+      type: 'image', mediaType: previewImage.mimeType, data: previewImage.data,
+    }]);
+    expect.soft(toolReply.content).not.toContain(previewImage.data);
+  });
+
+  it('bounds native previews and preserves text and protocol errors', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    fixtures.callTool = async () => ({
+      isError: true,
+      content: [
+        { type: 'text', text: 'Preview failed after sampling' },
+        { ...previewImage, annotations: { audience: ['user'] } },
+        { ...previewImage, data: 'A'.repeat(7_000_000) },
+        ...Array.from({ length: 5 }, () => previewImage),
+      ],
+    });
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    const result = await runTool(call, { connector_id: 'notion', tool_name: 'search', args: { query: 'preview' } });
+    expect(result.isError).toBe(true);
+    expect(result.images).toHaveLength(4);
+    expect(result.content).toContain('Preview failed after sampling');
+    expect(result.content).toMatch(/omitted.*: 3\./);
+    expect(result.content).not.toContain(previewImage.data);
+  });
+
+  it.each([true, false])('delivers connector previews to the next model request through run_program (text=%s)', async includeText => {
+    const serviceCall = vi.fn(async () => ({
+      content: [...(includeText ? [{ type: 'text', text: 'Preview title' }] : []), previewImage],
+      structuredContent: { id: 'preview-41' },
+    }));
+    fixtures.callTool = serviceCall;
+    fixtures.instances = [makeInstance({ id: 'notion', tools: [{
+      name: 'search', description: 'Search previews', input_schema: { type: 'object', properties: {} },
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    }] })];
+    const { createConnectorMetaTools } = await loadModule();
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    const { runProgramWithTools } = await import('../../../helpers/programmatic-tools');
+    const result = await runProgramWithTools([call], `
+      const result = await tools.call_connector_tool({ connector_id: 'notion', tool_name: 'search', args: {} });
+      if (!result.ok) throw Error(result.content);
+      const legacy = ${includeText} ? false : JSON.parse(result.content).content[0].data === ${JSON.stringify(previewImage.data)};
+      json({ hasPreviewId: result.content.includes('preview-41'), legacy, hasText: result.content.includes('Preview title') });
+    `, '.', UID);
+    expect(result.isError, result.content).not.toBe(true);
+    expect(serviceCall).toHaveBeenCalledTimes(1);
+    expect(result.content).toContain(`"hasText":${includeText}`);
+    expect(result.content).toContain(`"legacy":${!includeText}`);
+    expect(result.content).toContain('"hasPreviewId":true');
+    const images = result.requests[1].messages.flatMap((message: any) =>
+      message.content.flatMap((part: any) => part.type === 'tool_result' ? part.images ?? [] : []));
+    expect(images).toEqual([{ type: 'image', mediaType: previewImage.mimeType, data: previewImage.data }]);
+    expect(result.content).not.toContain(previewImage.data);
+  });
+
+  it('withholds user-only images from a pure programmatic receipt', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    fixtures.callTool = async () => ({
+      content: [{ ...previewImage, annotations: { audience: ['user'] } }],
+      structuredContent: { id: 'preview-41' },
+    });
+    const { createConnectorMetaTools } = await loadModule();
+    const { markProgrammaticToolCallState } = await import('#core-agent');
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    const result = await call.execute({ connector_id: 'notion', tool_name: 'search', args: { query: 'preview' } },
+      { workingDir: '.', state: markProgrammaticToolCallState({}) });
+    expect(result.isError).not.toBe(true);
+    expect(result.images).toBeUndefined();
+    expect(result.content).toContain('preview-41');
+    expect(result.content).toMatch(/omitted.*: 1\./);
+    expect(result.content).not.toContain(previewImage.data);
   });
   it('delivers the sanitized original connector error intact to the native model without leaking it into telemetry', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
@@ -1608,4 +1766,25 @@ describe('stringifyMcpResult (via call_connector_tool)', () => {
       .toEqual({ content, isError: true });
   });
 
+
+  it('keeps an accepted large preview without exceeding the program budget with a duplicate legacy copy', async () => {
+    const bytes = Buffer.alloc(4 * 1024 * 1024);
+    Buffer.from(previewImage.data, 'base64').copy(bytes);
+    const data = bytes.toString('base64');
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    fixtures.callTool = async () => ({
+      content: [{ ...previewImage, data }],
+      structuredContent: { id: 'large-preview' },
+    });
+    const { createConnectorMetaTools } = await loadModule();
+    const { markProgrammaticToolCallState } = await import('#core-agent');
+    const [, call] = await createConnectorMetaTools({ userId: UID });
+    const result = await call.execute({ connector_id: 'notion', tool_name: 'search', args: {} },
+      { workingDir: '.', state: markProgrammaticToolCallState({}) });
+    expect(result.images).toHaveLength(1);
+    expect(result.images?.[0]?.data === data).toBe(true);
+    expect(result.content).toContain('large-preview');
+    expect(result.content).toContain('legacy inline copy exceeds the program result limit');
+    expect(result.content.length).toBeLessThan(512);
+  });
 });

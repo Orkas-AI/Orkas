@@ -25,8 +25,10 @@ for (const errorKind of ['pageerror', 'console'] as const) {
     const snapshot = () => orkas.electronApp!.evaluate(() => (globalThis as any).__previewRecovery.read());
     const failed = await preview(entry);
     expect(failed.ok).toBe(false);
-    expect(failed.toolIsError).toBe(true);
+    expect(failed.toolIsError).toBe(false);
+    expect(failed.blockers).toContain('desktop: 1 console/runtime error(s)');
     expect(failed.viewports[0].consoleErrors).toHaveLength(1);
+    expect(failed.viewports[0].consoleErrors[0]).toContain('Preview recovery fixture fault');
     expect(recoveredPreviewWindows(await snapshot())).toEqual([]);
     const other = orkas.createWorkspaceFile('app-b/index.html', source(false));
     expect((await preview(other)).ok).toBe(true);

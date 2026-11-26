@@ -27,7 +27,7 @@ afterEach(() => {
 // executor and next-request receipts. Browser pixels and live model recovery are
 // independent acceptance seams; the browser and interaction smoke are isolated.
 for (const api of ['openai-completions', 'openai-responses'] as const) {
-  for (const scenario of ['ambiguous-preview', 'unknown-revision'] as const) {
+  for (const scenario of ['local-preview', 'app-preview', 'unknown-revision'] as const) {
     it(`preserves the rejection and accepts one explicit correction (${api}/${scenario})`, async () => {
       const workspace = path.join(root, 'workspace');
       fs.mkdirSync(workspace);
@@ -41,14 +41,30 @@ for (const api of ['openai-completions', 'openai-responses'] as const) {
       } as any);
       const apps: Array<{ id: string }> = [];
       const { createLocalTools } = await import('../../../src/main/model/core-agent/local-tools');
-      const name = scenario === 'ambiguous-preview' ? 'html_preview' : 'create_artifact';
+      const isPreview = scenario !== 'unknown-revision';
+      const name = isPreview ? 'html_preview' : 'create_artifact';
       const tool = createLocalTools({ userId: uid, cid, agentId: 'builder',
         onArtifactCreated: app => apps.push(app),
         artifactInteractionSmoke: async () => ({ ok: true, blockers: [] }),
       }).find(item => item.name === name)!;
-      const good = scenario === 'ambiguous-preview' ? { path: 'index.html' }
-        : { files: [{ path: 'index.html', content: html }] };
-      const bad = { ...good, artifact_id: scenario === 'ambiguous-preview' ? '' : 'invented-new-app' };
+      const files = [{ path: 'index.html', content: html }];
+      let expectedEntry = path.join(workspace, 'index.html');
+      let good: Record<string, unknown> = { files };
+      let bad: Record<string, unknown> = { ...good, artifact_id: 'invented-new-app' };
+      if (scenario === 'local-preview') {
+        good = { path: 'index.html' };
+        bad = { ...good, artifact_id: '' };
+      } else if (scenario === 'app-preview') {
+        const artifacts = await import('../../../src/main/features/chat_artifacts');
+        const saved = await artifacts.createArtifact(uid, cid, 'builder', { files });
+        if (!saved.ok) throw new Error('Could not create preview fixture');
+        const entry = artifacts.resolveArtifactFilePath(uid, cid, saved.artifactId, 'index.html');
+        if (!entry.ok) throw new Error('Could not resolve preview fixture');
+        expectedEntry = entry.absPath;
+        good = { artifact_id: saved.artifactId };
+        bad = { ...good, path: 'index.html' };
+      }
+      const beforePreview = fs.readFileSync(expectedEntry);
       const observed: Array<{ input: unknown; result: any }> = [];
       const execute = tool.execute.bind(tool);
       tool.execute = async (input, ctx) => {
@@ -67,8 +83,19 @@ for (const api of ['openai-completions', 'openai-responses'] as const) {
         if (round === 2) {
           expect(render).not.toHaveBeenCalled();
           expect(apps).toEqual([]);
-          expect(JSON.stringify(body)).toContain(scenario === 'ambiguous-preview'
-            ? 'supply exactly one' : 'application to revise was not found in this conversation');
+          const receipt = api === 'openai-completions'
+            ? body.messages.find((entry: any) => entry.role === 'tool' && entry.tool_call_id === 'call_1')?.content
+            : body.input.find((entry: any) => entry.type === 'function_call_output' && entry.call_id === 'call_1')?.output;
+          if (isPreview) {
+            expect(JSON.parse(receipt)).toMatchObject({ code: 'E_BAD_INPUT', issues: [
+              { field: 'path', reason: 'conflicting_sources', expected: expect.stringMatching(/local HTML.*omit artifact_id/i) },
+              { field: 'artifact_id', reason: 'conflicting_sources', expected: expect.stringMatching(/app in this conversation.*omit path/i) },
+            ] });
+            expect(receipt).not.toContain('index.html');
+            if (scenario === 'app-preview') expect(receipt).not.toContain(good.artifact_id);
+          } else {
+            expect(receipt).toContain('application to revise was not found in this conversation');
+          }
         }
         const args = round === 1 ? bad : good;
         const id = `call_${round}`;
@@ -107,10 +134,14 @@ for (const api of ['openai-completions', 'openai-responses'] as const) {
       expect(observed[1].result.isError).toBeFalsy();
       const declared = wire[0].tools.map((entry: any) => entry.function ?? entry).find((entry: any) => entry.name === name);
       expect(declared.strict).not.toBe(true);
-      expect(declared.parameters.required).toEqual(scenario === 'ambiguous-preview' ? [] : ['files']);
-      if (scenario === 'ambiguous-preview') {
+      expect(declared.parameters.required).toEqual(isPreview ? [] : ['files']);
+      if (isPreview) {
+        expect(declared.parameters.properties.path.description).toMatch(/omit artifact_id/i);
+        expect(declared.parameters.properties.artifact_id.description).toMatch(/omit path/i);
         expect(render).toHaveBeenCalledOnce();
-        expect(render.mock.calls[0][0]).toBe(path.join(workspace, 'index.html'));
+        expect(render.mock.calls[0][0]).toBe(expectedEntry);
+        expect(fs.readFileSync(expectedEntry)).toEqual(beforePreview);
+        expect(apps).toEqual([]);
       } else {
         expect(apps).toHaveLength(1);
         const parent = path.join(root, uid, 'cloud/chat_artifacts', cid);

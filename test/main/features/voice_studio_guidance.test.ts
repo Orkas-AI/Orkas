@@ -4,8 +4,9 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, expect, it } from 'vitest';
+import { versionChatMediaLocalUrlsInText, versionedChatMediaLocalUrl } from '../../../src/main/util/chat-media-url';
 import { bundledRuntimeEnv } from '../../../src/main/util/bundled-runtime';
-import { seedVoiceFixture, inspectVoiceFixture, voiceChecks, voiceTone, type VoiceTrace } from '../../../eval/model-eval/regression/voice-studio-fixtures';
+import { seedVoiceFixture, inspectVoiceFixture, voiceAcceptsLinkedAudio, voiceChecks, voiceTone, type VoiceTrace } from '../../../eval/model-eval/regression/voice-studio-fixtures';
 
 const require = createRequire(import.meta.url);
 const skill = path.resolve(__dirname, '../../../resources/builtin/marketplace/agents/5f890bd72ac4/skills/voice-project');
@@ -27,6 +28,79 @@ it('makes each private editing reference reachable without changing narration or
     const body = fs.readFileSync(path.join(skill, 'references', `${name}.md`), 'utf8');
     for (const link of ['timeline-mixing', 'word-editing']) expect(body).toContain(`](${link}.md)`);
   }
+});
+
+it('renders the saved revision returned by a colliding write and reports it for delivery', async () => {
+  const id = 'voice-trim-edges';
+  seedVoiceFixture(id, root);
+  process.env.ORKAS_WORKSPACE_ROOT = root;
+  const { activateUser } = await import('../../../src/main/features/users');
+  const userId = 'voice-guidance-test';
+  activateUser(userId);
+  const { createLocalTools } = await import('../../../src/main/model/core-agent/local-tools');
+  const { setWorkspacePath } = await import('../../../src/main/features/user_workspace');
+  expect(setWorkspacePath(userId, root).ok).toBe(true);
+  const dir = path.join(root, 'audio'), original = path.join(dir, 'voice-project.json');
+  const source = path.join(dir, 'sources/recording.wav'), previous = path.join(dir, 'export-previous/audio.wav');
+  const originalBytes = fs.readFileSync(original), sourceBytes = fs.readFileSync(source), previousBytes = fs.readFileSync(previous);
+  const revision = { ...JSON.parse(originalBytes.toString()), schema_version: 2,
+    processing: [{ type: 'silence', mode: 'edges', min_silence_sec: .3, padding_sec: .05 }], export: { format: 'wav' } };
+  const write = createLocalTools({ userId }).find(tool => tool.name === 'write_file')!;
+  const result = await write.execute({ path: original, content: JSON.stringify(revision) }, { workingDir: dir, state: {} });
+  expect(result.isError, String(result.content)).toBeFalsy();
+  const saved = String(result.content).match(/<file path="([^"]+)" total_bytes=/)?.[1];
+  expect(saved).toBe(path.join(dir, 'voice-project-2.json'));
+
+  const rendered = await audio.execute('render', { project: saved });
+  const [delivered] = rendered.absolute_files;
+  const published = [delivered, saved!];
+  const check = (files: string[]) => voiceChecks(id, { toolCalls: [{ name: 'bash', isError: false }],
+    voiceStudio: inspectVoiceFixture(id, root, files) } as any).filter(item => !item.pass).map(item => item.id);
+  expect(check(published)).toEqual([]);
+  expect(check([delivered, original])).toContain('acceptance:voice-project-replay');
+  expect(check([delivered])).toContain('acceptance:voice-project-replay');
+  const snapshot = rendered.absolute_files.find((file: string) => path.basename(file) === 'plan-snapshot.json');
+  expect(check([delivered, snapshot])).toContain('acceptance:voice-project-replay');
+
+  expect(rendered.project_path).toBe(saved);
+  expect(JSON.parse(fs.readFileSync(snapshot, 'utf8'))).toEqual(revision);
+  expect(fs.readFileSync(original)).toEqual(originalBytes);
+  expect(fs.readFileSync(source)).toEqual(sourceBytes);
+  expect(fs.readFileSync(previous)).toEqual(previousBytes);
+}, 30_000);
+
+it('reopens the documented conversion project and reproduces the delivered PCM without changing the original edit', async () => {
+  const body = fs.readFileSync(path.join(skill, 'references/media-delivery.md'), 'utf8');
+  const projects = [...body.matchAll(/```json\s*\n([\s\S]*?)\n```/g)]
+    .map(match => JSON.parse(match[1])).filter(value => value.schema_version && value.segments?.length);
+  expect(projects).toHaveLength(1);
+  seedVoiceFixture('voice-recorded-preserve-zh', root);
+  const dir = path.join(root, 'audio'), original = path.join(dir, 'voice-project.json');
+  const originalBytes = fs.readFileSync(original), source = path.join(dir, 'sources/recording.wav');
+  const sourceBytes = fs.readFileSync(source);
+  const converted = await audio.execute('convert', { project: original, input_path: 'sources/recording.wav', format: 'wav' });
+  const saved = path.join(dir, 'conversion-project.json');
+  fs.writeFileSync(saved, JSON.stringify(projects[0]));
+  // Reopen only the persisted project; no convert request or render override
+  // may supply missing source references or export settings.
+  const rendered = await audio.execute('render', { project: saved });
+  const pcm = (file: string) => {
+    const result = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, ['-v', 'error', '-nostdin', '-i', file,
+      '-f', 's16le', '-c:a', 'pcm_s16le', '-'], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
+    expect(result.status).toBe(0); expect(result.stderr.length).toBe(0);
+    return result.stdout;
+  };
+  for (const result of [converted, rendered]) {
+    expect(result.files.every((file: string) => !path.isAbsolute(file))).toBe(true);
+    expect(result.absolute_files).toEqual(result.files.map((file: string) => path.join(dir, file)));
+  }
+  const [delivered] = converted.absolute_files;
+  const [replay] = rendered.absolute_files;
+  expect(pcm(replay)).toEqual(pcm(delivered)); expect(pcm(delivered)).toEqual(pcm(source));
+  expect(rendered).toMatchObject({ sample_rate: 48000, channels: 1, duration_sec: 8 });
+  const receipt = JSON.parse(fs.readFileSync(path.join(dir, rendered.files.find((file: string) => file.endsWith('receipt.json'))), 'utf8'));
+  expect(receipt.export).toMatchObject({ format: 'wav', sample_rate: 48000, channels: 1, bit_depth: 16, normalize_loudness: false });
+  expect(fs.readFileSync(original)).toEqual(originalBytes); expect(fs.readFileSync(source)).toEqual(sourceBytes);
 });
 
 // Execute the actual documented project, then use frequency/PCM, preservation
@@ -56,7 +130,7 @@ import { recordedCases } from '../../../eval/model-eval/regression/voice-recorde
 import { deliveryCases } from '../../../eval/model-eval/regression/voice-delivery-fixtures';
 import { publishedVoiceFiles } from '../../../eval/model-eval/regression/voice-output-evidence';
 
-function trace(id: string, calls: any[] = [{ name: 'bash', isError: false }]) { return { toolCalls: calls, voiceStudio: inspectVoiceFixture(id, root) } as VoiceTrace; }
+function trace(id: string, calls: any[] = [{ name: 'bash', isError: false }], published?: readonly string[]) { return { toolCalls: calls, voiceStudio: inspectVoiceFixture(id, root, published) } as VoiceTrace; }
 const accepted = (id: string, t = trace(id)) => {
   const checks = voiceChecks(id, t);
   expect(checks.length).toBeGreaterThanOrEqual(4);
@@ -103,6 +177,7 @@ it.each(recordedCases)('calibrates human-recording completion, negation and fals
   seedVoiceFixture(id, root); expect(accepted(id)).toBe(false);
   const project = path.join(root, 'audio/voice-project.json'), p = JSON.parse(fs.readFileSync(project, 'utf8'));
   p.schema_version = 2; p.processing = id === recordedCases[0] ? [{ type: 'denoise', strength: 'standard' }] : id === recordedCases[1] ? [{ type: 'highpass', frequency_hz: 80 }] : id === recordedCases[2] ? [{ type: 'compressor' }] : [];
+  if (id === recordedCases[3]) p.export = { format: 'wav', channels: 1, normalize_loudness: false };
   fs.writeFileSync(project, JSON.stringify(p)); const r = await audio.execute('render', { project, format: 'wav' });
   expect(accepted(id), JSON.stringify(inspectVoiceFixture(id, root))).toBe(true);
   fs.writeFileSync(path.join(root, 'audio/000-unrelated.json'), '{');
@@ -117,17 +192,17 @@ it.each(recordedCases)('calibrates human-recording completion, negation and fals
   expect(accepted(id, trace(id, [{ name: 'bash', isError: false }, { name: 'generate_speech', op: 'separate', isError: true }]))).toBe(false);
   const file = path.join(root, 'audio', r.files[0]), bytes = fs.readFileSync(file);
   const draft=path.join(root,'audio/draft.wav');fs.writeFileSync(draft,voiceTone(8,1200));
-  const selected=trace(id);selected.voiceStudio=inspectVoiceFixture(id,root,[file]);expect(accepted(id,selected)).toBe(true);
+  const selected=trace(id);selected.voiceStudio=inspectVoiceFixture(id,root,[file,project]);expect(accepted(id,selected)).toBe(true);
   selected.voiceStudio=inspectVoiceFixture(id,root,[draft]);expect(accepted(id,selected)).toBe(false);
   selected.voiceStudio=inspectVoiceFixture(id,root,[]);expect(accepted(id,selected)).toBe(false);fs.rmSync(draft);
   for (const wrong of [voiceTone(8), Buffer.alloc(44)]) { fs.writeFileSync(file, wrong); expect(accepted(id)).toBe(false); }
   fs.writeFileSync(file, bytes);
   if (id === recordedCases[1]) {
     const followUp = 'voice-recorded-rumble-zh-undo'; expect(accepted(followUp)).toBe(false);
-    p.processing = []; fs.writeFileSync(project, JSON.stringify(p));
+    p.processing = []; p.export = { format: 'wav', channels: 1, normalize_loudness: false }; fs.writeFileSync(project, JSON.stringify(p));
     const undone=await audio.execute('render', { project, format: 'wav' }); expect(accepted(followUp)).toBe(true);
     const final=path.join(root,'audio',undone.files[0]),extra=path.join(root,'audio/retained-intermediate.wav');fs.writeFileSync(extra,voiceTone(8,1200));
-    const selectedUndo=trace(followUp);selectedUndo.voiceStudio=inspectVoiceFixture(followUp,root,[final]);expect(accepted(followUp,selectedUndo)).toBe(true);
+    const selectedUndo=trace(followUp);selectedUndo.voiceStudio=inspectVoiceFixture(followUp,root,[final,project]);expect(accepted(followUp,selectedUndo)).toBe(true);
     selectedUndo.voiceStudio=inspectVoiceFixture(followUp,root,[file]);expect(accepted(followUp,selectedUndo)).toBe(false);fs.rmSync(extra);
     const preserved = inspectVoiceFixture(followUp, root)!.recorded!;
     expect(preserved.speech_correlation).toBeLessThan(.8); // Clean speech excludes the rumble the user asked to retain.
@@ -145,6 +220,7 @@ it.each(enhancementCases)('calibrates real enhancement and rejects no-op, unrela
   const project = path.join(root, 'audio/voice-project.json'), p = JSON.parse(fs.readFileSync(project, 'utf8'));
   const steps = [{ type: 'highpass', frequency_hz: 80 }, { type: 'deesser', strength: 'standard' }, { type: 'compressor' }];
   p.schema_version = 2; p.processing = id === enhancementCases[3] ? steps : [steps[enhancementCases.indexOf(id)]];
+  if (id === 'voice-deess') p.export = { format: 'wav', normalize_loudness: false };
   fs.writeFileSync(project, JSON.stringify(p));
   const r = await audio.execute('render', { project, format: 'wav' }), file = path.join(root, 'audio', r.files[0]);
   expect(accepted(id), JSON.stringify(enhancementMeasures(decodeEnhancement(file)))).toBe(true);
@@ -410,8 +486,331 @@ it('rejects an undo project whose gain differs from its correct published record
   fs.writeFileSync(project, JSON.stringify(p)); await audio.execute('render', { project });
   p.processing = []; fs.writeFileSync(project, JSON.stringify(p));
   const result = await audio.execute('render', { project }), file = path.join(root, 'audio', result.files[0]);
-  const observed = () => { const t = trace(followUp); t.voiceStudio = inspectVoiceFixture(followUp, root, [file]); return t; };
+  const observed = () => { const t = trace(followUp); t.voiceStudio = inspectVoiceFixture(followUp, root, [file, project]); return t; };
   expect(accepted(followUp, observed())).toBe(true);
   p.segments[0].volume = .5; fs.writeFileSync(project, JSON.stringify(p));
   expect(accepted(followUp, observed()), 'undo must remain reproducible at the delivered level').toBe(false);
 }, 30000);
+
+// Portable calibration from the frozen source; official-account evaluation remains outside this edition.
+it.each(['voice-recorded-noise-en', 'voice-recorded-preserve-zh'])(
+  'requires the published project revision rather than an unshared correct draft: %s', async id => {
+    seedVoiceFixture(id, root);
+    const base = path.join(root, 'audio'), original = path.join(base, 'voice-project.json');
+    if (id === 'voice-recorded-preserve-zh') {
+      const stale = JSON.parse(fs.readFileSync(original, 'utf8'));
+      stale.export = { format: 'wav', channels: 2 };
+      fs.writeFileSync(original, JSON.stringify(stale));
+    }
+    const before = fs.readFileSync(original), source = fs.readFileSync(path.join(base, 'sources/recording.wav'));
+    const plan = JSON.parse(before.toString());
+    plan.schema_version = 2;
+    plan.processing = id === 'voice-recorded-noise-en' ? [{ type: 'denoise', strength: 'standard' }] : [];
+    plan.export = { format: 'wav', sample_rate: 48000, channels: 1, bit_depth: 16, normalize_loudness: false };
+    const revision = path.join(base, 'conversion-revision.json'); fs.writeFileSync(revision, JSON.stringify(plan));
+    const result = await audio.execute('render', { project: revision }), file = path.join(base, result.files[0]);
+    const observed = (attachments: string[]) => ({ toolCalls: [{ name: 'bash', isError: false }], voiceStudio: inspectVoiceFixture(id, root, attachments) }) as VoiceTrace;
+    expect(accepted(id, observed([file, revision])), 'The published saved revision reproduces the current audio.').toBe(true);
+    expect(accepted(id, observed([file, original])), 'A correct unshared draft cannot rescue the delivered stale project.').toBe(false);
+    expect(accepted(id, observed([file])), 'Audio without the requested project is incomplete.').toBe(false);
+    expect(accepted(id, observed([file, revision]))).toBe(true);
+    expect(fs.readFileSync(original)).toEqual(before); expect(fs.readFileSync(path.join(base, 'sources/recording.wav'))).toEqual(source);
+  }, 30000);
+
+it('accepts the published conversion project in its own directory and rejects an outside project', async () => {
+  const id = 'voice-recorded-preserve-zh'; seedVoiceFixture(id, root);
+  const base = path.join(root, 'audio'), original = path.join(base, 'voice-project.json');
+  const bytes = fs.readFileSync(original), source = fs.readFileSync(path.join(base, 'sources/recording.wav'));
+  const plan = JSON.parse(bytes.toString());
+  plan.export = { format: 'wav', sample_rate: 48000, channels: 1, bit_depth: 16, normalize_loudness: false };
+  const dir = path.join(base, 'conversion-project'); fs.mkdirSync(path.join(dir, 'sources'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'sources/recording.wav'), source);
+  const revision = path.join(dir, 'voice-project.json'); fs.writeFileSync(revision, JSON.stringify(plan));
+  const result = await audio.execute('render', { project: revision }), file = path.join(dir, result.files[0]);
+  const observed = (projectFile: string) => ({ toolCalls: [{ name: 'bash', isError: false }], voiceStudio: inspectVoiceFixture(id, root, [file, projectFile]) }) as VoiceTrace;
+  expect(accepted(id, observed(revision)), 'The delivered project owns its relative sources regardless of directory name.').toBe(true);
+  const outside = path.join(root, 'outside-project.json'); fs.writeFileSync(outside, JSON.stringify(plan));
+  expect(accepted(id, observed(outside))).toBe(false);
+  expect(accepted(id, observed(original)), 'The original also replays the mono recording with the new source-aware default.').toBe(true);
+  expect(fs.readFileSync(original)).toEqual(bytes); expect(fs.readFileSync(path.join(base, 'sources/recording.wav'))).toEqual(source);
+}, 30000);
+
+it('calibrates a multi-segment local revision against wrong gains, order, gaps, subtitles and duplicate synthesis', async () => {
+  const id = 'voice-revise-multisegment'; seedVoiceFixture(id, root);
+  expect(accepted(id)).toBe(false);
+  const project = path.join(root, 'audio/voice-project.json');
+  const plan = JSON.parse(fs.readFileSync(project, 'utf8'));
+  plan.segments[2].volume = .5; plan.segments[4].gap_after_sec = .35;
+  fs.writeFileSync(project, JSON.stringify(plan));
+  const result = await audio.execute('render', { project });
+  const file = path.join(root, 'audio', result.files[0]);
+  const bytes = fs.readFileSync(file);
+  const attachments = result.files.map((f: string) => path.join(root, 'audio', f));
+  const published = () => ({ toolCalls: [{ name: 'bash', isError: false }], voiceStudio: inspectVoiceFixture(id, root, attachments) }) as VoiceTrace;
+  const good = published(); expect(accepted(id, good), JSON.stringify(good.voiceStudio)).toBe(true);
+  expect(accepted(id, { ...good, toolCalls: [] })).toBe(false);
+  expect(accepted(id, { ...good, toolCalls: [...good.toolCalls, { name: 'generate_speech', op: 'generate', isError: false }] })).toBe(false);
+  expect(accepted(id, { ...good, voiceStudio: inspectVoiceFixture(id, root, []) })).toBe(false);
+  expect(accepted(id, { ...good, voiceStudio: inspectVoiceFixture(id, root, [file]) }), 'An unshared subtitle file is not a delivered subtitle.').toBe(false);
+  const srt = path.join(path.dirname(file), 'captions.srt'), captions = fs.readFileSync(srt);
+  fs.writeFileSync(srt, captions.toString().replace('00:00:06,150', '00:00:06,000'));
+  expect(accepted(id, published())).toBe(false); fs.writeFileSync(srt, captions);
+  // Render plausible but wrong outputs through the real script. Restore the
+  // correct saved plan so artifact checks cannot merely trust its settings.
+  for (const mutate of [
+    (p: any) => { p.segments[2].volume = 1; },
+    (p: any) => { [p.segments[0], p.segments[1]] = [p.segments[1], p.segments[0]]; },
+    (p: any) => { p.segments[4].gap_after_sec = .2; },
+    (p: any) => { p.segments.pop(); },
+  ]) {
+    const wrong = structuredClone(plan); mutate(wrong); fs.writeFileSync(project, JSON.stringify(wrong));
+    const candidate = await audio.execute('render', { project });
+    fs.writeFileSync(project, JSON.stringify(plan));
+    fs.copyFileSync(path.join(root, 'audio', candidate.files[0]), file);
+    expect(accepted(id, published())).toBe(false);
+    fs.rmSync(path.dirname(path.join(root, 'audio', candidate.files[0])), { recursive: true });
+  }
+  fs.writeFileSync(file, bytes); expect(accepted(id, published())).toBe(true);
+}, 30000);
+
+it('rejects global level changes in a de-essing-only delivery with otherwise correct spectral ratios', async () => {
+  const id = 'voice-deess'; seedVoiceFixture(id, root);
+  const project = path.join(root, 'audio/voice-project.json');
+  const plan = JSON.parse(fs.readFileSync(project, 'utf8'));
+  plan.schema_version = 2; plan.processing = [{ type: 'deesser', strength: 'standard' }];
+  plan.export = { format: 'wav', normalize_loudness: false };
+  fs.writeFileSync(project, JSON.stringify(plan));
+  const result = await audio.execute('render', { project });
+  const file = path.join(root, 'audio', result.files[0]), original = fs.readFileSync(file);
+  expect(accepted(id), 'Requested de-essing without an unrelated level change').toBe(true);
+  const altered = path.join(root, 'audio/.level-control.wav');
+  for (const { gain, valid } of [{ gain: 1.0001, valid: true }, { gain: .5, valid: false }, { gain: 2, valid: false }]) {
+    fs.writeFileSync(file, original);
+    const change = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, ['-v', 'error', '-nostdin', '-y', '-i', file,
+      '-af', `volume=${gain}`, '-c:a', 'pcm_s16le', altered], { timeout: 30000, encoding: 'utf8' });
+    expect(change.status).toBe(0); expect(change.stderr).toBe('');
+    fs.copyFileSync(altered, file); fs.rmSync(altered);
+    expect(accepted(id), `Gain ${gain}: permit PCM rounding, reject unrelated level changes`).toBe(valid);
+  }
+  fs.writeFileSync(file, original); expect(accepted(id)).toBe(true);
+}, 60000);
+
+it('accepts the published transcript pair despite retained duplicates and rejects a bad selected pair', () => {
+  const id = 'voice-transcribe-speech'; seedVoiceFixture(id, root);
+  const text = fs.readFileSync(path.resolve('test/fixtures/voice/jfk.txt'), 'utf8').trim();
+  const txt = path.join(root, 'audio/transcript.txt'), srt = path.join(root, 'audio/transcript.srt');
+  fs.writeFileSync(txt, text); fs.writeFileSync(srt, `1\n00:00:00,000 --> 00:00:11,000\n${text}\n`);
+  const duplicate = path.join(root, 'audio/transcript-copy.txt'); fs.writeFileSync(duplicate, text);
+  const observed = (files?: string[]) => ({ toolCalls: [{ name: 'bash', isError: false }], voiceStudio: inspectVoiceFixture(id, root, files) }) as VoiceTrace;
+  expect(accepted(id, observed()), 'Identical retained text is not a second transcription.').toBe(true);
+  fs.writeFileSync(duplicate, 'an unfinished draft');
+  expect(accepted(id, observed([txt, srt])), 'Only the host-published pair is the deliverable.').toBe(true);
+  expect(accepted(id, observed())).toBe(false);
+  expect(accepted(id, observed([duplicate, srt]))).toBe(false);
+  expect(accepted(id, observed([txt]))).toBe(false);
+  expect(accepted(id, observed([]))).toBe(false);
+  fs.writeFileSync(srt, `1\n00:00:00,000 --> 00:00:24,000\n${text}\n`);
+  expect(accepted(id, observed([txt, srt]))).toBe(false);
+});
+
+it('reopens the documented conversion project and reproduces the delivered PCM without changing the original edit', async () => {
+  const body = fs.readFileSync(path.join(skill, 'references/media-delivery.md'), 'utf8');
+  const projects = [...body.matchAll(/```json\s*\n([\s\S]*?)\n```/g)]
+    .map(match => JSON.parse(match[1])).filter(value => value.schema_version && value.segments?.length);
+  expect(projects).toHaveLength(1);
+  seedVoiceFixture('voice-recorded-preserve-zh', root);
+  const dir = path.join(root, 'audio'), original = path.join(dir, 'voice-project.json');
+  const originalBytes = fs.readFileSync(original), source = path.join(dir, 'sources/recording.wav');
+  const sourceBytes = fs.readFileSync(source);
+  const converted = await audio.execute('convert', { project: original, input_path: 'sources/recording.wav', format: 'wav' });
+  const saved = path.join(dir, 'conversion-project.json');
+  fs.writeFileSync(saved, JSON.stringify(projects[0]));
+  // Reopen only the persisted project; no convert request or render override
+  // may supply missing source references or export settings.
+  const rendered = await audio.execute('render', { project: saved });
+  const pcm = (file: string) => {
+    const result = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, ['-v', 'error', '-nostdin', '-i', file,
+      '-f', 's16le', '-c:a', 'pcm_s16le', '-'], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
+    expect(result.status).toBe(0); expect(result.stderr.length).toBe(0);
+    return result.stdout;
+  };
+  for (const result of [converted, rendered]) {
+    expect(result.files.every((file: string) => !path.isAbsolute(file))).toBe(true);
+    expect(result.absolute_files).toEqual(result.files.map((file: string) => path.join(dir, file)));
+  }
+  const [delivered] = converted.absolute_files;
+  const [replay] = rendered.absolute_files;
+  expect(pcm(replay)).toEqual(pcm(delivered)); expect(pcm(delivered)).toEqual(pcm(source));
+  expect(rendered).toMatchObject({ sample_rate: 48000, channels: 1, duration_sec: 8 });
+  const receipt = JSON.parse(fs.readFileSync(path.join(dir, rendered.files.find((file: string) => file.endsWith('receipt.json'))), 'utf8'));
+  expect(receipt.export).toMatchObject({ format: 'wav', sample_rate: 48000, channels: 1, bit_depth: 16, normalize_loudness: false });
+  expect(fs.readFileSync(original)).toEqual(originalBytes); expect(fs.readFileSync(source)).toEqual(sourceBytes);
+});
+
+it.each(['voice-revise-cached', 'voice-extract-video', 'voice-convert-isolated'])(
+  'evaluates the published audio in a separately named project while preserving the original: %s', async id => {
+    seedVoiceFixture(id, root);
+    const original = path.join(root, 'audio');
+    const revision = path.join(root, 'revised-project');
+    fs.cpSync(original, revision, { recursive: true });
+    const project = path.join(revision, 'voice-project.json');
+    let result;
+    if (id === 'voice-revise-cached') {
+      const plan = JSON.parse(fs.readFileSync(project, 'utf8'));
+      plan.segments[1].speed = .5;
+      fs.writeFileSync(project, JSON.stringify(plan));
+      result = await audio.execute('render', { project, format: 'wav' });
+    } else if (id === 'voice-extract-video') {
+      result = await audio.execute('extract', { project, input_path: 'sources/video.mkv' });
+    } else {
+      result = await audio.execute('convert', { project, input_path: 'sources/recording.wav', format: 'flac' });
+    }
+    const file = path.join(revision, result.files[0]);
+    const published = (...files: string[]) => trace(id, undefined, publishedVoiceFiles([{ from: 'voice-studio', produced: files }]));
+    expect(accepted(id, published(file, project)), 'An independently correct delivered revision may use a sibling directory').toBe(true);
+    expect(accepted(id, published(project)), 'An unpublished correct audio file cannot prove delivery').toBe(false);
+    const wrong = path.join(revision, 'wrong' + path.extname(file));
+    fs.writeFileSync(wrong, voiceTone(4, 220));
+    expect(accepted(id, published(wrong, project)), 'An unrelated published file cannot borrow the unpublished waveform').toBe(false);
+    const originalCopy = path.join(revision, 'sources', path.basename(file));
+    fs.copyFileSync(file, originalCopy);
+    expect(accepted(id, published(originalCopy, project)), 'A source asset cannot establish an export').toBe(false);
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-other-workspace-'));
+    try {
+      const outsideFile = path.join(outside, path.basename(file));
+      fs.copyFileSync(file, outsideFile);
+      const alias = path.join(revision, 'outside-alias');
+      fs.symlinkSync(outside, alias, 'junction');
+      expect(accepted(id, published(outsideFile, path.join(alias, path.basename(file)), project)), 'Outside and symlink-escaped audio are ineligible').toBe(false);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  }, 30_000,
+);
+it.each(['voice-preserve-pauses', 'voice-export-spec', 'voice-convert-preserve'])(
+  'checks one published final audio file while ignoring unpublished verification renders: %s', async id => {
+    seedVoiceFixture(id, root);
+    const base = path.join(root, 'audio');
+    const project = path.join(base, 'voice-project.json');
+    let result;
+    if (id === 'voice-export-spec') {
+      const plan = JSON.parse(fs.readFileSync(project, 'utf8'));
+      plan.export = { format: 'wav', sample_rate: 24000, channels: 1, bit_depth: 24, normalize_loudness: false };
+      fs.writeFileSync(project, JSON.stringify(plan));
+      result = await audio.execute('render', { project });
+    } else {
+      result = await audio.execute('convert', {
+        project, input_path: 'sources/recording.wav', format: id === 'voice-convert-preserve' ? 'flac' : 'wav',
+      });
+    }
+    const file = path.join(base, result.files[0]);
+    const verification = path.join(base, 'verification' + path.extname(file));
+    fs.copyFileSync(file, verification);
+    expect(accepted(id, trace(id, undefined, [file, project]))).toBe(true);
+    expect(accepted(id, trace(id, undefined, [file, file, project]))).toBe(true);
+    expect(accepted(id, trace(id, undefined, [file, verification, project]))).toBe(false);
+    fs.writeFileSync(verification, voiceTone(4, 220));
+    expect(accepted(id, trace(id, undefined, [verification, project])), 'An unpublished correct render cannot rescue a wrong delivery').toBe(false);
+  }, 30_000,
+);
+it('verifies a playable final FLAC link when only its project is attached', async () => {
+  const id = 'voice-convert-preserve';
+  seedVoiceFixture(id, root);
+  const project = path.join(root, 'audio', 'voice-project.json');
+  const result = await audio.execute('convert', { project, input_path: 'sources/recording.wav', format: 'flac' });
+  const file = path.join(root, 'audio', result.files[0]);
+  const link = `[Play the FLAC](${versionedChatMediaLocalUrl(file)})`;
+  const delivered = (text: string, from = 'voice-studio', produced = [project]) =>
+    trace(id, undefined, publishedVoiceFiles([{ from, text, produced }], { root, actorId: 'voice-studio' }));
+  expect(accepted(id, delivered(link))).toBe(true);
+  expect(accepted(id, delivered(link, 'voice-studio', [project, file]))).toBe(true);
+  expect(accepted(id, delivered('`' + link + '`'))).toBe(false);
+  expect(accepted(id, delivered(versionedChatMediaLocalUrl(file)))).toBe(false);
+  expect(accepted(id, delivered(link, 'user'))).toBe(false);
+  expect(accepted(id, delivered(link, 'another-agent'))).toBe(false);
+  fs.renameSync(file, file + '.saved');
+  expect(accepted(id, delivered(link))).toBe(false);
+}, 30_000);
+it('accepts a recorded-audio project link when the saved revision reproduces the delivered WAV', async () => {
+  const id = 'voice-recorded-rumble-zh', actorId = 'voice-studio';
+  seedVoiceFixture(id, root);
+  const base = path.join(root, 'audio');
+  const initial = path.join(base, 'voice-project.json');
+  const plan = JSON.parse(fs.readFileSync(initial, 'utf8'));
+  const project = path.join(base, '声道修订 (2).json');
+  fs.writeFileSync(project, JSON.stringify({
+    ...plan, schema_version: 2, processing: [{ type: 'highpass', frequency_hz: 80 }], export: { format: 'wav' },
+  }));
+  const result = await audio.execute('render', { project });
+  const file = path.join(base, result.files[0]);
+  const wav = `[试听](${versionedChatMediaLocalUrl(file)})`;
+  const revision = versionChatMediaLocalUrlsInText('[可修改项目](<audio/声道修订 (2).json>)', root);
+  const message = (text: string, flags = {}, produced = [file]) => ({ from: actorId, text, produced, ...flags });
+  const observed = (messages: Array<ReturnType<typeof message>>) => trace(id, undefined, publishedVoiceFiles(
+    messages, voiceAcceptsLinkedAudio(id) ? { root, actorId, projectLinks: true } : undefined,
+  ));
+  const linked = observed([message(wav + '\n' + revision, {}, [])]);
+  expect(linked.voiceStudio?.projectReplay).toMatchObject({ matched: true, maxSampleError: 0 });
+  expect(accepted(id, linked)).toBe(true);
+  expect(accepted(id, observed([message('', {}, [file, project])]))).toBe(true);
+  expect(accepted(id, observed([message(`[Project](<${project}>)`)]))).toBe(true);
+  const localAlias = path.join(root, 'linked-audio');
+  fs.symlinkSync(base, localAlias, 'junction');
+  const attachedProject = path.join(localAlias, path.basename(project));
+  const alsoLinked = observed([message(revision, {}, [file, attachedProject])]);
+  expect(alsoLinked.voiceStudio?.projectReplay).toMatchObject({ matched: true, candidates: 1 });
+  const different = path.join(base, 'different-gain.json');
+  fs.writeFileSync(different, JSON.stringify({
+    ...JSON.parse(fs.readFileSync(project, 'utf8')), segments: [{ ...plan.segments[0], volume: 0.5 }],
+  }));
+  const wrong = observed([message(`[Project](${versionedChatMediaLocalUrl(different)})`)]);
+  expect(wrong.voiceStudio?.projectReplay).toMatchObject({ matched: false, reason: 'no-match', attempted: 1 });
+  expect(accepted(id, wrong)).toBe(false);
+  for (const text of [
+    '',
+    `\`${revision}\``,
+    versionedChatMediaLocalUrl(project),
+    `[Project](${versionedChatMediaLocalUrl(initial)})`,
+    `[Project](${versionedChatMediaLocalUrl(path.join(base, result.files.find((name: string) => name.endsWith('plan-snapshot.json'))))})`,
+    `[Project](${versionedChatMediaLocalUrl(path.join(base, 'missing.json'))})`,
+  ]) expect(accepted(id, observed([message(text)])), text).toBe(false);
+  for (const flags of [{ from: 'user' }, { from: 'another-agent' }, { deleted_at: 1 }, { dispatch: true }]) {
+    expect(accepted(id, observed([message('', {}, [file]), message(revision, flags, [])]))).toBe(false);
+  }
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-project-link-outside-'));
+  try {
+    const foreign = path.join(outside, 'voice-project.json');
+    fs.copyFileSync(project, foreign);
+    const alias = path.join(base, 'foreign');
+    fs.symlinkSync(outside, alias, 'junction');
+    for (const target of [foreign, path.join(alias, path.basename(foreign))]) {
+      const text = `[Project](${versionedChatMediaLocalUrl(target)})`;
+      expect(publishedVoiceFiles([message(text)], { root, actorId, projectLinks: true })).toEqual([file]);
+    }
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+}, 30_000);
+it('rejects an edge-only trim with changed levels even when timing and all phrases match', async () => {
+  const id = 'voice-trim-edges';
+  seedVoiceFixture(id, root);
+  const project = path.join(root, 'audio/voice-project.json');
+  const plan = JSON.parse(fs.readFileSync(project, 'utf8'));
+  plan.schema_version = 2;
+  plan.processing = [{ type: 'silence', mode: 'edges', min_silence_sec: .3, padding_sec: .05 }];
+  plan.export = { format: 'wav', normalize_loudness: false };
+  fs.writeFileSync(project, JSON.stringify(plan));
+  const preserved = await audio.execute('render', { project });
+  const file = path.join(root, 'audio', preserved.files[0]);
+  expect(accepted(id, trace(id, undefined, [file, project]))).toBe(true);
+  const altered = path.join(root, 'audio', '.gain-control.wav');
+  const change = spawnSync(process.env.ORKAS_BUNDLED_FFMPEG!, [
+    '-v', 'error', '-nostdin', '-i', file, '-af', 'volume=0.5', '-c:a', 'pcm_s16le', altered,
+  ], { timeout: 30_000, encoding: 'utf8' });
+  expect(change.status).toBe(0);
+  expect(change.stderr).toBe('');
+  fs.renameSync(altered, file);
+  const adjusted = trace(id, undefined, [file, project]);
+  expect(voiceChecks(id, adjusted).find(check => check.id === 'acceptance:voice-outcome')?.pass).toBe(false);
+  expect(accepted(id, adjusted)).toBe(false);
+}, 30_000);

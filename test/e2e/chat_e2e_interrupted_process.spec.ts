@@ -3,6 +3,58 @@ import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
 
 
+for (const [language, width, timingLabel, audioLabel, done] of [
+  ['en', 1280, 'Check narration timing', 'Generate audio', 'Done'],
+  ['zh', 760, '检查旁白时长', '生成音频', '完成'],
+] as const) {
+  test(`replays speech preflight separately from generation (${language})`, async ({ orkas }, testInfo) => {
+    await orkas.invoke('config.setLanguage', { language });
+    const { conversation } = await orkas.invoke<{ conversation: { conversation_id: string } }>(
+      'conversations.create', { title: 'Narration timing' });
+    const cid = conversation.conversation_id;
+    const file = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`);
+    const speechEvent = (id: string, data: Record<string, unknown>) => ({
+      type: 'event', event: { stream: 'tool', data: { name: 'generate_speech', id, ...data } },
+    });
+    const saved = [
+      { id: 'speech-user', from: 'user', to: ['commander'], ts: '2026-11-25T10:00:00Z', text: 'Add a voice-over.' },
+      { id: 'speech-reply', from: 'commander', to: ['user'], ts: '2026-11-25T10:00:05Z', text: 'Narration is ready.',
+        turn_id: 'speech-turn', source_message_id: 'speech-user', seg: 0,
+        process: [
+          speechEvent('speech-timing', { phase: 'start', execution_state: 'proposed' }),
+          speechEvent('speech-timing', { phase: 'progress', execution_state: 'running', arguments: {
+            action: 'preflight', lines: [{ text: 'Fixture narration', target_duration: 2 }],
+          } }),
+          speechEvent('speech-timing', { phase: 'progress', arguments: {} }),
+          speechEvent('speech-timing', { phase: 'end', end_to_end_duration_ms: 1200 }),
+          speechEvent('speech-audio', { phase: 'start', arguments: { output_path: 'voice/line.mp3' } }),
+          speechEvent('speech-audio', { phase: 'end', end_to_end_duration_ms: 2300 }),
+        ] },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n';
+    writeFileSync(file, saved);
+
+    const page = await orkas.relaunch();
+    await page.setViewportSize({ width, height: 800 });
+    await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+    const rail = page.locator('#chat-history .chat-message.assistant', { hasText: 'Narration is ready.' }).locator('.stream-process');
+    await expect(rail).toBeVisible();
+    if (!await rail.evaluate((element: HTMLDetailsElement) => element.open)) {
+      await rail.locator('.stream-process-summary').click();
+    }
+    const timingRow = rail.locator('[data-process-call-id="tool:speech-timing"]');
+    const audioRow = rail.locator('[data-process-call-id="tool:speech-audio"]');
+    if (!await timingRow.isVisible()) await rail.locator('.stream-process-compact-summary').click();
+    await expect(timingRow).toBeVisible();
+    await expect(timingRow).toHaveCount(1);
+    await expect(timingRow).toContainText(`${timingLabel} · ${done}`);
+    await expect(timingRow).not.toContainText('Fixture narration');
+    await expect(audioRow).toBeVisible();
+    await expect(audioRow).toContainText(`${audioLabel} · voice/line.mp3 · ${done}`);
+    expect(readFileSync(file, 'utf8')).toBe(saved);
+    await page.screenshot({ path: testInfo.outputPath(`narration-process-${language}.png`) });
+  });
+}
+
 for (const [language, width] of [['en', 1280], ['zh', 760]] as const) {
   test(`shows a cancelled CLI notice and same-second elapsed time after reopening (${language})`, async ({ orkas }, testInfo) => {
     test.setTimeout(120_000);

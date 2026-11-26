@@ -484,6 +484,65 @@ describe('bash-risk › structure / edge cases', () => {
 // afterwards must stay out of it.
 describe('bash risk classifier — irreversible actions', () => {
   it.each([
+    'Get-Process fixture-runtime | ForEach-Object { if ($true) { Stop-Process -Id $_.Id -Force } }',
+    'Get-Process fixture-runtime | ForEach-Object { while ($true) { Stop-Process -Id $_.Id -Force; break } }',
+    'Get-Process fixture-runtime | ForEach-Object { for ($i=0; $i -lt 1; $i++) { Stop-Process -Id $_.Id -Force } }',
+    'if (Stop-Process -Name fixture-runtime -Force) { Write-Output done }',
+    'Get-Process fixture-runtime | Where-Object { $_.CPU -gt 0 } | ForEach-Object { try { Stop-Process -Id $_.Id -Force } catch {} }',
+    'Get-Process fixture-runtime | ForEach-Object -Process { spps -Id $PSItem.Id -Force }',
+    'Get-Process fixture-runtime | %{Stop-Process -Id $_.Id -Force}',
+    'powershell -NoProfile -Command "Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id $_.Id -Force }"',
+    'Stop-Process -Id (Get-Process -Name fixture-runtime).Id -Force',
+    'Stop-Process -Name fixture-runtime -ErrorVariable 10444 -Force',
+    'Get-Process fixture-runtime | ForEach-Object {\n# cleanup selected instances\nStop-Process -Id $_.Id -Force\n}',
+  ])('keeps selected process scope through executable blocks and wrappers: %s', command => {
+    const risk = classifyBashCommand(command);
+    expect(risk.reasons).toContain('destructive');
+    expect(risk.irreversible).toContain('untargeted_process_kill');
+  });
+
+  it('does not lose selection across deeply nested executable blocks or grouping', () => {
+    const command = 'Get-Process fixture-runtime | ForEach-Object {'
+      + 'try {'.repeat(32) + 'Stop-Process -Id $_.Id -Force' + '} finally {}'.repeat(32) + '}';
+    expect(classifyBashCommand(command).irreversible).toContain('untargeted_process_kill');
+    const expression = '('.repeat(32) + 'Get-Process fixture-runtime' + ')'.repeat(32);
+    expect(classifyBashCommand(`Stop-Process -Id ${expression}.Id -Force`).irreversible).toContain('untargeted_process_kill');
+  });
+
+  it.each([
+    'Get-Process fixture-runtime | ForEach-Object { if ($true) { Stop-Process -Id $_.Id -WhatIf } }',
+    'Get-Process fixture-runtime | ForEach-Object { while ($true) { Stop-Process -Id 10444 -Force; break } }',
+    'Get-Process fixture-runtime | ForEach-Object { Write-Output "if ($true) { Stop-Process -Id $_.Id -Force }" }',
+    'Write-Output { if ($true) { Stop-Process -Name fixture-runtime -Force } }',
+    'Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id $_.Id -WhatIf }',
+    'Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id $_.Id -WhatIf:$true }',
+    "Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id '$_.Id' -Force }",
+    'Get-Process fixture-runtime | ForEach-Object -Begin { Stop-Process -Id $_.Id -Force } -Process { Write-Output $_ }',
+    'Get-Process -Id 10444 | ForEach-Object { Stop-Process -Id $_.Id -Force }',
+    'Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id 10444 -Force }',
+    'Get-Process fixture-runtime | ForEach-Object { Write-Output "Stop-Process -Id $_.Id -Force" }',
+    "Get-Process fixture-runtime | ForEach-Object '{Stop-Process}'",
+    'Get-Process fixture-runtime | ForEach-Object { # Stop-Process -Name fixture-runtime\n Write-Output $_.Id }',
+    'Get-Process fixture-runtime | ForEach-Object { <# Stop-Process -Name fixture-runtime #> Write-Output $_.Id }',
+    'Stop-Process -Id (Get-Process -Id 10444).Id -Force',
+    'Stop-Process -Id (Get-Process fixture-runtime).Count -Force',
+    'Stop-Process -Id $knownPid -ErrorVariable "Get-Process"',
+    'Write-Output "ForEach-Object { Stop-Process -Name fixture-runtime }"',
+  ])('does not turn PID controls, dry runs or data into broad termination: %s', command => {
+    expect(classifyBashCommand(command).irreversible).toEqual([]);
+  });
+
+  it.each([
+    'Get-Process fixture-runtime | ForEach-Object { Stop-Process -Id $_.Id -Force }',
+    'Get-Process fixture-runtime | % { Stop-Process -Id $_.Id -Force }',
+    'Stop-Process -Id (Get-Process fixture-runtime).Id -Force',
+  ])('retains broad-selection risk when process names are projected to IDs: %s', command => {
+    // Enumerating every matching process is still a machine-wide selection;
+    // projecting its IDs must not turn it into the literal-PID exception below.
+    expect(classifyBashCommand(command).irreversible).toContain('untargeted_process_kill');
+  });
+
+  it.each([
     // Recursive removal — the tree is gone and its children were never listed.
     ['rm -rf /tmp/build', 'recursive_delete'],
     ['rm -r ./cache', 'recursive_delete'],

@@ -35,6 +35,7 @@ vi.mock('../../../src/main/logger', () => ({ createLogger: () => ({ warn: vi.fn(
 
 import { BrowserWindow } from 'electron';
 import { openPreview, initializePreview, closePreview, setPreviewDirty, requestPreviewOwner, resolvePreviewOwner, isPreviewContents, readyPreview, replacePreview } from '../../../src/main/features/preview_windows';
+import { chatMediaLocalUrl } from '../../../src/main/util/chat-media-url';
 
 beforeEach(() => {
   for (const win of runtime.windows) win.destroy();
@@ -43,6 +44,55 @@ beforeEach(() => {
 });
 
 describe('independent preview ownership and lifecycle', () => {
+  it('ignores nested Markdown navigation and a link superseded by a new file selection', async () => {
+    const main = new BrowserWindow({});
+    const html = { kind: 'file', path: path.resolve('fixture', 'source.html'), title: 'HTML', options: {} };
+    const markdown = chatMediaLocalUrl(path.resolve('fixture', 'guide.markdown'));
+    let authorize!: (allowed: boolean) => void;
+    const allowLink = vi.fn(() => new Promise<boolean>(resolve => { authorize = resolve; }));
+    await openPreview('user-a', main.webContents, html, allowLink);
+    const child = runtime.windows.at(-1);
+    child.webContents.mainFrame = { url: 'file:///renderer/preview.html' };
+    const frame = { url: chatMediaLocalUrl(html.path), parent: child.webContents.mainFrame };
+    const nested = { url: chatMediaLocalUrl(path.resolve('fixture', 'nested.html')), parent: frame };
+    const navigate = (frame: object) => {
+      const preventDefault = vi.fn();
+      child.webContents.emit('will-frame-navigate', { url: markdown, isMainFrame: false, frame, initiator: frame, preventDefault });
+      expect(preventDefault).toHaveBeenCalledOnce();
+    };
+    readyPreview('user-a', child.webContents);
+    navigate(nested);
+    expect(allowLink).not.toHaveBeenCalled();
+    navigate(frame);
+    expect(allowLink).toHaveBeenCalledOnce();
+
+    const selected = { kind: 'file', path: path.resolve('fixture', 'selected.txt'), title: 'Selected file', options: {} };
+    await openPreview('user-a', main.webContents, selected);
+    authorize(true);
+    expect(await replacePreview('user-a', child.webContents, true)).toEqual({ source: selected });
+    readyPreview('user-a', child.webContents);
+    expect(await replacePreview('user-a', child.webContents, true)).toBeUndefined();
+    expect(initializePreview('user-a', child.webContents).source).toEqual(selected);
+  });
+
+  it.each([
+    { kind: 'file', path: '/fixture/report.md', title: 'Report' },
+    { kind: 'video', src: 'chat-media://local/fixture/clip.webm', title: 'Clip' },
+  ])('refreshes a changed $kind in the original native window', async source => {
+    const main = new BrowserWindow({});
+    const first = { ...source, options: { fileRevision: 'initial' } };
+    const revised = { ...source, options: { fileRevision: 'replaced' } };
+    const { windowId } = await openPreview('user-a', main.webContents, first);
+    const child = runtime.windows.at(-1);
+    readyPreview('user-a', child.webContents);
+    await openPreview('user-a', main.webContents, first);
+    expect(child.webContents.send).not.toHaveBeenCalledWith('preview-windows:replace-request', {});
+    expect(await openPreview('user-a', main.webContents, revised)).toEqual({ windowId });
+    expect(child.webContents.send).toHaveBeenCalledWith('preview-windows:replace-request', {});
+    expect(await replacePreview('user-a', child.webContents, true)).toEqual({ source: revised });
+    expect(child.loadFile).toHaveBeenCalledOnce();
+  });
+
   it('keeps the video window visible without reloading or raising stale content, including rapid selections', async () => {
     const main = new BrowserWindow({});
     const video = (name: string) => ({ kind: 'video', src: `chat-media://local/${name}.mp4`, title: name, options: {} });

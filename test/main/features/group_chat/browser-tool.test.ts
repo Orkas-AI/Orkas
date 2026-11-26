@@ -66,7 +66,7 @@ describe('browser model tool', () => {
     const observe = vi.fn(async () => ({ ok: true, page_id: 'page-1', untrusted_content: true }));
     const tool = buildBrowserTool(callbacks({ observe }));
     await run(tool, { operation: 'observe' });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 }, expect.any(Function));
     await run(tool, { operation: 'observe', tab_id: '0123456789ab', scope: 'meta' });
     expect(observe).toHaveBeenLastCalledWith('0123456789ab', 'meta', {});
   });
@@ -80,9 +80,9 @@ describe('browser model tool', () => {
       state: { toolResultInlineLedger: { initialTokens: 40_000, remainingTokens, perResultTokens: 10_000 } },
     }) as never;
     await tool.execute({ operation: 'observe' }, context(2_500));
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 2_500 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 2_500 }, expect.any(Function));
     await tool.execute({ operation: 'observe' }, context(40_000));
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 }, expect.any(Function));
     await tool.execute({ operation: 'observe', scope: 'meta' }, context(2_500));
     expect(observe).toHaveBeenLastCalledWith(undefined, 'meta', {});
   });
@@ -113,14 +113,14 @@ describe('browser model tool', () => {
     const tool = buildBrowserTool(callbacks({ observe }));
 
     await run(tool, { operation: 'observe' });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 }, expect.any(Function));
 
     await run(tool, { operation: 'observe', text_offset: 6000, element_offset: 80 });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 6000, elementOffset: 80, tokenBudget: 10_000 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 6000, elementOffset: 80, tokenBudget: 10_000 }, expect.any(Function));
 
     // Zero is a position; it must survive rather than read as "unset".
     await run(tool, { operation: 'observe', text_offset: 0 });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 0, tokenBudget: 10_000 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 0, tokenBudget: 10_000 }, expect.any(Function));
 
     observe.mockClear();
     for (const key of ['text_offset', 'element_offset']) {
@@ -167,7 +167,7 @@ describe('browser model tool', () => {
     await buildBrowserTool(deps).execute({ operation, page_id: 'page-1',
       element_ref: 'e1', page_action: 'click' }, { signal: controller.signal } as never);
     if (operation === 'act') expect(deps.act).toHaveBeenCalledWith({ pageId: 'page-1', elementRef: 'e1', action: 'click' }, controller.signal);
-    else expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded' }, controller.signal);
+    else expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded' }, controller.signal, expect.any(Function));
   });
 
   it('publishes one closed multi-operation contract with explicit trust and safety boundaries', () => {
@@ -287,7 +287,7 @@ describe('browser model tool', () => {
       text: 'Orkas',
     }, undefined);
     await run(tool, { operation: 'wait', wait_condition: 'loaded', timeout_ms: 1200 });
-    expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded', timeoutMs: 1200 }, undefined);
+    expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded', timeoutMs: 1200 }, undefined, expect.any(Function));
     await run(tool, { operation: 'close', tab_id: '0123456789ab' });
     expect(deps.close).toHaveBeenCalledWith('0123456789ab');
     await run(tool, { operation: 'retain', tab_id: '0123456789ab', retention: 'deliverable' });
@@ -304,7 +304,7 @@ describe('browser model tool', () => {
     for (const timeout_ms of [-1, 0, 249, 15001, 60000]) {
       expect((await run(tool, { operation: 'wait', timeout_ms })).result.isError).toBeFalsy();
     }
-    expect(deps.wait.mock.calls).toEqual(Array.from({ length: 5 }, () => [{ condition: 'loaded' }, undefined]));
+    expect(deps.wait.mock.calls).toEqual(Array.from({ length: 5 }, () => [{ condition: 'loaded' }, undefined, expect.any(Function)]));
     for (const timeout_ms of [1.5, '1000', null]) {
       expect((await run(tool, { operation: 'wait', timeout_ms })).result.isError).toBe(true);
     }

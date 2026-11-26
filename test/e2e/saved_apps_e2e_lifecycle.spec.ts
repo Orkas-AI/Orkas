@@ -1120,7 +1120,7 @@ test('uses the localized built-in name when opening and reopening an edit copy',
     await expect(card).toContainText(title);
     await card.hover();
     await card.locator('[data-app-more]').click();
-    await expect(page.locator('.app-row-menu [data-action="edit"]')).toHaveText(lang==='zh'?'修改':'Edit a copy');
+    await expect(page.locator('.app-row-menu [data-action="edit"]')).toHaveText(lang==='zh'?'修改':'Edit');
     await page.screenshot({path:info.outputPath('app-modify-menu-'+lang+'.png')});
     await page.locator('.app-row-menu [data-action="edit"]').click();
     await expect(page.locator('#chat-header-title')).toHaveText(taskTitle);

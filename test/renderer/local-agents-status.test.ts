@@ -224,10 +224,10 @@ describe('external-agent unavailable status copy', () => {
       pt: 'Não instalado',
     };
     const prerequisiteCopy = {
-      en: 'Supports Claude Code, Codex, OpenClaw, OpenCode, and Hermes. Install and configure one to connect.',
-      zh: '快速接入已安装的智能体，支持 Claude Code、Codex、OpenClaw、OpenCode 和 Hermes。',
-      ja: 'Claude Code、Codex、OpenClaw、OpenCode、Hermes に対応しています。インストールして設定すると接続できます。',
-      pt: 'Compatível com Claude Code, Codex, OpenClaw, OpenCode e Hermes. Instale e configure um deles para conectar.',
+      en: 'Install and set up the CLI before connecting it.',
+      zh: '请先安装并设置要接入的 CLI。',
+      ja: '接続する CLI を先にインストールし、設定してください。',
+      pt: 'Instale e configure a CLI antes de conectá-la.',
     };
     for (const locale of ['en', 'zh', 'ja', 'pt']) {
       const table = JSON.parse(fs.readFileSync(path.join(rendererRoot, `locales/${locale}.json`), 'utf8'));
@@ -369,7 +369,7 @@ describe('external-agent unavailable status copy', () => {
     expect(harness.selectState.options).toEqual([
       {
         value: 'claude',
-        label: 'ClaudeCode',
+        label: 'Claude Code',
         hint: 'agent_modal.ext_cli_status_not_found',
         disabled: true,
       },
@@ -544,7 +544,7 @@ describe('external-agent unavailable status copy', () => {
     await flushPromises();
     expect(harness.getInvokeCount()).toBe(6);
     expect(harness.selectState.options).toEqual([
-      { value: 'claude', label: 'ClaudeCode (2.1.148)' },
+      { value: 'claude', label: 'Claude Code (2.1.148)' },
       { value: 'codex', label: 'Codex (0.146.0)' },
     ]);
     harness.resolveDetect('claude', {
@@ -676,7 +676,7 @@ describe('external-agent unavailable status copy', () => {
         iconName: 'warning',
         disabled: true,
       },
-      { value: 'claude', label: 'ClaudeCode' },
+      { value: 'claude', label: 'Claude Code' },
     ]);
     expect(harness.selectState.value).toBe('claude');
     expect(harness.status.hidden).toBe(false);
@@ -689,7 +689,7 @@ describe('external-agent unavailable status copy', () => {
 
     expect(harness.selectState.options[1]).toEqual({
       value: 'claude',
-      label: 'ClaudeCode (2.1.148)',
+      label: 'Claude Code (2.1.148)',
     });
     expect(harness.status.hidden).toBe(true);
     expect(harness.warning.hidden).toBe(true);

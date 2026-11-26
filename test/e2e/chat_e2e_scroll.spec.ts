@@ -1,6 +1,7 @@
 import { expect, test } from './fixtures/orkas';
 
 declare const currentCid: string;
+declare function isConvPending(cid: string): boolean;
 
 
 
@@ -40,6 +41,75 @@ async function historyScrollState(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('conversation message-list scrolling', () => {
+  test('keeps the current bubble in place when a background task becomes unread', async ({ modelOrkas }, testInfo) => {
+    const page = modelOrkas.page!;
+    const backgroundPrompt = 'Finish this task after I switch away.';
+    const earlierPrompt = 'Give this task an earlier exchange.';
+    const currentPrompt = 'Keep this message at the top while the other task finishes.';
+    let finishBackground!: () => void;
+    let finishCurrent!: () => void;
+    const backgroundReply = new Promise<void>(resolve => { finishBackground = resolve; });
+    const currentReply = new Promise<void>(resolve => { finishCurrent = resolve; });
+    modelOrkas.setModelRequestScript(request => {
+      const messages = request.messages as Array<{ role: string; content?: unknown }>;
+      const lastUser = messages.filter(message => message.role === 'user').at(-1);
+      const content = JSON.stringify(lastUser?.content ?? '');
+      if (content.includes(backgroundPrompt)) return { text: 'Background task finished.', waitFor: backgroundReply };
+      if (content.includes(currentPrompt)) return { text: 'Current task finished.', waitFor: currentReply };
+      if (content.includes(earlierPrompt)) return { text: 'Earlier reply in the current task.' };
+      return undefined;
+    });
+
+    async function startTask(prompt: string) {
+      await page.locator('#new-chat-btn').click();
+      await page.locator('#new-chat-input').fill(prompt);
+      await page.locator('#new-chat-send-btn').click();
+      await expect(page.locator('#chat-history .chat-message.user')).toContainText(prompt);
+      return page.evaluate(() => currentCid);
+    }
+
+    try {
+      const backgroundCid = await startTask(backgroundPrompt);
+      await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 30_000 }).toBe(1);
+      const openCid = await startTask(earlierPrompt);
+      expect(openCid).not.toBe(backgroundCid);
+      await expect(page.locator('#chat-history [data-role="final"]')).toHaveText('Earlier reply in the current task.');
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+      await page.locator('#chat-input').fill(currentPrompt);
+      await page.locator('#chat-send-btn').click();
+      await expect.poll(() => modelOrkas.modelRequests.length).toBe(3);
+      const bubble = page.locator('#chat-history .chat-message.user > .chat-bubble', { hasText: currentPrompt });
+      await expect.poll(() => historyScrollState(page)).toMatchObject({ pinActive: true, spacerCount: 1 });
+      const before = await bubble.boundingBox();
+      expect(before).toBeTruthy();
+      const headerMember = await page.locator('#chat-header-meta .chat-header-meta-member').first().elementHandle();
+      const messageRow = await bubble.locator('..').elementHandle();
+      await page.screenshot({ path: testInfo.outputPath('before-background-unread.png') });
+
+      finishBackground();
+      const backgroundDot = page.locator(`.sidebar-conversation-nav .conv-item[data-cid="${backgroundCid}"] .task-unread-dot`);
+      await expect(backgroundDot.first()).toBeVisible();
+      // The unread push can precede EOF on the task's primary stream.
+      // Sample after its send controller has also completed cleanup.
+      await expect.poll(() => page.evaluate(cid => isConvPending(cid), backgroundCid)).toBe(false);
+      await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+      expect(await headerMember.evaluate(node => node.isConnected)).toBe(true);
+      expect(await messageRow.evaluate(node => node.isConnected)).toBe(true);
+      const after = await bubble.boundingBox();
+      expect(after).toBeTruthy();
+      await page.screenshot({ path: testInfo.outputPath('after-background-unread.png') });
+      expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
+      expect(await historyScrollState(page)).toMatchObject({ pinActive: true, spacerCount: 1 });
+
+      finishCurrent();
+      await expect(page.locator('#chat-history [data-role="final"]').last()).toHaveText('Current task finished.');
+      await expect.poll(() => historyScrollState(page)).toMatchObject({ pinActive: false, spacerCount: 0 });
+    } finally {
+      finishBackground();
+      finishCurrent();
+    }
+  });
+
   test('keeps the sent attachment bubble in place when an active reply is recovered', async ({ modelOrkas }, testInfo) => {
     const page = modelOrkas.page!;
     await page.setViewportSize({ width: 1050, height: 760 });

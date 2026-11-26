@@ -287,6 +287,7 @@ export async function analyzeMedia(p: AnalyzeParams): Promise<AnalyzeResult> {
     const lines = packTranscriptPhrases(units, meas.timing.silences, {
       ...(typeof p.breakSec === 'number' ? { breakSec: p.breakSec } : {}),
       ...(detail === 'segment' ? { segments: true } : {}),
+      ...(p.structuredPhrases && detail === 'word' ? { includeUntranscribed: true } : {}),
     });
     const text = formatPhraseLines(lines);
     return {

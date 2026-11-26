@@ -615,7 +615,8 @@ describe('group_chat app_nav registry', () => {
       'chat.app_nav_configure:AI Team',
     ]);
     // Exactly one icon per card: the brand mark when the catalog ships one, else the page icon.
-    expect(row.children.map((button) => button.children.map((icon) => `${icon.className}|${icon.innerHTML}`)))
+    expect(row.children.map((button) => button.children.filter((child) => child.className.startsWith('chat-app-nav-btn-page-icon'))
+      .map((icon) => `${icon.className}|${icon.innerHTML}`)))
       .toEqual([
         ['chat-app-nav-btn-page-icon is-brand|<svg>gmail</svg>'],
         ['chat-app-nav-btn-page-icon|icon:panel-list'],

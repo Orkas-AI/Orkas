@@ -235,3 +235,12 @@ record/digest comparisons and cleanup. Review attributed logs separately from
 injected failures. A toast or successful API result alone never completes a
 manual row. Live models, media services and paid settlement require their own
 explicit execution authority and remain separate from deterministic evidence.
+
+## Local Workbench follow-ups and durable task results
+
+- After a request with an attachment in Content or Commerce, submit an unrelated text-only request. Preserve its text and start with an empty source list. Check the actual request files and confirm the first task kept its attachment.
+- When a run writes over 100 files, the receipt keeps the Agent reply and usable outputs within its 100-file limit. Verify the files appear in the same order after archival. A declared artifact beyond the general scan is still readable. An oversized intermediate cannot suppress a text reply or an explicitly delivered file.
+- If a declared file disappears or is replaced before archival, the durable receipt reports a save failure and preserves the reply and remaining files. A concurrent reader gets the settled receipt once archival completes. No retry repeats model execution.
+- A failed history record shows the failure and an excerpt of its saved reply. Opening it shows the full reply as text alongside the failure notice. Reopen in Chinese and English and confirm the original request can still be edited. Missing, unsupported and unreadable Commerce references keep the draft and start no task.
+
+Use `test/main/features/app-agent-sessions.test.ts`, `test/main/features/web-app-tasks.test.ts`, `test/e2e/content_workbench_e2e_lifecycle.spec.ts`, `test/e2e/content_workbench_e2e_media.spec.ts`, `test/e2e/app_output_e2e_commerce.spec.ts` and `test/e2e/builtin_apps_e2e_lifecycle.spec.ts` for the corresponding scenarios.

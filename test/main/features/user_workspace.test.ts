@@ -18,12 +18,17 @@ vi.mock('../../../src/main/logger', () => ({
 }));
 
 let tmpDir: string;
+let fixtureRoot: string;
 let prevWs: string | undefined;
 let prevHome: string | undefined;
 let prevGuard: string | undefined;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ws-'));
+  fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ws-'));
+  // paths.ts places the default workspace beside its data root. Keep both
+  // under this fixture so a sweep never reaches another test's workspace.
+  tmpDir = path.join(fixtureRoot, 'data');
+  fs.mkdirSync(tmpDir);
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   prevHome = process.env.HOME;
   prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
@@ -38,7 +43,7 @@ afterEach(() => {
   else process.env.HOME = prevHome;
   if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
   else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(fixtureRoot, { recursive: true, force: true });
 });
 
 // Electron's `dialog` and `BrowserWindow` are not available in unit tests,
@@ -675,11 +680,15 @@ describe('user_workspace › scoped (projects)', () => {
 
 describe('user_workspace › sweepEmptyConvDirs', () => {
   it('skips user-selected external workspace roots on boot cleanup', async () => {
+    const dataRoot = path.join(tmpDir, 'data');
+    process.env.ORKAS_WORKSPACE_ROOT = dataRoot;
     const ws = await import('../../../src/main/features/user_workspace');
-    const cfgFile = path.join(tmpDir, 'userSweep', 'local', 'workspace.json');
+    const paths = await import('../../../src/main/paths');
+    const cfgFile = path.join(dataRoot, 'userSweep', 'local', 'workspace.json');
     const external = path.join(tmpDir, 'external-workspace');
     const externalEmpty = path.join(external, 'empty-turn-dir');
-    const managed = path.join(tmpDir, '..', 'userWorkSpace');
+    const managed = path.join(tmpDir, 'userWorkSpace');
+    expect(paths.DEFAULT_USER_WORKSPACE).toBe(managed);
     const managedEmpty = path.join(managed, 'empty-turn-dir');
     fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
     fs.mkdirSync(externalEmpty, { recursive: true });

@@ -7,6 +7,8 @@
   },
   "include": [
     "../../playwright.config.ts",
+    "../../scripts/e2e-attempt-reporter.ts",
+    "../../scripts/checkpoint-reporter.ts",
     "./**/*.ts"
   ],
   "exclude": []

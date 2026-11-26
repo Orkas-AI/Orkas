@@ -9,6 +9,25 @@ function risk(id: string, name: string, extra: Partial<ToolSchema> = {}, custom 
 
 describe('connector operation classification', () => {
   it.each([
+    ['estimate_rank_tracker_cost', 'R', undefined],
+    ['get_ai_visibility_run', 'R', undefined],
+    ['create_project', 'W', undefined],
+    ['research_keywords', 'H', 'money'],
+    ['run_rank_tracker', 'H', 'money'],
+    ['save_ai_visibility_tracker', 'H', 'money'],
+    ['save_project_website_setup', 'H', 'money'],
+    ['save_report', 'H', 'external_communication'],
+    ['set_report_sharing', 'H', 'external_communication'],
+    ['submit_indexnow_urls', 'H', 'external_communication'],
+    ['delete_site_audit', 'D', 'delete'],
+  ])('classifies OpenSEO %s by its effects even if the provider labels it read-only', (name, expected, operation) => {
+    expect(risk('openseo', name, { annotations: { readOnlyHint: true } })).toMatchObject({
+      risk: expected,
+      ...(operation ? { sensitive_operation: operation } : {}),
+    });
+  });
+
+  it.each([
     ['gmail', 'GMAIL_GET_ATTACHMENT', 'R'],
     ['m365-mail', 'OUTLOOK_DOWNLOAD_OUTLOOK_ATTACHMENT', 'R'],
     ['m365-mail', 'OUTLOOK_ADD_MAIL_ATTACHMENT', 'W'],

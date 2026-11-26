@@ -216,6 +216,7 @@ export function isHtmlPreviewUrl(raw: unknown): boolean {
 
 interface PreviewFrameRef {
   url: string;
+  parent?: PreviewFrameRef | null;
 }
 
 interface PreviewFrameNavigationEvent extends NavigationEvent {
@@ -235,13 +236,18 @@ interface PreviewFrameWebContents {
 /** Keep local previews away from privileged document schemes. */
 export function installHtmlPreviewNavigationGuard(
   webContents: PreviewFrameWebContents,
+  routeLocalNavigation?: (event: PreviewFrameNavigationEvent, target: URL) => boolean,
 ): void {
   webContents.on('will-frame-navigate', (event) => {
     if (event.isMainFrame) return;
     const sourceUrl = event.frame?.url || event.initiator?.url || '';
     if (!isHtmlPreviewUrl(sourceUrl)) return;
-    if (parsedLocalChatMediaUrl(event.url) || safeExternalHttpUrl(event.url)) return;
-    event.preventDefault();
+    const local = parsedLocalChatMediaUrl(event.url);
+    if (local) {
+      if (routeLocalNavigation?.(event, local)) event.preventDefault();
+    } else if (!safeExternalHttpUrl(event.url)) {
+      event.preventDefault();
+    }
   });
 }
 
