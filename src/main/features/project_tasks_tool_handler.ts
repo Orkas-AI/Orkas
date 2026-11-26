@@ -1,6 +1,6 @@
 /** Host-bound backlog operations shared by the in-process runtime and CLI bridge. */
 import * as projectTasks from './project_tasks';
-import type { ProjectTasksToolHandler } from '../../core-agent/src/tools/project-tasks-tool';
+import type { ProjectTaskNoteInput, ProjectTasksToolHandler } from '../../core-agent/src/tools/project-tasks-tool';
 import { backlogExecutionSnapshot, type BacklogRunIdentity } from './group_chat/task_board';
 import { taskSummaryPage } from './task_query';
 import { getActiveUserId } from './users';
@@ -60,10 +60,10 @@ export function createProjectTasksHandler(
         ? { fields: { owner_agent: owner.name, owner_agent_id: owner.agent_id } }
         : { error: `unknown owner "${ownerRaw}" — no matching enabled agent in this account` };
     }
-    const { getBindings } = await import('./projects');
+    const { availableProjectAgentIds } = await import('./projects');
     let bound: string[];
     const names = new Map(agentDisplayNameById);
-    if (pid) bound = (await getBindings(uid, pid)).agents;
+    if (pid) bound = await availableProjectAgentIds(uid, pid);
     else {
       const { getActiveUserId } = await import('./users');
       if (getActiveUserId() !== uid) return { error: 'account_changed' };
@@ -141,30 +141,12 @@ export function createProjectTasksHandler(
         ...ownerFields,
         ...(input.due_at !== undefined ? { due_at: input.due_at } : {}),
         created_by: 'agent',
+        ...(cid ? { change_cid: cid } : {}),
       }, { beforeWrite });
       if (!r.ok) return { ok: false, error: (r as { error: string }).error };
-      // Link only the first open to-do saved in this conversation.
-      let task = r.task;
-
-      // The to-do is already saved, so an unreadable backlog leaves it
-      // unlinked rather than failing the creation.
-      const linksHere = async (): Promise<boolean> => {
-        if (!pid) return true;
-        try {
-          return !(await projectTasks.listTasks(uid, pid)).some((other) => (
-            other.id !== task.id && other.origin_cid === cid && other.status !== 'done'
-          ));
-        } catch {
-          return false;
-        }
-      };
-      if (!task.origin_cid && cid && await linksHere()) {
-        await projectTasks.recordTaskExecution(uid, pid, task.id, cid);
-        task = (await projectTasks.getTask(uid, pid, task.id)) || task;
-      }
-      return { ok: true, task: savedView(task), alreadyExists: r.alreadyExists };
+      return { ok: true, task: savedView(r.task), alreadyExists: r.alreadyExists };
     },
-    update: async (taskId: string, patch: projectTasks.TaskContentInput & { status?: projectTasks.TaskStatus; owner?: string; due_at?: string }) => {
+    update: async (taskId: string, patch: projectTasks.TaskContentInput & ProjectTaskNoteInput & { status?: projectTasks.TaskStatus; owner?: string; due_at?: string }) => {
       const current = await projectTasks.getTask(uid, pid, taskId);
       if (!current) return { ok: false, error: 'task_not_found' };
       let ownerPatch: { owner_agent?: string; owner_agent_id?: string } = {};
@@ -187,6 +169,9 @@ export function createProjectTasksHandler(
         ...ownerPatch,
         // An empty string clears, like `owner`.
         ...(patch.due_at !== undefined ? { due_at: patch.due_at === '' ? null : patch.due_at } : {}),
+        ...(patch.note !== undefined ? { note: patch.note } : {}),
+        ...(patch.note_kind !== undefined ? { note_kind: patch.note_kind } : {}),
+        ...(cid ? { change_cid: cid } : {}),
       }, { beforeWrite });
       return r.ok === true ? { ok: true, task: savedView(r.task) } : {
         ok: false,
@@ -195,10 +180,12 @@ export function createProjectTasksHandler(
           : r.error,
       };
     },
-    complete: async (taskId: string) => {
+    complete: async (taskId: string, extras: ProjectTaskNoteInput = {}) => {
       beforeWrite();
       const r = await projectTasks.updateTask(uid, pid, taskId, {
         status: 'done',
+        ...extras,
+        ...(cid ? { change_cid: cid } : {}),
       }, { beforeWrite });
       return r.ok ? { ok: true, task: savedView(r.task) } : { ok: false, error: (r as { error: string }).error };
     },

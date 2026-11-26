@@ -21,6 +21,7 @@ export type TaskInterventionKind =
 
 export interface TaskInterventionEvent {
   attention_id: string;
+  bash_request_id?: string;
   user_id: string;
   conversation_id: string;
   kind: TaskInterventionKind;
@@ -89,6 +90,7 @@ export function captureDeliveredTaskIntervention(
     if (!requestId || !activeUid || !conversationId) return false;
     emitTaskIntervention({
       attention_id: `${requestKind}:${requestId}`,
+      ...(channel === 'bash:permission' ? { bash_request_id: requestId } : {}),
       user_id: activeUid,
       conversation_id: conversationId,
       kind: requestKind,

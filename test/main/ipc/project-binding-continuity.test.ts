@@ -83,6 +83,31 @@ describe('local project binding continuity', () => {
     return { agents, projects, paths, pid, aid, target, body, bindingsFile };
   }
 
+  it('reports built-in Agents as available without adding them, and keeps Add from writing one', async () => {
+    const { pid, aid, paths, bindingsFile } = await fixture();
+    const builtinId = 'c0ffee000004';
+    const builtinDir = paths.userMarketplaceAgentDir('member', builtinId);
+    fs.mkdirSync(builtinDir, { recursive: true });
+    fs.writeFileSync(path.join(builtinDir, 'agent.json'), JSON.stringify({ agent_id: builtinId, name: 'BuiltinStudio', workflow: 'Edit' }));
+    fs.writeFileSync(path.join(builtinDir, '_install.json'), JSON.stringify({ seed_source: 'builtin' }));
+    (await import('../../../src/main/features/agents')).clearAgentListCache();
+    const before = fs.readFileSync(bindingsFile, 'utf8');
+
+    const listed = await invoke('projects.bindings.list', { projectId: pid });
+    expect(listed.bindings.agents).toEqual([aid]);
+    expect(listed.agentDetails.map((row: any) => row.agent_id)).toEqual([aid]);
+    expect(listed.availableAgents.map((row: any) => [row.agent_id, !!row.builtin]))
+      .toEqual([[aid, false], [builtinId, true]]);
+
+    const candidates = await invoke('projects.bindings.candidates', { projectId: pid });
+    expect(candidates.agents.find((row: any) => row.agent_id === builtinId)).toMatchObject({ builtin: true });
+    expect(candidates.agents.some((row: any) => row.agent_id === aid)).toBe(false);
+
+    expect((await invoke('projects.bindings.add', { projectId: pid, kind: 'agent', id: builtinId })).bindings.agents)
+      .toEqual([aid]);
+    expect(fs.readFileSync(bindingsFile, 'utf8')).toBe(before);
+  });
+
   it.each(['commit', 'rollback'])('keeps bindings and recovers details after an Agent update %s', async outcome => {
     const { agents, pid, aid, target, body, bindingsFile } = await fixture();
     const before = fs.readFileSync(bindingsFile, 'utf8');

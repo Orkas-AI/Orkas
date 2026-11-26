@@ -772,55 +772,147 @@ test.describe('task board scheduling (D29 planned dependencies)', () => {
     await expect(page.locator('#chat-history')).not.toContainText('My unsaved changes');
   });
 
-  test('sends an already-queued task into its matching active turn', async ({ modelOrkas, boardPage }) => {
-    const app = modelOrkas;
-    const page = boardPage;
-    const rows = page.locator('#chat-task-board-list .chat-queue-item');
-    const before = app.modelRequests.length;
+  for (const trigger of ['button', 'Shift+Enter']) {
+    test(`sends an already-queued task into its matching active turn using ${trigger}`, async ({ modelOrkas, boardPage }, testInfo) => {
+      const app = modelOrkas;
+      const page = boardPage;
+      const rows = page.locator('#chat-task-board-list .chat-queue-item');
+      const before = app.modelRequests.length;
 
-    app.setModelMode('very-slow');
-    const input = page.locator('#chat-input');
-    await input.fill('@ContentWriter keep working on the long draft.');
-    await input.dispatchEvent('input');
-    await page.locator('#chat-send-btn').click();
-    await expect.poll(() => app.modelRequests.length, { timeout: 15_000 }).toBe(before + 1);
-    // The pre-send composer shortcut was removed: ordinary sends queue first,
-    // and only the durable queue row may offer the explicit promotion action.
-    await expect(page.locator('#chat-steer-btn')).toHaveCount(0);
+      // Hold the active turn through layout checks and the Send now action.
+      app.setModelMode('controlled-slow');
+      const input = page.locator('#chat-input');
+      await input.fill('@ContentWriter keep working on the long draft.');
+      await input.dispatchEvent('input');
+      await page.locator('#chat-send-btn').click();
+      await expect.poll(() => app.modelRequests.length, { timeout: 15_000 }).toBe(before + 1);
+      // The pre-send composer shortcut was removed: ordinary sends queue first,
+      // and only the durable queue row may offer the explicit promotion action.
+      await expect(page.locator('#chat-steer-btn')).toHaveCount(0);
 
-    // Use the ordinary composer send path so the second message first becomes a
-    // durable backend queue task. The row must then restore the explicit
-    // Send-now choice instead of forcing cancel + duplicate resend.
-    await input.fill('@ContentWriter include the new headline immediately.');
-    await input.press('Enter');
-    const queuedRow = page.locator('#chat-task-board-list .chat-queue-item', {
-      hasText: 'include the new headline immediately',
+      // Use the ordinary composer send path so the second message first becomes a
+      // durable backend queue task. The row must then restore the explicit
+      // Send-now choice instead of forcing cancel + duplicate resend.
+      await input.fill('@ContentWriter include the new headline immediately.');
+      await input.press('Enter');
+      const queuedRow = page.locator('#chat-task-board-list .chat-queue-item', {
+        hasText: 'include the new headline immediately',
+      });
+      await expect(queuedRow).toBeVisible({ timeout: 5_000 });
+      // Screenshot regression: an ordinary same-Agent queued row used to show
+      // both an assignee dropdown and a "No dependency" dropdown. It now keeps
+      // the send-time assignee as text, has no dependency chip, and offers only
+      // actions that do not rewrite either fact.
+      await expect(queuedRow.locator('xpath=ancestor::section[contains(@class, "chat-queue-agent-group")][1]').locator('.chat-queue-agent-name')).toHaveText('ContentWriter');
+      await expect(queuedRow.locator('.chat-queue-dep')).toHaveCount(0);
+      await expect(queuedRow.locator('[data-act="task-reassign"]')).toHaveCount(0);
+      await expect(queuedRow.locator('[data-act="task-after"]')).toHaveCount(0);
+      await expect(queuedRow.locator('[data-act="task-cancel"]')).toBeVisible();
+      const sendNow = queuedRow.locator('[data-act="task-send-now"]');
+      await expect(sendNow).toBeVisible();
+      await expect(sendNow).toHaveAttribute('aria-keyshortcuts', 'Shift+Enter');
+      await expect(sendNow).toHaveAccessibleName('Send now');
+
+      if (trigger === 'button') {
+        const shortcutStrokesMatchLabel = () => sendNow.evaluate(button => {
+          const labelColor = getComputedStyle(button).color;
+          const paths = Array.from(button.querySelectorAll('.chat-queue-shortcut svg path'));
+          return paths.length === 2 && paths.every(path => getComputedStyle(path).stroke === labelColor);
+        });
+        await input.hover();
+        await expect.poll(shortcutStrokesMatchLabel, { message: 'Shortcut color at rest' }).toBe(true);
+        await sendNow.hover();
+        await expect.poll(shortcutStrokesMatchLabel, { message: 'Shortcut color on hover' }).toBe(true);
+      }
+
+      if (trigger === 'Shift+Enter') {
+        await input.fill('@ContentWriter keep the second correction queued.');
+        await input.press('Enter');
+        const second = rows.filter({ hasText: 'keep the second correction queued' });
+        await expect(second).toBeVisible();
+        await expect(second.locator('[aria-keyshortcuts]')).toHaveCount(0);
+        // Editing keeps the familiar newline, even with another eligible row.
+        await queuedRow.locator('[data-act="task-edit"]').click();
+        await input.press('End');
+        await input.press('Shift+Enter');
+        await expectComposerText(input, '@ContentWriter include the new headline immediately.\n');
+        await input.press('Escape');
+        await input.fill('Unsent draft stays here.');
+        const viewport = page.viewportSize();
+        const conversationId = await page.evaluate<string>('currentCid');
+        for (const lang of ['en', 'fr', 'ar', 'zh']) {
+          await page.evaluate(async ({ lang, conversationId }) => {
+            await (window as any).setLang(lang);
+            (window as any).TaskBoard.render(conversationId);
+          }, { lang, conversationId });
+          for (const width of lang === 'en' || lang === 'zh' ? [1360, 800] : [800]) {
+            await page.setViewportSize({ width, height: 900 });
+            await expect(sendNow).toBeVisible();
+            await expect.poll(() => queuedRow.evaluate(row => {
+              const list = row.closest('.chat-queue-list');
+              const shortcut = row.querySelector('.chat-queue-shortcut');
+              if (!row.isConnected || !list || !shortcut?.getClientRects().length) return null;
+              const visible = list.getBoundingClientRect();
+              const hint = shortcut.getBoundingClientRect();
+              const range = document.createRange();
+              range.selectNode(shortcut.previousSibling!);
+              const label = range.getBoundingClientRect();
+              const style = getComputedStyle(shortcut);
+              const shiftOutline = shortcut.querySelector('.is-shift path')?.getBoundingClientRect();
+              const enterOutline = shortcut.querySelector('.is-enter path')?.getBoundingClientRect();
+              return {
+                actionsFit: Array.from(row.querySelectorAll('button')).every(button => {
+                  const rect = button.getBoundingClientRect();
+                  return rect.left >= visible.left && rect.right <= visible.right
+                    && button.scrollWidth <= button.clientWidth;
+                }),
+                shortcutIsUnframed: style.borderStyle === 'none' && style.backgroundColor === 'rgba(0, 0, 0, 0)',
+                shortcutClearsLabel: Math.max(hint.left - label.right, label.left - hint.right) >= 6,
+                shiftIsWide: (shiftOutline?.width ?? 0) >= 10,
+                enterIsCompact: !!enterOutline && enterOutline.width >= 8 && enterOutline.height >= 8
+                  && enterOutline.width <= enterOutline.height + 1,
+              };
+            }), { timeout: 3_000, message: `Queue action layout at ${width}px in ${lang}` }).toEqual({
+              actionsFit: true,
+              shortcutIsUnframed: true,
+              shortcutClearsLabel: true,
+              shiftIsWide: true,
+              enterIsCompact: true,
+            });
+            await page.locator('#chat-task-board').screenshot({ path: testInfo.outputPath(`send-now-${lang}-${width}.png`) });
+          }
+        }
+        if (viewport) await page.setViewportSize(viewport);
+      }
+
+      app.setModelMode('success');
+      app.setModelTextReplies(['E2E queued update absorbed into the active turn.']);
+      const firstId = await queuedRow.getAttribute('data-task-id');
+      if (trigger === 'button') await sendNow.click();
+      else await input.press('Shift+Enter');
+      const cid = await page.evaluate<string>('currentCid');
+      await expect.poll(async () => {
+        const result = await app.invoke<{ tasks: Array<{ task_id: string; message_sent_at?: string }> }>('groupChat.tasks.list', { cid });
+        return Boolean(result.tasks.find(task => task.task_id === firstId)?.message_sent_at);
+      }).toBe(true);
+      app.releaseControlledModelChunk();
+      app.finishControlledModelStream();
+      if (trigger === 'Shift+Enter') await expectComposerText(input, 'Unsent draft stays here.');
+      await expect(page.locator('#chat-history')).toContainText(
+        'E2E queued update absorbed into the active turn.',
+        { timeout: 20_000 },
+      );
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
+
+      // The promoted row shares the active turn's result and is not painted as
+      // a fake second execution. With no multi-task controls left, the board
+      // retracts instead of keeping the original task as a permanent row.
+      await expect(page.locator('#chat-task-board')).toBeHidden({ timeout: 10_000 });
+      if (trigger === 'Shift+Enter') {
+        await input.fill('Ordinary multiline draft');
+        await input.press('Shift+Enter');
+        await expectComposerText(input, 'Ordinary multiline draft\n');
+      }
     });
-    await expect(queuedRow).toBeVisible({ timeout: 5_000 });
-    // Screenshot regression: an ordinary same-Agent queued row used to show
-    // both an assignee dropdown and a "No dependency" dropdown. It now keeps
-    // the send-time assignee as text, has no dependency chip, and offers only
-    // actions that do not rewrite either fact.
-    await expect(queuedRow.locator('xpath=ancestor::section[contains(@class, "chat-queue-agent-group")][1]').locator('.chat-queue-agent-name')).toHaveText('ContentWriter');
-    await expect(queuedRow.locator('.chat-queue-dep')).toHaveCount(0);
-    await expect(queuedRow.locator('[data-act="task-reassign"]')).toHaveCount(0);
-    await expect(queuedRow.locator('[data-act="task-after"]')).toHaveCount(0);
-    await expect(queuedRow.locator('[data-act="task-cancel"]')).toBeVisible();
-    const sendNow = queuedRow.locator('[data-act="task-send-now"]');
-    await expect(sendNow).toBeVisible();
-
-    app.setModelMode('success');
-    app.setModelTextReplies(['E2E queued update absorbed into the active turn.']);
-    await sendNow.click();
-    await expect(page.locator('#chat-history')).toContainText(
-      'E2E queued update absorbed into the active turn.',
-      { timeout: 20_000 },
-    );
-    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
-
-    // The promoted row shares the active turn's result and is not painted as
-    // a fake second execution. With no multi-task controls left, the board
-    // retracts instead of keeping the original task as a permanent row.
-    await expect(page.locator('#chat-task-board')).toBeHidden({ timeout: 10_000 });
-  });
+  }
 });

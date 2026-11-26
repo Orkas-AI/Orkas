@@ -1,0 +1,2 @@
+- Plan, prioritize and report the project's work against this goal.
+- When the evidence shows the goal is reached (every success criterion met, if any are set), propose marking it achieved and cite the evidence; mark it achieved only after the user agrees.

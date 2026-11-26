@@ -3,11 +3,17 @@
 ## Scope
 
 Native notifications are an attention layer for tasks that reach a terminal
-state while Orkas is still running but no app window is focused. The app-level
+state or a delivered user-action gate while Orkas is in the background. On
+macOS, an active app with a visible, non-minimized window is in the foreground
+even while a native sheet owns focus. Windows and Linux use app window focus.
+The app-level
 preference and the operating-system permission are independent authorities:
 the checkbox stores the user's choice, while the recovery row explains when the
 system prevents visible delivery. Notifications do not change task execution,
 window-close, or process-exit behavior.
+A pending Bash approval stays visible on its task row. Moving Orkas to the
+background sends one native reminder. Answering or cancelling the request
+clears the pending attention.
 
 New shared-project to-dos assigned to the active account also use this native
 attention layer, with distinct To-do copy and grouping. A first complete pull
@@ -40,6 +46,7 @@ may mirror those dots.
 | Recover from a failed write | The setter rejects, returns a mismatched value, or throws | The checkbox rolls back to the actual/previous value, is re-enabled, and can be retried | False success leaves notification delivery different from the UI | Renderer harness injects each failure and observes final state and bounded local logs | Optimistic UI must not become the persisted source of truth |
 | Recover from blocked system presentation | App preference enabled; permission denied or badge-only; settings route available or unavailable | Warning appears only while blocked, the button appears only when actionable, and focus return refreshes status | The app claims delivery is enabled without a recovery path | Renderer permission-state harness plus platform manual matrix | Real OS presentation state is platform-owned and cannot be fully simulated portably |
 | Notice a finished background task | Completed, failed, waiting for input, or cancelled; app focused or backgrounded | Supported background terminal states create one generic native notification; focused/cancelled states do not | Missing notification hides completed work; a false notification distracts the user | Main feature tests observe the native-notification adapter and prohibited calls | Actual banners require platform manual verification |
+| Find a Bash approval after leaving the app | The permission dialog opened in the foreground and the account changes, the task is cancelled, the user responds, or Orkas moves to the background | The task row shows awaiting confirmation until resolved. A still-pending request gets one background reminder, and a stale reminder cannot open a resolved request | An unresolved foreground prompt used to disappear from the system notification path on app blur | Main adapter and Bash lifecycle tests assert native show, close and click. Electron dialog regression checks the task row in English and Chinese | Native OS banner presentation remains platform-specific |
 
 ## Automated coverage
 
@@ -107,6 +114,10 @@ may mirror those dots.
    - Exactly one generic notification appears after the entire task finishes.
    - It contains no prompt, conversation title, attachment name, generated
      content, path, or other private user data.
+   - On macOS, verify the Dock badge appears when only minimized or hidden
+     windows remain, then clears after a visible window returns.
+   - Keep an Orkas window visible and open a native sheet. Task completion
+     produces no system notification or Dock badge, including after the sheet closes.
 7. Click the notification.
    - A minimized or hidden window is restored and focused.
    - The originating conversation opens and its latest history loads.

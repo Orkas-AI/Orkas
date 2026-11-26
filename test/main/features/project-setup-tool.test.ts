@@ -22,6 +22,17 @@ vi.mock('../../../src/main/logger', () => ({
 
 vi.mock('../../../src/main/features/agents', () => ({
   getAgent: async () => undefined,
+  listAgentSummaries: async () => [
+    { agent_id: 'review-fixture', name: 'Review Agent', source: 'custom', enabled: true },
+    { agent_id: 'draft-fixture', name: 'Draft Agent', source: 'custom', enabled: true },
+    { agent_id: 'disabled-fixture', name: 'Disabled Agent', source: 'custom', enabled: false },
+    { agent_id: 'review-copy', name: 'Twin', source: 'custom', enabled: true },
+    { agent_id: 'draft-copy', name: 'Twin', source: 'custom', enabled: true },
+    { agent_id: 'platform-fixture', name: 'Platform Agent', source: 'marketplace', enabled: true },
+    { agent_id: 'builtin-fixture', name: 'Builtin Studio', source: 'marketplace', seed_source: 'builtin', enabled: true },
+  ],
+  agentPrioritySource: (agent: { source: string; seed_source?: string }) => agent.source === 'custom'
+    ? 'custom' : agent.seed_source === 'builtin' ? 'builtin' : 'platform',
 }));
 
 let tmpDir: string;
@@ -29,6 +40,7 @@ let prevWs: string | undefined;
 const UID = 'u-project-setup';
 
 beforeEach(async () => {
+  vi.stubEnv('ORKAS_PROJECT_RECAP_TAB_ENABLED', '1');
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-project-setup-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -40,6 +52,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await (await import('../../../src/main/features/search/indexer')).flushAll();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -54,6 +67,77 @@ async function call(cid: string, input: unknown, projectId: string | null = null
   const result = await executor.execute(input as never, {} as never);
   return { raw: result, body: JSON.parse(result.content as string) };
 }
+
+describe('project_setup › add_agents', () => {
+  it('adds one existing Agent to the current project and preserves the same membership on a repeat', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const project = await projects.createProject(UID, 'Current');
+    if (!project.ok) throw new Error('project fixture failed');
+    const pid = project.project.project_id;
+    const conv = await chats.createConversation(UID, { projectId: pid });
+    const input = { action: 'add_agents', agents: ['Review Agent'] };
+    expect((await call(conv.conversation_id, input)).body).toMatchObject({
+      ok: true, project_id: pid, results: [{ status: 'added', agent_id: 'review-fixture' }],
+    });
+    expect((await call(conv.conversation_id, input)).body.results).toMatchObject([{ status: 'already_present' }]);
+    expect((await projects.getBindings(UID, pid)).agents).toEqual(['review-fixture']);
+    expect((await chats.getConversationMetadata(UID, conv.conversation_id))?.project_id).toBe(pid);
+  });
+
+  it('reports partial success for an explicit existing target without moving the conversation', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const project = await projects.createProject(UID, 'Launch');
+    if (!project.ok) throw new Error('project fixture failed');
+    const conv = await chats.createConversation(UID, {});
+    const input = {
+      action: 'add_agents', target_project: 'Launch',
+      agents: ['Review Agent', 'draft-fixture', 'Disabled Agent', 'Twin', 'Missing Agent'],
+    };
+    const { body } = await call(conv.conversation_id, input);
+    expect(body).toMatchObject({ ok: false, status: 'partial', results: [
+      { status: 'added', agent_id: 'review-fixture' },
+      { status: 'added', agent_id: 'draft-fixture' },
+      { status: 'failed', error: 'agent_disabled' },
+      { status: 'failed', error: 'agent_ambiguous' },
+      { status: 'failed', error: 'agent_not_found' },
+    ] });
+    expect((await projects.getBindings(UID, project.project.project_id)).agents).toEqual(['review-fixture', 'draft-fixture']);
+    expect((await chats.getConversationMetadata(UID, conv.conversation_id))?.project_id).toBeFalsy();
+    expect(await projects.listProjects(UID)).toHaveLength(1);
+  });
+
+  it('refuses a conflicting action or a foreign project before writing', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const foreign = await projects.createProject('other-account', 'Foreign');
+    if (!foreign.ok) throw new Error('foreign project fixture failed');
+    const conv = await chats.createConversation(UID, {});
+    const cid = conv.conversation_id;
+    expect((await call(cid, { action: 'create', name: 'Accidental', agents: ['Review Agent'] })).raw.isError).toBe(true);
+    expect((await call(cid, { action: 'add_agents', target_project: foreign.project.project_id, agents: ['Review Agent'] })).body.error)
+      .toBe('project_not_found');
+    expect((await call(cid, { action: 'add_agents', agents: 'Review Agent' })).raw.isError).toBe(true);
+    expect(await projects.listProjects(UID)).toEqual([]);
+    expect((await projects.getBindings('other-account', foreign.project.project_id)).agents).toEqual([]);
+  });
+
+  it('reports a built-in Agent as already present without writing membership', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const paths = await import('../../../src/main/paths');
+    const project = await projects.createProject(UID, 'Private');
+    if (!project.ok) throw new Error('project fixture failed');
+    const pid = project.project.project_id;
+    const cid = (await chats.createConversation(UID, { projectId: pid })).conversation_id;
+    expect((await call(cid, { action: 'add_agents', agents: ['Builtin Studio'] })).body).toMatchObject({
+      ok: true, results: [{ status: 'already_present', agent_id: 'builtin-fixture' }],
+    });
+    expect(fs.existsSync(paths.projectBindingsFile(UID, pid))).toBe(false);
+  });
+
+});
 
 describe('project_setup › create', () => {
   it.each([false, true])('reports retained setup after filing fails and retries into the same project (with todos=%s)', async (withTodos) => {
@@ -141,12 +225,7 @@ describe('project_setup › create', () => {
     expect(inProject.map((task) => task.content).sort())
       .toEqual(['Agree the weekly check scope', 'List the competitors worth watching']);
     expect(await projectTasks.listTasks(UID, '')).toEqual([]);
-    // The first to-do is this conversation's next step, so opening or running
-    // it returns here; the rest of the backlog links on its first run.
-    expect(inProject.find((task) => task.content === 'List the competitors worth watching'))
-      .toMatchObject({ origin_cid: cid });
-    expect(inProject.find((task) => task.content === 'Agree the weekly check scope'))
-      .not.toHaveProperty('origin_cid');
+    for (const task of inProject) expect(task).not.toHaveProperty('origin_cid');
   });
 
   it('reports the name the project actually got after a duplicate was suffixed', async () => {
@@ -226,11 +305,14 @@ describe('project_setup › create', () => {
     expect(await projects.listProjects(UID)).toHaveLength(2);
   });
 
-  it('saves the goal it is given as the project instructions every conversation receives, and refuses an unbounded one', async () => {
+  it('saves the goal it is given as the project goal every conversation receives, and refuses an unbounded one', async () => {
     const chats = await import('../../../src/main/features/chats');
     const projects = await import('../../../src/main/features/projects');
+    const goals = await import('../../../src/main/features/project_goal');
     const changed: string[] = [];
-    projects.onProjectInstructionsChanged((event) => { changed.push(`${event.uid}:${event.projectId}`); });
+    const rulesChanged: string[] = [];
+    goals.onProjectGoalChanged((event) => { changed.push(`${event.uid}:${event.projectId}`); });
+    projects.onProjectInstructionsChanged((event) => { rulesChanged.push(event.projectId); });
     const conv = await chats.createConversation(UID, { title: 'goal' });
     const { body } = await call(conv.conversation_id, {
       action: 'create', name: 'Launch plan', todos: ['Draft the brief'],
@@ -238,10 +320,13 @@ describe('project_setup › create', () => {
     });
     expect(body.ok).toBe(true);
     expect(body.goal_saved).toBe(true);
-    // The rail and the open project page learn about the write from the host.
-    expect(await projects.readProjectInstructions(UID, body.project_id))
-      .toMatchObject({ ok: true, content: '三个月内把 Lumen 的上线邮件、定价页和发布会物料全部准备好。' });
+    // The goal tab and the open project page learn about the write from the
+    // host; the rules are untouched (plan C1).
+    expect(await goals.readProjectGoal(UID, body.project_id))
+      .toMatchObject({ goal: '三个月内把 Lumen 的上线邮件、定价页和发布会物料全部准备好。', success_criteria: [], status: 'active' });
+    expect((await projects.readProjectInstructions(UID, body.project_id) as { content?: string }).content || '').toBe('');
     expect(changed).toEqual([`${UID}:${body.project_id}`]);
+    expect(rulesChanged).toEqual([]);
 
     // No goal means no instructions, not an empty placeholder.
     const plain = await chats.createConversation(UID, { title: 'plain' });
@@ -363,7 +448,8 @@ describe('project_setup › move_conversation', () => {
   it('advertises current movement/removal and rejects the retired unfile action', async () => {
     const { cid, pid, chats, filing } = await fixture();
     const schema = (await tool(cid)).inputSchema as any;
-    expect(schema.properties.action.enum).toEqual(['create', 'rename', 'move_conversation', 'remove_conversation']);
+    expect(schema.properties.action.enum).toEqual(['create', 'rename', 'set_goal', 'move_conversation', 'remove_conversation', 'add_agents']);
+    expect(schema.properties.agents).toMatchObject({ type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' } });
     expect(schema.properties.target_project.description).toMatch(/exact.*name|name.*exact/i);
     expect((await call(cid, { action: 'move_conversation' })).raw.isError).toBe(true);
     expect((await call(cid, { action: 'unfile' }, pid)).raw.isError).toBe(true);
@@ -540,4 +626,117 @@ describe('project_setup › rename', () => {
     expect((await chats.getConversationMetadata(UID, cid))?.project_id).toBe(pid);
   });
 
+});
+
+// Commander project continuity (Common/docs/plans/commander-project-continuity.md
+// §3.2(1), §3.5). A project goal is its own record (goal.json): older clients
+// rewrite project.json with only the fields they know, and the rules stay in
+// ORKAS.md. Goal and success criteria are both optional, because not every
+// project has a clear, measurable target.
+describe('project_setup › project goal', () => {
+  it('hides stored goal operations and rejects stale goal writes before creating or changing a project', async () => {
+    vi.stubEnv('ORKAS_PROJECT_RECAP_TAB_ENABLED', undefined);
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const goals = await import('../../../src/main/features/project_goal');
+    const project = await projects.createProject(UID, 'Existing project');
+    if (!project.ok) throw new Error('project fixture failed');
+    const pid = project.project.project_id;
+    await goals.saveProjectGoal(UID, pid, { goal: 'Previously saved' }, 'ui');
+    const outside = (await chats.createConversation(UID, { title: 'Outside' })).conversation_id;
+    const inside = (await chats.createConversation(UID, { title: 'Inside', projectId: pid })).conversation_id;
+    const { properties } = (await tool(outside)).inputSchema as { properties: { action: { enum: string[] } } };
+    expect(properties.action.enum).not.toContain('set_goal');
+    for (const field of ['goal', 'success_criteria', 'status']) expect(properties).not.toHaveProperty(field);
+    for (const request of [
+      { action: 'create', name: 'Blocked project', goal: 'Invisible goal' },
+      { action: 'create', name: 'Blocked project', success_criteria: ['Invisible criterion'] },
+    ]) {
+      expect((await call(outside, request)).body).toMatchObject({ ok: false, code: 'E_PROJECT_GOAL_DISABLED' });
+    }
+    expect((await projects.listProjectNameRows(UID)).map(row => row.name)).toEqual(['Existing project']);
+    expect((await call(inside, { action: 'set_goal', goal: '' }, pid)).body)
+      .toMatchObject({ ok: false, code: 'E_PROJECT_GOAL_DISABLED' });
+    expect(await goals.readProjectGoal(UID, pid)).toMatchObject({ goal: 'Previously saved' });
+    expect((await call(outside, { action: 'create', name: 'Ordinary project', todos: ['First task'] })).body.ok).toBe(true);
+  });
+  async function readGoal(pid: string): Promise<Record<string, unknown> | null> {
+    const { projectDir } = await import('../../../src/main/paths');
+    const file = path.join(projectDir(UID, pid), 'goal.json');
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null;
+  }
+
+  it('saves a stated goal and its success criteria as the project goal and leaves the rules empty', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const conv = await chats.createConversation(UID, { title: 'goal' });
+    const { body } = await call(conv.conversation_id, {
+      action: 'create', name: 'Launch plan', todos: ['Draft the brief'],
+      goal: '  三个月内把 Lumen 的上线邮件、定价页和发布会物料全部准备好。  ',
+      success_criteria: ['上线邮件发给全部老客户', '定价页上线'],
+    });
+    expect(body.ok).toBe(true);
+    expect(body.goal_saved).toBe(true);
+    expect(await readGoal(body.project_id)).toMatchObject({
+      goal: '三个月内把 Lumen 的上线邮件、定价页和发布会物料全部准备好。',
+      success_criteria: ['上线邮件发给全部老客户', '定价页上线'],
+      status: 'active',
+    });
+    expect((await projects.readProjectInstructions(UID, body.project_id) as { content?: string }).content || '').toBe('');
+  });
+
+  it('creates a project without a goal record when no goal is stated', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const conv = await chats.createConversation(UID, { title: 'no goal' });
+    const { body } = await call(conv.conversation_id, { action: 'create', name: 'Client files', todos: ['Collect the contracts'] });
+    expect(body.ok).toBe(true);
+    expect(body).not.toHaveProperty('goal_saved');
+    expect(await readGoal(body.project_id)).toBeNull();
+    expect((await projects.readProjectInstructions(UID, body.project_id) as { content?: string }).content || '').toBe('');
+  });
+
+  it('takes a goal without criteria or with up to five, and refuses more or an over-long one before creating anything', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const create = async (name: string, extra: Record<string, unknown>) => {
+      const conv = await chats.createConversation(UID, { title: name });
+      return call(conv.conversation_id, { action: 'create', name, goal: '把店铺月销做到 10 万', ...extra });
+    };
+    const open = await create('Open goal', {});
+    expect(open.body.ok).toBe(true);
+    expect((await readGoal(open.body.project_id))?.success_criteria ?? []).toEqual([]);
+    const five = ['月销连续两个月不低于 10 万', '退货率不高于 5%', '复购率不低于 30%', '好评率不低于 98%', '客单价不低于 200 元'];
+    const full = await create('Five criteria', { success_criteria: five });
+    expect(full.body.ok).toBe(true);
+    expect((await readGoal(full.body.project_id))?.success_criteria).toEqual(five);
+    expect((await create('Six criteria', { success_criteria: [...five, '粉丝数过万'] })).raw.isError).toBe(true);
+    expect((await create('Long criterion', { success_criteria: ['x'.repeat(201)] })).raw.isError).toBe(true);
+    expect((await projects.listProjects(UID)).map((project) => project.name)).not.toEqual(
+      expect.arrayContaining(['Six criteria']),
+    );
+    expect((await projects.listProjects(UID)).map((project) => project.name)).not.toContain('Long criterion');
+  });
+
+  it('lets set_goal edit, achieve and clear the current project goal, and refuses a paused status or a projectless conversation', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const pid = ((await projects.createProject(UID, '店铺运营')) as { project: { project_id: string } }).project.project_id;
+    const conv = await chats.createConversation(UID, { title: 'set goal', projectId: pid });
+    const setGoal = (input: Record<string, unknown>) => call(conv.conversation_id, { action: 'set_goal', ...input }, pid);
+    expect((await setGoal({ goal: '把店铺月销做到 10 万', success_criteria: ['月销连续两个月不低于 10 万'] })).body.ok).toBe(true);
+    expect(await readGoal(pid)).toMatchObject({ goal: '把店铺月销做到 10 万', success_criteria: ['月销连续两个月不低于 10 万'], status: 'active' });
+    expect((await setGoal({ status: 'achieved' })).body.ok).toBe(true);
+    const achieved = await readGoal(pid);
+    expect(achieved).toMatchObject({ status: 'achieved' });
+    expect(achieved?.achieved_at).toBeTruthy();
+    // Pausing only means something once auto-advance follows the goal (plan §9).
+    expect((await setGoal({ status: 'paused' })).raw.isError).toBe(true);
+    expect(await readGoal(pid)).toMatchObject({ status: 'achieved' });
+    // An empty goal clears the record; a project without a goal is ordinary.
+    expect((await setGoal({ goal: '' })).body.ok).toBe(true);
+    expect(await readGoal(pid)).toBeNull();
+    const loose = await chats.createConversation(UID, { title: 'outside' });
+    expect((await call(loose.conversation_id, { action: 'set_goal', goal: '随便一个目标' })).raw.isError).toBe(true);
+  });
 });

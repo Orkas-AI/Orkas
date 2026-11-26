@@ -56,4 +56,53 @@ describe('project binding picker order', () => {
     }
     expect(warn).not.toHaveBeenCalled();
   });
+
+  // Built-in Agents are already available in every project (2026-11-23): the
+  // picker still shows them so users find VideoStudio, but greyed, with the
+  // reason in words and without an Add control.
+  it('shows built-in Agents after the addable ones, greyed with their availability and no Add control', async () => {
+    const agents = [
+      { agent_id: 'builtin-video', source: 'marketplace', name: 'VideoStudio', builtin: true },
+      { agent_id: 'platform1', source: 'marketplace', name: 'Platform Agent' },
+      { agent_id: 'custom1', source: 'custom', name: 'Custom Agent' },
+    ].map(agent => ({ ...agent, description_en: 'Description' }));
+    const list = { innerHTML: '', querySelectorAll: () => [] };
+    const empty = { textContent: '', style: { display: '' } };
+    const search = { value: '', focus() {}, addEventListener() {} };
+    const overlay = {
+      innerHTML: '',
+      querySelector: (selector: string) => ({
+        '#project-binding-picker-list': list,
+        '#project-binding-picker-empty': empty,
+        '#project-binding-picker-search-input': search,
+      })[selector] ?? null,
+    };
+    const context = vm.createContext({
+      createLogger: () => ({ warn() {} }),
+      window: { addEventListener() {}, orkas: { invoke: async () => ({ ok: true, agents }) } },
+      document: {
+        readyState: 'loading', addEventListener() {}, getElementById: () => null,
+        createElement: () => overlay, body: { appendChild() {} },
+      },
+      escapeHtml: (value: unknown) => String(value ?? ''),
+      pickDesc: (item: { description_en: string }) => item.description_en,
+      t: (key: string) => key,
+      setTimeout: (callback: () => void) => callback(),
+    });
+    vm.runInContext(source, context, { filename: 'project-detail.js' });
+    await context._openAddPicker();
+    const rows = [...list.innerHTML.matchAll(/<div class="project-binding-picker-item[^"]*"[^>]*data-id="([^"]+)"[\s\S]*?(?=<div class="project-binding-picker-item|$)/g)]
+      .map(match => ({ id: match[1], html: match[0] }));
+    expect(rows.map(row => row.id)).toEqual(['custom1', 'platform1', 'builtin-video']);
+    const builtin = rows.find(row => row.id === 'builtin-video')!;
+    expect(builtin.html).toContain('is-disabled');
+    expect(builtin.html).toContain('aria-disabled="true"');
+    expect(builtin.html).toContain('project.bindings.builtin_available_short');
+    expect(builtin.html).not.toContain('data-action="pick"');
+    for (const id of ['custom1', 'platform1']) {
+      const row = rows.find(entry => entry.id === id)!;
+      expect(row.html).toContain('data-action="pick"');
+      expect(row.html).not.toContain('is-disabled');
+    }
+  });
 });

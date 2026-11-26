@@ -51,7 +51,10 @@ type Recipient = { kind: string; id?: string; name?: string };
 /** Let pending microtasks and the IPC promise chain settle. */
 const settle = () => new Promise((resolve) => { setTimeout(resolve, 0); });
 
-function mountProjectDetail(bindings: Bindings, held: string[] = [], agentDetails: Record<string, Array<{ agent_id: string; name: string }>> = {}) {
+type AgentRow = { agent_id: string; name: string; builtin?: boolean };
+
+function mountProjectDetail(bindings: Bindings, held: string[] = [], agentDetails: Record<string, AgentRow[]> = {},
+                            builtins: AgentRow[] | null = null) {
   const holdSet = new Set(held);
   const gates: Record<string, Array<() => void>> = {};
   const bindingCalls: string[] = [];
@@ -94,6 +97,12 @@ function mountProjectDetail(bindings: Bindings, held: string[] = [], agentDetail
                 ok: true,
                 bindings: { agents: bindings[pid] || [] },
                 agentDetails: agentDetails[pid] || [],
+                // Built-ins are usable in every project; omit the field to
+                // exercise the membership-only answer of the cached first paint.
+                ...(builtins ? { availableAgents: [
+                  ...(agentDetails[pid] || []),
+                  ...builtins.filter((row) => !(agentDetails[pid] || []).some((added) => added.agent_id === row.agent_id)),
+                ] } : {}),
               });
             case 'projects.files.tree':
               return answer(channel, { ok: true, tree: [] });
@@ -118,7 +127,7 @@ function mountProjectDetail(bindings: Bindings, held: string[] = [], agentDetail
   vm.runInContext(projectDetailSource, context, { filename: 'project-detail.js' });
   vm.runInContext(
     'const _COMMANDER = { kind: "commander", id: "", name: "" }; const _composerAgentScopes = new Map();\n'
-      + ['_normRecipient', '_recipientList', '_recipientSet', 'validateRecipientAgainstProject']
+      + ['_normRecipient', '_recipientList', '_recipientSet', 'projectAvailableAgentIds', 'validateRecipientAgainstProject']
         .map((name) => extractFunction(conversationSource, name)).join('\n'),
     context,
     { filename: 'conversation.js#validateRecipientAgainstProject' },
@@ -184,6 +193,32 @@ describe('project composer recipient follows the open project', () => {
 
     panel.release('projects.files.tree');
     await opening;
+  });
+
+  it('keeps a built-in Agent pick in a project that never added it', async () => {
+    const videoStudio: AgentRow = { agent_id: 'agent_video', name: 'VideoStudio', builtin: true };
+    const panel = mountProjectDetail({ p_alpha: ['agent_writer'], p_beta: [] }, [], {}, [videoStudio]);
+    await panel.open('p_alpha');
+    panel.pickAgent('agent_video', 'VideoStudio');
+
+    await panel.open('p_beta');
+
+    expect(panel.recipient()).toEqual({ kind: 'agent', id: 'agent_video', name: 'VideoStudio' });
+  });
+
+  it('lists only added Agents in the project rail, never the built-ins it may already hold', async () => {
+    const videoStudio: AgentRow = { agent_id: 'agent_video', name: 'VideoStudio', builtin: true };
+    const panel = mountProjectDetail(
+      { p_alpha: ['agent_writer', 'agent_video'] },
+      [],
+      { p_alpha: [{ agent_id: 'agent_writer', name: 'Writer' }, videoStudio] },
+      [videoStudio],
+    );
+    await panel.open('p_alpha');
+
+    expect(panel.agentList.innerHTML).toContain('Writer');
+    expect(panel.agentList.innerHTML).not.toContain('VideoStudio');
+    expect(panel.agentCount.textContent).toBe('1');
   });
 
   it('drops an agent the newly opened project is not bound to', async () => {
