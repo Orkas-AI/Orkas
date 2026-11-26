@@ -75,7 +75,13 @@ social), also read [references/clips.md](references/clips.md).
      matter — NEVER invent what is on screen, and never escalate to a separate billable vision model.
 3. **Keep and execute a cut list.** For retake cleanup, run `stage-edit cut_selection
    --input <source> --transcript <saved-word-transcript>` to list measured candidate
-   IDs and a `selection_id`. Save chosen IDs, reasons and uncertainty in `cuts.json`.
+   IDs and a `selection_id`. A row with `review` is a measured, isolated sound
+   whose words do not line up with the transcript. If it matters to the requested
+   cleanup, use `stage-edit edit_video --op trim` on the original with `--start`
+   at `review.startSec` and `--duration` equal to the review end minus its start.
+   Transcribe that excerpt once in the source language. Use the result to choose
+   that row's ID, keeping meaningful or uncertain speech. Save chosen IDs,
+   reasons and uncertainty in `cuts.json`.
    Execute those choices with the same command plus `--keep '[1,3]' --selection-id
    <returned-id> --output <new-file>`, rather than retyping cut times. The script
    rechecks the inputs, keeps whole selected phrases and pauses between adjacent

@@ -19,12 +19,24 @@ async function fixture(check: (dir: string, run: (script: string, input: unknown
     fs.writeFileSync(path.join(dir, 'request.json'), options.rawRequest ?? JSON.stringify(input));
     const args = options.args ?? (script === 'image_asset'
       ? ['--project', options.project ?? dir, '--request', options.request ?? 'request.json'] : ['--input', 'request.json']);
+    const runner = path.join(pc, 'bin/run-skill.cjs');
+    let launchArgs = [runner, 'video-studio', script, '--', ...args];
+    if (process.platform === 'win32' && launchArgs.join(' ').length > 30_000) {
+      // Windows rejects this command line before Node starts. Exercise the same
+      // runner/parser in an isolated child, with argv populated after launch;
+      // this proves the 64 KiB parser boundary, not OS command-line capacity.
+      const argvFile = path.join(dir, 'large-inline-argv.json');
+      fs.writeFileSync(argvFile, JSON.stringify(launchArgs.slice(1)));
+      launchArgs = ['-e', 'const fs=require("node:fs");const [runner,file]=process.argv.slice(1);'
+        + 'process.argv=[process.execPath,runner,...JSON.parse(fs.readFileSync(file,"utf8"))];require(runner);', runner, argvFile];
+    }
     const result = spawnSync(process.env.ORKAS_TEST_NODE || process.execPath,
-      [path.join(pc, 'bin/run-skill.cjs'), 'video-studio', script, '--', ...args], {
+      launchArgs, {
         cwd: options.cwd ?? dir, encoding: 'utf8', timeout: 30_000,
         env: { ...process.env, ORKAS_PC_DIR: pc, ORKAS_WORKSPACE_ROOT: dir,
           ORKAS_RUN_SKILL_DIR: installed, ORKAS_UID: 'fixture', ORKAS_GLOBAL_SKILL_ROOTS_ENABLED: '0' },
       });
+    expect(result.error, 'The isolated runner must start before its output can be checked.').toBeUndefined();
     expect(result.stderr).toBe('');
     const body = JSON.parse(result.stdout);
     expect(result.status, result.stdout).toBe(body.ok ? 0 : 1);
@@ -207,6 +219,53 @@ describe('VideoStudio private preparation through the installed runner', () => {
     });
   });
 
+  it('maps a crop from a proportional preview to the original and preserves pixels beyond the preview bounds', async () => {
+    await fixture(async (dir, run) => {
+      const input = path.join(dir, 'portrait.png');
+      const mouth = Buffer.from('<svg width="120" height="20"><rect width="120" height="20" fill="red"/></svg>');
+      await sharp({ create: { width: 1080, height: 1350, channels: 3, background: 'white' } })
+        .composite([{ input: mouth, left: 420, top: 855 }]).png().toFile(input);
+      const before = fs.readFileSync(input);
+      const request = { op: 'process', input_path: 'portrait.png', output_path: 'crop.png',
+        source_size: { width: 1080, height: 1350 }, preview_size: { width: 819, height: 1024 },
+        crop: { left: 90, top: 205, width: 680, height: 645 } };
+      expect(run('image_asset', request)).toMatchObject({ ok: true, width: 896, height: 851, model_calls: 0 });
+      const pixel = await sharp(path.join(dir, 'crop.png')).extract({ left: 301, top: 585, width: 1, height: 1 })
+        .removeAlpha().raw().toBuffer();
+      expect([...pixel]).toEqual([255, 0, 0]);
+      expect(fs.readFileSync(input)).toEqual(before);
+      expect(run('image_asset', { ...request, output_path: 'full.png',
+        crop: { left: 0, top: 0, width: 819, height: 1024 } }))
+        .toMatchObject({ ok: true, width: 1080, height: 1350 });
+      for (const delta of [
+        { preview_size: { width: 819, height: 1000 } },
+        { preview_size: { width: 2160, height: 2700 } },
+        { crop: { left: 1, top: 0, width: 819, height: 1024 } },
+        { source_size: { width: 819, height: 1024 } },
+        { crop: undefined },
+      ]) {
+        expect(run('image_asset', { ...request, ...delta, output_path: 'rejected.png' }))
+          .toMatchObject({ ok: false, errorCode: 'E_IMAGE_ASSET_COORDINATES' });
+      }
+      expect(fs.existsSync(path.join(dir, 'rejected.png'))).toBe(false);
+    });
+  });
+
+  it('maps preview coordinates after applying the original photo orientation', async () => {
+    await fixture(async (dir, run) => {
+      await sharp({ create: { width: 40, height: 20, channels: 3, background: 'red' } })
+        .composite([{ input: { create: { width: 20, height: 20, channels: 3, background: 'blue' } }, left: 20, top: 0 }])
+        .withMetadata({ orientation: 6 }).jpeg().toFile(path.join(dir, 'rotate.jpg'));
+      expect(run('image_asset', { op: 'process', input_path: 'rotate.jpg', output_path: 'bottom.png',
+        source_size: { width: 20, height: 40 }, preview_size: { width: 10, height: 20 },
+        crop: { left: 0, top: 12, width: 10, height: 8 } })).toMatchObject({ ok: true, width: 20, height: 16 });
+      const pixel = await sharp(path.join(dir, 'bottom.png')).extract({ left: 10, top: 8, width: 1, height: 1 })
+        .removeAlpha().raw().toBuffer();
+      expect(pixel[2]).toBeGreaterThan(240);
+      expect(pixel[0]).toBeLessThan(15);
+    });
+  });
+
   it('rejects destructive, escaped, malformed and oversized work without publishing output', async () => {
     await fixture(async (dir, run) => {
       await sharp({ create: { width: 20, height: 20, channels: 3, background: 'red' } }).png().toFile(path.join(dir, 'source.png'));
@@ -236,9 +295,9 @@ describe('VideoStudio private preparation through the installed runner', () => {
       const result = run('storyboard_timing', input);
       expect(result).toMatchObject({ ok: true, kind: 'estimate', planned_end_sec: 20, remaining_timeline_sec: 0 });
       expect(result.sum_estimated_speech_sec).toBeLessThan(20);
-      expect(result.segments[0]).toMatchObject({ estimated_sec: 8.75, remaining_sec: -4.75 });
+      expect(result.segments[0]).toMatchObject({ estimated_sec: 7.78, remaining_sec: -3.78 });
       expect(result.timing_review).toEqual({ advisory: true, status: 'has_findings',
-        crowded_segments: [{ id: 'end', over_by_sec: 4.75 }], timeline_over_by_sec: 0 });
+        crowded_segments: [{ id: 'end', over_by_sec: 3.78 }], timeline_over_by_sec: 0 });
       const revised = run('storyboard_timing', { ...input, segments: [{ ...input.segments[0], text: '提起倒掉，冲洗收好。' }] });
       expect(revised.segments[0].remaining_sec).toBeGreaterThan(0);
       expect(revised.segments[0].text_sha256).not.toBe(result.segments[0].text_sha256);
@@ -251,12 +310,12 @@ describe('VideoStudio private preparation through the installed runner', () => {
 
   it('keeps exact, shorter and longer estimates advisory, including silent shots beyond the requested timeline', async () => {
     await fixture(async (_dir, run) => {
-      // Four Han characters without pauses estimate one second at natural speed.
-      for (const [duration, remainder, status] of [[1.01, 0.01, 'no_findings'], [1, 0, 'no_findings'], [0.99, -0.01, 'has_findings']] as const) {
+      // Nine Han characters without pauses estimate two seconds at natural speed.
+      for (const [duration, remainder, status] of [[2.01, 0.01, 'no_findings'], [2, 0, 'no_findings'], [1.99, -0.01, 'has_findings']] as const) {
         const result = run('storyboard_timing', { duration_sec: 20,
-          segments: [{ id: 'line', text: '一二三四', start_sec: 4, target_sec: duration }] });
+          segments: [{ id: 'line', text: '一二三四五六七八九', start_sec: 4, target_sec: duration }] });
         expect(result).toMatchObject({ ok: true, kind: 'estimate', speed: 1 });
-        expect(result.segments[0]).toMatchObject({ estimated_sec: 1, remaining_sec: remainder });
+        expect(result.segments[0]).toMatchObject({ estimated_sec: 2, remaining_sec: remainder });
         expect(result.timing_review).toEqual({ advisory: true, status,
           crowded_segments: remainder < 0 ? [{ id: 'line', over_by_sec: 0.01 }] : [], timeline_over_by_sec: 0 });
       }

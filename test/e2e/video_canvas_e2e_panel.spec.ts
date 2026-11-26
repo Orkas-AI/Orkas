@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import type { Locator } from '@playwright/test';
+import type { VideoCanvasJobState } from '../../src/main/features/video_canvas_jobs';
 
 import { composerText, expectComposerText } from './fixtures/composer';
 import { expect, OrkasTestApp, test } from './fixtures/orkas';
@@ -27,7 +28,15 @@ section { position: absolute; inset: 0; display: flex; align-items: center; just
 
 type Seed = { production: string; versionsDir: string };
 
-function seedProduction(workspace: string): Seed {
+/** Final text can paint before the host finishes writing its conversation state. */
+async function drainCanvasConversation(app: OrkasTestApp, cid: string): Promise<void> {
+  await expect.poll(() => app.electronApp!.evaluate(async (_electron, args) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    return require(args.bus).drainConversationWrites('account-e2e', args.cid);
+  }, { bus: path.resolve(__dirname, '../../src/main/features/group_chat/bus.ts'), cid })).toBe(true);
+}
+
+function seedProduction(workspace: string, fps = 30): Seed {
   const production = path.join(workspace, 'ad');
   const video = path.join(production, 'videos', 'main');
   mkdirSync(video, { recursive: true });
@@ -39,7 +48,7 @@ function seedProduction(workspace: string): Seed {
     schema_version: 3,
     id: 'main',
     label: LONG_TITLE,
-    canvas: { width: 540, height: 960, fps: 30 },
+    canvas: { width: 540, height: 960, fps },
     scenes: [
       { id: 'hook', clips: [{ id: 'hook-clip', asset: 'pour-2', in: 0, dur: 1 }], text: { headline: { value: 'A bright idea' } } },
       { id: 'price', duration: 1, text: { amount: { fact_id: 'price' } } },
@@ -68,7 +77,7 @@ function seedProduction(workspace: string): Seed {
     sha256: 'e2e',
     duration_sec: 3,
     canvas: '540x960',
-    fps: 30,
+    fps,
     integrated_lufs: null,
     shipped_at: '2026-11-05T00:00:00Z',
     warnings: [],
@@ -77,7 +86,7 @@ function seedProduction(workspace: string): Seed {
 }
 
 /** The seeded production's pictures and clips, made by the bundled FFmpeg the renderer also uses. */
-async function encodeSeedMedia(app: OrkasTestApp, production: string): Promise<void> {
+async function encodeSeedMedia(app: OrkasTestApp, production: string, fps = 30): Promise<void> {
   await app.electronApp!.evaluate(async (_electron, args) => {
     const require = (process as any).mainModule.require.bind((process as any).mainModule);
     const { ffmpeg } = require(args.module).bundledFfmpegPaths();
@@ -87,7 +96,7 @@ async function encodeSeedMedia(app: OrkasTestApp, production: string): Promise<v
         { windowsHide: true, timeout: 60000 }, (error: Error | null) => error ? reject(error) : resolve());
     });
     const clip = (file: string, source: string, seconds: number) => encode([
-      '-f', 'lavfi', '-i', `${source}=s=540x960:r=30:d=${seconds}`,
+      '-f', 'lavfi', '-i', `${source}=s=540x960:r=${args.fps}:d=${seconds}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-threads', '1', file,
     ]);
     const still = (file: string, source: string) => encode(['-f', 'lavfi', '-i', `${source}=s=540x720:r=1:d=1`, '-frames:v', '1', file]);
@@ -97,13 +106,15 @@ async function encodeSeedMedia(app: OrkasTestApp, production: string): Promise<v
     await clip(`${args.dir}/gen/pour-1.mp4`, 'testsrc2', 1);
     await clip(`${args.dir}/gen/pour-2.mp4`, 'smptehdbars', 1);
     await clip(`${args.dir}/versions/main-v1.mp4`, 'testsrc2', 3);
-  }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), dir: production.split(path.sep).join('/') });
+  }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), dir: production.split(path.sep).join('/'), fps });
 }
 
 test.describe('video canvas', () => {
   test.describe.configure({ timeout: process.platform === 'win32' ? 300_000 : 180_000 });
 
   test('shows a production as cards, and changes it without a model', async ({ modelOrkas }, testInfo) => {
+    // Serializing this journey's full video trace can outlast the default cleanup window.
+    modelOrkas.setTraceStopTimeout(45_000);
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const { page } = modelOrkas;
     const shot = (name: string) => page.screenshot({ path: testInfo.outputPath(`${name}.png`) });
@@ -118,14 +129,19 @@ test.describe('video canvas', () => {
     const cid = String(await page.evaluate('currentCid'));
     await expect(page.locator('#video-canvas-toggle')).toBeHidden();
 
-    // Freeze the workspace so the seeded production lands where this conversation looks.
-    const stateFile = path.join(modelOrkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
-    const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
-    state.workspace_dir = 'e2e-video-canvas';
-    writeFileSync(stateFile, JSON.stringify(state), 'utf8');
-    const workspace = path.join(modelOrkas.workspaceRoot, '..', 'userWorkSpace', 'e2e-video-canvas');
-    const { production } = seedProduction(workspace);
-    await encodeSeedMedia(modelOrkas, production);
+    await drainCanvasConversation(modelOrkas, cid);
+
+    // Seed the workspace resolved by the live conversation after its send settles.
+    const workspace = await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      return require(args.workspace).getConversationWorkspacePath(args.uid, args.cid) as Promise<string>;
+    }, {
+      uid: 'account-e2e', cid,
+      workspace: path.resolve(__dirname, '../../src/main/features/group_chat/conv_workspace.ts'),
+    });
+    const fixtureFps = 12;
+    const { production } = seedProduction(workspace, fixtureFps);
+    await encodeSeedMedia(modelOrkas, production, fixtureFps);
 
     // The toggle appears once there is something to show, and opens the canvas.
     // Files alone are not enough: a chat VideoStudio never joined shows nothing, because a
@@ -137,6 +153,7 @@ test.describe('video canvas', () => {
       const require = (process as any).mainModule.require.bind((process as any).mainModule);
       await require(args.module).bumpConversationActivity(args.uid, args.cid, new Date().toISOString(), { senderKind: 'agent', senderId: '79df9cc89f5f' });
     }, { module: path.resolve(__dirname, '../../src/main/features/chats.ts'), uid: 'account-e2e', cid });
+    await expect.poll(async () => (await modelOrkas.invoke<{ productions: unknown[] }>('videoCanvas.read', { cid })).productions.length).toBe(1);
     await page.evaluate('VideoCanvas.probe(currentCid)');
     await expect(toggle).toBeVisible();
     await page.setViewportSize({ width: 1600, height: 960 });
@@ -299,7 +316,7 @@ test.describe('video canvas', () => {
     await takePanel.locator('textarea').focus();
     await page.keyboard.type(' warmer');
     await generateAgain.click();
-    await expect(page.locator('.ui-toast', { hasText: 'That model is no longer available' })).toBeVisible();
+    await expect(page.locator('.ui-toast', { hasText: 'Configure a video service in Settings and try again.' })).toBeVisible();
     await expect(page.locator('.ui-dialog-overlay.open')).toHaveCount(0);
 
     // A configured-service confirmation belongs to its original task. Only the services, availability and
@@ -308,11 +325,17 @@ test.describe('video canvas', () => {
     await modelOrkas.electronApp!.evaluate(({ ipcMain }) => {
       const original = (ipcMain as any)._invokeHandlers?.get('orkas.invoke');
       if (typeof original !== 'function') throw new Error('Native IPC fixture seam unavailable');
-      const control = { pending: false, calls: [] as unknown[], restore: () => {
+      const control = { pending: false, calls: [] as unknown[], takes: new Map<string, VideoCanvasJobState>(), restore: () => {
         ipcMain.removeHandler('orkas.invoke'); ipcMain.handle('orkas.invoke', original);
       } };
       ipcMain.removeHandler('orkas.invoke');
       ipcMain.handle('orkas.invoke', (event, request) => {
+        if (request?.channel === 'videoCanvas.read') {
+          return Promise.resolve(original(event, request)).then(snapshot => {
+            const take = control.takes.get(request.payload?.cid);
+            return take && snapshot.ok ? { ...snapshot, jobs: [...snapshot.jobs, take] } : snapshot;
+          });
+        }
         if (request?.channel === 'videoCanvas.redoOptions') {
           return { ok: true, current: 'doubao', choices: [
             { id: 'doubao', name: 'Doubao Seedance 2.0', params: { duration: 5, audio: true } },
@@ -354,7 +377,7 @@ test.describe('video canvas', () => {
       // Leaving and coming back forgets what the panel learned, so the stubbed services show.
       await page.evaluate(id => (window as any).setView('conversation', id), otherDuringPrice.conversation.conversation_id);
       await openTake();
-      await expect(takePanel).toContainText('5s · Sound');
+      await expect(takePanel).toContainText('5s · With sound');
       // Generate names no price (2026-11-12), and with nothing changed there is nothing to make.
       await expect(takePanel.locator('[data-action="take-generate"]')).toHaveText('Generate');
       await expect(takePanel.locator('[data-action="take-generate"]')).toBeDisabled();
@@ -372,7 +395,7 @@ test.describe('video canvas', () => {
       await page.evaluate('VideoCanvas.notifyBusy(currentCid, false)');
       await expect(page.locator('.ai-select-item', { hasText: 'MiniMax H3 Lite' })).toBeVisible();
       await page.locator('.ai-select-item', { hasText: 'MiniMax H3 Lite' }).click();
-      await expect(takePanel).toContainText('768p · 5s · Sound');
+      await expect(takePanel).toContainText('768p · 5s · With sound');
       await takePanel.locator('textarea').fill('third take, closer');
       await takePanel.locator('[data-action="take-generate"]').click();
       const dialog = page.locator('.ui-dialog-overlay.open');
@@ -396,15 +419,23 @@ test.describe('video canvas', () => {
       // So it does while the take is being made.
       const takeEvent = { cid: String(await page.evaluate('currentCid')), dir: 'ad', kind: 'redo', shot: await shotCards.first().getAttribute('data-card'), phase: 'generate' };
       const pushTake = (status: string) => modelOrkas.electronApp!.evaluate(({ BrowserWindow }, event) => {
+        // The paid dispatch is stubbed, so publish the same job through both read and push.
+        const takes = (globalThis as any).__canvasPriceControl.takes;
+        if (event.status === 'running') takes.set(event.cid, event);
+        else takes.delete(event.cid);
         for (const win of BrowserWindow.getAllWindows()) win.webContents.send('conversations:video-canvas-job', event);
       }, { ...takeEvent, status });
       const takeModel = takePanel.locator('.video-canvas-take-model .ai-select-trigger');
       await expect(takeModel).toBeEnabled();
       await pushTake('running');
       await expect(takeModel).toBeDisabled();
+      await page.evaluate(() => (window as any).VideoCanvas.refresh());
+      await expect(takeModel).toBeDisabled();
       await expect(takePanel.locator('[data-action="gen-settings"]')).toBeDisabled();
       await pushTake('stopped');
       await expect(takeModel).toBeEnabled();
+      await page.evaluate(() => (window as any).VideoCanvas.refresh());
+      await expect(takePanel.locator('[data-action="gen-settings"]')).toBeEnabled();
     } finally {
       await modelOrkas.electronApp!.evaluate(() => (globalThis as any).__canvasPriceControl.restore());
     }
@@ -471,7 +502,7 @@ test.describe('video canvas', () => {
     await waiting(2);
 
     // Dragging footage onto a scene changes its picture; the card goes back where it was.
-    const source = page.locator('.video-canvas-card[data-card="asset:spare"]');
+    const source = page.locator('.video-canvas-card[data-card="asset:phone"]');
     const sourceBox = (await source.boundingBox())!;
     const target = (await chips.first().boundingBox())!;
     await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
@@ -480,7 +511,7 @@ test.describe('video canvas', () => {
     await expect(chips.first()).toHaveClass(/\bis-drop-target\b/);
     await shot('canvas-drop-target');
     await page.mouse.up();
-    await expect.poll(() => manifest().scenes[0].clips[0].asset).toBe('spare');
+    await expect.poll(() => manifest().scenes[0].clips[0].asset).toBe('phone');
     expect(manifest().scenes[0].clips[0].id).toBe('close-clip');
     const after = (await source.boundingBox())!;
     expect(Math.abs(after.x - sourceBox.x)).toBeLessThan(2);
@@ -667,7 +698,7 @@ test.describe('video canvas', () => {
     // 2026-11-11). The caret waits on the ask.
     const askedLines = async () => (await composerText(composer)).split('\n').filter((line) => line.trim());
     await videoCard.locator('.video-canvas-card-menu').click();
-    await expect(page.locator('.context-menu-item')).toHaveText(['Another version', 'Tell the Agent']);
+    await expect(page.locator('.context-menu-item')).toHaveText(['Another version', 'Edit in chat']);
     await page.locator('.context-menu-item', { hasText: 'Another version' }).click();
     const listed = [
       'Use this footage and these shots:',
@@ -706,26 +737,29 @@ test.describe('video canvas', () => {
     await modelOrkas.closePreview(preview);
 
     // Replacing footage from a file changes every scene using it and drops the old row.
-    const replacement = path.join(workspace, 'new-photo.png');
-    writeFileSync(replacement, readFileSync(path.join(production, 'media', 'spare.png')));
+    // The promotion's edited delivery must still contain motion. Replace this
+    // two-second clip with distinct moving footage from the local seed.
+    const replacement = path.join(workspace, 'new-clip.mp4');
+    writeFileSync(replacement, readFileSync(path.join(production, 'versions', 'main-v1.mp4')));
     await page.locator('.video-canvas-card[data-card="asset:phone"]').hover();
     await page.locator('.video-canvas-card[data-card="asset:phone"] .video-canvas-card-menu').click();
     const chooser = page.waitForEvent('filechooser');
     await page.locator('.context-menu-item', { hasText: 'Replace' }).click();
     await (await chooser).setFiles(replacement);
-    await expect.poll(() => manifest().scenes.at(-1).clips?.[0]?.asset).toBe('new-photo');
+    await expect.poll(() => manifest().scenes[0].clips[0].asset).toBe('new-clip');
+    await expect.poll(() => manifest().scenes.at(-1).clips?.[0]?.asset).toBe('new-clip');
     await expect(page.locator('.video-canvas-card[data-card="asset:phone"]')).toHaveCount(0);
-    await expect(page.locator('.video-canvas-card[data-card="asset:new-photo"]')).toHaveCount(1);
+    await expect(page.locator('.video-canvas-card[data-card="asset:new-clip"]')).toHaveCount(1);
     await waiting(4);
     await update.click();
     await expectNewVersion(5);
 
     // A used asset refuses to go, and says why.
-    await page.locator('.video-canvas-card[data-card="asset:new-photo"]').hover();
-    await page.locator('.video-canvas-card[data-card="asset:new-photo"] .video-canvas-card-menu').click();
+    await page.locator('.video-canvas-card[data-card="asset:new-clip"]').hover();
+    await page.locator('.video-canvas-card[data-card="asset:new-clip"] .video-canvas-card-menu').click();
     await page.locator('.context-menu-item.is-danger').click();
     await expect(page.locator('.ui-toast', { hasText: 'still uses' })).toBeVisible();
-    await expect(page.locator('.video-canvas-card[data-card="asset:new-photo"]')).toHaveCount(1);
+    await expect(page.locator('.video-canvas-card[data-card="asset:new-clip"]')).toHaveCount(1);
 
     // An unused one goes, and its file stays.
     await page.locator('.video-canvas-card[data-card="asset:photo"]').hover();
@@ -762,7 +796,7 @@ test.describe('video canvas', () => {
     await expect(page.locator('.video-canvas-header').getByRole('button', { name: '再做一条' })).toHaveCount(0);
     await videoCard.hover();
     await videoCard.locator('.video-canvas-card-menu').click();
-    await expect(page.locator('.context-menu-item')).toHaveText(['再做一版', '告诉智能体']);
+    await expect(page.locator('.context-menu-item')).toHaveText(['再做一版', '在对话里改']);
     await page.keyboard.press('Escape');
     await expect(page.locator('.context-menu-item')).toHaveCount(0);
     await page.evaluate(() => (window as any).setLang('en'));
@@ -850,6 +884,8 @@ test.describe('video canvas', () => {
     });
     spot = await openBoardPoint();
     await page.mouse.click(spot.x, spot.y, { button: 'right' });
+    // Clearing the composer can make its chat history scroll after the menu opens.
+    await page.locator('#chat-history').dispatchEvent('scroll', { bubbles: false });
     await expect(page.locator('.context-menu-item')).toHaveText(['Upload footage', 'Another version of the video']);
     await shot('canvas-board-menu');
     await page.locator('.context-menu-item', { hasText: 'Another version of the video' }).click();
@@ -877,6 +913,99 @@ test.describe('video canvas', () => {
   // reference or as the frames it opens and ends on, and a line drawn from a card's "+" makes a
   // new shot. Only the services, availability and dispatch are stubbed: the new shots are saved
   // through the real IPC to canvas.json, and a finished one leaves the real ledger row and layout.
+  test('reviews a held-still render before publishing it from the canvas', async ({ modelOrkas }, testInfo) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    const { page } = modelOrkas;
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Prepare a held-frame canvas review.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
+      .toBeVisible({ timeout: 30_000 });
+    const cid = String(await page.evaluate('currentCid'));
+    await expect(page.locator('#video-canvas-toggle')).toBeHidden();
+
+    await drainCanvasConversation(modelOrkas, cid);
+
+    // Freeze the workspace so the seeded production lands where this conversation looks.
+    const stateFile = path.join(modelOrkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
+    const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
+    state.workspace_dir = 'e2e-video-review';
+    writeFileSync(stateFile, JSON.stringify(state), 'utf8');
+    const workspace = path.join(modelOrkas.workspaceRoot, '..', 'userWorkSpace', 'e2e-video-review');
+    const fixtureFps = 12;
+    const { production } = seedProduction(workspace, fixtureFps);
+    await encodeSeedMedia(modelOrkas, production, fixtureFps);
+
+    const videoDir = path.join(production, 'videos', 'main');
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      await require(args.module).noteTimelineBeforeChange({
+        productionDirAbs: args.production,
+        videoDirAbs: args.videoDir,
+      });
+    }, { module: path.resolve(__dirname, '../../src/main/features/video_timeline_render.ts'), production, videoDir });
+    const manifestFile = path.join(videoDir, 'manifest.json');
+    const heldManifest = JSON.parse(readFileSync(manifestFile, 'utf8'));
+    heldManifest.scenes = [{
+      id: 'price',
+      clips: [{ id: 'price-hold', asset: 'spare', in: 0, dur: 3 }],
+      text: { amount: { fact_id: 'price' } },
+    }];
+    writeFileSync(manifestFile, JSON.stringify(heldManifest));
+    const versionsPath = path.join(production, 'versions.json');
+    const versionCount = () => (JSON.parse(readFileSync(versionsPath, 'utf8')).versions as unknown[]).length;
+
+    const toggle = page.locator('#video-canvas-toggle');
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      await require(args.module).bumpConversationActivity(args.uid, args.cid, new Date().toISOString(), { senderKind: 'agent', senderId: '79df9cc89f5f' });
+    }, { module: path.resolve(__dirname, '../../src/main/features/chats.ts'), uid: 'account-e2e', cid });
+    await expect.poll(async () => (await modelOrkas.invoke<{ productions: unknown[] }>('videoCanvas.read', { cid })).productions.length).toBe(1);
+    await page.evaluate('VideoCanvas.probe(currentCid)');
+    await expect(toggle).toBeVisible();
+    await page.setViewportSize({ width: 1600, height: 960 });
+    await toggle.click();
+    const panel = page.locator('#video-canvas-panel');
+    await expect(panel).toBeVisible();
+    await expect(toggle).toHaveClass(/\bis-active\b/);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('#conversation-info-panel')).toBeHidden();
+
+    const update = panel.getByRole('button', { name: 'Update video', exact: true });
+    await expect(update).toBeEnabled();
+    await update.click();
+    const review = panel.locator('.video-canvas-status-row.is-review');
+    await expect.poll(async () => {
+      if (versionCount() > 1) return 'published before review';
+      return await review.isVisible() ? 'review' : 'rendering';
+    }, { timeout: 120_000 }).toBe('review');
+    await expect(review).toContainText(/\d+%/);
+    expect(versionCount()).toBe(1);
+    await page.screenshot({ path: testInfo.outputPath('canvas-held-stills-en.png') });
+    const pendingPreview = await modelOrkas.openPreview(() => review.getByRole('button', { name: 'Preview this version' }).click());
+    await expect(pendingPreview.locator('.chat-file-viewer-video')).toHaveAttribute('src', /render.*main\.mp4/);
+    await modelOrkas.closePreview(pendingPreview);
+    await review.getByRole('button', { name: 'Return to editing' }).click();
+    await expect(review).not.toBeVisible();
+    expect(versionCount()).toBe(1);
+    await expect(update).toBeEnabled();
+    await update.click();
+    await expect(review).toBeVisible({ timeout: 120_000 });
+    expect(versionCount()).toBe(1);
+    const draftRender = path.join(production, 'render', 'main.mp4');
+    const renderedAt = statSync(draftRender).mtimeMs;
+    await page.evaluate(() => (window as any).setLang('zh'));
+    await expect(review.getByRole('button', { name: '仍然更新' })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('canvas-held-stills-zh.png') });
+    await review.getByRole('button', { name: '仍然更新' }).click();
+    await expect.poll(versionCount, { timeout: 30_000 }).toBe(2);
+    await expect(panel.locator('[data-card="video:main"] video')).toHaveAttribute('src', /main-v2\.mp4/);
+    expect(statSync(draftRender).mtimeMs).toBe(renderedAt);
+    expect((JSON.parse(readFileSync(path.join(production, 'versions.json'), 'utf8')).versions.at(-1)).override.codes)
+      .toEqual(['DELIVERY_HELD_STILLS']);
+  });
+
   test('adds footage to a shot in its panel, and draws a new shot from a card', async ({ modelOrkas }, testInfo) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const { page } = modelOrkas;
@@ -887,6 +1016,7 @@ test.describe('video canvas', () => {
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
       .toBeVisible({ timeout: 30_000 });
     const cid = String(await page.evaluate('currentCid'));
+    await drainCanvasConversation(modelOrkas, cid);
     const stateFile = path.join(modelOrkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
     const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
     state.workspace_dir = 'e2e-video-canvas-new-shot';
@@ -975,10 +1105,11 @@ test.describe('video canvas', () => {
           const framed = draft.method === 'frames';
           const ratios = framed ? ['adaptive', '16:9', '9:16'] : ['16:9', '9:16'];
           const ratio = ratios.includes(draft.ratio) ? draft.ratio : framed ? 'adaptive' : '9:16';
-          const duration = draft.duration === 10 ? 10 : 5;
+          const durations = [-1, 5, 10];
+          const duration = durations.includes(draft.duration) ? draft.duration : 5;
           const resolution = draft.resolution === '1080p' ? '1080p' : '720p';
           return { ok: true, kind: 'video', method: draft.method, frames_fit: true, current: 'doubao', choices: [
-            doubao({ ratios, resolutions: ['720p', '1080p'], durations: [5, 10], silent: true, params: { ratio, resolution, duration, audio: draft.audio === true } }),
+            doubao({ name: 'Seedance 2.5', ratios, resolutions: ['720p', '1080p'], durations, silent: true, params: { ratio, resolution, duration, audio: draft.audio === true } }),
           ] };
         }
         if (channel === 'videoCanvas.generateDraft') {
@@ -1022,7 +1153,7 @@ test.describe('video canvas', () => {
       const settings = takePanel.locator('[data-action="gen-settings"]');
       const popover = page.locator('#video-canvas-settings');
       const pick = (setting: string, value: string) => popover.locator(`[data-setting="${setting}"][data-value="${value}"]`);
-      await expect(settings).toHaveText('References · 9:16 · 720p · 5s · Sound');
+      await expect(settings).toHaveText('References · 9:16 · 720p · 5s · With sound');
       await expect(settings).toHaveAttribute('aria-label', 'Generation settings');
       // In full, on a row of its own above the model, with Generate at the end of the model's row
       // (2026-11-10: beside the model, both were cut short).
@@ -1091,7 +1222,7 @@ test.describe('video canvas', () => {
       // Its length and sound change before it is made again, and are asked of the services.
       await settings.click();
       await pick('duration', '10').click();
-      await expect(settings).toHaveText('References · 9:16 · 720p · 10s · Sound');
+      await expect(settings).toHaveText('References · 9:16 · 720p · 10s · With sound');
       await pick('audio', 'false').click();
       await expect(settings).toHaveText('References · 9:16 · 720p · 10s · Silent');
       await expect(pick('audio', 'false')).toHaveAttribute('aria-pressed', 'true');
@@ -1100,7 +1231,7 @@ test.describe('video canvas', () => {
       // A service that cannot leave sound out has it, and says why silence is out of reach.
       await takePanel.locator('.video-canvas-take-model .ai-select-trigger').click();
       await page.locator('.ai-select-item', { hasText: 'Google Gemini Omni 1.1 Flash' }).click();
-      await expect(settings).toHaveText('References · 9:16 · 720p · Sound');
+      await expect(settings).toHaveText('References · 9:16 · 720p · With sound');
       await settings.click();
       await expect(pick('audio', 'false')).toBeDisabled();
       await expect(popover.locator('.video-canvas-settings-note')).toHaveText(["This model can't use first or last frames", 'This model always makes sound']);
@@ -1178,13 +1309,17 @@ test.describe('video canvas', () => {
       await expect.poll(() => drafts()[0]?.[1].prompt).toBe('A lamp slowly turns on');
       await expect(settings).toHaveText('References · 9:16 · 720p · 5s · Silent');
       await settings.click();
+      await expect(pick('duration', '-1')).toHaveText('Auto');
+      await pick('duration', '-1').click();
+      await expect.poll(() => drafts()[0]?.[1].duration).toBe(-1);
+      await expect(settings).toHaveText('References · 9:16 · 720p · Auto · Silent');
       await pick('duration', '10').click();
       await expect.poll(() => drafts()[0]?.[1].duration).toBe(10);
       await pick('resolution', '1080p').click();
       await expect.poll(() => drafts()[0]?.[1].resolution).toBe('1080p');
       await pick('audio', 'true').click();
       await expect.poll(() => drafts()[0]?.[1].audio).toBe(true);
-      await expect(settings).toHaveText('References · 9:16 · 1080p · 10s · Sound');
+      await expect(settings).toHaveText('References · 9:16 · 1080p · 10s · With sound');
       await shot('canvas-new-shot-settings');
       await page.keyboard.press('Escape');
       await shot('canvas-new-shot');
@@ -1193,11 +1328,11 @@ test.describe('video canvas', () => {
       await toggle.click();
       await draftCard.locator('.video-canvas-card-title').click();
       await expect(takePanel.locator('textarea')).toHaveValue('A lamp slowly turns on');
-      await expect(settings).toHaveText('References · 9:16 · 1080p · 10s · Sound');
+      await expect(settings).toHaveText('References · 9:16 · 1080p · 10s · With sound');
       // Opening on frames, the shape follows the first frame.
       await settings.click();
       await pick('method', 'frames').click();
-      await expect(settings).toHaveText('First and last frames · Match first frame · 1080p · 10s · Sound');
+      await expect(settings).toHaveText('First and last frames · Match first frame · 1080p · 10s · With sound');
       await expect(pick('ratio', 'adaptive')).toHaveAttribute('aria-pressed', 'true');
       await page.keyboard.press('Escape');
       await expect(takePanel.locator('.video-canvas-take-ref-role')).toHaveText(['First frame']);
@@ -1392,6 +1527,7 @@ test.describe('video canvas', () => {
       await page.locator('#new-chat-send-btn').click();
       await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toBeVisible({ timeout: 30_000 });
       const cid = String(await page.evaluate('currentCid'));
+      await drainCanvasConversation(app, cid);
       const stateFile = path.join(app.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
       const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
       state.workspace_dir = 'e2e-video-canvas-voice';
@@ -1538,6 +1674,7 @@ test.describe('video canvas', () => {
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
       .toBeVisible({ timeout: 30_000 });
     const cid = String(await page.evaluate('currentCid'));
+    await drainCanvasConversation(modelOrkas, cid);
     const stateFile = path.join(modelOrkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
     const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
     state.workspace_dir = 'e2e-video-canvas-page';
@@ -1614,4 +1751,185 @@ test.describe('video canvas', () => {
     await expect(siteCard).toHaveCount(1);
     expect(readFileSync(path.join(production, 'assets.json'), 'utf8')).toBe(ledger);
   });
+
+  // 2026-11-16: a free stock file names its source and author under its name. Only a page on the
+  // provider's own site is a link, and it opens in the browser without selecting the card.
+  test('credits stock footage on its card and opens its page in the browser', async ({ modelOrkas }, testInfo) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    const { page } = modelOrkas;
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Prepare the stock credit canvas e2e conversation.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
+      .toBeVisible({ timeout: 30_000 });
+    const cid = String(await page.evaluate('currentCid'));
+    await drainCanvasConversation(modelOrkas, cid);
+    const stateFile = path.join(modelOrkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
+    const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
+    state.workspace_dir = 'e2e-video-canvas-stock';
+    writeFileSync(stateFile, JSON.stringify(state), 'utf8');
+
+    const production = path.join(modelOrkas.workspaceRoot, '..', 'userWorkSpace', 'e2e-video-canvas-stock', 'cafe');
+    const video = path.join(production, 'videos', 'main');
+    mkdirSync(video, { recursive: true });
+    mkdirSync(path.join(production, 'media', 'stock'), { recursive: true });
+    writeFileSync(path.join(video, 'index.html'), PAGE);
+    writeFileSync(path.join(video, 'manifest.json'), JSON.stringify({
+      schema_version: 3,
+      id: 'main',
+      label: 'Cafe',
+      canvas: { width: 540, height: 960, fps: 30 },
+      scenes: [{ id: 'hook', clips: [{ id: 'hook-clip', asset: 'pour', in: 0, dur: 1 }], text: { headline: { value: 'Slow mornings' } } }],
+    }));
+    const pageUrl = 'https://pixabay.com/videos/woman-pouring-coffee-3195394/';
+    const longAuthor = 'Anastasia Shuraeva-Konstantinopolskaya and the Morning Light Collective';
+    const ledger = JSON.stringify({ assets: [
+      { id: 'pour', kind: 'image', label: 'woman pouring coffee', path: 'media/stock/pixabay-image-3195394.png', origin: 'stock',
+        source: { provider: 'pixabay', id: 'pixabay-image-3195394', page_url: pageUrl, author: 'Ana Lee', license: 'Pixabay Content License' } },
+      { id: 'rain', kind: 'image', label: 'rain on a window', path: 'media/stock/pixabay-image-2.png', origin: 'stock',
+        source: { provider: 'pixabay', id: 'pixabay-image-2', page_url: 'https://evil.example.com/', author: longAuthor, license: 'Pixabay Content License' } },
+      { id: 'photo', kind: 'image', label: 'Front photo.png', path: 'media/photo.png', origin: 'upload' },
+    ] });
+    writeFileSync(path.join(production, 'assets.json'), ledger);
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      const { ffmpeg } = require(args.module).bundledFfmpegPaths();
+      if (!ffmpeg) throw new Error('Bundled FFmpeg is required for this fixture');
+      const still = (file: string, source: string) => new Promise<void>((resolve, reject) => {
+        require('node:child_process').execFile(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `${source}=s=720x540:r=1:d=1`, '-frames:v', '1', file],
+          { windowsHide: true, timeout: 60000 }, (error: Error | null) => error ? reject(error) : resolve());
+      });
+      await still(`${args.dir}/media/stock/pixabay-image-3195394.png`, 'testsrc2');
+      await still(`${args.dir}/media/stock/pixabay-image-2.png`, 'smptebars');
+      await still(`${args.dir}/media/photo.png`, 'testsrc2');
+    }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), dir: production.split(path.sep).join('/') });
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      await require(args.module).bumpConversationActivity(args.uid, args.cid, new Date().toISOString(), { senderKind: 'agent', senderId: '79df9cc89f5f' });
+    }, { module: path.resolve(__dirname, '../../src/main/features/chats.ts'), uid: 'account-e2e', cid });
+    await modelOrkas.electronApp!.evaluate(({ shell }) => {
+      (globalThis as any).__stockOpened = [];
+      shell.openExternal = async (url: string) => { (globalThis as any).__stockOpened.push(url); };
+    });
+    await page.evaluate('VideoCanvas.probe(currentCid)');
+    await page.setViewportSize({ width: 1600, height: 960 });
+    await page.locator('#video-canvas-toggle').click();
+
+    const pour = page.locator('.video-canvas-card[data-card="asset:pour"]');
+    const rain = page.locator('.video-canvas-card[data-card="asset:rain"]');
+    const photo = page.locator('.video-canvas-card[data-card="asset:photo"]');
+    await expect(pour).toHaveCount(1);
+    const link = pour.locator('a.video-canvas-credit');
+    await expect(link).toHaveText('Pixabay · Ana Lee');
+    await expect(link).toHaveAttribute('href', pageUrl);
+    // A page off the provider's site stays words, not a link; uploads carry no credit.
+    await expect(rain.locator('a.video-canvas-credit')).toHaveCount(0);
+    await expect(rain.locator('.video-canvas-credit')).toHaveText(`Pixabay · ${longAuthor}`);
+    await expect(photo.locator('.video-canvas-credit')).toHaveCount(0);
+    // A long name stays on one line inside the card, without widening it.
+    const [rainBox, photoBox] = await Promise.all([rain.boundingBox(), photo.boundingBox()]);
+    expect(Math.round(rainBox!.width)).toBe(Math.round(photoBox!.width));
+    expect(await rain.locator('.video-canvas-credit').evaluate((el) => el.scrollWidth > el.clientWidth && el.getClientRects().length === 1)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath('canvas-stock-credit.png') });
+
+    await link.click();
+    await expect.poll(() => modelOrkas.electronApp!.evaluate(() => (globalThis as any).__stockOpened)).toEqual([pageUrl]);
+    await expect(pour).not.toHaveClass(/\bis-selected\b/);
+    // Keyboard reaches the link like any control on the card.
+    await link.focus();
+    await expect(link).toBeFocused();
+    await page.screenshot({ path: testInfo.outputPath('canvas-stock-credit-focus.png') });
+    expect(readFileSync(path.join(production, 'assets.json'), 'utf8')).toBe(ledger);
+  });
+  // 2026-11-16: a film joined from generated shots with ffmpeg has no timeline, and its card
+  // and the open board left "another version" out, though the 2026-11-11 decision lists one
+  // for each video.
+  test('asks for another version of a video made with ffmpeg alone', async ({ modelOrkas }, testInfo) => {
+    if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    const { page } = modelOrkas;
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Prepare the joined film canvas e2e conversation.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]'))
+      .toBeVisible({ timeout: 30_000 });
+    const cid = String(await page.evaluate('currentCid'));
+    await drainCanvasConversation(modelOrkas, cid);
+    const stateFile = path.join(modelOrkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', cid, 'state.json');
+    const state = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, unknown>;
+    state.workspace_dir = 'e2e-video-canvas-joined';
+    writeFileSync(stateFile, JSON.stringify(state), 'utf8');
+
+    const production = path.join(modelOrkas.workspaceRoot, '..', 'userWorkSpace', 'e2e-video-canvas-joined', 'airbattle');
+    mkdirSync(path.join(production, 'shots'), { recursive: true });
+    mkdirSync(path.join(production, 'versions'), { recursive: true });
+    writeFileSync(path.join(production, 'assets.json'), JSON.stringify({ assets: [
+      { id: 'lock', kind: 'video', label: 'Missile lock', path: 'shots/lock.mp4', origin: 'generated', shot: 'lock', prompt: 'A jet locks on' },
+      { id: 'escape', kind: 'video', label: 'Barrel roll', path: 'shots/escape.mp4', origin: 'generated', shot: 'escape', prompt: 'The jet rolls away' },
+    ] }));
+    writeFileSync(path.join(production, 'versions.json'), JSON.stringify({ versions: [{
+      id: 'v1',
+      path: 'versions/airbattle-v1.mp4',
+      sha256: 'e2e',
+      duration_sec: 2,
+      canvas: '480x270',
+      fps: 24,
+      integrated_lufs: null,
+      shipped_at: '2026-11-16T00:00:00Z',
+      warnings: [],
+    }] }));
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      const { ffmpeg } = require(args.module).bundledFfmpegPaths();
+      if (!ffmpeg) throw new Error('Bundled FFmpeg is required for this fixture');
+      const clip = (file: string, source: string, seconds: number) => new Promise<void>((resolve, reject) => {
+        require('node:child_process').execFile(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `${source}=s=480x270:r=24:d=${seconds}`,
+          '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-threads', '1', file],
+        { windowsHide: true, timeout: 60000 }, (error: Error | null) => error ? reject(error) : resolve());
+      });
+      await clip(`${args.dir}/shots/lock.mp4`, 'testsrc2', 1);
+      await clip(`${args.dir}/shots/escape.mp4`, 'smptebars', 1);
+      await clip(`${args.dir}/versions/airbattle-v1.mp4`, 'testsrc2', 2);
+    }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), dir: production.split(path.sep).join('/') });
+    await modelOrkas.electronApp!.evaluate(async (_electron, args) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      await require(args.module).bumpConversationActivity(args.uid, args.cid, new Date().toISOString(), { senderKind: 'agent', senderId: '79df9cc89f5f' });
+    }, { module: path.resolve(__dirname, '../../src/main/features/chats.ts'), uid: 'account-e2e', cid });
+    await page.evaluate('VideoCanvas.probe(currentCid)');
+    await page.setViewportSize({ width: 1600, height: 960 });
+    await page.locator('#video-canvas-toggle').click();
+
+    const videoCard = page.locator('.video-canvas-card[data-card="video:delivered"]');
+    await expect(videoCard).toHaveCount(1);
+    const composer = page.locator('#chat-input');
+    const askedLines = async () => (await composerText(composer)).split('\n').filter((line) => line.trim());
+    const listed = ['Use this footage and these shots:', '- Shot "Missile lock"', '- Shot "Barrel roll"'];
+    await videoCard.hover();
+    await videoCard.locator('.video-canvas-card-menu').click();
+    await expect(page.locator('.context-menu-item')).toHaveText(['Another version', 'Edit in chat']);
+    await page.locator('.context-menu-item', { hasText: 'Another version' }).click();
+    await expect(composer).toBeFocused();
+    expect(await askedLines()).toEqual(['Make another version of "airbattle-v1.mp4":', ...listed]);
+
+    await page.evaluate(() => {
+      const input = document.getElementById('chat-input');
+      (window as any).composerSetText(input, '');
+      (window as any).composerNotify(input);
+    });
+    const spot = await page.evaluate(() => {
+      const board = document.getElementById('video-canvas-viewport')!.getBoundingClientRect();
+      for (let y = board.top + 24; y < board.bottom - 64; y += 24) {
+        for (let x = board.left + 24; x < board.right - 24; x += 24) {
+          if (document.elementFromPoint(x, y)?.id === 'video-canvas-viewport') return { x, y };
+        }
+      }
+      throw new Error('no open board');
+    });
+    await page.mouse.click(spot.x, spot.y, { button: 'right' });
+    await expect(page.locator('.context-menu-item')).toHaveText(['Upload footage', 'Another version of the video']);
+    await page.screenshot({ path: testInfo.outputPath('canvas-joined-board-menu.png') });
+    await page.locator('.context-menu-item', { hasText: 'Another version of the video' }).click();
+    await expect(composer).toBeFocused();
+    expect(await askedLines()).toEqual(['Make another version of "airbattle-v1.mp4":', ...listed]);
+  });
+
 });

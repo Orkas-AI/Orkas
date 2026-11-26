@@ -28,6 +28,7 @@ the product's appearance follows
 - Make one key image and reuse it on every clip: head and shoulders at arm's
   length, looking into the lens, natural light, hands empty. Describe the face
   feature by feature in the look line rather than with adjectives.
+Reuse the exact supplied photo when its framing already works for the shot. Use the configured image service when an edited reference is needed.
 - Plain clothes without text or logos, in a colour that sits well with the
   product. Set the scene where the product is really used, and keep to two or
   three settings.

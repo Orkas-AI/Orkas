@@ -54,6 +54,11 @@ content.
   scene's own words in large type around them. Text inside a capture is image
   content and is exempt from DOM type floors; the scene's message still needs
   readable type.
+- Where a line says what someone does in a site or app (search, pick, upload,
+  confirm), show it done on that screen with `screen-demo.js`
+  ([timeline](@skill/video-studio/references/timeline.md)): tap or type where
+  the line says, cut to the screen it leads to, and move in on or ring what the
+  line points at.
 - Never redraw a captured screen or photo as placeholder bars or a simplified
   card. Draw an interface only for a capability with no real visual, and mark
   that one as illustrative.

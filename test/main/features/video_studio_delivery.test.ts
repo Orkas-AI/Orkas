@@ -12,6 +12,7 @@ import * as studio from '../../../src/main/features/video_studio';
 
 import {
   assessCutsOffBeat,
+  assessHeldShot,
   assessDeliveredNarration,
   assessDeliveredSpec,
   cutsOffBeatIssues,
@@ -157,14 +158,12 @@ describe('assessDeliveredNarration', () => {
 describe('assessDeliveredSpec', () => {
   const base = {
     spec: {
-      durationSec: 60, width: 1920, height: 1080, fps: 30, hasAudio: true, subtitleStreams: 0,
+      durationSec: 60, width: 1920, height: 1080, fps: 30, hasAudio: true,
     },
     expectedDurationSec: 60,
     expectedAspect: '16:9',
     expectsAudio: true,
-    expectsCaptions: false,
     integratedLufs: -14.2,
-    sidecarSubtitleFound: false,
   };
 
   it('passes the delivered spec when it matches what was expected', () => {
@@ -180,34 +179,13 @@ describe('assessDeliveredSpec', () => {
     expect(loud?.message).toContain('quieter by 4.3 LU');
   });
 
-  it('catches captions that were asked for and the file does not carry', () => {
-    const issues = assessDeliveredSpec({ ...base, expectsCaptions: true });
-    const captions = issues.find((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING');
-    expect(captions?.message).toContain('Captions were asked for');
-    // Burned-in captions are pixels; the check says so instead of accusing.
-    expect(captions?.message).toContain('Burned-in captions cannot be detected');
-    // A sidecar counts as produced.
-    expect(assessDeliveredSpec({ ...base, expectsCaptions: true, sidecarSubtitleFound: true })
-      .some((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING')).toBe(false);
-    // So does a real subtitle stream.
-    expect(assessDeliveredSpec({
-      ...base, expectsCaptions: true, spec: { ...base.spec, subtitleStreams: 1 },
-    }).some((issue) => issue.code === 'DELIVERY_CAPTIONS_MISSING')).toBe(false);
-  });
-
-  it('catches a delivery that is not the length or shape the user approved', () => {
+  it('blocks a file that disagrees with the timeline duration or expected shape', () => {
     const drifted = assessDeliveredSpec({ ...base, spec: { ...base.spec, durationSec: 75.04 } });
-    expect(drifted.find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.message)
-      .toContain('75.04s');
-    // The length the Agent passed for its own cut asks for the real length back, never a
-    // stretched file (2026-11-14: a 14.4 s montage was slowed to the 15 s it had passed).
-    const requested = assessDeliveredSpec({ ...base, durationSource: 'requested', spec: { ...base.spec, durationSec: 75.04 } })
-      .find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.message ?? '';
-    expect(requested).toContain('expect_duration_sec says');
-    expect(requested).toContain('real length as expect_duration_sec');
-    expect(requested).toContain('Do not speed up, slow down or pad');
-    expect(requested).not.toContain('Narration and captions');
-    expect(drifted.find((issue) => issue.code === 'DELIVERY_DURATION_DRIFT')?.message).toContain('Narration and captions');
+    expect(drifted).toContainEqual(expect.objectContaining({
+      code: 'DELIVERY_DURATION_DRIFT',
+      severity: 'error',
+      message: expect.stringContaining('Narration and captions'),
+    }));
     const wrongCanvas = assessDeliveredSpec({
       ...base, spec: { ...base.spec, width: 1080, height: 1920 },
     });
@@ -217,6 +195,24 @@ describe('assessDeliveredSpec', () => {
     // within tolerance and must not be reported as a wrong canvas.
     expect(assessDeliveredSpec({ ...base, spec: { ...base.spec, width: 1918 } })
       .some((issue) => issue.code === 'DELIVERY_ASPECT_MISMATCH')).toBe(false);
+  });
+
+  it.each([29.6, 29.5, 30.5, 0, Number.POSITIVE_INFINITY])(
+    'omits a length advisory for a matching or unusable target (%s)', (target) => {
+      expect(assessDeliveredSpec({
+        ...base, spec: { ...base.spec, durationSec: 30 }, expectedDurationSec: null, requestedDurationSec: target,
+      })).toEqual([]);
+    },
+  );
+
+  it('reports a requested duration separately from a timeline length error', () => {
+    expect(assessDeliveredSpec({
+      ...base, spec: { ...base.spec, durationSec: 15 }, expectedDurationSec: 20, requestedDurationSec: 30,
+    })).toEqual([
+      expect.objectContaining({ code: 'DELIVERY_DURATION_DRIFT', severity: 'error' }),
+      expect.objectContaining({ code: 'DELIVERY_REQUESTED_DURATION_DRIFT', severity: 'warning',
+        message: expect.stringMatching(/15\.00s.*30(?:\.00)?s/) }),
+    ]);
   });
 
   it('catches a narrated video delivered with no audio at all', () => {
@@ -334,6 +330,25 @@ describe('cuts against the beat of a video cut to its music', () => {
     expect(assessCutsOffBeat([9.33], beats, 0)).toEqual([]);
   });
 
+  it('names a video cut to its music whose picture does not change: no cut, or one shot over half of it', () => {
+    expect(assessHeldShot([], 15.034)).toEqual([{
+      code: 'DELIVERY_NO_CUTS',
+      severity: 'warning',
+      message: 'The delivered file has no cut: one picture runs the whole 15.03s. Check how long each shot was made to last, then render and deliver again.',
+    }]);
+    // One photo stretched past its beat: 26.8 s of a 30 s video before the next picture.
+    expect(assessHeldShot([26.8, 28.2], 30)).toEqual([{
+      code: 'DELIVERY_SHOT_HELD',
+      severity: 'warning',
+      message: 'One shot runs from 0.00s to 26.80s, more than half of this 30.00s video, so the picture does not change on the beat there. Check how long each shot was made to last, then render and deliver again.',
+    }]);
+    expect(assessHeldShot([4, 26], 30)[0].message).toMatch(/^One shot runs from 4\.00s to 26\.00s, /);
+    // A hold of half the video or less, or no length to measure against, is left alone.
+    expect(assessHeldShot([7.5], 15)).toEqual([]);
+    expect(assessHeldShot([0.94, 1.88, 2.81, 9, 10.3], 15)).toEqual([]);
+    expect(assessHeldShot([], 0)).toEqual([]);
+  });
+
   it('reads the cuts and the beat from the delivered file: a montage on the beat passes, one that adds up a rounded beat fails', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-beat-check-'));
     try {
@@ -343,14 +358,37 @@ describe('cuts against the beat of a video cut to its music', () => {
       makeBeatMontage(onBeat, 16, onBeatCuts(16));
       makeBeatMontage(drifting, 16, driftingCuts(16));
       makeBeatMontage(toneOnly, 16, driftingCuts(16), 'tone');
-      expect(await cutsOffBeatIssues(onBeat, 30)).toEqual([]);
-      const off = await cutsOffBeatIssues(drifting, 30);
+      expect(await cutsOffBeatIssues(onBeat, { fps: 30, durationSec: 16 })).toEqual([]);
+      const off = await cutsOffBeatIssues(drifting, { fps: 30, durationSec: 16 });
       expect(off.map((issue) => issue.code)).toEqual(['DELIVERY_CUTS_OFF_BEAT']);
       // Every one of the sixteen joins is read as a cut; the later ones have drifted off.
       expect(off[0].message).toMatch(/^[1-9]\d* of 16 cuts are more than a frame off the beat: /);
       // A soundtrack with no steady beat has nothing to cut on, so nothing is reported.
-      expect(await cutsOffBeatIssues(toneOnly, 30)).toEqual([]);
-      expect(await cutsOffBeatIssues(drifting, null)).toEqual([]);
+      expect(await cutsOffBeatIssues(toneOnly, { fps: 30, durationSec: 16 })).toEqual([]);
+      expect(await cutsOffBeatIssues(drifting, { fps: null, durationSec: 16 })).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('reads a picture that does not change from the delivered file, beat or not', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-beat-check-'));
+    try {
+      const still = path.join(dir, 'still.mp4');
+      const held = path.join(dir, 'held.mp4');
+      const heldTone = path.join(dir, 'held-tone.mp4');
+      makeBeatMontage(still, 16, []);
+      makeBeatMontage(held, 16, [onBeatCuts(16)[0], 14.0625]);
+      makeBeatMontage(heldTone, 16, [onBeatCuts(16)[0], 14.0625], 'tone');
+      expect(await cutsOffBeatIssues(still, { fps: 30, durationSec: 16 })).toEqual([
+        expect.objectContaining({ code: 'DELIVERY_NO_CUTS', message: expect.stringMatching(/one picture runs the whole 16\.00s/) }),
+      ]);
+      const issues = await cutsOffBeatIssues(held, { fps: 30, durationSec: 16 });
+      expect(issues.map((issue) => issue.code)).toEqual(['DELIVERY_SHOT_HELD']);
+      expect(issues[0].message).toMatch(/^One shot runs from 0\.9\ds to 14\.0\ds, more than half of this 16\.00s video/);
+      // With no steady beat to cut on, the held picture is still named; without a length it is not.
+      expect((await cutsOffBeatIssues(heldTone, { fps: 30, durationSec: 16 })).map((issue) => issue.code)).toEqual(['DELIVERY_SHOT_HELD']);
+      expect(await cutsOffBeatIssues(still, { fps: null, durationSec: null })).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

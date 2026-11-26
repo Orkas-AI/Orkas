@@ -5,6 +5,8 @@ import { expect, test } from './fixtures/orkas';
 
 
 test('video controls share one translucent row and preserve playback, seeking and volume', async ({ orkas }, info) => {
+  // Generate the seekable video and exercise all ten sizes across both surfaces.
+  test.setTimeout(120_000);
   const file = path.join(orkas.userWorkspaceRoot, 'controls.webm');
   await orkas.electronApp!.evaluate(async (_electron, args) => {
     const req = (process as any).mainModule.require.bind((process as any).mainModule);
@@ -69,7 +71,12 @@ test('video controls share one translucent row and preserve playback, seeking an
       else {
         const win = await orkas.electronApp!.browserWindow(preview);
         await win.evaluate((win, size) => win.setContentSize(size.width, size.height), { width, height });
-        await expect.poll(async () => Math.round((await video.boundingBox())!.width)).toBe(Math.min(width, height * 16 / 9));
+        const fittedWidth = Math.min(width, height * 16 / 9);
+        // Windows rounds native bounds to physical pixels. Preserve the actual controls boundary.
+        await expect.poll(() => video.evaluate((element, expectedWidth) => ({
+          fitsRequestedWidth: Math.abs(element.getBoundingClientRect().width - expectedWidth) < 1,
+          aboveControlBoundary: element.clientWidth > 1440,
+        }), fittedWidth)).toEqual({ fitsRequestedWidth: true, aboveControlBoundary: fittedWidth > 1440 });
       }
       if (surface === 'preview' && index === sizes.length - 1) {
         await target.evaluate(() => (window as any).setLang('zh'));

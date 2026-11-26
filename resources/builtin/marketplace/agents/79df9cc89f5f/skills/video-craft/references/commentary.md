@@ -84,7 +84,8 @@ AI label where it is published, and offer to add a small visible one.
 
 1. Cut each span with `trim`; cut a `narrated` span silent with the bundled
    ffmpeg and `-an` (`concat` adds silence to clips that have none). `concat`
-   them in order.
+   them in order and keep this cut before adding narration, with a name
+   such as `render/pre-narration.mp4` so it can be found for revisions.
 2. Voice each line with `generate_speech`, `target_duration` set to its span,
    one file per line. Place every line at its span's start in one `mix` call
    with `--audio-segments --on-existing-audio mix --duck`: `original` spans

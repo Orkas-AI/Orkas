@@ -41,7 +41,7 @@ series values are correct.
 
 When a visual reference exists, also record `reference_fit`: the result follows the declared `keep` and `adapt` traits without copying `do_not_copy` material. Do not mark an intentional, authorized deviation as a defect merely because it differs from an autonomous default.
 
-Checklist results are diagnostic evidence used to find the weakest pages and prioritize repairs. Use `BLOCKER` only for a concrete delivery failure such as clipped or unreadable primary content, an unsupported or materially false claim, invalid structure, or a requested reference/template requirement that was not met. Otherwise classify a supported defect as `WARNING` and improve it when a proportionate edit is available. Never invent a numeric aesthetic score or average.
+Checklist results are diagnostic evidence used to find the weakest pages and prioritize repairs. Use `BLOCKER` only for a concrete delivery failure listed under Findings and repair. Otherwise classify a supported defect as `WARNING` and improve it when a proportionate edit is available. Never invent a numeric aesthetic score or average.
 
 ### Whole-deck review
 
@@ -103,7 +103,7 @@ suggestions.
 
 Classify each finding:
 
-- `BLOCKER`: invalid OpenXML, missing/blank required slide, clipped or unreadable primary content, unresolved placeholder/template text, a material unsupported claim, or a deliverable that is not an editable PPTX when one was requested.
+- `BLOCKER`: invalid OpenXML or structure, missing/blank required slide, clipped or unreadable primary content, unresolved placeholder/template text, a material unsupported or false claim, a changed contracted user-supplied string, an unmet requested reference/template requirement, or a deliverable that is not an editable PPTX when one was requested.
 - `WARNING`: visible but non-blocking density, hierarchy, consistency, image-quality, source-placement, or target-viewer risk.
 - `PASS`: supported by named structural or render evidence.
 

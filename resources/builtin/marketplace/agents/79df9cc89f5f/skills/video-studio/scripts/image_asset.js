@@ -58,6 +58,62 @@ async function inspect(sharp, input) {
     coordinate_space: 'oriented_original_pixels' };
 }
 
+function originalCrop(request, width, height) {
+  shape(request.source_size, ['width', 'height']);
+  if (request.source_size.width !== width || request.source_size.height !== height) {
+    fail('E_IMAGE_ASSET_COORDINATES', 'source_size must match inspect dimensions, not a compressed preview.');
+  }
+  const crop = request.crop;
+  shape(crop, ['left', 'top', 'width', 'height']);
+  integer(crop.left); integer(crop.top); bounds(crop.width, crop.height);
+  const right = crop.left + crop.width;
+  const bottom = crop.top + crop.height;
+  if (request.preview_size === undefined) {
+    if (right > width || bottom > height) {
+      fail('E_IMAGE_ASSET_COORDINATES', 'Crop must fit the oriented original image.');
+    }
+    return crop;
+  }
+
+  const preview = request.preview_size;
+  shape(preview, ['width', 'height']);
+  bounds(preview.width, preview.height);
+  const scale = Math.max(preview.width, preview.height) / Math.max(width, height);
+  if (scale > 1 || Math.round(width * scale) !== preview.width || Math.round(height * scale) !== preview.height) {
+    fail('E_IMAGE_ASSET_COORDINATES', 'preview_size must match a proportional preview of the whole oriented original.');
+  }
+  if (right > preview.width || bottom > preview.height) {
+    fail('E_IMAGE_ASSET_COORDINATES', 'Crop must fit preview_size when given in preview pixels.');
+  }
+  // Map both edges so a crop that touches the preview edge still ends at the original edge.
+  const left = Math.round(crop.left * width / preview.width);
+  const top = Math.round(crop.top * height / preview.height);
+  return { left, top, width: Math.round(right * width / preview.width) - left,
+    height: Math.round(bottom * height / preview.height) - top };
+}
+
+function productionRoot(raw) {
+  const candidate = path.resolve(raw);
+  try { return fs.realpathSync(candidate); }
+  catch (error) {
+    // Windows can report ENOENT for a child of an existing file. Locate that
+    // blocking ancestor before choosing the missing-directory diagnostic.
+    if (error.code === 'ENOENT') {
+      let parent = path.dirname(candidate);
+      while (parent !== path.dirname(parent)) {
+        try {
+          if (!fs.statSync(parent).isDirectory()) fail('E_IMAGE_ASSET_PROJECT', 'Production path is not a directory.');
+          break;
+        } catch (parentError) {
+          if (!['ENOENT', 'ENOTDIR'].includes(parentError.code)) throw parentError;
+        }
+        parent = path.dirname(parent);
+      }
+    }
+    throw error;
+  }
+}
+
 function failure(error, stage) {
   if (error.code?.startsWith('E_IMAGE_ASSET_')) return { ok: false, errorCode: error.code, message: error.message };
   const missing = error.code === 'ENOENT';
@@ -93,7 +149,7 @@ module.exports = async function imageAsset({ args }) {
       fail('E_IMAGE_ASSET_ARGS', 'Usage: image_asset --project production (--request-file request.json | --request-json JSON). --request remains a file-only alias.');
     }
     stage = 'project';
-    const root = fs.realpathSync(path.resolve(args[1]));
+    const root = productionRoot(args[1]);
     if (!fs.statSync(root).isDirectory()) fail('E_IMAGE_ASSET_PROJECT', 'Production path is not a directory.');
     stage = 'request';
     const inline = args[2] === '--request-json';
@@ -109,8 +165,11 @@ module.exports = async function imageAsset({ args }) {
     if (Buffer.byteLength(bytes, 'utf8') > 65536) fail('E_IMAGE_ASSET_LIMIT', 'Request JSON exceeds 64 KiB.');
     stage = inline ? 'inline_json' : 'json';
     const request = JSON.parse(bytes);
-    shape(request, ['op', 'input_path', 'output_path', 'source_size', 'crop', 'resize', 'padding']);
+    shape(request, ['op', 'input_path', 'output_path', 'source_size', 'preview_size', 'crop', 'resize', 'padding']);
     if (!['inspect', 'process'].includes(request.op)) fail('E_IMAGE_ASSET_ARGUMENT', 'op must be inspect or process.');
+    if (request.preview_size !== undefined && (request.op !== 'process' || request.crop === undefined)) {
+      fail('E_IMAGE_ASSET_COORDINATES', 'preview_size is only used with a process crop.');
+    }
     stage = 'input';
     const input = projectPath(root, request.input_path, 'input_path');
     if (!fs.statSync(input).isFile()) fail('E_IMAGE_ASSET_INPUT', 'Input image path is not a file.');
@@ -128,16 +187,7 @@ module.exports = async function imageAsset({ args }) {
     let { width, height } = original;
     let pipeline = sharp(input, { failOn: 'error', limitInputPixels: MAX_AREA }).autoOrient();
     if (request.crop !== undefined) {
-      shape(request.source_size, ['width', 'height']);
-      if (request.source_size.width !== width || request.source_size.height !== height) {
-        fail('E_IMAGE_ASSET_COORDINATES', 'source_size must match inspect dimensions, not a compressed preview.');
-      }
-      shape(request.crop, ['left', 'top', 'width', 'height']);
-      const crop = request.crop;
-      integer(crop.left); integer(crop.top); bounds(crop.width, crop.height);
-      if (crop.left + crop.width > width || crop.top + crop.height > height) {
-        fail('E_IMAGE_ASSET_COORDINATES', 'Crop must fit the oriented original image.');
-      }
+      const crop = originalCrop(request, width, height);
       pipeline = pipeline.extract(crop);
       width = crop.width; height = crop.height;
     }

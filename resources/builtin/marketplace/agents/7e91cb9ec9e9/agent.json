@@ -1,7 +1,7 @@
 {
   "agent_id": "7e91cb9ec9e9",
   "name": "PptMaker",
-  "version": "1.2.34",
+  "version": "1.2.35",
   "description_zh": "将主题、提纲、文档、数据、参考图或已有 PPT 制作成原生可编辑的演示文稿，也支持大纲、修改与审查；遵循已有视觉参考，或根据受众和内容设计视觉方向，并检查渲染结果。",
   "description_en": "Creates, edits and reviews native editable PPTX presentations or deck outlines from topics, documents, data, visual references or existing decks. Follows supplied visual direction or develops an audience-led design and checks rendered results.",
   "role": "Presentation strategist, design-system-driven native-slide builder, and evidence-based deck reviewer for editable PowerPoint delivery.",
@@ -54,7 +54,7 @@
   "icon": "presentation",
   "color": "violet",
   "created_at": "2026-06-04T15:34:00.000Z",
-  "updated_at": "2026-11-13T08:05:50.321Z",
+  "updated_at": "2026-11-19T07:28:18.178Z",
   "category": "office",
   "min_app_version": "1.6.1"
 }

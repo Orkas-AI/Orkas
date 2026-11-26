@@ -34,6 +34,13 @@ run in several placements. Selling a specific product also follows
   later beat can use another moment of a clip, a tighter crop or a slow push on
   one of its frames under the words. A run of plain text cards over a flat
   background reads as slides; let only the end card stand alone.
+- Ask for stills the page can move: wider than the frame with the subject clear
+  of the edges, so it can be pushed toward or panned across, or two states or
+  angles of the subject to cut between. One key image cannot carry the whole ad.
+- Give each still one move that shows what its line points at: push toward the
+  detail the line names, pan from one thing to the next, or cut to a tighter
+  crop on the beat. A picture that only sits while the words change reads as a
+  slide; the end card can hold still.
 - Cast for the arc: someone the viewer wants to become for an aspirational
   piece, someone they recognise as themselves for a problem piece.
 

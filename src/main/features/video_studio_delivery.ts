@@ -7,7 +7,7 @@ import * as path from 'node:path';
 import { createLogger } from '../logger';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
 import { rhythmSteps } from './audio_rhythm';
-import { runVideoProcessForTest, transcribeSpeech } from './video_studio';
+import { referenceVideoInput, runVideoProcessForTest, transcribeSpeech } from './video_studio';
 import { parseSilenceLog, type PhraseSpan } from './video_phrases';
 import { isPathAllowed } from '../util/path-sandbox';
 import { sha256OfFileStream } from '../util/sha256';
@@ -33,7 +33,6 @@ export type DeliveryVideoSpec = {
   fps: number | null;
   hasAudio: boolean;
   audioStreams?: number;
-  subtitleStreams: number;
   videoDurationSec?: number;
   audioDurationSec?: number;
   /** A mix marker requires narration evidence; it cannot establish a clean result. */
@@ -58,6 +57,7 @@ export type DeliveryIssue = {
     | 'DELIVERY_NARRATION_OVERLAP'
     | 'DELIVERY_NARRATION_TRUNCATED'
     | 'DELIVERY_DURATION_DRIFT'
+    | 'DELIVERY_REQUESTED_DURATION_DRIFT'
     | 'DELIVERY_ASPECT_MISMATCH'
     | 'DELIVERY_NO_AUDIO'
     | 'DELIVERY_AUDIO_SILENT'
@@ -66,7 +66,8 @@ export type DeliveryIssue = {
     | 'DELIVERY_SILENT_STRETCH'
     | 'DELIVERY_NARRATION_OVER_SPEECH'
     | 'DELIVERY_CUTS_OFF_BEAT'
-    | 'DELIVERY_CAPTIONS_MISSING'
+    | 'DELIVERY_NO_CUTS'
+    | 'DELIVERY_SHOT_HELD'
     | 'DELIVERY_NARRATION_UNVERIFIABLE';
   severity: 'error' | 'warning';
   message: string;
@@ -118,41 +119,44 @@ export function assessDeliveredNarration(
   return issues;
 }
 
-/** Delivered file against what it should be: length, canvas, audio presence,
- *  loudness, and requested captions. */
+/** Delivered file against what it should be: length, canvas, audio presence
+ *  and loudness. */
 export function assessDeliveredSpec(input: {
   spec: DeliveryVideoSpec;
+  /** The length that narration and captions in the current timeline use. */
   expectedDurationSec: number | null;
-  /** Where the expected length came from: the video's timeline, or the length the Agent passed
-   *  for a file it made itself. Only the first has narration and captions timed against it. */
-  durationSource?: 'timeline' | 'requested';
+  /** The caller's editorial length target, when known. */
+  requestedDurationSec?: number;
   expectedAspect: string | null;
   expectsAudio: boolean;
-  expectsCaptions: boolean;
   integratedLufs: number | null;
   /** Full successful decode: true only when every sample in every audio stream is zero. */
   digitalSilence?: boolean | null;
-  sidecarSubtitleFound: boolean;
 }): DeliveryIssue[] {
   const issues: DeliveryIssue[] = [];
   const { spec } = input;
-  if (typeof spec.durationSec === 'number' && typeof input.expectedDurationSec === 'number'
-    && input.expectedDurationSec > 0) {
-    const drift = Math.abs(spec.durationSec - input.expectedDurationSec);
+  const { expectedDurationSec, requestedDurationSec } = input;
+  if (typeof spec.durationSec === 'number' && expectedDurationSec !== null && expectedDurationSec > 0) {
+    const drift = Math.abs(spec.durationSec - expectedDurationSec);
     if (drift > DELIVERY_DURATION_TOLERANCE_SEC) {
-      // A file the Agent cut itself was once slowed down to match a rounded "about 15 s"
-      // (2026-11-14 montage run), changing the music it was cut to.
       issues.push({
         code: 'DELIVERY_DURATION_DRIFT',
         severity: 'error',
-        message: input.durationSource === 'requested'
-          ? `The delivered video is ${spec.durationSec.toFixed(2)}s but expect_duration_sec says`
-            + ` ${input.expectedDurationSec}s (off by ${drift.toFixed(2)}s). If you made it this length on purpose,`
-            + ' deliver it again with its real length as expect_duration_sec. Do not speed up, slow down or pad'
-            + ' a finished cut to reach a number: that changes its music and the timing it was cut to.'
-          : `The delivered video is ${spec.durationSec.toFixed(2)}s but it should be`
-            + ` ${input.expectedDurationSec}s (off by ${drift.toFixed(2)}s). Narration and captions are timed against`
-            + ' that length, so the two have to agree before delivery.',
+        message: `The delivered video is ${spec.durationSec.toFixed(2)}s but it should be`
+          + ` ${expectedDurationSec}s (off by ${drift.toFixed(2)}s). Narration and captions are timed against`
+          + ' that length, so the two have to agree before delivery.',
+      });
+    }
+  }
+  if (typeof spec.durationSec === 'number' && typeof requestedDurationSec === 'number'
+    && Number.isFinite(requestedDurationSec) && requestedDurationSec > 0) {
+    const drift = Math.abs(spec.durationSec - requestedDurationSec);
+    if (drift > DELIVERY_DURATION_TOLERANCE_SEC) {
+      issues.push({
+        code: 'DELIVERY_REQUESTED_DURATION_DRIFT',
+        severity: 'warning',
+        message: `The delivered video is ${spec.durationSec.toFixed(2)}s. The requested length was ${requestedDurationSec}s`
+          + ` (a difference of ${drift.toFixed(2)}s). Use the editing context to decide whether to keep this cut or revise it.`,
       });
     }
   }
@@ -198,15 +202,6 @@ export function assessDeliveredSpec(input: {
           + ` ${Math.abs(off).toFixed(1)} LU). Run normalize_loudness on the final file.`,
       });
     }
-  }
-  if (input.expectsCaptions && spec.subtitleStreams === 0 && !input.sidecarSubtitleFound) {
-    issues.push({
-      code: 'DELIVERY_CAPTIONS_MISSING',
-      severity: 'warning',
-      message: 'Captions were asked for, and the delivered file has no subtitle stream and no sidecar subtitle file'
-        + ' beside it. Burned-in captions cannot be detected from the container, so if they were burned in say so;'
-        + ' otherwise the captions were not produced.',
-    });
   }
   return issues;
 }
@@ -276,11 +271,14 @@ function streamDurationField(
   return Number.isFinite(seconds) && seconds > 0 ? { [key]: seconds } : {};
 }
 
-export async function probeDeliveredVideo(videoAbsPath: string, signal?: AbortSignal): Promise<DeliveryVideoSpec | null> {
+export async function probeDeliveredVideo(
+  videoAbsPath: string, signal?: AbortSignal, options?: { referenceContainer?: true },
+): Promise<DeliveryVideoSpec | null> {
   const { ffprobe } = bundledFfmpegPaths();
-  if (!ffprobe) return null;
+  const inputArgs = options?.referenceContainer ? referenceVideoInput(videoAbsPath) : [videoAbsPath];
+  if (!ffprobe || !inputArgs) return null;
   const r = await run(ffprobe, [
-    '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', videoAbsPath,
+    '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', ...inputArgs,
   ], signal);
   if (r.code !== 0) return null;
   try {
@@ -300,7 +298,6 @@ export async function probeDeliveredVideo(videoAbsPath: string, signal?: AbortSi
       fps: Number.isFinite(num) && Number.isFinite(den) && den ? num / den : null,
       hasAudio: streams.some((s) => s.codec_type === 'audio'),
       audioStreams: streams.filter((s) => s.codec_type === 'audio').length,
-      subtitleStreams: streams.filter((s) => s.codec_type === 'subtitle').length,
       narrationMixExpected: typeof parsed.format?.tags?.comment === 'string'
         && parsed.format.tags.comment.split('\n').includes('ORKAS_NARRATION_MIX_V1'),
       ...streamDurationField('videoDurationSec', video),
@@ -514,11 +511,36 @@ export function assessCutsOffBeat(cuts: readonly number[], beats: readonly numbe
   }];
 }
 
-/** Where the cuts of a video cut to its music land against the beat of its own sound,
- *  read from the delivered file. No steady beat, or a pass that fails: nothing to report. */
-export async function cutsOffBeatIssues(videoAbs: string, fps: number | null, signal?: AbortSignal): Promise<DeliveryIssue[]> {
-  const { ffmpeg } = bundledFfmpegPaths();
-  if (!ffmpeg || !fps || !(fps > 0)) return [];
+/** A video cut to its music whose picture does not change: no cut at all, or one shot
+ *  holding more than half of it. Cuts are the delivered file's own, in seconds. Pure. */
+export function assessHeldShot(cuts: readonly number[], durationSec: number): DeliveryIssue[] {
+  if (!(durationSec > 0)) return [];
+  const length = durationSec.toFixed(2);
+  if (!cuts.length) {
+    return [{
+      code: 'DELIVERY_NO_CUTS',
+      severity: 'warning',
+      message: `The delivered file has no cut: one picture runs the whole ${length}s. Check how long each shot was made to last, then render and deliver again.`,
+    }];
+  }
+  const bounds = [0, ...cuts, durationSec];
+  let held = { start: 0, end: 0 };
+  for (let index = 1; index < bounds.length; index += 1) {
+    const start = bounds[index - 1];
+    const end = Math.max(start, bounds[index]);
+    if (end - start > held.end - held.start) held = { start, end };
+  }
+  if (held.end - held.start <= durationSec / 2) return [];
+  return [{
+    code: 'DELIVERY_SHOT_HELD',
+    severity: 'warning',
+    message: `One shot runs from ${held.start.toFixed(2)}s to ${held.end.toFixed(2)}s, more than half of this ${length}s video, so the picture does not change on the beat there. Check how long each shot was made to last, then render and deliver again.`,
+  }];
+}
+
+/** The beat of the delivered file's own sound, as the music-cut beat check finds it. Empty
+ *  when there is no steady beat, the sound cannot be read, or the check is cancelled. */
+async function deliveredBeats(ffmpeg: string, videoAbs: string, signal?: AbortSignal): Promise<number[]> {
   const pcmAbs = path.join(os.tmpdir(), `orkas-beat-check-${randomUUID()}.f32`);
   let samples: Float32Array;
   try {
@@ -549,13 +571,16 @@ export async function cutsOffBeatIssues(videoAbs: string, fps: number | null, si
     }
     next = steps.next();
   }
-  const beats = next.value.beats.times;
-  if (!beats.length) return [];
+  return next.value.beats.times;
+}
+
+/** The cuts of the delivered file, in seconds; null when the pass fails. */
+async function deliveredCuts(ffmpeg: string, videoAbs: string, signal?: AbortSignal): Promise<number[] | null> {
   const scenes = await run(ffmpeg, ['-hide_banner', '-nostats', '-loglevel', 'error', '-t', String(BEAT_CHECK_MAX_SEC), '-i', videoAbs,
     '-an', '-vf', `select='gt(scene,${BEAT_CUT_SCENE_THRESHOLD})',metadata=print:file=-`, '-f', 'null', '-'], signal, DELIVERY_DECODE_TIMEOUT_MS);
   if (scenes.code !== 0) {
     log.warn('beat check cut pass failed', { code: scenes.code });
-    return [];
+    return null;
   }
   const cuts: number[] = [];
   let pts = Number.NaN;
@@ -567,7 +592,26 @@ export async function cutsOffBeatIssues(videoAbs: string, fps: number | null, si
       pts = Number.NaN;
     }
   }
-  return assessCutsOffBeat(cuts, beats, fps);
+  return cuts;
+}
+
+/** Read from the delivered file of a video cut to its music: a picture that does not change,
+ *  and cuts that miss the beat of its own sound. A cut pass that fails reports nothing; with no
+ *  steady beat or no frame rate, only the held picture is reported. */
+export async function cutsOffBeatIssues(
+  videoAbs: string,
+  video: { fps: number | null; durationSec: number | null },
+  signal?: AbortSignal,
+): Promise<DeliveryIssue[]> {
+  const { ffmpeg } = bundledFfmpegPaths();
+  if (!ffmpeg) return [];
+  const cuts = await deliveredCuts(ffmpeg, videoAbs, signal);
+  if (!cuts || signal?.aborted) return [];
+  const held = video.durationSec ? assessHeldShot(cuts, Math.min(video.durationSec, BEAT_CHECK_MAX_SEC)) : [];
+  const fps = video.fps && video.fps > 0 ? video.fps : null;
+  const beats = fps && cuts.length ? await deliveredBeats(ffmpeg, videoAbs, signal) : [];
+  if (signal?.aborted) return [];
+  return [...held, ...(fps ? assessCutsOffBeat(cuts, beats, fps) : [])];
 }
 
 export async function measureVoicedSpan(

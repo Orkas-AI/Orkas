@@ -7,13 +7,14 @@ import { spawn } from 'node:child_process';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import type { BrowserWindow as ElectronBrowserWindow, NativeImage as ElectronNativeImage } from 'electron';
+import type { BrowserWindow as ElectronBrowserWindow, NativeImage as ElectronNativeImage, Rectangle } from 'electron';
 
 import { bundledFfmpegPaths, bundledWhisperPaths } from '../util/bundled-runtime';
 import { redactPaths } from '../util/redact';
 import { logErrorSummary } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
 import { createLogger } from '../logger';
+import { getCurrentLang } from '../i18n';
 import { writeJson } from '../storage';
 import { prepareProducedFileForInput } from './produced_output_hooks';
 import {
@@ -22,7 +23,10 @@ import {
   type Issue,
 } from './video_studio_qa';
 import { extractCssImports, extractCssUrls, extractHtmlResourceRefs, parseHtmlStructure, type HtmlResourceRef } from './video_studio_html_check';
-import { PHRASE_SILENCE_FILTER, parseSilenceLog, phraseViewForResult, type PhraseWord } from './video_phrases';
+import {
+  PHRASE_SILENCE_FILTER, packTranscriptPhrases, parseSilenceLog, pausesHoldSpeech, phraseViewForResult, placeWordsInSpeech, speechSpans,
+  type PhraseSpan, type PhraseWord,
+} from './video_phrases';
 import { rhythmSteps, tempoOf } from './audio_rhythm';
 import { hardenedWebPreferences } from '../util/window-security';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
@@ -54,33 +58,13 @@ export type RenderFormat = 'mp4' | 'webm';
 
 export interface CompositionOptions {
   compositionDirAbs: string;
-  /** Optional main-process-owned repair ledger. When omitted, direct callers
-   * retain the legacy composition-local ledger used by tests and scripts. */
-  repairStateAbsPath?: string;
   outputAbsPath?: string;
-  reportAbsPath?: string;
-  findingsAbsPath?: string;
-  snapshotAbsPath?: string;
   quality?: RenderQuality;
   fps?: number;
   /** Final exports normally choose the highest safe fps for this machine.
    * Set false only when the user explicitly requires exact render settings. */
   allowFpsFallback?: boolean;
   format?: RenderFormat;
-  variables?: Record<string, unknown>;
-  frameEvidenceDirAbs?: string;
-  frameSampleTimes?: Array<{ label: string; timeSec: number; sceneId?: string }>;
-  visualBaselineAbsPath?: string;
-  updateVisualBaseline?: boolean;
-  /** Whether this composition's frame 0 is the delivered video's first frame.
-   *  Only the owning tool layer knows: a standalone COMPOSE always is, while an
-   *  assembled child is only when it is the first segment of its parent EDL.
-   *  Omitted means yes, so direct callers and tests keep the original rule. */
-  isDeliveredOpening?: boolean;
-  /** QA finding codes the user chose to skip, read from the production state
-   *  by the owning tool layer. Matching design/frame findings report as
-   *  informational; media-integrity QA is never filtered. */
-  waivedQaFindings?: string[];
   /** Timing-normalized visual identity of the canonical composition inputs,
    * computed by the owning tool layer. When present, successful renders
    * persist provenance and later identical-key renders may reuse the prior
@@ -99,7 +83,12 @@ export interface SpeechTranscribeOptions {
   model?: string;
   language?: string;
   timestamps?: 'segment' | 'word';
-  allowModelDownload?: boolean;
+  /** Also return the phrase view's lines as `phrase_lines`, for frames under them. */
+  phraseLines?: boolean;
+  /** Leave words the recognizer gave no room for a time out of `words` instead of refusing
+   *  the transcript. Only for looking at frames under what is heard: subtitles and cuts need
+   *  every word timed. */
+  looseTiming?: boolean;
   signal?: AbortSignal;
   onProgress?: (event: { phase: string; message: string; data?: Record<string, unknown> }) => void;
 }
@@ -167,8 +156,6 @@ export type NativeRenderProfile = {
   fallback_reason?: 'constrained_machine';
   confirmation_required?: false;
   degrade_ineffective?: string;
-  previous_observed_capture_fps?: number;
-  previous_realtime_factor?: number;
   frame_pipeline?: 'raw_bgra_pipe' | 'video_track_reuse' | 'scene_segment_assembly';
   /** Why the scene-segment pipeline did not own this render. Present only on
    * raw whole-composition renders so a raw run is always explainable. */
@@ -190,6 +177,9 @@ export type LoudnessReport = {
   input_i: number | null;
   input_tp: number | null;
   input_lra: number | null;
+  /** The gating threshold and offset loudnorm measured, which a second pass takes back. */
+  input_thresh?: number | null;
+  target_offset?: number | null;
   target_i: number;
   target_tp: number;
   target_lra: number;
@@ -200,6 +190,11 @@ export type LoudnessReport = {
 
 const DEFAULT_WIDTH = 1920;
 const DEFAULT_HEIGHT = 1080;
+/** Text has to reach about this size where it is watched: a phone showing the video full
+ *  screen, about this many CSS pixels across its short side (2026-11-19). At 1080 that is
+ *  42 px; an absolute 18 px floor let 6 px text through on a phone. */
+export const PHONE_TEXT_MIN_PX = 14;
+export const PHONE_SHORT_SIDE_PX = 360;
 const DEFAULT_DURATION_SEC = 5;
 const MAX_RENDER_DURATION_SEC = 20 * 60;
 const MAX_FPS = 60;
@@ -272,8 +267,23 @@ function normalizedLocalRefPath(ref: string): string {
   return decoded.replace(/\\/g, '/').replace(/^\.\/+/, '');
 }
 
+/** Page scripts VideoStudio ships with its skill and copies into a video folder
+ *  the first time a page references them. */
+const BUNDLED_VENDOR_FILES = new Set(['gsap.min.js', 'screen-demo.js']);
+const GSAP_VENDOR_REF = 'assets/vendor/gsap.min.js';
+
+function bundledVendorFile(ref: string): string | null {
+  const rel = normalizedLocalRefPath(ref);
+  const file = rel.startsWith('assets/vendor/') ? rel.slice('assets/vendor/'.length) : '';
+  return BUNDLED_VENDOR_FILES.has(file) ? file : null;
+}
+
 function isKnownBundledVendorRef(ref: string): boolean {
-  return normalizedLocalRefPath(ref) === 'assets/vendor/gsap.min.js';
+  return bundledVendorFile(ref) !== null;
+}
+
+function isGsapVendorRef(ref: string): boolean {
+  return normalizedLocalRefPath(ref) === GSAP_VENDOR_REF;
 }
 
 function gsapVendorCompatibilityIssue(text: string): { code: string; missing: string[] } | null {
@@ -287,7 +297,7 @@ function isFileSync(absPath: string): boolean {
   try { return fss.statSync(absPath).isFile(); } catch { return false; }
 }
 
-function builtinGsapVendorCandidates(): string[] {
+function builtinVendorCandidates(file: string): string[] {
   const agentRel = path.join(
     'marketplace',
     'agents',
@@ -296,7 +306,7 @@ function builtinGsapVendorCandidates(): string[] {
     'video-studio',
     'assets',
     'vendor',
-    'gsap.min.js',
+    file,
   );
   const sourceRel = path.join('resources', 'builtin', agentRel);
   const roots = [
@@ -331,10 +341,12 @@ function builtinGsapVendorCandidates(): string[] {
 }
 
 async function copyKnownBundledVendor(ref: string, targetAbsPath: string): Promise<{ ok: true } | { ok: false; code: string; missing?: string[] }> {
-  if (!isKnownBundledVendorRef(ref)) return { ok: false, code: 'LOCAL_VENDOR_UNKNOWN' };
-  const source = builtinGsapVendorCandidates().find((candidate) => isFileSync(candidate));
-  if (!source) return { ok: false, code: 'VENDOR_GSAP_SOURCE_MISSING' };
-  const sourceIssue = gsapVendorCompatibilityIssue(await fs.readFile(source, 'utf8').catch(() => ''));
+  const file = bundledVendorFile(ref);
+  if (!file) return { ok: false, code: 'LOCAL_VENDOR_UNKNOWN' };
+  const gsap = isGsapVendorRef(ref);
+  const source = builtinVendorCandidates(file).find((candidate) => isFileSync(candidate));
+  if (!source) return { ok: false, code: gsap ? 'VENDOR_GSAP_SOURCE_MISSING' : 'VENDOR_SOURCE_MISSING' };
+  const sourceIssue = gsap ? gsapVendorCompatibilityIssue(await fs.readFile(source, 'utf8').catch(() => '')) : null;
   if (sourceIssue) return { ok: false, code: 'VENDOR_GSAP_SOURCE_INCOMPATIBLE', missing: sourceIssue.missing };
   await fs.mkdir(path.dirname(targetAbsPath), { recursive: true });
   await fs.copyFile(source, targetAbsPath);
@@ -342,7 +354,7 @@ async function copyKnownBundledVendor(ref: string, targetAbsPath: string): Promi
 }
 
 async function validateKnownBundledVendor(ref: string, targetAbsPath: string): Promise<Issue | null> {
-  if (!isKnownBundledVendorRef(ref)) return null;
+  if (!isGsapVendorRef(ref)) return null;
   const text = await fs.readFile(targetAbsPath, 'utf8').catch(() => '');
   const issue = gsapVendorCompatibilityIssue(text);
   if (!issue) return null;
@@ -377,27 +389,10 @@ function machineRamGB(): number {
   return Math.round((os.totalmem() / 1024 ** 3) * 10) / 10;
 }
 
-function renderProfilePath(compositionDirAbs: string): string {
-  return path.join(path.resolve(compositionDirAbs, '..', 'render'), '.render-profile.json');
-}
-
-type PersistedRenderProfile = {
-  gpuMode?: 'hardware' | 'software';
-  lastRender?: {
-    observed_capture_fps?: number;
-    observed_realtime_factor?: number;
-  };
-};
-
-async function readObservedRenderProfile(compositionDirAbs: string): Promise<PersistedRenderProfile> {
+/** Lets a manual check stand in for a machine whose GPU Electron cannot report. */
+function mockedGpuMode(): 'hardware' | 'software' | undefined {
   const mocked = process.env.ORKAS_MOCK_OBSERVED_GPU_MODE;
-  if (mocked === 'hardware' || mocked === 'software') return { gpuMode: mocked };
-  try {
-    const parsed = JSON.parse(await fs.readFile(renderProfilePath(compositionDirAbs), 'utf8')) as PersistedRenderProfile;
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
+  return mocked === 'hardware' || mocked === 'software' ? mocked : undefined;
 }
 
 async function observeElectronGpuMode(): Promise<'hardware' | 'software' | undefined> {
@@ -457,15 +452,13 @@ export function selectSafeFinalRenderFps(input: {
 }
 
 export async function resolveNativeRenderProfile(
-  compositionDirAbs: string,
   meta: CompositionMeta,
   quality: RenderQuality | undefined,
   requestedFps: number,
   allowFpsFallback: boolean,
 ): Promise<NativeRenderProfile> {
   const ramGB = machineRamGB();
-  const observed = await readObservedRenderProfile(compositionDirAbs);
-  const observedGpuMode = await observeElectronGpuMode() || observed.gpuMode;
+  const observedGpuMode = await observeElectronGpuMode() || mockedGpuMode();
   const constrained = isConstrainedMachine(ramGB, observedGpuMode);
   const costUnits = estimateRenderCost(meta.width, meta.height, meta.durationSec, requestedFps);
   let decision = renderCostDecision({ constrained, costUnits, isFinal: quality === 'high' });
@@ -496,12 +489,6 @@ export async function resolveNativeRenderProfile(
       fallback_reason: 'constrained_machine' as const,
       confirmation_required: false as const,
     } : {}),
-    ...(positiveNumber(observed.lastRender?.observed_capture_fps)
-      ? { previous_observed_capture_fps: round2(Number(observed.lastRender?.observed_capture_fps)) }
-      : {}),
-    ...(positiveNumber(observed.lastRender?.observed_realtime_factor)
-      ? { previous_realtime_factor: round2(Number(observed.lastRender?.observed_realtime_factor)) }
-      : {}),
     ...(renderFps !== requestedFps ? { degraded_fps: `${requestedFps}->${renderFps}` } : {}),
     ...(decision === 'degrade' && renderFps === requestedFps
       ? { degrade_ineffective: 'fps already at floor; heavy composition may render slowly on this machine' }
@@ -513,6 +500,10 @@ function crfForQuality(quality: RenderQuality | undefined): number {
   if (quality === 'high') return 16;
   if (quality === 'standard') return 20;
   return 26;
+}
+
+export function mp4VideoEncoderArgs(quality: RenderQuality | undefined): string[] {
+  return ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', String(crfForQuality(quality)), '-movflags', '+faststart'];
 }
 
 function positiveNumber(value: unknown): number | undefined {
@@ -708,7 +699,7 @@ export async function loadCompositionMeta(compositionDirAbs: string): Promise<{ 
           message: `Built-in vendor resource could not be prepared: ${item.ref}`,
           fixHint: prepared.missing
             ? `Built-in GSAP vendor is missing required APIs: ${prepared.missing.join(', ')}.`
-            : 'Use the provided path assets/vendor/gsap.min.js or remove the runtime dependency.',
+            : `Use the provided path assets/vendor/${bundledVendorFile(item.ref)} or remove the runtime dependency.`,
         });
         continue;
       }
@@ -916,7 +907,7 @@ export async function withVideoStudioTimeout<T>(
  * frame sheets, audio-only track reuse) is deliberately not gated. */
 let compositionRenderSlotTail: Promise<void> = Promise.resolve();
 const RENDER_SLOT_WAIT_PROGRESS_INTERVAL_MS = 30_000;
-const softwareOnscreenCompositionWindows = new WeakSet<ElectronBrowserWindow>();
+const softwarePresentation = new WeakMap<ElectronBrowserWindow, 'onscreen' | 'offscreen'>();
 
 export async function acquireCompositionRenderSlot(input: {
   signal?: AbortSignal;
@@ -961,8 +952,8 @@ export async function acquireCompositionRenderSlot(input: {
 export type CompositionWindowOptions = {
   /** Directories the page may load from besides the composition itself. */
   extraAllowedDirsAbs?: readonly string[];
-  /** Replaces the whole-timeline adapter installed after load. */
-  adapterScript?: string;
+  /** Installed after load: it drives the page's time for each captured frame. */
+  adapterScript: string;
   /** Called with each console error the page raises, from before it loads. */
   onConsoleError?: (message: string) => void;
   /** Paint rate of an offscreen window. Each settled frame waits on paint ticks,
@@ -974,7 +965,7 @@ export async function withCompositionWindow<T>(
   meta: CompositionMeta,
   p: CompositionOptions,
   fn: (win: ElectronBrowserWindow) => Promise<T>,
-  windowOpts: CompositionWindowOptions = {},
+  windowOpts: CompositionWindowOptions,
 ): Promise<T> {
   const electron = await import('electron');
   const { BrowserWindow, session, app } = electron;
@@ -1004,14 +995,13 @@ export async function withCompositionWindow<T>(
     backgroundColor: '#000000',
     webPreferences: hardenedWebPreferences({
       session: ses,
-      // Offscreen painting fixes stale hidden-window captures on hardware and
-      // macOS software compositors. Windows software compositing has the
-      // inverse defect: its offscreen surface retains the prior scene while a
-      // hidden on-screen surface tracks timeline seeks correctly.
+      // Windows software retains the prior scene on an offscreen surface.
+      // Use its hidden on-screen surface for presentation acknowledgements.
       offscreen: useOffscreenPainting,
     }),
   });
-  if (!useOffscreenPainting) softwareOnscreenCompositionWindows.add(win);
+  if (!useOffscreenPainting) softwarePresentation.set(win, 'onscreen');
+  if (process.platform === 'darwin' && softwareRendering) softwarePresentation.set(win, 'offscreen');
   try {
     // Electron centers new Windows/Linux windows within the display work
     // area, which can shrink even a useContentSize window (1920x1080 became
@@ -1047,7 +1037,7 @@ export async function withCompositionWindow<T>(
       destroyOnTimeout,
     );
     await withVideoStudioTimeout(
-      win.webContents.executeJavaScript(windowOpts.adapterScript ?? buildTimelineAdapterScript(meta, p.variables), true),
+      win.webContents.executeJavaScript(windowOpts.adapterScript, true),
       COMPOSITION_SCRIPT_TIMEOUT_MS,
       'E_COMPOSITION_SCRIPT_TIMEOUT',
       'composition window timed out while installing the timeline adapter.',
@@ -1064,113 +1054,6 @@ export async function withCompositionWindow<T>(
   } finally {
     try { win.destroy(); } catch { /* best effort */ }
   }
-}
-
-export function buildTimelineAdapterScript(meta: CompositionMeta, variables?: Record<string, unknown>): string {
-  const vars = JSON.stringify(variables || {});
-  return `
-(() => {
-  const root = document.querySelector('[data-composition-id]') || document.body;
-  const compositionId = root && root.getAttribute ? (root.getAttribute('data-composition-id') || ${JSON.stringify(meta.id)}) : ${JSON.stringify(meta.id)};
-  const variables = ${vars};
-  window.__ORKAS_VIDEO_VARIABLES__ = variables;
-  function num(v, fallback) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : fallback;
-  }
-  function pauseMedia() {
-    for (const media of Array.from(document.querySelectorAll('audio,video'))) {
-      try { media.pause(); } catch {}
-    }
-  }
-  async function seekMedia(t) {
-    const mediaEls = Array.from(document.querySelectorAll('audio,video'));
-    await Promise.all(mediaEls.map((media) => new Promise((resolve) => {
-      const start = num(media.getAttribute('data-start'), 0);
-      const local = Math.max(0, t - start);
-      let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
-      try {
-        media.pause();
-        if (Number.isFinite(media.duration) && Math.abs(media.currentTime - local) > 0.04) {
-          media.addEventListener('seeked', finish, { once: true });
-          media.currentTime = Math.min(local, Math.max(0, media.duration || local));
-          setTimeout(finish, 1000);
-        } else {
-          finish();
-        }
-      } catch {
-        finish();
-      }
-    })));
-  }
-  function seekTimelines(t) {
-    const timelines = window.__timelines || {};
-    const tl = timelines[compositionId] || timelines.main || timelines.root;
-    if (!tl) return false;
-    try {
-      if (typeof tl.pause === 'function') tl.pause();
-      // GSAP skips rendering when the playhead is already at the requested
-      // time, so a zero-duration set positioned exactly there never applies.
-      // A freshly created paused timeline sits at 0, which makes frame 0 the
-      // permanent victim: tl.set(scene, autoAlpha 1) at position 0 — the
-      // reveal the authoring skill asks for — is never rendered, the
-      // scaffold's .clip opacity:0/visibility:hidden stands, and frame 0
-      // captures blank. Verified against the bundled build: seek(0) leaves
-      // the element untouched while seek(0.5) applies it, and a forced render
-      // fixes 0. Force only when the seek is a no-op, so ordinary frames keep
-      // the normal path.
-      const before = typeof tl.time === 'function' ? Number(tl.time()) : NaN;
-      const forceRender = () => {
-        if (Number.isFinite(before) && Math.abs(before - t) < 1e-6 && typeof tl.render === 'function') {
-          tl.render(t, false, true);
-        }
-      };
-      if (typeof tl.seek === 'function') { tl.seek(t, false); forceRender(); return true; }
-      if (typeof tl.time === 'function') { tl.time(t, false); forceRender(); return true; }
-      if (typeof tl.progress === 'function' && typeof tl.duration === 'function') {
-        const dur = Number(tl.duration()) || ${meta.durationSec};
-        tl.progress(dur > 0 ? Math.max(0, Math.min(1, t / dur)) : 0, false);
-        return true;
-      }
-    } catch {}
-    return false;
-  }
-  function seekWebAnimations(t) {
-    try {
-      for (const anim of document.getAnimations({ subtree: true })) {
-        try {
-          anim.pause();
-          anim.currentTime = Math.max(0, t * 1000);
-        } catch {}
-      }
-    } catch {}
-  }
-  function applyTimedVisibility(t) {
-    for (const el of Array.from(document.querySelectorAll('[data-start], [data-duration]'))) {
-      if (el === root) continue;
-      const start = num(el.getAttribute('data-start'), 0);
-      const dur = num(el.getAttribute('data-duration'), Number.POSITIVE_INFINITY);
-      if (!Number.isFinite(dur)) continue;
-      const visible = t >= start && t <= start + dur;
-      if (el.classList && el.classList.contains('clip')) {
-        el.style.visibility = visible ? '' : 'hidden';
-      }
-    }
-  }
-  window.__ORKAS_VIDEO__ = window.__ORKAS_VIDEO__ || {};
-  window.__ORKAS_VIDEO__.duration = ${meta.durationSec};
-  window.__ORKAS_VIDEO__.seek = async (t) => {
-    pauseMedia();
-    const usedTimeline = seekTimelines(t);
-    seekWebAnimations(t);
-    if (!usedTimeline) applyTimedVisibility(t);
-    await seekMedia(t);
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  };
-  pauseMedia();
-})()
-`;
 }
 
 async function waitForReady(win: ElectronBrowserWindow): Promise<void> {
@@ -1208,10 +1091,125 @@ new Promise((resolve) => requestAnimationFrame(() => {
 `, true), COMPOSITION_SCRIPT_TIMEOUT_MS, 'E_COMPOSITION_PAINT_TIMEOUT', 'composition paint did not settle before capture.', () => {
     try { win.destroy(); } catch { /* best effort */ }
   });
-  // On Windows the software compositor needs an on-screen backing surface and
-  // a short post-RAF grace period before capturePage observes its invalidation.
-  if (softwareOnscreenCompositionWindows.has(win)) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
+}
+
+export function usesSoftwareCompositionPresentation(win: ElectronBrowserWindow): boolean {
+  return softwarePresentation.has(win);
+}
+
+/** Read only the tiny marker patch. Subscription images use physical pixels. */
+function compositionMarkerVisible(image: ElectronNativeImage, width: number, height: number,
+  colors: readonly boolean[], cellWidth: number, markerHeight: number): boolean | null {
+  if (image.isEmpty()) return null;
+  const { width: imageWidth, height: imageHeight } = image.getSize();
+  if (imageWidth < colors.length || imageHeight < 1) return null;
+  const xScale = imageWidth / width;
+  const yScale = imageHeight / height;
+  const patchWidth = Math.min(imageWidth, Math.ceil(colors.length * cellWidth * xScale));
+  const patchHeight = Math.min(imageHeight, Math.ceil(markerHeight * yScale));
+  const pixels = image.crop({ x: 0, y: 0, width: patchWidth, height: patchHeight }).toBitmap();
+  if (pixels.length !== patchWidth * patchHeight * 4) return null;
+  return colors.every((magenta, index) => {
+    const x = Math.floor((index + 0.5) * cellWidth * xScale);
+    const y = Math.floor(markerHeight * yScale / 2);
+    const offset = (y * patchWidth + x) * 4;
+    const [blue, green, red] = pixels.subarray(offset, offset + 3);
+    return magenta ? red > 150 && blue > 150 && green < 90 : green > 150 && red < 90 && blue < 90;
+  });
+}
+
+/** Software compositors can present after the page's RAF callbacks. Wait for
+ * a paint of the target marker, then for the paint that removes it. */
+export async function capturePresentedCompositionFrame(input: {
+  win: ElectronBrowserWindow;
+  width: number;
+  height: number;
+  render: () => Promise<void>;
+  timeoutMessage: string;
+  signal?: AbortSignal;
+}): Promise<ElectronNativeImage> {
+  const { win, width, height, signal } = input;
+  signal?.throwIfAborted();
+  const contents = win.webContents;
+  const markerId = `orkas-frame-${crypto.randomUUID()}`;
+  const cellWidth = Math.min(width, 4);
+  const markerHeight = Math.min(height, 4);
+  const colorCount = Math.min(16, Math.floor(width / cellWidth));
+  const markerBits = Number.parseInt(markerId.slice(12, 20), 16);
+  const colors = Array.from({ length: colorCount }, (_, i) => (markerBits & (1 << i)) !== 0);
+  const stops = colors.map((magenta, i) => `${magenta ? 'magenta' : 'lime'} ${i * cellWidth}px ${(i + 1) * cellWidth}px`);
+  const background = colorCount > 1 ? `linear-gradient(to right, ${stops.join(', ')})` : (colors[0] ? 'magenta' : 'lime');
+  const offscreen = softwarePresentation.get(win) === 'offscreen';
+  let receive: ((image: ElectronNativeImage) => void) | undefined;
+  const onPaint = (_event: unknown, dirty: Rectangle, image: ElectronNativeImage) => {
+    if (!receive || image.isEmpty()) return;
+    const size = image.getSize();
+    // A paint of an unrelated patch cannot acknowledge removal. Offscreen
+    // software sends a full backing bitmap together with its damage rectangle.
+    if (size.width < width || size.height < height || dirty.x !== 0 || dirty.y !== 0
+      || dirty.width < Math.ceil(colorCount * cellWidth * size.width / width)
+      || dirty.height < Math.ceil(markerHeight * size.height / height)) return;
+    receive(image);
+  };
+  let abort: (() => void) | undefined;
+  const dispose = () => { try { win.destroy(); } catch { /* best effort */ } };
+  const cancelled = signal ? new Promise<never>((_, reject) => {
+    abort = () => { dispose(); reject(signal.reason); };
+    signal.addEventListener('abort', abort, { once: true });
+  }) : null;
+  let subscribed = false;
+  try {
+    if (offscreen) contents.on('paint', onPaint);
+    else contents.beginFrameSubscription(false, (image) => receive?.(image));
+    subscribed = true;
+    const waitForFrame = async (visible: boolean, source: string) => {
+      const presented = new Promise<ElectronNativeImage>((resolve, reject) => {
+        receive = (image) => {
+          try {
+            if (compositionMarkerVisible(image, width, height, colors, cellWidth, markerHeight) === visible) {
+              receive = undefined;
+              resolve(image);
+            }
+          } catch (error) { reject(error); }
+        };
+      });
+      const updated = contents.executeJavaScript(source, true).then(async () => {
+        if (offscreen) return;
+        // A hidden static surface can miss a presentation callback. Request
+        // another paint and inspect its snapshot until the event or snapshot
+        // confirms the marker state. The capture watchdog bounds this loop.
+        while (receive) {
+          await settleCompositionPaint(win);
+          if (receive) receive(await contents.capturePage(undefined, { stayHidden: true }));
+        }
+      });
+      const [image] = await Promise.all([presented, updated]);
+      return image;
+    };
+    const capture = (async () => {
+      await input.render();
+      await waitForFrame(true, `(() => {
+        const marker = document.createElement('orkas-frame-marker');
+        marker.id = ${JSON.stringify(markerId)};
+        marker.setAttribute('popover', 'manual');
+        marker.inert = true;
+        marker.style.cssText = 'all:initial!important;position:fixed!important;inset:0 auto auto 0!important;'
+          + 'margin:0!important;display:block!important;pointer-events:none!important;'
+          + ${JSON.stringify(`width:${colorCount * cellWidth}px!important;height:${markerHeight}px!important;background:${background}!important`)};
+        document.documentElement.append(marker);
+        marker.showPopover();
+      })()`);
+      return waitForFrame(false, `document.getElementById(${JSON.stringify(markerId)}).remove()`);
+    })();
+    return await withVideoStudioTimeout(cancelled ? Promise.race([capture, cancelled]) : capture,
+      COMPOSITION_RENDER_FRAME_TIMEOUT_MS, 'E_RENDER_CAPTURE_TIMEOUT', input.timeoutMessage, dispose);
+  } finally {
+    receive = undefined;
+    if (abort) signal?.removeEventListener('abort', abort);
+    if (subscribed && !win.isDestroyed()) {
+      if (offscreen) contents.off('paint', onPaint);
+      else contents.endFrameSubscription();
+    }
   }
 }
 
@@ -1226,6 +1224,7 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
   const safeX = Math.max(48, Math.min(96, width * 0.05));
   const safeY = Math.max(48, Math.min(96, height * 0.06));
   const round = (value) => Math.round(Number(value || 0) * 100) / 100;
+  const minTextPx = Math.round(${PHONE_TEXT_MIN_PX} * Math.min(width, height) / ${PHONE_SHORT_SIDE_PX});
   const selectorFor = (el) => {
     if (!el || !el.tagName) return 'document';
     if (el.id) return '#' + el.id;
@@ -1412,6 +1411,10 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
     visibleCount += 1;
     const rect = el.getBoundingClientRect();
     if (!rect || rect.width <= 1 || rect.height <= 1) continue;
+    // What screen-demo.js draws inside a screenshot (typed text, a zoomed screen it
+    // clips) is part of that screen, like the screenshot's own words.
+    const screen = el.closest && el.closest('[data-orkas-screen]');
+    if (screen && screen !== el) continue;
     const text = directText(el);
     const rectEvidence = {
       rect: { left: round(rect.left), top: round(rect.top), right: round(rect.right), bottom: round(rect.bottom), width: round(rect.width), height: round(rect.height) },
@@ -1450,8 +1453,8 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
         });
       }
       const fs = parseFloat(style.fontSize || '0');
-      if (Number.isFinite(fs) && fs > 0 && fs < 18) {
-        add('FONT_TOO_SMALL', 'warning', 'high', el, 'text is below the 18px legibility floor.', { ...rectEvidence, font_size_px: round(fs), minimum_px: 18 });
+      if (Number.isFinite(fs) && fs > 0 && fs < minTextPx) {
+        add('FONT_TOO_SMALL', 'warning', 'high', el, 'text is ' + round(fs) + 'px, under the ' + minTextPx + 'px it needs to be read when this video fills a phone screen.', { ...rectEvidence, font_size_px: round(fs), minimum_px: minTextPx });
       }
       if (rect.left < safeX || rect.top < safeY || rect.right > width - safeX || rect.bottom > height - safeY) {
         add('SAFE_AREA_VIOLATION', 'warning', 'medium', el, 'readable text sits near the video edge or platform-safe area.', { ...rectEvidence, safe_area: { x: round(safeX), y: round(safeY) } });
@@ -1667,6 +1670,14 @@ export async function referenceTempo(samples: Float32Array, sampleRate: number, 
 /** On-demand source evidence before authoring. Read grants never become write
  * grants: freeze the source under the composition, then decode only that copy.
  * No shell, provider, or semantic verdict is involved. */
+/** The local reference readers use the same explicit media input contract. */
+export function referenceVideoInput(file: string): string[] | null {
+  const extension = path.extname(file).toLowerCase();
+  const demuxer = ({ '.mp4': 'mov', '.mov': 'mov', '.m4v': 'mov', '.webm': 'matroska', '.mkv': 'matroska', '.ogv': 'ogg' } as Record<string, string>)[extension];
+  // Explicit demuxing and local protocols keep reference reading confined to media.
+  return demuxer ? ['-protocol_whitelist', 'file,pipe', '-f', demuxer, '-i', file] : null;
+}
+
 export async function inspectVideoReference(input: {
   inputAbsPath: string;
   compositionDirAbs: string;
@@ -1682,8 +1693,7 @@ export async function inspectVideoReference(input: {
     return fail('E_PATH_OUT_OF_SCOPE', 'Reference evidence must be written inside the writable workspace.');
   }
   const ext = path.extname(input.inputAbsPath).toLowerCase();
-  const demuxer = ({ '.mp4': 'mov', '.mov': 'mov', '.m4v': 'mov', '.webm': 'matroska', '.mkv': 'matroska', '.ogv': 'ogg' } as Record<string, string>)[ext];
-  if (!demuxer) return fail('E_REFERENCE_FORMAT', 'Unsupported reference video container.');
+  if (!referenceVideoInput(input.inputAbsPath)) return fail('E_REFERENCE_FORMAT', 'Unsupported reference video container.');
   const supplied = input.sampleTimes;
   if (supplied !== undefined && (!Array.isArray(supplied) || supplied.length < 1 || supplied.length > REFERENCE_MAX_SAMPLES
     || supplied.some(t => typeof t !== 'number' || !Number.isFinite(t) || t < 0)
@@ -1717,9 +1727,7 @@ export async function inspectVideoReference(input: {
         callback(null, chunk);
       },
     }), fss.createWriteStream(source, { flags: 'wx' }), { signal });
-    // Explicit demuxer + protocol allow-list excludes disguised playlists and
-    // network indirection. MOV external data references remain disabled.
-    const safeInput = ['-protocol_whitelist', 'file,pipe', '-f', demuxer, '-i', source];
+    const safeInput = referenceVideoInput(source)!;
     const probe = await runProcess(bins.ffprobe, ['-v', 'error', ...safeInput,
       '-show_entries', 'stream=index,codec_type,width,height,duration:format=duration', '-of', 'json'],
     { signal, timeoutMs: 10_000, maxOutputBytes: 64 * 1024 });
@@ -1900,9 +1908,11 @@ function buildAudioMixGraph(audioTracksIn: AudioTrack[], durationSec: number): {
       : `${indexes.map(label).join('')}amix=inputs=${indexes.length}:duration=longest:normalize=0[${out}]`);
     const others = tracks.flatMap((track, index) => (track.voice || (track.duck && !track.voice) ? [] : [index]));
     filters.push(mixed(voices, 'voice_mix'));
-    filters.push('[voice_mix]asplit=2[voice_out][voice_key]');
+    filters.push('[voice_mix]asetnsamples=n=1024:p=1,asplit=2[voice_out][voice_key]');
     filters.push(mixed(ducked, 'duck_mix'));
-    filters.push('[duck_mix][voice_key]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[duck_out]');
+    // Complete frames keep compressor EOF from discarding the music tail.
+    filters.push('[duck_mix]asetnsamples=n=1024:p=1[duck_aligned]');
+    filters.push('[duck_aligned][voice_key]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[duck_out]');
     filters.push(`[voice_out][duck_out]${others.map(label).join('')}amix=inputs=${2 + others.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);
   } else {
     filters.push(`${tracks.map((_track, index) => `[a${index}]`).join('')}amix=inputs=${tracks.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);
@@ -1931,7 +1941,7 @@ export function buildFrameEncoderArgs(opts: Omit<FrameEncoderOptions, 'ffmpeg' |
     args.push('-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', String(crfForQuality(opts.quality) + 8));
     if (audioTracks.length) args.push('-c:a', 'libopus');
   } else {
-    args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', String(crfForQuality(opts.quality)), '-movflags', '+faststart');
+    args.push(...mp4VideoEncoderArgs(opts.quality));
     if (audioTracks.length) args.push('-c:a', 'aac');
   }
   args.push('-t', opts.durationSec.toFixed(3), opts.outputAbsPath);
@@ -2172,7 +2182,7 @@ function loudnessNumber(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function loudnessReportFromJson(value: Record<string, unknown> | null, rawTail = ''): LoudnessReport {
+export function loudnessReportFromJson(value: Record<string, unknown> | null, rawTail = ''): LoudnessReport {
   if (!value) {
     return {
       ok: false,
@@ -2191,11 +2201,24 @@ function loudnessReportFromJson(value: Record<string, unknown> | null, rawTail =
     input_i: loudnessNumber(value.input_i),
     input_tp: loudnessNumber(value.input_tp),
     input_lra: loudnessNumber(value.input_lra),
+    input_thresh: loudnessNumber(value.input_thresh),
+    target_offset: loudnessNumber(value.target_offset),
     target_i: LOUDNESS_TARGET_I,
     target_tp: LOUDNESS_TARGET_TP,
     target_lra: LOUDNESS_TARGET_LRA,
     normalized: value,
   };
+}
+
+/** loudnorm options that apply a measurement of the same audio, or null when it is incomplete.
+ *  One pass guesses as it goes and falls short on a quiet mix with louder moments: a -28 LUFS
+ *  ad (a music bed under a 2 s voice-over) came out at -18.4 against -14 (2026-11-17). Pure. */
+export function loudnormSecondPassOptions(report: LoudnessReport | null | undefined): string | null {
+  if (!report) return null;
+  const values = [report.input_i, report.input_tp, report.input_lra, report.input_thresh, report.target_offset];
+  if (!values.every((value) => typeof value === 'number' && Number.isFinite(value))) return null;
+  const [i, tp, lra, thresh, offset] = values as number[];
+  return `measured_I=${i}:measured_TP=${tp}:measured_LRA=${lra}:measured_thresh=${thresh}:offset=${offset}:linear=true`;
 }
 
 export function shouldNormalizeLoudness(report: LoudnessReport | null, quality: RenderQuality | undefined): { normalize: boolean; reason: string } {
@@ -2232,18 +2255,26 @@ export async function analyzeLoudness(ffmpeg: string, mediaAbsPath: string, sign
   return loudnessReportFromJson(parseLastJsonObject(text), text.slice(-1000));
 }
 
-export async function normalizeAudioInPlace(ffmpeg: string, mediaAbsPath: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+/** `measured` is analyzeLoudness of this same file; with it, the normalization is the second of
+ *  two passes and lands on the target instead of short of it. */
+export async function normalizeAudioInPlace(
+  ffmpeg: string,
+  mediaAbsPath: string,
+  signal?: AbortSignal,
+  measured?: LoudnessReport | null,
+): Promise<Record<string, unknown>> {
   const ext = path.extname(mediaAbsPath) || '.mp4';
   if (ext.toLowerCase() !== '.mp4') {
     return { skipped: true, reason: 'audio normalization currently applies only to mp4 output' };
   }
   const tmp = path.join(path.dirname(mediaAbsPath), `${path.basename(mediaAbsPath, ext)}.norm-${Date.now()}${ext}`);
+  const secondPass = loudnormSecondPassOptions(measured);
   const r = await runProcess(ffmpeg, [
     '-y',
     '-hide_banner',
     '-loglevel', 'error',
     '-i', mediaAbsPath,
-    '-af', `loudnorm=I=${LOUDNESS_TARGET_I}:TP=${LOUDNESS_TARGET_TP}:LRA=${LOUDNESS_TARGET_LRA}`,
+    '-af', `loudnorm=I=${LOUDNESS_TARGET_I}:TP=${LOUDNESS_TARGET_TP}:LRA=${LOUDNESS_TARGET_LRA}${secondPass ? `:${secondPass}` : ''}`,
     '-c:v', 'copy',
     '-c:a', 'aac',
     '-b:a', '192k',
@@ -2258,7 +2289,7 @@ export async function normalizeAudioInPlace(ffmpeg: string, mediaAbsPath: string
     return { skipped: true, reason: 'normalization failed', stderr_tail: redactPaths(r.stderr.slice(-1000)) };
   }
   await fs.rename(tmp, mediaAbsPath);
-  return { skipped: false, path: mediaAbsPath };
+  return { skipped: false, path: mediaAbsPath, passes: secondPass ? 2 : 1 };
 }
 
 export async function buildMediaQa(
@@ -2523,22 +2554,284 @@ function whisperLanguageArg(language: string | undefined): string {
   return (value.split(/[-_]/)[0] || value).toLowerCase();
 }
 
+/** The sentence a Chinese recording is read as following, in the script the account reads.
+ *  Without one the bundled model wrote Mandarin in Traditional characters, so captions came out
+ *  Traditional for a Simplified reader, and it misheard more: on 2026-11-24 a talk read
+ *  會員/採過康 and a lecture 未國 where they said 会员/踩过坑 and 魏国; with the sentence both
+ *  came out Simplified and right. A Traditional Chinese account gets the Traditional sentence. Pure. */
+export function chineseTranscriptPrompt(lang: string): string {
+  return lang === 'zh-tw' ? '以下是普通話的句子。' : '以下是普通话的句子。';
+}
+
+/** Match offline audio projects: the bundled Intel macOS Metal path can corrupt recognition. */
+const whisperDeviceArgs = (): string[] => (process.platform === 'darwin' && process.arch === 'x64' ? ['-ng'] : []);
+
 export function buildSpeechTranscribeArgs(
   modelPath: string,
   wavPath: string,
   outBase: string,
-  options: Pick<SpeechTranscribeOptions, 'language' | 'timestamps'>,
+  options: Pick<SpeechTranscribeOptions, 'language' | 'timestamps'> & { prompt?: string },
 ): string[] {
   const timestampDetail = options.timestamps === 'word' ? 'word' : 'segment';
   const args = ['-m', modelPath, '-f', wavPath, timestampDetail === 'word' ? '-ojf' : '-oj', '-of', outBase, '-np'];
   args.push('-l', whisperLanguageArg(options.language));
-  // Match offline audio projects: the bundled Intel macOS Metal path can corrupt recognition.
-  if (process.platform === 'darwin' && process.arch === 'x64') args.push('-ng');
+  if (options.prompt) args.push('--prompt', options.prompt);
+  args.push(...whisperDeviceArgs());
   if (timestampDetail === 'word') {
     const dtwModel = whisperDtwModel(modelPath);
     if (dtwModel) args.push('-dtw', dtwModel);
   }
   return args;
+}
+
+/** Most measured speech spans recognized again to place the words: about eight minutes of talk. */
+export const WORD_PLACEMENT_MAX_SPANS = 240;
+/** Most speech, in seconds, recognized again to place the words. */
+const WORD_PLACEMENT_MAX_SPEECH_SEC = 900;
+/** Spans up to this long with their padding fit the short recognition window below. */
+const WORD_PLACEMENT_SHORT_SEC = 5;
+/** whisper.cpp audio context for short spans, in 20 ms frames (5.12 s). A span is otherwise padded
+ * to a 30 s window: 204 short spans took 98 s on a CPU, 21 s with this (2026-11-18), and the text
+ * only guides placement. */
+const WORD_PLACEMENT_SHORT_CONTEXT = '256';
+/** Pause kept on each side of a span, at most half of it, so a soft onset is still heard. */
+const WORD_PLACEMENT_PAD_SEC = 0.1;
+const WORD_PLACEMENT_TIMEOUT_MS = 90_000;
+
+/** Where the samples of a 16-bit mono PCM WAV are and their rate, from its header alone. */
+async function pcm16MonoWav(file: fs.FileHandle): Promise<{ rate: number; dataOffset: number; dataBytes: number } | null> {
+  const head = Buffer.alloc(64 * 1024);
+  const { bytesRead } = await file.read(head, 0, head.length, 0);
+  if (bytesRead < 12 || head.toString('ascii', 0, 4) !== 'RIFF' || head.toString('ascii', 8, 12) !== 'WAVE') return null;
+  let rate = 0;
+  for (let offset = 12; offset + 8 <= bytesRead;) {
+    const id = head.toString('ascii', offset, offset + 4), size = head.readUInt32LE(offset + 4), body = offset + 8;
+    if (id === 'fmt ' && size >= 16 && body + 16 <= bytesRead) {
+      const pcm = head.readUInt16LE(body) === 1 && head.readUInt16LE(body + 2) === 1 && head.readUInt16LE(body + 14) === 16;
+      rate = pcm ? head.readUInt32LE(body + 4) : 0;
+    } else if (id === 'data') {
+      return rate > 0 ? { rate, dataOffset: body, dataBytes: size } : null;
+    }
+    offset = body + size + (size % 2);
+  }
+  return null;
+}
+
+function wavBytes(rate: number, samples: Buffer): Buffer {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii'); header.writeUInt32LE(36 + samples.length, 4); header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii'); header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(rate, 24); header.writeUInt32LE(rate * 2, 28); header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write('data', 36, 'ascii'); header.writeUInt32LE(samples.length, 40);
+  return Buffer.concat([header, samples]);
+}
+
+/**
+ * The recognized words, each moved into the measured speech span it was spoken in, or null when
+ * they cannot be placed and keep their recognized times. Each span between measured pauses is cut
+ * from the extracted audio and recognized on its own in one more whisper.cpp run; that text only
+ * guides placement (`placeWordsInSpeech`). Bounded by span count, speech length and a deadline;
+ * a failed or unusable run changes nothing. Throws only when cancelled.
+ */
+async function placeWordsBySpanRecognition(o: {
+  backend: { cli: string; model: string }; wavPath: string; dir: string; language: string; prompt?: string;
+  words: PhraseWord[]; silences: PhraseSpan[]; durationSec: number; signal?: AbortSignal;
+}): Promise<PhraseWord[] | null> {
+  const spans = speechSpans(o.silences, o.durationSec);
+  const speech = spans.reduce((sum, s) => sum + s.endSec - s.startSec, 0);
+  if (spans.length < 2 || spans.length > WORD_PLACEMENT_MAX_SPANS || speech > WORD_PLACEMENT_MAX_SPEECH_SEC
+    || !o.words.length || pausesHoldSpeech(o.words, spans)) return null;
+  const started = Date.now();
+  const spanDir = path.join(o.dir, 'spans');
+  await fs.mkdir(spanDir, { recursive: true });
+  const files: string[] = [];
+  const handle = await fs.open(o.wavPath, 'r');
+  try {
+    const wav = await pcm16MonoWav(handle);
+    if (!wav) return null;
+    for (let i = 0; i < spans.length; i += 1) {
+      const before = i > 0 ? spans[i].startSec - spans[i - 1].endSec : spans[i].startSec;
+      const after = (i + 1 < spans.length ? spans[i + 1].startSec : o.durationSec) - spans[i].endSec;
+      const from = Math.max(0, spans[i].startSec - Math.min(WORD_PLACEMENT_PAD_SEC, before / 2));
+      const to = spans[i].endSec + Math.max(0, Math.min(WORD_PLACEMENT_PAD_SEC, after / 2));
+      const first = Math.floor(from * wav.rate) * 2, end = Math.min(wav.dataBytes, Math.ceil(to * wav.rate) * 2);
+      const samples = Buffer.alloc(Math.max(0, end - first));
+      if (samples.length) await handle.read(samples, 0, samples.length, wav.dataOffset + first);
+      files.push(path.join(spanDir, `${i}.wav`));
+      await fs.writeFile(files[i], wavBytes(wav.rate, samples));
+    }
+  } finally { await handle.close(); }
+  const short = files.filter((_, i) => spans[i].endSec - spans[i].startSec + 2 * WORD_PLACEMENT_PAD_SEC <= WORD_PLACEMENT_SHORT_SEC);
+  const long = files.filter(file => !short.includes(file));
+  // The same opening sentence as the whole file, so each span is written in the same script.
+  const base = ['-m', o.backend.model, '-l', o.language, ...(o.prompt ? ['--prompt', o.prompt] : []), '-oj', '-np', '-nf', ...whisperDeviceArgs()];
+  for (const [group, context] of [[short, ['-ac', WORD_PLACEMENT_SHORT_CONTEXT]], [long, []]] as const) {
+    if (!group.length) continue;
+    o.signal?.throwIfAborted();
+    const timeoutMs = WORD_PLACEMENT_TIMEOUT_MS - (Date.now() - started);
+    const run = timeoutMs > 0
+      ? await runProcess(o.backend.cli, [...base, ...context, ...group.flatMap(file => ['-f', file])], { signal: o.signal, timeoutMs })
+      : null;
+    if (run?.aborted) o.signal?.throwIfAborted();
+    if (!run || run.code !== 0) {
+      log.warn('speech.transcribe kept recognized word times', { spans: spans.length, reason: run ? (run.timedOut ? 'timeout' : `exit ${run.code}`) : 'timeout' });
+      return null;
+    }
+  }
+  const texts = await Promise.all(files.map(async (file) => {
+    try {
+      const rows = (JSON.parse(await fs.readFile(`${file}.json`, 'utf8')) as WhisperJsonObject).transcription;
+      return Array.isArray(rows) ? rows.map(row => String((row as WhisperJsonObject)?.text ?? '').trim()).join(' ') : '';
+    } catch { return ''; }
+  }));
+  const placed = placeWordsInSpeech(o.words, spans.map((s, i) => ({ ...s, text: texts[i] })));
+  log.info('speech.transcribe word placement', { spans: spans.length, placed: !!placed, ms: Date.now() - started });
+  return placed;
+}
+
+/** Share of the words that may start after the end of the recording before its timing as a
+ *  whole is not trusted. Real transcripts had at most 5 of 89 there (2026-11-19). */
+const LATE_WORDS_MAX_SHARE = 0.1;
+
+const isTextToken = (token: unknown): boolean => {
+  const text = token && typeof token === 'object' && !Array.isArray(token) ? (token as WhisperJsonObject).text : undefined;
+  return typeof text === 'string' && !!text.trim() && !isWhisperSpecialToken(text);
+};
+
+/** A whisper result whose times past the end of the recording end there, or null when too many
+ *  of its words start after the end for its timing to be trusted (left to the usual checks).
+ *  2026-11-19: 128 of 263 real transcripts were refused whole for such times, mostly by tens
+ *  of milliseconds or by a last segment running to the recognizer's 30 s window. Pure. */
+export function endedWithRecording(parsed: unknown, endMs: number): unknown | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !(endMs > 0)) return null;
+  const rows = (parsed as WhisperJsonObject).transcription;
+  if (!Array.isArray(rows)) return null;
+  const words = rows.flatMap((row) => (row && typeof row === 'object' && Array.isArray((row as WhisperJsonObject).tokens)
+    ? ((row as WhisperJsonObject).tokens as unknown[]).filter(isTextToken) : []));
+  const late = words.filter((token) => (offsetsMs((token as WhisperJsonObject).offsets)?.from ?? 0) >= endMs).length;
+  if (late > words.length * LATE_WORDS_MAX_SHARE) return null;
+  return clampWhisperTimesToEnd(parsed, endMs);
+}
+
+/** A whisper result with every time past `endMs` ended there and every segment or word
+ *  starting at or after it dropped; anything else is left for the usual checks. Pure. */
+export function clampWhisperTimesToEnd(parsed: unknown, endMs: number): unknown {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !(endMs > 0)) return parsed;
+  const rows = (parsed as WhisperJsonObject).transcription;
+  if (!Array.isArray(rows)) return parsed;
+  // Only timed objects are touched; anything malformed is kept for the structural checks.
+  const timing = (item: unknown) => (item && typeof item === 'object' && !Array.isArray(item) ? offsetsMs((item as WhisperJsonObject).offsets) : null);
+  const startsAfter = (item: unknown) => (timing(item)?.from ?? -1) >= endMs;
+  const ended = (item: unknown): unknown => {
+    const time = timing(item);
+    if (!time || time.to <= endMs) return item;
+    return { ...(item as WhisperJsonObject), offsets: { ...((item as WhisperJsonObject).offsets as object), to: endMs } };
+  };
+  const transcription = rows.filter((row) => !startsAfter(row)).map((row) => {
+    const kept = ended(row);
+    const tokens = kept && typeof kept === 'object' && !Array.isArray(kept) ? (kept as WhisperJsonObject).tokens : undefined;
+    return Array.isArray(tokens) ? { ...(kept as WhisperJsonObject), tokens: tokens.filter((token) => !startsAfter(token)).map(ended) } : kept;
+  });
+  return { ...(parsed as WhisperJsonObject), transcription };
+}
+
+/**
+ * whisper.cpp may time the first words after a long pause to end before they start: the start is
+ * the segment's, the end a word time drifted into the pause before it (2026-11-23: five words after
+ * a 2.6 s pause in a talk to camera, each starting at 38.4 s and ending between 37.0 and 38.2 s).
+ * The whole transcript was then refused, so a talk with one long pause got no subtitles and no
+ * timed cuts. Each run of such words takes the time between the words around it, split at the
+ * run's own end times when they fall in order inside it, else evenly; word placement then moves
+ * them into the measured speech. A run with no time between its neighbours is left as it came,
+ * and the usual checks refuse it. Pure; returns how many words it retimed.
+ */
+export function retimeInvertedWords(parsed: unknown): { parsed: unknown; retimed: number } {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { parsed, retimed: 0 };
+  const rows = (parsed as WhisperJsonObject).transcription;
+  if (!Array.isArray(rows)) return { parsed, retimed: 0 };
+  type Ref = { row: number; token: number; from: number; to: number };
+  const refs: Ref[] = [];
+  rows.forEach((row, rowIndex) => {
+    const tokens = row && typeof row === 'object' && !Array.isArray(row) ? (row as WhisperJsonObject).tokens : undefined;
+    if (!Array.isArray(tokens)) return;
+    tokens.forEach((token, tokenIndex) => {
+      const time = isTextToken(token) ? offsetsMs((token as WhisperJsonObject).offsets) : null;
+      if (time) refs.push({ row: rowIndex, token: tokenIndex, ...time });
+    });
+  });
+  const inverted = (ref: Ref) => ref.to < ref.from;
+  let transcription: unknown[] | undefined;
+  let retimed = 0;
+  for (let start = 0; start < refs.length; start += 1) {
+    if (!inverted(refs[start])) continue;
+    let end = start;
+    while (end + 1 < refs.length && inverted(refs[end + 1])) end += 1;
+    const run = refs.slice(start, end + 1);
+    const low = start > 0 ? refs[start - 1].to : 0;
+    const lastRow = offsetsMs((rows[run[run.length - 1].row] as WhisperJsonObject).offsets);
+    const high = end + 1 < refs.length ? refs[end + 1].from : lastRow?.to ?? low;
+    start = end;
+    if (!(high - low >= run.length)) continue;
+    const ownEnds = run.every((ref, index) => ref.to > (index ? run[index - 1].to : low) && ref.to <= high);
+    run.forEach((ref, index) => {
+      const from = index === 0 ? low : ownEnds ? run[index - 1].to : Math.round(low + (high - low) * index / run.length);
+      const to = ownEnds ? ref.to : Math.round(low + (high - low) * (index + 1) / run.length);
+      transcription ??= [...rows];
+      if (transcription[ref.row] === rows[ref.row]) {
+        const row = rows[ref.row] as WhisperJsonObject;
+        transcription[ref.row] = { ...row, tokens: [...(row.tokens as unknown[])] };
+      }
+      const tokens = (transcription[ref.row] as WhisperJsonObject).tokens as WhisperJsonObject[];
+      const token = tokens[ref.token];
+      tokens[ref.token] = { ...token, offsets: { ...(token.offsets as object), from, to } };
+      retimed += 1;
+    });
+  }
+  return transcription ? { parsed: { ...(parsed as WhisperJsonObject), transcription }, retimed } : { parsed, retimed };
+}
+
+/** Share of the recognized segments that may lie in measured silence and be dropped (one is
+ *  always allowed while another remains); above it the recording is quieter than the pause
+ *  threshold, and nothing is dropped. */
+const SILENT_SEGMENTS_MAX_SHARE = 0.25;
+
+/**
+ * A segment recognized wholly inside a measured silence is dropped: the recognizer fills silence
+ * with words never said (2026-11-23: "(字幕:J Chong)" in the last 2.5 s of silence of a talk), and
+ * they would be subtitled. When more than a quarter of the segments lie in silence (beyond one), or
+ * all of them, the recording is quieter than the pause threshold and nothing is dropped. Pure;
+ * returns the dropped text.
+ */
+export function dropSegmentsHeardInSilence(parsed: unknown, silences: readonly PhraseSpan[]): { parsed: unknown; dropped: string[] } {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !silences.length) return { parsed, dropped: [] };
+  const rows = (parsed as WhisperJsonObject).transcription;
+  if (!Array.isArray(rows)) return { parsed, dropped: [] };
+  const spoken = rows.filter((row) => row && typeof row === 'object' && !Array.isArray(row) && String((row as WhisperJsonObject).text ?? '').trim());
+  // Index the farthest end at each starting time. This also handles overlapping
+  // or out-of-order intervals without combining adjacent, distinct silences.
+  const quiet = silences.map(({ startSec, endSec }) => ({ from: startSec * 1000, to: endSec * 1000 }))
+    .filter(span => !Number.isNaN(span.from) && !Number.isNaN(span.to))
+    .sort((a, b) => a.from - b.from);
+  for (let i = 1; i < quiet.length; i += 1) quiet[i].to = Math.max(quiet[i].to, quiet[i - 1].to);
+  const silent = new Set(spoken.filter((row) => {
+    const time = offsetsMs((row as WhisperJsonObject).offsets);
+    if (!time || time.to <= time.from) return false;
+    let low = 0;
+    let high = quiet.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (quiet[mid].from <= time.from + 20) low = mid + 1;
+      else high = mid;
+    }
+    return low > 0 && time.to - 20 <= quiet[low - 1].to;
+  }));
+  if (!silent.size || silent.size >= spoken.length || silent.size > Math.max(1, spoken.length * SILENT_SEGMENTS_MAX_SHARE)) {
+    return { parsed, dropped: [] };
+  }
+  return {
+    parsed: { ...(parsed as WhisperJsonObject), transcription: rows.filter((row) => !silent.has(row)) },
+    dropped: [...silent].map((row) => String((row as WhisperJsonObject).text).trim()),
+  };
 }
 
 /** Validate emitted intervals after legitimate punctuation/subword merging.
@@ -2572,6 +2865,45 @@ async function invalidTranscriptTiming(p: SpeechTranscribeOptions, transcription
   return { ok: false, op: 'speech.transcribe', errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT', timing_valid: false,
     message: 'The transcript text was preserved, but its timestamps are invalid. Subtitles and timing-based edits are unavailable.',
     text, ...(textPath ? { text_path: textPath } : {}) };
+}
+
+/** Validate each recognition before choosing which result can replace the saved transcript. */
+function prepareSpeechReading(parsed: unknown, duration: number, measuredSilences: PhraseSpan[],
+  timestampDetail: 'word' | 'segment', looseTiming?: boolean) {
+  // The recognizer times the last words of a recording up to its 30 s window past the end;
+  // nothing is said after the audio ends, so those times end with it.
+  parsed = endedWithRecording(parsed, duration * 1000) ?? parsed;
+  // Lines heard in silence go before any check, so they are neither subtitled nor refused for.
+  const heard = dropSegmentsHeardInSilence(parsed, measuredSilences);
+  const retimed = retimeInvertedWords(heard.parsed);
+  parsed = retimed.parsed;
+  const transcription = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as WhisperJsonObject).transcription : undefined;
+  if (!Array.isArray(transcription) || transcription.some(segment => !segment || typeof segment !== 'object'
+    || Array.isArray(segment) || typeof (segment as WhisperJsonObject).text !== 'string')) {
+    return { kind: 'malformed' as const };
+  }
+  const malformedTime = transcription.some(segment => {
+    const item = segment as WhisperJsonObject, timing = offsetsMs(item.offsets);
+    if (!timing || timing.from < 0 || timing.to < timing.from || (String(item.text).trim() && timing.to === timing.from)) return true;
+    return Array.isArray(item.tokens) && item.tokens.some(token => {
+      if (!token || typeof token !== 'object' || Array.isArray(token)) return false;
+      const t = token as WhisperJsonObject;
+      if (typeof t.text !== 'string' || !t.text.trim() || isWhisperSpecialToken(t.text)) return false;
+      const time = offsetsMs(t.offsets);
+      return !time || time.from < 0 || time.to < time.from || time.to > duration * 1000 + 1;
+    });
+  });
+  const wordView = normalizeWhisperTranscript(parsed, 'word');
+  // A word left as a point, with no room between its neighbours, has no time to show it at.
+  if (looseTiming && Array.isArray(wordView.words)) {
+    wordView.words = (wordView.words as Array<{ startSec: number; endSec: number }>).filter((word) => word.endSec > word.startSec);
+  }
+  const normalized = timestampDetail === 'word' ? wordView : normalizeWhisperTranscript(parsed, 'segment');
+  if (malformedTime || !validTranscriptIntervals(normalized.segments, duration) || !validTranscriptIntervals(wordView.words, duration)) {
+    return { kind: 'timing' as const, transcription: transcription as WhisperJsonObject[] };
+  }
+  return { kind: 'ready' as const, normalized, wordView, droppedSegments: heard.dropped.length, retimedWords: retimed.retimed };
 }
 
 export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<VideoStudioResult> {
@@ -2657,11 +2989,16 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
     // Always ask for word times: they cost no measurable time (2.1 s either way on a
     // 128 s podcast) and the phrase view needs them; the transcript keeps the detail
     // the caller asked for.
+    const language = whisperLanguageArg(p.language);
+    let prompt = language === 'zh' ? chineseTranscriptPrompt(getCurrentLang()) : undefined;
     const args = buildSpeechTranscribeArgs(backend.model, wav, outBase, {
       language: p.language,
       timestamps: 'word',
+      ...(prompt ? { prompt } : {}),
     });
-    const tr = await runProcess(backend.cli, args, { signal: p.signal, timeoutMs: 45 * 60 * 1000 });
+    const recognitionTimeoutMs = 45 * 60 * 1000;
+    const recognitionDeadline = performance.now() + recognitionTimeoutMs;
+    const tr = await runProcess(backend.cli, args, { signal: p.signal, timeoutMs: recognitionTimeoutMs });
     // whisper.cpp reports a language it cannot use on stderr and may still
     // exit 0 without output; name the caller's value instead of "no output".
     if (/\bunknown language\b/i.test(tr.stderr)) {
@@ -2693,40 +3030,73 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
     let parsed: unknown;
     try { parsed = JSON.parse(raw); }
     catch { /* Invalid backend output is rejected before replacing a transcript. */ }
-    const transcription = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as WhisperJsonObject).transcription : undefined;
-    if (!Array.isArray(transcription) || transcription.some(segment => !segment || typeof segment !== 'object'
-      || Array.isArray(segment) || typeof (segment as WhisperJsonObject).text !== 'string')) {
+    const measuredSilences = parseSilenceLog(ex.stderr, duration!);
+    const prepare = (value: unknown) => prepareSpeechReading(value, duration!, measuredSilences, timestampDetail, p.looseTiming);
+    let reading = language === 'zh' ? prepare(parsed) : undefined;
+    const heardLanguage = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? ((parsed as WhisperJsonObject).result as WhisperJsonObject | undefined)?.language : undefined;
+    const detectedChinese = language === 'auto' && heardLanguage === 'zh';
+    const invalidChineseTiming = reading?.kind === 'timing' && reading.transcription.some(row => String(row.text).trim());
+    const retryTimeoutMs = detectedChinese ? recognitionTimeoutMs : Math.floor(recognitionDeadline - performance.now());
+    // Retry with the opening sentence for auto-detected Chinese, or remove it when
+    // explicitly requested Chinese yielded text with invalid timing.
+    if ((detectedChinese || invalidChineseTiming) && retryTimeoutMs > 0) {
+      p.signal?.throwIfAborted();
+      const retryPrompt = detectedChinese ? chineseTranscriptPrompt(getCurrentLang()) : undefined;
+      const secondBase = path.join(tmp, detectedChinese ? 'transcript-prompted' : 'transcript-unprompted');
+      const retryArgs = buildSpeechTranscribeArgs(backend.model, wav, secondBase, { language: 'zh', timestamps: 'word', prompt: retryPrompt });
+      const rerun = await runProcess(backend.cli, retryArgs, { signal: p.signal, timeoutMs: retryTimeoutMs });
+      if (rerun.aborted) p.signal?.throwIfAborted();
+      const rerunRaw = rerun.code === 0 ? await fs.readFile(`${secondBase}.json`, 'utf8').catch(() => '') : '';
+      let reparsed: unknown;
+      try { reparsed = rerunRaw.trim() ? JSON.parse(rerunRaw) : undefined; } catch { reparsed = undefined; }
+      const candidate = prepare(reparsed);
+      if (candidate.kind === 'ready' && candidate.normalized.text) {
+        reading = candidate;
+        prompt = retryPrompt;
+      } else {
+        log.warn('speech.transcribe kept the first reading of a Chinese recording', { code: rerun.code });
+      }
+    }
+    reading ??= prepare(parsed);
+    if (reading.kind === 'malformed') {
       return { ok: false, op: 'speech.transcribe', errorCode: 'E_TRANSCRIBE_INVALID_OUTPUT',
         message: 'The transcription result could not be read. Try transcribing the recording again.' };
     }
-    const malformedTime = transcription.some(segment => {
-      const item = segment as WhisperJsonObject, timing = offsetsMs(item.offsets);
-      if (!timing || timing.from < 0 || timing.to < timing.from || (String(item.text).trim() && timing.to === timing.from)) return true;
-      return Array.isArray(item.tokens) && item.tokens.some(token => {
-        if (!token || typeof token !== 'object' || Array.isArray(token)) return false;
-        const t = token as WhisperJsonObject;
-        if (typeof t.text !== 'string' || !t.text.trim() || isWhisperSpecialToken(t.text)) return false;
-        const time = offsetsMs(t.offsets);
-        return !time || time.from < 0 || time.to < time.from || time.to > duration! * 1000 + 1;
-      });
-    });
-    const wordView = normalizeWhisperTranscript(parsed, 'word');
-    const normalized = timestampDetail === 'word' ? wordView : normalizeWhisperTranscript(parsed, 'segment');
-    if (malformedTime || !validTranscriptIntervals(normalized.segments, duration!) || !validTranscriptIntervals(wordView.words, duration!)) {
-      return await invalidTranscriptTiming(p, transcription as WhisperJsonObject[]);
+    if (reading.kind === 'timing') return await invalidTranscriptTiming(p, reading.transcription);
+    const { normalized, wordView, droppedSegments, retimedWords } = reading;
+    if (droppedSegments || retimedWords) {
+      log.info('speech.transcribe repaired recognizer output', { droppedSegments, retimedWords });
     }
+    // Word times drift across pauses (2026-11-17: a false start read as the end of the sentence
+    // before it and a retake cleanup kept it), so each word is moved into the measured speech it
+    // was spoken in. The words, sentences and text stay as recognized.
+    const placed = await placeWordsBySpanRecognition({
+      backend, wavPath: wav, dir: tmp, durationSec: duration!, signal: p.signal,
+      language: typeof wordView.language === 'string' && wordView.language ? wordView.language : whisperLanguageArg(p.language),
+      ...(prompt ? { prompt } : {}),
+      words: Array.isArray(wordView.words) ? wordView.words as PhraseWord[] : [],
+      silences: measuredSilences,
+    }).catch((err) => {
+      if (p.signal?.aborted) throw err;
+      log.warn('speech.transcribe kept recognized word times', { error: logErrorSummary(err) });
+      return null;
+    });
+    if (placed && validTranscriptIntervals(placed, duration!)) wordView.words = placed;
     if (p.transcriptAbsPath) {
       await writeJson(p.transcriptAbsPath, normalized);
     }
     const words = Array.isArray(wordView.words) ? wordView.words as PhraseWord[] : [];
     const units = words.length ? words : (Array.isArray(normalized.segments) ? normalized.segments as PhraseWord[] : []);
+    const silences = parseSilenceLog(ex.stderr);
+    const phraseOpts = words.length ? {} : { segments: true };
     return {
       ok: true,
       op: 'speech.transcribe',
       // First, so it is what a capped result shows: times to cut on, split at
       // pauses measured in this audio rather than the recognizer's word gaps.
-      phrases: phraseViewForResult(units, parseSilenceLog(ex.stderr), words.length ? {} : { segments: true }),
+      phrases: phraseViewForResult(units, silences, phraseOpts),
+      ...(p.phraseLines ? { phrase_lines: packTranscriptPhrases(units, silences, phraseOpts) } : {}),
       summary: normalized,
       transcript_path: p.transcriptAbsPath || '',
       backend: 'orkas-native:whisper.cpp',

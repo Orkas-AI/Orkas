@@ -5,6 +5,7 @@ import {
   assessVoiceoverCoverage,
   mapWithConcurrencyLimit,
   parseFfmpegProgressTimeSec,
+  trimShortfallWarning,
   validateTrimRequest,
 } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
 
@@ -273,5 +274,37 @@ describe('validateTrimRequest', () => {
 
   it('allows an overlong duration when the start can still produce a usable clip to EOF', () => {
     expect(validateTrimRequest(10, 8, 10)).toBeNull();
+  });
+});
+
+describe('trimShortfallWarning', () => {
+  const frame = 1 / 30;
+  const warn = (over: Partial<Parameters<typeof trimShortfallWarning>[0]>) => trimShortfallWarning({
+    inputSec: 4, startSec: 1.6, requestedSec: 2.4, cutSec: 2.4, toleranceSec: frame / 2, ...over,
+  });
+
+  it('stays quiet within half a frame of the request and speaks just past it', () => {
+    expect(warn({ cutSec: 2.4 - frame / 3 })).toBeNull();
+    expect(warn({ cutSec: 2.4 - frame })).toContain('not the 2.40s asked for');
+  });
+
+  it('points at --start when a later start is what cut the piece short', () => {
+    const text = warn({ startSec: 3.005, cutSec: 0.967 });
+    expect(text).toContain('from 3.005s this cut is 0.97s');
+    expect(text).toContain('start at or before 1.60s');
+  });
+
+  it('does not blame --start when the request fit and the picture still stopped', () => {
+    const text = warn({ startSec: 1, cutSec: 1.5 });
+    expect(text).toContain('stops or skips');
+    expect(text).not.toContain('start at or before');
+  });
+
+  it('says the input is too short when no start would give the length', () => {
+    expect(warn({ startSec: 0, requestedSec: 5, cutSec: 4 })).toContain('The input is only 4.00s long');
+  });
+
+  it('still reports the shortfall when the input length is unknown', () => {
+    expect(warn({ inputSec: 0, cutSec: 1 })).toContain("picture stops early: this cut is 1.00s");
   });
 });

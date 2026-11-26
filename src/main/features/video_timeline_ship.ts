@@ -15,6 +15,7 @@ import { createLogger } from '../logger';
 import { writeBytesAtomic } from '../storage';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
 import { versionedChatMediaLocalUrl } from '../util/chat-media-url';
+import { narrationPlaybackIssues, originalClipAudioWarnings, type KeptClipAudio } from './video_narration_playback';
 import { fileEditLock } from '../util/locks';
 import { logErrorSummary } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
@@ -32,9 +33,11 @@ import {
   probeDeliveredVideo,
   type DeliveryNarrationLine,
 } from './video_studio_delivery';
+import { spreadIndexes } from './video_phrases';
+import { compareWithReference } from './video_reference_compare';
 import { writeFrameContactSheet } from './video_studio_qa';
-import { deriveVideoTimeline, sheetLayoutFor, spokenWords, timelineAudioTracks, validateVideoTimeline, type VideoAssetRecord } from './video_timeline';
-import { loadVideoProject, markTimelineDelivered, renderedBeforeLastChange, renderedVisualReview, parseVisualReview, visualReview, type VideoVisualReview } from './video_timeline_render';
+import { deriveVideoTimeline, sheetLayoutFor, spokenWords, timelineAudioTracks, validateVideoTimeline, VideoAssetLedgerSchema, type VideoAssetRecord } from './video_timeline';
+import { loadVideoProject, markTimelineDelivered, renderedBeforeLastChange, renderedVisualReview, parseVisualReview, verifyRenderedAudioSources, visualReview, type VideoVisualReview } from './video_timeline_render';
 
 const log = createLogger('video-timeline-ship');
 
@@ -45,11 +48,28 @@ const VERSIONS_DIR = 'versions';
 /** Streams this far apart mean one of them stops before the other does. */
 const AV_DURATION_TOLERANCE_SEC = 0.5;
 const STATIC_SHARE_HINT = 0.4;
+/** A video stops when the still pictures in its scenes without footage stand still for more
+ *  than this share of it. 2026-11-15–21: three of eleven users who got a video called it a set
+ *  of pictures and cards, one at 82% still. 2026-11-22: counting only videos whose product.json
+ *  named something missed a site promo that held its screenshots 59% of the time, and stopped
+ *  explainers that named their topic there (13 of 45 kept benchmark explainers, their diagrams
+ *  drawn in the page and held while the voice explains, never judged too still). Over 115 kept
+ *  deliveries, counting pictures alone stops the same promotions and adverts and no explainer. */
+const HELD_STILLS_BLOCK = 0.5;
+/** Scenes named in the message, most still first; the rest are counted. */
+const HELD_STILLS_NAMED = 4;
 const SHOTS_PER_SECOND_HINT = 1.5;
 const HINT_DECODE_TIMEOUT_MS = 5 * 60 * 1000;
 const HINT_SCENE_CHANGE_THRESHOLD = 0.35;
 const STATIC_MIN_SEC = 1;
 const DELIVERED_SHEET_FRAMES = 12;
+/** Lines of a voiced delivery shown, each with its frame, before its last frame. A 30 s tutorial
+ *  narrated in one take had 13 clauses; eleven left out the click it named (2026-11-19). */
+const HEARD_SHEET_LINES = 16;
+/** A line's frame is taken this long before it ends, so a cut right after it does not show instead. */
+const LINE_END_LOOK_SEC = 0.1;
+/** The last frame gets a cell of its own unless the last line's frame is this close to it. */
+const LAST_FRAME_SEPARATE_SEC = 0.5;
 const DELIVERED_FRAME_TIMEOUT_MS = 30 * 1000;
 const DELIVERED_SCENE_FRAME_WIDTH = 480;
 const DELIVERED_SCENE_FRAMES_MAX = 64;
@@ -85,6 +105,22 @@ export type VideoVersion = {
   warnings: string[];
   /** Blocking findings the user chose to deliver anyway, and why. */
   override?: { codes: string[]; reason: string };
+  /** The video carries a voice: it plays narration, narration was made for it, or its last
+   *  version did. A music cut is not listened to, as a recognizer reads words into music. */
+  voiced?: true;
+};
+
+export type HeldStillsFinding = {
+  percent: number;
+  scenes: { id: string; seconds: number }[];
+};
+
+class CanvasReviewExpired extends Error {}
+class RenderedAudioChanged extends Error {}
+
+const RENDERED_AUDIO_CHANGED: ShipIssue = {
+  code: 'DELIVERY_TIMELINE_CHANGED', severity: 'error',
+  message: 'The audio sources of this render could not be verified against the current timeline. Run video.render again, then deliver.',
 };
 
 export type VideoShipOptions = {
@@ -94,10 +130,16 @@ export type VideoShipOptions = {
   /** The timeline this file was rendered from, when there is one. */
   videoDirAbs?: string;
   /** What a video made with ffmpeg alone is supposed to be. */
-  expect?: { durationSec?: number; aspect?: string; hasAudio?: boolean; captions?: boolean };
+  expect?: { durationSec?: number; aspect?: string; hasAudio?: boolean };
   override?: { codes: string[]; reason: string };
+  /** Waits for the canvas' decision after all delivery checks. The returned guard
+   * still owns the same canvas update when the version is recorded. */
+  reviewHeldStills?: (finding: HeldStillsFinding) => Promise<(() => boolean) | null>;
   /** The video is cut to its music's beat, so each cut is checked against that beat. */
   cutToBeat?: boolean;
+  /** The reference this video was made from: delivery sets the two side by side and
+   *  names the quarters that move much less than the reference does. */
+  referenceAbs?: string;
   /** Runs on the copy the version keeps, never on the file it was made from, which can be
    *  an old video or an attachment: the account's output policy can change its bytes,
    *  and the version records what the user receives. */
@@ -105,18 +147,83 @@ export type VideoShipOptions = {
   signal?: AbortSignal;
 };
 
-export function parseVisualHints(stderr: string, durationSec: number): { staticShare: number; shots: number } {
+export function parseVisualHints(stderr: string, durationSec: number): {
+  staticShare: number; shots: number; frozen: Array<{ startSec: number; endSec: number }>;
+} {
   const starts = [...stderr.matchAll(/freeze_start:\s*(-?[\d.]+)/g)].map((match) => Number(match[1]));
   const ends = [...stderr.matchAll(/freeze_end:\s*(-?[\d.]+)/g)].map((match) => Number(match[1]));
   let staticSec = 0;
+  const frozen: Array<{ startSec: number; endSec: number }> = [];
   for (const [index, start] of starts.entries()) {
-    staticSec += Math.max(0, (ends[index] ?? durationSec) - start);
+    const end = ends[index] ?? durationSec;
+    staticSec += Math.max(0, end - start);
+    if (end > start) frozen.push({ startSec: Math.max(0, start), endSec: end });
   }
   const shots = 1 + [...stderr.matchAll(/Parsed_showinfo.*\bn:\s*\d+/g)].length;
-  return { staticShare: durationSec > 0 ? Math.min(1, staticSec / durationSec) : 0, shots };
+  return { staticShare: durationSec > 0 ? Math.min(1, staticSec / durationSec) : 0, shots, frozen };
 }
 
-async function visualHintIssues(ffmpeg: string, videoAbs: string, durationSec: number | null, signal?: AbortSignal): Promise<ShipIssue[]> {
+type Span = { startSec: number; endSec: number };
+
+/** Seconds of `from`..`to` that none of `spans` covers. */
+function uncovered(from: number, to: number, spans: readonly Span[]): number {
+  let left = to - from;
+  let reach = from;
+  for (const span of [...spans].sort((a, b) => a.startSec - b.startSec)) {
+    const start = Math.max(span.startSec, reach);
+    const end = Math.min(span.endSec, to);
+    if (end > start) { left -= end - start; reach = end; }
+  }
+  return Math.max(0, left);
+}
+
+/** Seconds each scene that places a still picture stands still, most first. The time footage
+ *  plays is left out: a recording may hold still, as a screen does between steps. Only that
+ *  time: on 2026-11-23 a promotion put one stock clip and four screenshots in a single scene, so
+ *  a scene-wide exemption delivered it 69% still. A scene drawn in the page alone is left out
+ *  too: an explainer's diagram holds while the voice explains it. */
+export function heldStillScenes(
+  frozen: ReadonlyArray<Span>,
+  scenes: ReadonlyArray<{ id: string; startSec: number; endSec: number; footage: readonly Span[]; pictures: boolean }>,
+): Array<{ id: string; seconds: number }> {
+  return scenes
+    .filter((scene) => scene.pictures)
+    .map((scene) => ({
+      id: scene.id,
+      seconds: frozen.reduce((sum, span) => {
+        const from = Math.max(span.startSec, scene.startSec);
+        const to = Math.min(span.endSec, scene.endSec);
+        return to > from ? sum + uncovered(from, to, scene.footage) : sum;
+      }, 0),
+    }))
+    .filter((scene) => scene.seconds > 0.001)
+    .sort((a, b) => b.seconds - a.seconds);
+}
+
+function heldStillsWhere(scenes: ReadonlyArray<{ id: string; seconds: number }>): string {
+  const named = scenes.slice(0, HELD_STILLS_NAMED).map((scene) => `"${scene.id}" (${scene.seconds.toFixed(1)} s)`);
+  const more = scenes.length - named.length;
+  return `${scenes.length === 1 ? 'scene' : 'scenes'} ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
+}
+
+/** What a video built from held stills should do next. */
+export function heldStillsMessage(share: number, scenes: ReadonlyArray<{ id: string; seconds: number }>): string {
+  return `${Math.round(share * 100)}% of this video is a still frame held for a second or more, so it plays as a slideshow. It stands still in ${heldStillsWhere(scenes)}. Make those scenes move, then render and deliver again: where the shot need not be the user's own, such as a place or people using this kind of thing, cut to suitable available footage; where it is the user's own product or photo, move across it with a slow push in, pan or scroll; on a screen of a site or app, show the step the line names done on it with ./assets/vendor/screen-demo.js (timeline.md).`;
+}
+
+/** Said when a video stopped once for held stills comes back still held: it is delivered, so
+ *  changes cannot go round and round. */
+export function heldStillsDeliveredMessage(share: number, scenes: ReadonlyArray<{ id: string; seconds: number }>): string {
+  return `${Math.round(share * 100)}% of this video still stands still after one round of changes, in ${heldStillsWhere(scenes)}. It is delivered as it is: say in your reply which scenes still hold still, so the user can ask for more movement.`;
+}
+
+async function visualHintIssues(
+  ffmpeg: string, videoAbs: string, durationSec: number | null, signal?: AbortSignal,
+  timeline?: Pick<TimelineFacts, 'sceneSpans'> | null,
+  /** This video was stopped for held stills since its last delivery, on other bytes. */
+  stoppedBefore = false,
+  onHeldStills?: (finding: HeldStillsFinding) => void,
+): Promise<ShipIssue[]> {
   if (!durationSec || durationSec <= 0) return [];
   const run = await runVideoProcessForTest(ffmpeg, [
     '-hide_banner', '-nostats', '-i', videoAbs,
@@ -128,9 +235,19 @@ async function visualHintIssues(ffmpeg: string, videoAbs: string, durationSec: n
     log.warn('visual hint pass failed', { code: run.code });
     return [];
   }
-  const { staticShare, shots } = parseVisualHints(run.stderr, durationSec);
+  const { staticShare, shots, frozen } = parseVisualHints(run.stderr, durationSec);
   const issues: ShipIssue[] = [];
-  if (staticShare > STATIC_SHARE_HINT) {
+  const held = timeline ? heldStillScenes(frozen, timeline.sceneSpans) : [];
+  const heldShare = held.reduce((sum, scene) => sum + scene.seconds, 0) / durationSec;
+  if (heldShare > HELD_STILLS_BLOCK) {
+    onHeldStills?.({
+      percent: Math.min(100, Math.round(heldShare * 100)),
+      scenes: held.slice(0, HELD_STILLS_NAMED),
+    });
+    issues.push(stoppedBefore
+      ? { code: 'DELIVERY_HELD_STILLS', severity: 'warning', message: heldStillsDeliveredMessage(heldShare, held) }
+      : { code: 'DELIVERY_HELD_STILLS', severity: 'error', message: heldStillsMessage(heldShare, held) });
+  } else if (staticShare > STATIC_SHARE_HINT) {
     issues.push({
       code: 'DELIVERY_MOSTLY_STATIC',
       severity: 'warning',
@@ -156,14 +273,18 @@ type TimelineFacts = {
   durationSec: number;
   aspect: string;
   hasAudio: boolean;
+  keptClipAudio: KeptClipAudio[];
   lines: DeliveryNarrationLine[];
   voiced: VoicedWords[];
   /** A scene speaks, or a narration track plays. */
   playsNarration: boolean;
   /** Every file the tracks play, whatever they are labelled. */
   trackAudio: Set<string>;
+  assets: readonly VideoAssetRecord[];
   /** When each scene is fully built: its last frame. */
   sceneEnds: Array<{ id: string; atSec: number }>;
+  /** Where each scene plays, when within it footage shows, and whether it places a still picture. */
+  sceneSpans: Array<{ id: string; startSec: number; endSec: number; footage: Span[]; pictures: boolean }>;
 };
 
 async function timelineExpectations(input: {
@@ -219,20 +340,39 @@ async function timelineExpectations(input: {
     if (audioSha256) voiced.push({ sceneId: scene.id, text: scene.narration.text, audioSha256, record });
   }
   const tracks = manifest.tracks ?? [];
+  const audioTracks = timelineAudioTracks({ manifest, timeline, resolve: (id) => id });
+  const keptClipAudio = audioTracks.flatMap((track) => {
+    const record = byId.get(track.absPath);
+    if (track.inSec === undefined || track.durSec === undefined || track.volume <= 0 || record?.kind !== 'video') return [];
+    return [{ sourceAbs: path.resolve(input.productionDirAbs, record.path), sourceStartSec: track.inSec,
+      startSec: track.startSec, durationSec: track.durSec }];
+  });
   return {
     timeline: {
       videoId: manifest.id,
       durationSec: timeline.durationSec,
       aspect: `${manifest.canvas.width}:${manifest.canvas.height}`,
-      hasAudio: timelineAudioTracks({ manifest, timeline, resolve: (id) => id }).some((track) => track.volume > 0),
+      hasAudio: audioTracks.some((track) => track.volume > 0),
+      keptClipAudio,
       lines,
       voiced,
       playsNarration: manifest.scenes.some((scene) => !!scene.narration?.asset) || tracks.some((track) => track.kind === 'narration'),
+      assets: project.assets,
       trackAudio: new Set(tracks.flatMap((track) => {
         const record = byId.get(track.asset);
         return record ? [path.resolve(input.productionDirAbs, record.path)] : [];
       })),
       sceneEnds: timeline.scenes.map((scene) => ({ id: scene.id, atSec: (scene.startFrame + scene.frameCount - 1) / timeline.fps })),
+      sceneSpans: timeline.scenes.map((scene) => ({
+        id: scene.id,
+        startSec: scene.startFrame / timeline.fps,
+        endSec: (scene.startFrame + scene.frameCount) / timeline.fps,
+        footage: scene.clips.filter((clip) => byId.get(clip.assetId)?.kind === 'video').map((clip) => ({
+          startSec: (scene.startFrame + clip.startFrame) / timeline.fps,
+          endSec: (scene.startFrame + clip.startFrame + clip.frameCount) / timeline.fps,
+        })),
+        pictures: (manifest.scenes[scene.index].clips ?? []).some((clip) => byId.get(clip.asset)?.kind === 'image'),
+      })),
     },
     issues,
   };
@@ -248,6 +388,9 @@ type VersionFile = {
   delivered_narration: Record<string, string[]>;
   /** Narration generated here since the last delivery, newest last. Written by the host. */
   voices_since_delivery: MadeVoice[];
+  /** Videos stopped for held stills since their last delivery, with the sha256 of the file
+   *  stopped. Another file of the same video is then delivered with the finding as a warning. */
+  held_stills_stopped: Record<string, string>;
 };
 
 /** Unreadable is not empty: starting a new list would lose every earlier version. */
@@ -256,12 +399,12 @@ async function readVersionFile(file: string): Promise<VersionFile> {
   try {
     raw = await fs.readFile(file, 'utf8');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { versions: [], delivered_narration: {}, voices_since_delivery: [] };
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { versions: [], delivered_narration: {}, voices_since_delivery: [], held_stills_stopped: {} };
     throw err;
   }
-  let stored: { versions?: unknown; delivered_narration?: unknown; voices_since_delivery?: unknown } | null;
+  let stored: { versions?: unknown; delivered_narration?: unknown; voices_since_delivery?: unknown; held_stills_stopped?: unknown } | null;
   try {
-    stored = JSON.parse(raw) as { versions?: unknown; delivered_narration?: unknown; voices_since_delivery?: unknown } | null;
+    stored = JSON.parse(raw) as { versions?: unknown; delivered_narration?: unknown; voices_since_delivery?: unknown; held_stills_stopped?: unknown } | null;
   } catch {
     stored = null;
   }
@@ -272,7 +415,15 @@ async function readVersionFile(file: string): Promise<VersionFile> {
     versions: stored.versions as VideoVersion[],
     delivered_narration: deliveredWords(stored.delivered_narration),
     voices_since_delivery: madeVoices(stored.voices_since_delivery),
+    held_stills_stopped: stoppedFiles(stored.held_stills_stopped),
   };
+}
+
+/** A malformed entry only means the video can be stopped for held stills once more. */
+function stoppedFiles(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([videoId, sha256]) =>
+    videoId.trim() && typeof sha256 === 'string' && /^[0-9a-f]{64}$/.test(sha256)));
 }
 
 /** A malformed entry, or one whose path leaves the production, is not one the host wrote. */
@@ -314,13 +465,26 @@ function withDeliveredWords(stored: Record<string, string[]>, voiced: readonly V
 }
 
 async function writeVersionFile(file: string, stored: VersionFile): Promise<void> {
-  const { versions, delivered_narration, voices_since_delivery } = stored;
+  const { versions, delivered_narration, voices_since_delivery, held_stills_stopped } = stored;
   const body = {
     versions,
     ...(Object.keys(delivered_narration).length ? { delivered_narration } : {}),
     ...(voices_since_delivery.length ? { voices_since_delivery } : {}),
+    ...(Object.keys(held_stills_stopped).length ? { held_stills_stopped } : {}),
   };
   await writeBytesAtomic(file, Buffer.from(`${JSON.stringify(body, null, 2)}\n`));
+}
+
+/** Remember the file a video was stopped for held stills on. Unrecorded, the next file would be
+ *  stopped again, so a list that cannot be read or written is left alone and logged. */
+async function noteHeldStillsStop(productionDirAbs: string, videoId: string, sha256: string): Promise<void> {
+  const file = path.join(productionDirAbs, 'versions.json');
+  if (!isPathAllowed(file, [productionDirAbs])) return;
+  await fileEditLock(file).runExclusive(async () => {
+    const stored = await readVersionFile(file);
+    if (stored.held_stills_stopped[videoId]) return;
+    await writeVersionFile(file, { ...stored, held_stills_stopped: { ...stored.held_stills_stopped, [videoId]: sha256 } });
+  }).catch((err) => log.warn('held stills stop not recorded', { error: logErrorSummary(err, { closed: true }) }));
 }
 
 /** The nearest folder at or above the file, within the workspace, that holds a production. */
@@ -403,10 +567,18 @@ async function unplayedNarration(productionDirAbs: string, timeline: TimelineFac
   if (!waiting.length) return [];
   const named = waiting.slice(0, VOICES_NAMED).map((voice) => (voice.seconds ? `${voice.path} (${voice.seconds.toFixed(1)} s)` : voice.path)).join(', ');
   const more = waiting.length > VOICES_NAMED ? ` and ${waiting.length - VOICES_NAMED} more` : '';
+  const take = waiting.length === 1 ? waiting[0] : null;
+  const asset = take?.seconds !== undefined && take.seconds <= timeline.durationSec
+    ? timeline.assets.find((row) => row.kind === 'audio'
+      && path.resolve(productionDirAbs, row.path) === path.resolve(productionDirAbs, take.path))
+    : undefined;
+  const repair = asset
+    ? `Put it in the timeline as scene narration. If this take covers several scenes from the start, add ${JSON.stringify({ kind: 'narration', asset: asset.id, volume: 1 })} to manifest.json tracks instead. Render and ship the new file with video_id ${JSON.stringify(timeline.videoId)}.`
+    : `Put ${waiting.length === 1 ? 'it' : 'them'} in the video, as scene narration or as a narration track when one file covers several scenes, then render and ship.`;
   return [{
     code: 'DELIVERY_NARRATION_MISSING',
     severity: 'error',
-    message: `This video plays no narration, but narration was made for it: ${named}${more}. Put ${waiting.length === 1 ? 'it' : 'them'} in the video, as scene narration or as a narration track when one file covers several scenes, then render and ship. If the user asked for no narration, ship with accept_findings and say why.`,
+    message: `This video plays no narration, but narration was made for it: ${named}${more}. ${repair} If the user asked for no narration, ship with accept_findings and say why.`,
   }];
 }
 
@@ -423,6 +595,8 @@ async function recordVersion(input: {
   voiced?: readonly VoicedWords[];
   /** A delivery: narration made before it is no longer waiting for one. */
   delivers?: boolean;
+  checkLatest?: (latest: VideoVersion | undefined) => Promise<void>;
+  inspectRepeat?: (keptPath: string) => Promise<void>;
   keep: (id: string) => Promise<KeptFile>;
   build: (id: string, kept: KeptFile) => VideoVersion;
 }): Promise<VideoVersion> {
@@ -433,8 +607,12 @@ async function recordVersion(input: {
     const { versions } = stored;
     const words = withDeliveredWords(stored.delivered_narration, input.voiced ?? []);
     const voices = input.delivers ? [] : stored.voices_since_delivery;
+    // A delivery ends the round of changes the held-stills stop began.
+    const { [input.videoId]: stoppedHere, ...stoppedElsewhere } = stored.held_stills_stopped;
+    const stopped = input.delivers ? stoppedElsewhere : stored.held_stills_stopped;
     const same = (version: VideoVersion) => version.sha256 === input.sha256 || version.source_sha256 === input.sha256;
     const ofVideo = versions.filter((version) => version.video_id === input.videoId);
+    if (input.checkLatest) await input.checkLatest(ofVideo.at(-1));
     // A repeat of the latest delivery is that delivery. Older bytes coming back are not:
     // moving a scene and moving it back has to end on the version showing that order.
     const existing = input.anyVersion ? ofVideo.find(same) : ofVideo.filter((_, index) => index === ofVideo.length - 1).find(same);
@@ -445,16 +623,17 @@ async function recordVersion(input: {
           || await sha256OfFileStream(keptPath).catch(() => null) !== existing.sha256) {
         throw new Error('The previously delivered file is missing or changed. Restore that file or render a new version before delivering again.');
       }
+      await input.inspectRepeat?.(keptPath);
       // Unchanged bytes can still carry new words, as with captions off, and are still delivered.
-      if (words || voices.length !== stored.voices_since_delivery.length) {
-        await writeVersionFile(file, { versions, delivered_narration: words ?? stored.delivered_narration, voices_since_delivery: voices });
+      if (words || voices.length !== stored.voices_since_delivery.length || (input.delivers && stoppedHere)) {
+        await writeVersionFile(file, { versions, delivered_narration: words ?? stored.delivered_narration, voices_since_delivery: voices, held_stills_stopped: stopped });
       }
       return existing;
     }
     const id = `v${versions.length + 1}`;
     const version = input.build(id, await input.keep(id));
     versions.push(version);
-    await writeVersionFile(file, { versions, delivered_narration: words ?? stored.delivered_narration, voices_since_delivery: voices });
+    await writeVersionFile(file, { versions, delivered_narration: words ?? stored.delivered_narration, voices_since_delivery: voices, held_stills_stopped: stopped });
     return version;
   });
 }
@@ -508,33 +687,97 @@ function portablePath(productionDirAbs: string, fileAbs: string): string {
  * every measurement and went out as finished. Best effort: failing costs the look, not
  * the delivery.
  */
+/** A line of a delivered file's voice, as it was heard. */
+export type HeardLine = { startSec: number; endSec: number; text: string };
+
+/** A frame of a sheet: where to take it, what its cell says, and the words heard there. */
+export type SheetSample = { atSec: number; label: string; heard?: string };
+
+/** Frames of a delivered file to look at. Twelve spread over it, or, when its voice was heard,
+ *  one just before each line ends (up to sixteen lines), then its last frame (2026-11-17: a tutorial ended on the
+ *  export spinner while its last line said the file was saved, and the evenly spaced frames
+ *  showed the spinner beside nothing that claimed otherwise). Pure. */
+export function deliveredFrameSamples(durationSec: number, heard: readonly HeardLine[] = []): SheetSample[] {
+  const lastSec = Math.max(0, Math.round((durationSec - 0.1) * 1000) / 1000);
+  if (!heard.length) {
+    return Array.from({ length: DELIVERED_SHEET_FRAMES }, (_item, index) => {
+      const atSec = lastSec * index / (DELIVERED_SHEET_FRAMES - 1);
+      return { atSec, label: `${atSec.toFixed(1)}s` };
+    });
+  }
+  const samples: SheetSample[] = spreadIndexes(heard.length, HEARD_SHEET_LINES).map((index, order) => {
+    const line = heard[index];
+    const atSec = Math.round(Math.min(lastSec, Math.max(line.startSec, line.endSec - LINE_END_LOOK_SEC)) * 1000) / 1000;
+    return { atSec, label: `#${order + 1} ${atSec.toFixed(1)}s`, heard: line.text };
+  });
+  if (lastSec - samples[samples.length - 1].atSec > LAST_FRAME_SEPARATE_SEC) {
+    samples.push({ atSec: lastSec, label: `#${samples.length + 1} ${lastSec.toFixed(1)}s (last frame)` });
+  }
+  return samples;
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+async function isPngFile(fileAbs: string): Promise<boolean> {
+  const handle = await fs.open(fileAbs, 'r').catch(() => null);
+  if (!handle) return false;
+  try {
+    const head = Buffer.alloc(PNG_SIGNATURE.length);
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    return bytesRead === head.length && head.equals(PNG_SIGNATURE);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+/** One sheet of a video's frames at the given times, or null when none could be taken. */
+export async function writeTimedFrameSheet(input: {
+  videoPathAbs: string;
+  outputDirAbs: string;
+  width: number;
+  height: number;
+  samples: ReadonlyArray<{ atSec: number; label: string }>;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const { ffmpeg } = bundledFfmpegPaths();
+  if (!ffmpeg || !input.samples.length || !input.width || !input.height) return null;
+  const layout = sheetLayoutFor(input.width, input.height);
+  const taken: Array<{ label: string; time_seconds: number; path: string }> = [];
+  for (const [index, sample] of input.samples.entries()) {
+    const framePath = path.join(input.outputDirAbs, `${String(index).padStart(2, '0')}.png`);
+    const run = await runVideoProcessForTest(ffmpeg, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-ss', sample.atSec.toFixed(3), '-i', input.videoPathAbs,
+      '-frames:v', '1', '-vf', `scale=${layout.thumbWidth}:${layout.thumbHeight}`, framePath,
+    ], { timeoutMs: DELIVERED_FRAME_TIMEOUT_MS, ...(input.signal ? { signal: input.signal } : {}) });
+    // A frame is used only when it is an image: a cell left blank would show nothing as if it were the picture.
+    const wrote = run.code === 0 && await isPngFile(framePath);
+    if (wrote) taken.push({ label: sample.label, time_seconds: sample.atSec, path: framePath });
+  }
+  return taken.length
+    ? writeFrameContactSheet(input.outputDirAbs, taken, { labelOnly: true, ...layout })
+    : null;
+}
+
 export async function writeDeliveredFrameSheet(input: {
   videoPathAbs: string;
   outputDirAbs: string;
   durationSec: number;
   width: number;
   height: number;
+  /** The file's voice as heard; frames then follow its lines. */
+  heard?: readonly HeardLine[];
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const { ffmpeg } = bundledFfmpegPaths();
-  if (!ffmpeg || !(input.durationSec > 0) || !input.width || !input.height) return null;
-  const layout = sheetLayoutFor(input.width, input.height);
-  const lastSec = Math.max(0, input.durationSec - 0.1);
-  const samples: Array<{ label: string; time_seconds: number; path: string }> = [];
-  for (let index = 0; index < DELIVERED_SHEET_FRAMES; index += 1) {
-    const timeSec = lastSec * index / (DELIVERED_SHEET_FRAMES - 1);
-    const framePath = path.join(input.outputDirAbs, `${String(index).padStart(2, '0')}.png`);
-    const run = await runVideoProcessForTest(ffmpeg, [
-      '-hide_banner', '-loglevel', 'error', '-y',
-      '-ss', timeSec.toFixed(3), '-i', input.videoPathAbs,
-      '-frames:v', '1', '-vf', `scale=${layout.thumbWidth}:${layout.thumbHeight}`, framePath,
-    ], { timeoutMs: DELIVERED_FRAME_TIMEOUT_MS, ...(input.signal ? { signal: input.signal } : {}) });
-    const wrote = run.code === 0 && await fs.access(framePath).then(() => true, () => false);
-    if (wrote) samples.push({ label: `${timeSec.toFixed(1)}s`, time_seconds: timeSec, path: framePath });
-  }
-  return samples.length
-    ? writeFrameContactSheet(input.outputDirAbs, samples, { labelOnly: true, ...layout })
-    : null;
+  if (!(input.durationSec > 0)) return null;
+  return writeTimedFrameSheet({
+    videoPathAbs: input.videoPathAbs,
+    outputDirAbs: input.outputDirAbs,
+    width: input.width,
+    height: input.height,
+    samples: deliveredFrameSamples(input.durationSec, input.heard ?? []),
+    ...(input.signal ? { signal: input.signal } : {}),
+  });
 }
 
 /** How each scene came out, under the names a preview uses, for whatever shows the scenes.
@@ -568,11 +811,31 @@ async function writeDeliveredSceneFrames(input: {
   }
 }
 
+/** What a picture and sound of different lengths should do next. On 2026-11-19 a tutorial was
+ *  told only that "one of them stops early" (picture 30.6 s, sound 22.2 s) and stopped to ask for
+ *  narration to be recorded again. */
+export function avDurationMismatchMessage(videoSec: number, audioSec: number, narrationCutOff = false): string {
+  const lengths = `The picture runs ${videoSec.toFixed(2)}s and the sound ${audioSec.toFixed(2)}s`;
+  const gap = Math.abs(videoSec - audioSec).toFixed(2);
+  if (audioSec < videoSec && narrationCutOff) {
+    return `${lengths}. The delivered mix cuts off existing narration. Check the full original recording against the current picture. If it fits, rebuild the mix from the original narration and deliver again. If it does not fit, adjust the timing before recording again.`;
+  }
+  return audioSec < videoSec
+    ? `${lengths}, so the last ${gap}s have no sound. Give that stretch sound, such as another narration line or music under the end, or cut the picture to ${audioSec.toFixed(2)}s, then deliver again.`
+    : `${lengths}, so the sound runs ${gap}s past the picture. Cut the sound to ${videoSec.toFixed(2)}s or extend the picture, then deliver again.`;
+}
+
 export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioResult> {
   const op = 'video.ship' as const;
+  const expiredReview = { ok: false, op, errorCode: 'E_VIDEO_SHIP_REVIEW_EXPIRED', message: 'The video changed. Update it again.' } as const;
   const previewDirAbs = p.videoDirAbs
     ? path.join(p.productionDirAbs, 'preview', path.basename(p.videoDirAbs), String(Date.now())) : null;
-  if (!isPathAllowed(p.videoPathAbs, p.allowedRoots) || !isPathAllowed(p.productionDirAbs, p.allowedRoots)
+  // 2026-11-20: a recreation rendered fine, then twice passed its absolute path with one
+  // character copied wrong, was told only that the file was out of scope, and gave up.
+  if (!isPathAllowed(p.videoPathAbs, p.allowedRoots)) {
+    return { ok: false, op, errorCode: 'E_VIDEO_SHIP_OUT_OF_SCOPE', message: 'That file is outside the files this task can use. Pass its path relative to the production folder, such as render/main.mp4, and run it again.' };
+  }
+  if (!isPathAllowed(p.productionDirAbs, p.allowedRoots)
       || ['versions', 'versions.json', 'preview'].some(name => !isPathAllowed(path.join(p.productionDirAbs, name), [p.productionDirAbs]))
       || (previewDirAbs && !isPathAllowed(previewDirAbs, [p.productionDirAbs]))
       || (p.videoDirAbs && !isPathAllowed(path.join(p.videoDirAbs, '.last-render.json'), [p.productionDirAbs]))) {
@@ -580,9 +843,16 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
   }
   // Said apart from an unreadable file: told the stream was unreadable, live runs took
   // a mistyped path for a broken check and stopped.
-  if (!await fs.stat(p.videoPathAbs).then((stat) => stat.isFile(), () => false)) {
+  const initialFile = await fs.stat(p.videoPathAbs).catch(() => null);
+  if (!initialFile?.isFile()) {
     return { ok: false, op, errorCode: 'E_VIDEO_SHIP_NO_FILE', message: `There is no file at ${p.videoPathAbs}. Pass the path video.render returned.` };
   }
+  const sourceIsCurrent = async () => {
+    if (!isPathAllowed(p.videoPathAbs, p.allowedRoots)) return false;
+    const current = await fs.stat(p.videoPathAbs).catch(() => null);
+    return !!current?.isFile() && current.dev === initialFile.dev && current.ino === initialFile.ino
+      && current.size === initialFile.size && current.mtimeMs === initialFile.mtimeMs && current.ctimeMs === initialFile.ctimeMs;
+  };
   const { ffmpeg } = bundledFfmpegPaths();
   if (!ffmpeg) return { ok: false, op, errorCode: 'E_FFMPEG_MISSING', message: 'Bundled ffmpeg not found.' };
   const issues: ShipIssue[] = [];
@@ -611,12 +881,16 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
     !isPathAllowed(path.join(previewDirAbs, `${String(index + 1).padStart(2, '0')}-${scene.id}-end.png`), [p.productionDirAbs]))) {
     return { ok: false, op, errorCode: 'E_VIDEO_SHIP_OUT_OF_SCOPE', message: 'That file is outside the files this task can use.' };
   }
+  // An unreadable list stops the delivery when it is recorded, with its own message.
+  const stored = await readVersionFile(path.join(p.productionDirAbs, 'versions.json')).catch(() => null);
   if (timeline) {
-    // An unreadable list stops the delivery when it is recorded, with its own message.
-    const stored = await readVersionFile(path.join(p.productionDirAbs, 'versions.json')).catch(() => null);
     issues.push(...staleNarration(timeline.voiced, stored?.delivered_narration ?? {}));
     issues.push(...await unplayedNarration(p.productionDirAbs, timeline, stored?.voices_since_delivery ?? []));
   }
+  // Read before this delivery clears the voices made for it.
+  const lastOfVideo = (stored?.versions ?? []).filter((version) => version.video_id === timeline?.videoId).at(-1);
+  const voiced = timeline?.playsNarration === true || spec.narrationMixExpected === true
+    || (stored?.voices_since_delivery.length ?? 0) > 0 || lastOfVideo?.voiced === true;
   if (p.videoDirAbs && await renderedBeforeLastChange({ productionDirAbs: p.productionDirAbs, videoDirAbs: p.videoDirAbs, fileAbs: p.videoPathAbs })) {
     issues.push({
       code: 'DELIVERY_TIMELINE_CHANGED',
@@ -625,46 +899,75 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
     });
   }
 
-  const durationTarget = timeline?.durationSec ?? p.expect?.durationSec ?? null;
   const aspect = timeline?.aspect ?? p.expect?.aspect ?? null;
   const expectsAudio = timeline?.hasAudio ?? p.expect?.hasAudio ?? false;
   const audio = spec.hasAudio ? await measureDeliveredAudio(p.videoPathAbs, spec.audioStreams ?? 1, p.signal, spec.durationSec) : null;
   let integratedLufs = audio?.integratedLufs ?? null;
   issues.push(...assessDeliveredSpec({
     spec,
-    expectedDurationSec: durationTarget,
-    durationSource: timeline?.durationSec != null ? 'timeline' : 'requested',
+    expectedDurationSec: timeline?.durationSec ?? null,
+    ...(p.expect?.durationSec !== undefined ? { requestedDurationSec: p.expect.durationSec } : {}),
     expectedAspect: aspect,
     expectsAudio,
-    expectsCaptions: !!p.expect?.captions,
     integratedLufs,
     digitalSilence: audio?.digitalSilence ?? null,
-    sidecarSubtitleFound: false,
   }));
   if (timeline) {
     issues.push(...assessDeliveredNarration(timeline.lines, spec.durationSec)
       .map(({ code, severity, message }) => ({ code, severity, message })));
   }
+  // The matched source voice tells the first delivery error whether the existing mix can be repaired.
+  const playbackIssues = spec.hasAudio ? await narrationPlaybackIssues({
+    ffmpeg,
+    videoAbs: p.videoPathAbs,
+    productionDirAbs: p.productionDirAbs,
+    voices: stored?.voices_since_delivery ?? [],
+    ...(p.signal ? { signal: p.signal } : {}),
+  }) : [];
   if (spec.hasAudio && spec.audioDurationSec !== undefined && spec.videoDurationSec !== undefined
     && Math.abs(spec.audioDurationSec - spec.videoDurationSec) > AV_DURATION_TOLERANCE_SEC) {
     issues.push({
       code: 'DELIVERY_AV_DURATION_MISMATCH',
       severity: 'error',
-      message: `The picture runs ${spec.videoDurationSec.toFixed(2)}s and the sound ${spec.audioDurationSec.toFixed(2)}s, so one of them stops early.`,
+      message: avDurationMismatchMessage(spec.videoDurationSec, spec.audioDurationSec,
+        playbackIssues.some((issue) => issue.code === 'DELIVERY_NARRATION_CUT_OFF')),
     });
   }
-  issues.push(...await visualHintIssues(ffmpeg, p.videoPathAbs, spec.durationSec, p.signal));
+  // 2026-11-22: stopped for held stills, a video gets one round of changes. A later file of it,
+  // even one still held, is delivered with the finding as a warning; the same file is stopped again.
+  const stoppedSha = timeline ? stored?.held_stills_stopped[timeline.videoId] : undefined;
+  const stoppedBefore = !p.reviewHeldStills && !!stoppedSha && await sha256OfFileStream(p.videoPathAbs) !== stoppedSha;
+  const held: { finding?: HeldStillsFinding } = {};
+  issues.push(...await visualHintIssues(ffmpeg, p.videoPathAbs, spec.durationSec, p.signal, timeline, stoppedBefore,
+    p.reviewHeldStills ? (finding) => { held.finding = finding; } : undefined));
   // Sound the file itself shows is missing, and narration laid over the clip's own speech
   // (from the record its mix left): both ask for a repair within the delivery's rework.
   issues.push(...assessSilentStretches(audio?.silences, expectsAudio));
   issues.push(...await narrationOverSpeechIssues(p.videoPathAbs, p.productionDirAbs, p.signal, spec.narrationMixExpected === true));
-  if (p.cutToBeat) issues.push(...await cutsOffBeatIssues(p.videoPathAbs, spec.fps, p.signal));
+  issues.push(...playbackIssues);
+  if (p.cutToBeat) issues.push(...await cutsOffBeatIssues(p.videoPathAbs, { fps: spec.fps, durationSec: spec.durationSec }, p.signal));
 
   const blocking = issues.filter((issue) => issue.severity === 'error');
   const warnings = issues.filter((issue) => issue.severity !== 'error');
-  const accepted = new Set(p.override?.codes ?? []);
+  let override = p.override;
+  const accepted = new Set(override?.codes ?? []);
   const unaccepted = blocking.filter((issue) => !accepted.has(issue.code));
-  if (unaccepted.length) {
+  let review: { sha256: string; isCurrent: () => boolean } | undefined;
+  if (p.reviewHeldStills && stored && held.finding && unaccepted.length === 1
+      && unaccepted[0].code === 'DELIVERY_HELD_STILLS' && !p.signal?.aborted) {
+    const sha256 = await sha256OfFileStream(p.videoPathAbs).catch(() => null);
+    if (!sha256 || !await sourceIsCurrent()) return expiredReview;
+    const isCurrent = await p.reviewHeldStills(held.finding);
+    if (isCurrent) {
+      review = { sha256, isCurrent };
+      override = { codes: ['DELIVERY_HELD_STILLS'], reason: 'User confirmed this rendered version on the video canvas.' };
+      accepted.add('DELIVERY_HELD_STILLS');
+    }
+  }
+  if (unaccepted.length && !review) {
+    if (!p.reviewHeldStills && timeline && unaccepted.some((issue) => issue.code === 'DELIVERY_HELD_STILLS')) {
+      await noteHeldStillsStop(p.productionDirAbs, timeline.videoId, await sha256OfFileStream(p.videoPathAbs));
+    }
     return {
       ok: false,
       op,
@@ -674,14 +977,46 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
       warnings,
     };
   }
-  const sha256 = await sha256OfFileStream(p.videoPathAbs);
-  let review = await renderedVisualReview(p.videoDirAbs, sha256);
+  const checkReview = async () => {
+    if (!review) return;
+    if (p.signal?.aborted || !review.isCurrent() || !isPathAllowed(p.videoPathAbs, p.allowedRoots)
+        || (p.videoDirAbs && await renderedBeforeLastChange({
+          productionDirAbs: p.productionDirAbs, videoDirAbs: p.videoDirAbs, fileAbs: p.videoPathAbs,
+        })) || p.signal?.aborted || !review.isCurrent()) throw new CanvasReviewExpired();
+  };
+  // Measured only for a delivery that goes ahead: a blocked one is fixed first.
+  const reference = p.referenceAbs
+    ? await compareWithReference({ ffmpeg, referenceAbs: p.referenceAbs, videoAbs: p.videoPathAbs, videoSec: spec.durationSec, ...(p.signal ? { signal: p.signal } : {}) })
+    : null;
+  if (reference?.issue) warnings.push(reference.issue);
+  const sha256 = await sha256OfFileStream(p.videoPathAbs).catch((err) => {
+    if (review) return null;
+    throw err;
+  });
+  if (sha256 === null || (review && sha256 !== review.sha256)) return expiredReview;
+  let visual = await renderedVisualReview(p.videoDirAbs, sha256);
   const videoId = timeline?.videoId;
   const { name, ext } = path.parse(p.videoPathAbs);
   let version: VideoVersion;
+  let audioSourcesSha256: string | undefined;
+  const verifyAudio = async () => {
+    if (!p.videoDirAbs) return;
+    const audio = await verifyRenderedAudioSources({
+      productionDirAbs: p.productionDirAbs, videoDirAbs: p.videoDirAbs, fileAbs: p.videoPathAbs,
+      allowedRoots: p.allowedRoots, signal: p.signal,
+    });
+    if (audio === false || (audio !== undefined && !await sourceIsCurrent())) throw new RenderedAudioChanged();
+    audioSourcesSha256 = audio;
+  };
   // A changed output-policy copy is judged before recordVersion publishes it.
   // Keep this failure distinct from a ledger/write failure for the same repair path.
   let finalizedBlock: ShipIssue[] | null = null;
+  const inspectOriginalAudio = async (fileAbs: string) => {
+    if (!timeline?.keptClipAudio.length) return;
+    warnings.push(...await originalClipAudioWarnings({
+      ffmpeg, videoAbs: fileAbs, clips: timeline.keptClipAudio, allowedRoots: p.allowedRoots, signal: p.signal,
+    }));
+  };
   try {
     version = await recordVersion({
       productionDirAbs: p.productionDirAbs,
@@ -689,15 +1024,29 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
       ...(videoId ? { videoId } : {}),
       ...(timeline ? { voiced: timeline.voiced } : {}),
       delivers: true,
+      inspectRepeat: async (fileAbs) => {
+        await inspectOriginalAudio(fileAbs);
+        await verifyAudio();
+      },
+      ...(review ? {
+        checkLatest: async (latest: VideoVersion | undefined) => {
+          if (latest?.id !== lastOfVideo?.id || latest?.sha256 !== lastOfVideo?.sha256) throw new CanvasReviewExpired();
+          await checkReview();
+        },
+      } : {}),
       keep: async (id) => {
         const { finalPath } = await uniquifyPath(path.join(p.productionDirAbs, VERSIONS_DIR, `${videoId ?? name}-${id}${ext}`), () => false);
         if (!isPathAllowed(finalPath, [p.productionDirAbs])) throw new Error('That file is outside the files this task can use.');
         await fs.mkdir(path.dirname(finalPath), { recursive: true });
         await fs.copyFile(p.videoPathAbs, finalPath, fsConstants.COPYFILE_FICLONE);
         try {
+          if (review) {
+            if (await sha256OfFileStream(finalPath) !== review.sha256) throw new CanvasReviewExpired();
+            await checkReview();
+          }
           await p.finalize?.(finalPath);
           const keptSha256 = await sha256OfFileStream(finalPath);
-          if (keptSha256 !== sha256 && (review.status === 'has_findings' || review.status === 'no_findings')) review = { ...review, status: 'stale' };
+          if (keptSha256 !== sha256 && (visual.status === 'has_findings' || visual.status === 'no_findings')) visual = { ...visual, status: 'stale' };
           if (keptSha256 !== sha256 && expectsAudio) {
             const finalSpec = await probeDeliveredVideo(finalPath, p.signal);
             const finalAudio = finalSpec?.hasAudio
@@ -705,8 +1054,8 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
             integratedLufs = finalAudio?.integratedLufs ?? null;
             const finalIssues: ShipIssue[] = finalSpec ? assessDeliveredSpec({
               spec: finalSpec, expectedDurationSec: null, expectedAspect: null,
-              expectsAudio, expectsCaptions: false, integratedLufs,
-              digitalSilence: finalAudio?.digitalSilence ?? null, sidecarSubtitleFound: false,
+              expectsAudio, integratedLufs,
+              digitalSilence: finalAudio?.digitalSilence ?? null,
             }) : [{ code: 'DELIVERY_VIDEO_UNREADABLE', severity: 'error', message: 'The final file has no readable video stream.' }];
             const audioCodes = new Set(['DELIVERY_NO_AUDIO', 'DELIVERY_AUDIO_SILENT', 'DELIVERY_AUDIO_UNVERIFIABLE', 'DELIVERY_LOUDNESS_OFF_TARGET']);
             for (const list of [blocking, warnings]) {
@@ -719,6 +1068,9 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
               throw new Error(rejected[0].message);
             }
           }
+          await inspectOriginalAudio(finalPath);
+          if (review) await checkReview();
+          await verifyAudio();
           return { path: finalPath, sha256: keptSha256 };
         } catch (err) {
           await fs.rm(finalPath, { force: true }).catch(() => {});
@@ -735,18 +1087,24 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
         canvas: spec.width && spec.height ? `${spec.width}x${spec.height}` : null,
         fps: spec.fps,
         integrated_lufs: integratedLufs,
-        visual_review: review,
+        visual_review: visual,
         shipped_at: new Date().toISOString(),
         warnings: warnings.map((issue) => issue.code),
-        ...(blocking.length && p.override ? { override: { codes: blocking.map((issue) => issue.code), reason: p.override.reason } } : {}),
+        ...(blocking.length && override ? { override: { codes: blocking.map((issue) => issue.code), reason: override.reason } } : {}),
+        ...(voiced ? { voiced: true as const } : {}),
       }),
     });
   } catch (err) {
+    if (err instanceof CanvasReviewExpired) return expiredReview;
+    if (err instanceof RenderedAudioChanged) {
+      const issue = RENDERED_AUDIO_CHANGED;
+      return { ok: false, op, errorCode: 'E_VIDEO_SHIP_BLOCKED', message: issue.message, issues: [issue], warnings };
+    }
     if (finalizedBlock) return { ok: false, op, errorCode: 'E_VIDEO_SHIP_BLOCKED', message: finalizedBlock[0].message, issues: finalizedBlock, warnings };
     return { ok: false, op, errorCode: 'E_VIDEO_SHIP_RECORD', message: String((err as Error).message || err).slice(0, 300) };
   }
   if (timeline && p.videoDirAbs) {
-    await markTimelineDelivered({ productionDirAbs: p.productionDirAbs, videoDirAbs: p.videoDirAbs }, version.id)
+    await markTimelineDelivered({ productionDirAbs: p.productionDirAbs, videoDirAbs: p.videoDirAbs }, version.id, audioSourcesSha256)
       .catch((err) => log.warn('delivery not noted', { error: logErrorSummary(err) }));
     await writeDeliveredSceneFrames({
       ffmpeg,
@@ -758,13 +1116,66 @@ export async function shipVideoFile(p: VideoShipOptions): Promise<VideoStudioRes
       ...(p.signal ? { signal: p.signal } : {}),
     });
   }
+  // versions.json keeps the review on the version; the reply shows it once, below.
+  const { visual_review: _storedReview, ...shownVersion } = version;
   return {
     ok: true,
     op,
-    version,
+    version: shownVersion,
     media: versionedChatMediaLocalUrl(path.resolve(p.productionDirAbs, version.path)),
     visual_review: parseVisualReview(version.visual_review) ?? visualReview('not_checked'),
     warnings,
     ...(blocking.length ? { accepted_issues: blocking } : {}),
+    ...(reference ? { reference_comparison: reference.report } : {}),
   };
+}
+
+/** The asset ids a timeline plays: its clips, narration and tracks. */
+async function assetsTimelineUses(videoDirAbs: string): Promise<Set<string>> {
+  const used = new Set<string>();
+  try {
+    const manifest = JSON.parse(await fs.readFile(path.join(videoDirAbs, 'manifest.json'), 'utf8')) as {
+      scenes?: Array<{ clips?: Array<{ asset?: unknown }>; narration?: { asset?: unknown } }>;
+      tracks?: Array<{ asset?: unknown }>;
+    };
+    for (const scene of manifest.scenes ?? []) {
+      for (const clip of scene.clips ?? []) if (typeof clip.asset === 'string') used.add(clip.asset);
+      if (typeof scene.narration?.asset === 'string') used.add(scene.narration.asset);
+    }
+    for (const track of manifest.tracks ?? []) if (typeof track.asset === 'string') used.add(track.asset);
+  } catch {
+    // An unreadable timeline was already refused by delivery; credit nothing from it.
+  }
+  return used;
+}
+
+export type StockCredits = { lines: string[]; file: string; timeline: boolean };
+
+/**
+ * After a delivery, the credit lines its licences ask for, saved beside the delivered file as
+ * `<name>.credits.txt`. A timeline credits the files it plays; a file made with ffmpeg alone
+ * credits every such file in the production, as the host cannot tell which it used. Null when
+ * nothing needs credit.
+ */
+export async function writeStockCredits(input: {
+  productionDirAbs: string;
+  deliveredAbs: string;
+  videoDirAbs?: string;
+}): Promise<StockCredits | null> {
+  let rows: VideoAssetRecord[] = [];
+  try {
+    rows = VideoAssetLedgerSchema.parse(JSON.parse(await fs.readFile(path.join(input.productionDirAbs, 'assets.json'), 'utf8'))).assets;
+  } catch {
+    return null;
+  }
+  const used = input.videoDirAbs ? await assetsTimelineUses(input.videoDirAbs) : null;
+  const lines = [...new Set(rows
+    .filter((row) => row.origin === 'stock' && row.source?.credit && (!used || used.has(row.id)))
+    .map((row) => String(row.source!.credit).replace(/\s+/g, ' ').trim())
+    .filter(Boolean))];
+  if (!lines.length) return null;
+  const file = path.join(path.dirname(input.deliveredAbs), `${path.basename(input.deliveredAbs, path.extname(input.deliveredAbs))}.credits.txt`);
+  if (!isPathAllowed(file, [input.productionDirAbs])) throw new Error('Credit output is outside the production.');
+  await writeBytesAtomic(file, Buffer.from(`${lines.join('\n')}\n`));
+  return { lines, file, timeline: !!input.videoDirAbs };
 }

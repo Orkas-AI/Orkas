@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildMixFilter, burnsubsForceStyle, VERTICAL_CAPTION_MARGIN_V } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
+import { breakCaptionLine, buildMixFilter, burnsubsForceStyle, captionEm, captionLineEm, VERTICAL_CAPTION_FONT_SIZE, VERTICAL_CAPTION_MARGIN_V, wrapCaptionText } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
 
 const SR = 48000;
 // Every tail pins `aformat=channel_layouts=stereo` after the resample: a
@@ -74,8 +74,8 @@ describe('buildMixFilter — ducking the base under the added sound', () => {
   it('keys a sidechain compressor on the base with the added bed, matching the timeline duck', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [2], baseHasAudio: true, mode: 'mix', padWholeDurSec: 6, loudnorm: LN, duck: true });
     expect(f).toContain('[1:a]aresample=48000,adelay=2000:all=1[seg0]');
-    expect(f).toContain('[seg0]asplit=2[bedmix][bedkey0]');
-    expect(f).toContain('[0:a]aresample=48000[base0]');
+    expect(f).toContain('[seg0]asetnsamples=n=1024:p=1,asplit=2[bedmix][bedkey0]');
+    expect(f).toContain('[0:a]aresample=48000,asetnsamples=n=1024:p=1[base0]');
     expect(f).toContain('[base0][bedkey]sidechaincompress=threshold=0.02:ratio=10:attack=20:release=400[base]');
     expect(f).toContain('[base][bedmix]amix=inputs=2:duration=longest:normalize=0,apad=whole_dur=6.000,');
   });
@@ -84,15 +84,15 @@ describe('buildMixFilter — ducking the base under the added sound', () => {
     // sidechaincompress stops with whichever input ends first; an unpadded key
     // left everything after the last line silent (measured 2026-11-12).
     const f = buildMixFilter({ sr: SR, segmentStartSec: [2], baseHasAudio: true, mode: 'mix', padWholeDurSec: 6, loudnorm: LN, duck: true });
-    expect(f).toContain('[bedkey0]apad=whole_dur=6.000[bedkey]');
+    expect(f).toContain('[bedkey0]apad=whole_dur=6.000,asetnsamples=n=1024:p=1[bedkey]');
     const unknown = buildMixFilter({ sr: SR, segmentStartSec: [2], baseHasAudio: true, mode: 'mix', padWholeDurSec: null, loudnorm: LN, duck: true });
-    expect(unknown).toContain('[bedkey0]apad[bedkey]');
+    expect(unknown).toContain('[bedkey0]apad,asetnsamples=n=1024:p=1[bedkey]');
   });
 
   it('ducks under the combined bed when several lines are placed', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0, 5], baseHasAudio: true, mode: 'mix', padWholeDurSec: 30, loudnorm: LN, duck: true });
     expect(f).toContain('[seg0][seg1]amix=inputs=2:duration=longest:normalize=0[vobed]');
-    expect(f).toContain('[vobed]asplit=2[bedmix][bedkey0]');
+    expect(f).toContain('[vobed]asetnsamples=n=1024:p=1,asplit=2[bedmix][bedkey0]');
   });
 
   it('ignores duck when there is no base sound to lower', () => {
@@ -114,9 +114,9 @@ describe('buildMixFilter — ducking the base under the added sound', () => {
 describe('burnsubsForceStyle — caption height by frame shape', () => {
   it('raises plain captions on a vertical frame above the platform buttons', () => {
     expect(burnsubsForceStyle('', { width: 1080, height: 1920 }, '/a/captions.srt'))
-      .toBe(`:force_style='MarginV=${VERTICAL_CAPTION_MARGIN_V}'`);
+      .toBe(`:force_style='FontSize=${VERTICAL_CAPTION_FONT_SIZE},MarginV=${VERTICAL_CAPTION_MARGIN_V}'`);
     expect(burnsubsForceStyle('PingFang SC', { width: 1080, height: 1920 }, '/a/captions.vtt'))
-      .toBe(`:force_style='FontName=PingFang SC,MarginV=${VERTICAL_CAPTION_MARGIN_V}'`);
+      .toBe(`:force_style='FontName=PingFang SC,FontSize=${VERTICAL_CAPTION_FONT_SIZE},MarginV=${VERTICAL_CAPTION_MARGIN_V}'`);
   });
 
   it('keeps the default height on landscape and square frames', () => {
@@ -132,5 +132,67 @@ describe('burnsubsForceStyle — caption height by frame shape', () => {
 
   it('keeps the default when the frame size could not be read', () => {
     expect(burnsubsForceStyle('', null, '/a/captions.srt')).toBe('');
+  });
+});
+
+
+// 2026-11-23: on 1080x1920, plain captions at libass's default size fit about ten Chinese
+// characters per line, and libass breaks only at spaces, so a 15-character line ran off both edges.
+describe('caption lines fit the frame', () => {
+  it('measures wide characters as a whole em and the rest as about half, markup as none', () => {
+    expect(captionEm('想吃的朋友')).toBe(5);
+    expect(captionEm('Hello')).toBeCloseTo(3);
+    expect(captionEm('<i>好</i>{\\b1}吧')).toBe(2);
+  });
+
+  it('gives a vertical frame at the vertical size about thirteen characters, a wide one about twenty-eight', () => {
+    expect(captionLineEm({ width: 1080, height: 1920 }, VERTICAL_CAPTION_FONT_SIZE)).toBe(13);
+    expect(captionLineEm({ width: 1080, height: 1920 }, 16)).toBe(9);
+    expect(captionLineEm({ width: 1920, height: 1080 }, 16)).toBe(28);
+  });
+
+  it('breaks a long line in even parts at punctuation, else between wide characters, and never before a closing mark', () => {
+    const parts = breakCaptionLine('想吃的朋友，可以提前在群里跟我说，帮你留着。', 13);
+    expect(parts.join('')).toBe('想吃的朋友，可以提前在群里跟我说，帮你留着。');
+    for (const part of parts) expect(captionEm(part)).toBeLessThanOrEqual(13);
+    expect(parts.length).toBe(2);
+    // A comma near the middle is taken over a break between two characters.
+    expect(breakCaptionLine('今天说三个坑，第一个是规则太复杂', 13)).toEqual(['今天说三个坑，', '第一个是规则太复杂']);
+    expect(breakCaptionLine('大家好这周我们店上了一款新品抹茶红豆卷', 13).map(captionEm).every((em) => em <= 13)).toBe(true);
+    expect(breakCaptionLine('一二三四五六七八九十十一。', 12).some((part) => part.startsWith('。'))).toBe(false);
+    expect(breakCaptionLine('The quick brown fox jumps over the lazy dog', 10)).toEqual(['The quick brown', 'fox jumps over', 'the lazy dog']);
+    expect(breakCaptionLine('短句', 13)).toEqual(['短句']);
+  });
+
+  it('preserves VTT blocks, cue identifiers and CRLF while wrapping numeric and keyword-leading dialogue', () => {
+    const header = ['WEBVTT', 'Language: a-long-header-value', '', 'STYLE', '::cue { color: lime; }', '',
+      'NOTE a multi-line annotation', '00:00.000 --> 00:05.000', 'comment text remains intact', '',
+      'REGION', 'id:a-very-long-region-name', '', 'cue-identifier-with-long-name',
+      '00:00.000 --> 00:05.000 align:start'].join('\r\n');
+    const result = wrapCaptionText(header + '\r\n12345678901234567890\r\nNOTE this is dialogue\r\n', 6);
+    expect(result.startsWith(header + '\r\n')).toBe(true);
+    const lines = result.slice(header.length + 2).trimEnd().split('\r\n');
+    expect(lines.join('').replace(/ /g, '')).toBe('12345678901234567890NOTEthisisdialogue');
+    expect(lines.every((line) => captionEm(line) <= 6)).toBe(true);
+    expect(wrapCaptionText(header + '\r\n短\r\n', 6)).toBe(header + '\r\n短\r\n');
+    const nextCue = 'STYLE example identifier\n00:01.000 --> 00:03.000\n';
+    expect(wrapCaptionText('WEBVTT\n\n' + nextCue + '12345678901234567890', 6))
+      .toBe('WEBVTT\n\n' + nextCue + '1234567890\n1234567890');
+  });
+
+  it('retains every character of a long unbroken cue', () => {
+    const line = '长'.repeat(10_000);
+    const parts = breakCaptionLine(line, 13);
+    expect(parts.join('')).toBe(line);
+    expect(parts.every((part) => part.length <= 13)).toBe(true);
+  });
+
+  it('wraps only the text lines of a caption file and leaves short ones as they are', () => {
+    const srt = '1\n00:00:00,000 --> 00:00:05,000\n想吃的朋友，可以提前在群里跟我说，帮你留着。\n\n2\n00:00:05,000 --> 00:00:07,000\n甜度调低了\n';
+    const wrapped = wrapCaptionText(srt, 13);
+    expect(wrapped.split('\n').slice(0, 2)).toEqual(['1', '00:00:00,000 --> 00:00:05,000']);
+    expect(wrapped).toContain('甜度调低了');
+    expect(wrapped.split('\n').filter((line) => line && !/-->|^\d+$/.test(line)).every((line) => captionEm(line) <= 13)).toBe(true);
+    expect(wrapCaptionText('WEBVTT\n\n00:00.000 --> 00:01.000\n短\n', 13)).toBe('WEBVTT\n\n00:00.000 --> 00:01.000\n短\n');
   });
 });
