@@ -105,7 +105,7 @@ function createProcessTestElement(tagName = 'div'): any {
   return node;
 }
 
-function loadConversationRenderer() {
+function loadConversationRenderer(onPushEvent?: (channel: string, handler: Function) => void) {
   const pendingConvs = new Map<string, any>();
   const groupBusyConvs = new Map<string, boolean>();
   const context: any = {
@@ -162,6 +162,7 @@ function loadConversationRenderer() {
       'chat.stream.plan_with_steps': `Plan (${params?.n} steps): ${params?.titles}`,
       'chat.stream.plan': `Plan ${params?.p}`,
       'chat.stream.phase_progress': 'progress',
+      'chat.stream.phase_end': 'Done',
       'chat.process.with_target': `${params?.action} · ${params?.target}`,
       'chat.process.with_status': `${params?.label} · ${params?.status}`,
       'chat.process.started_action': `Started · ${params?.label}`,
@@ -197,6 +198,7 @@ function loadConversationRenderer() {
       'chat.process.action_generate_video': 'Generate video',
       'chat.from_agent_unknown': 'Agent',
       'chat.process.action_generate_audio': 'Generate audio',
+      'chat.process.action_check_narration_timing': 'Check narration timing',
       'chat.process.action_create_plan': 'Create plan',
       'chat.process.action_execute_plan': 'Execute plan',
       'chat.process.action_update_plan': 'Update plan',
@@ -213,6 +215,7 @@ function loadConversationRenderer() {
       'chat.process.action_background_task': 'Background task',
       'chat.process.action_not_allowed': 'Not allowed',
       'chat.process.status_done': 'Done',
+      'chat.process.publish_call_ended': 'Publish tool call ended',
       'chat.process.status_failed': 'Failed',
       'chat.process.status_not_executed': 'Not executed',
       'chat.process.preparing_action': `Preparing: ${params?.label || ''}`,
@@ -301,6 +304,7 @@ function loadConversationRenderer() {
       addEventListener() {},
       uiIconHtml: (name: string, className: string) => `<svg class="${escapeHtml(className)}" data-icon="${escapeHtml(name)}"></svg>`,
       ConversationRuntime: {},
+      ...(onPushEvent ? { orkas: { onPushEvent } } : {}),
     },
   };
   context.window.window = context.window;
@@ -1430,6 +1434,47 @@ describe('conversation sidebar task row actions', () => {
     expect(html).toContain('class="conv-item-actions"');
     expect(html).toContain('conv-item-menu');
     expect(html).toContain('data-hide-pin="1"');
+  });
+
+  it('shows background completion without scheduling a conversation task-link reload', () => {
+    const handlers = new Map<string, Function>();
+    const context = loadConversationRenderer((channel, handler) => handlers.set(channel, handler));
+    context.currentCid = 'open-task';
+    context.currentView = 'conversation';
+    context._handleTaskTerminalUnread = vi.fn();
+    const payload = { type: 'terminal', conversation_id: 'background-task', status: 'completed' };
+
+    handlers.get('conversation:task_terminal')!(payload);
+
+    expect(context._handleTaskTerminalUnread).toHaveBeenCalledExactlyOnceWith(payload);
+    expect(context._scheduleConversationTaskLinksRefresh).not.toHaveBeenCalled();
+  });
+
+  it('reconciles an ended automation link only for the task it was running in', async () => {
+    const handlers = new Map<string, Function>();
+    const context = loadConversationRenderer((channel, handler) => handlers.set(channel, handler));
+    const runningLink = { kind: 'automation', task_id: 'auto-1' };
+    const permanentLink = { kind: 'todo', task_id: 'todo-1' };
+    context.currentUserId = 'u1';
+    context.currentView = 'conversation';
+    context.currentCid = 'open-task';
+    context.conversations = [
+      { conversation_id: 'background-task', task_links: [runningLink, permanentLink] },
+      { conversation_id: 'open-task', task_links: [runningLink], origin_auto_task_id: 'auto-1' },
+    ];
+    context.window.orkas.invoke = vi.fn(async () => ({ ok: true, conversation: { task_links: [permanentLink] } }));
+    context.renderConversationList = vi.fn();
+    context._refreshChatHeader = vi.fn();
+
+    const runEnded = handlers.get('conversations:automation_run_ended')!;
+    await runEnded({ cid: 'open-task', taskId: 'auto-1' });
+    await runEnded({ cid: 'background-task', taskId: 'auto-1' });
+
+    expect(context.window.orkas.invoke).toHaveBeenCalledExactlyOnceWith('conversations.get', { cid: 'background-task' });
+    expect(context.conversations[0].task_links).toEqual([permanentLink]);
+    expect(context.conversations[1].task_links).toEqual([runningLink]);
+    expect(context.renderConversationList).toHaveBeenCalledOnce();
+    expect(context._refreshChatHeader).not.toHaveBeenCalled();
   });
 
   it('renders an inline title input while renaming a row', () => {
@@ -4247,6 +4292,19 @@ describe('conversation process read_file resource labels', () => {
     })).toBe('Started · Delete agent · Data Analyst');
   });
 
+  it.each([
+    { stream: 'tool', data: { phase: 'end', name: 'tool_result', duration_ms: 9 } },
+    { stream: 'cli', data: { type: 'tool-event', phase: 'result', tool: 'tool_result' } },
+  ])('labels an unsuccessful generic $stream result as failed', ({ stream, data }) => {
+    const context = loadConversationRenderer();
+    const failed = { stream, data: { ...data, isError: true } };
+    const succeeded = { stream, data: { ...data, isError: false } };
+
+    expect(context._eventProcessKind(failed)).toBe('err');
+    expect(context._formatEventLine(failed)).toContain('Run action · Failed');
+    expect(context._formatEventLine(succeeded)).toContain('Run action · Done');
+  });
+
   it('keeps project-relative file paths but reduces absolute paths to a filename', () => {
     const context = loadConversationRenderer();
 
@@ -4732,9 +4790,9 @@ describe('conversation execution plan presentation', () => {
 });
 
 describe('conversation process metadata formatting', () => {
-  const orkasBridgeCases: Array<[string, Record<string, unknown>, string]> = [
+  const orkasBridgeCases: Array<[string, Record<string, unknown>, string, string?]> = [
     ['inner_browser', { operation: 'open', url: 'https://example.com/docs' }, 'Run action · inner_browser · open · https://example.com/docs'],
-    ['publish_outputs', { paths: ['reports/result.md'] }, 'Run action · publish_outputs · reports/result.md'],
+    ['publish_outputs', { paths: ['reports/result.md'] }, 'Run action · publish_outputs · reports/result.md', 'Publish tool call ended'],
     ['orkas_list_skills', {}, 'View skill'],
     ['orkas_read_skill', { id: 'pdf' }, 'View skill · pdf'],
     ['orkas_run_skill', { skill: 'pdf' }, 'Use skill · pdf'],
@@ -4765,11 +4823,11 @@ describe('conversation process metadata formatting', () => {
     ],
     ['orkas_handoff_to_commander', { reason: 'needs orchestration' }, 'Hand off to Commander'],
   ];
-  const orkasBridgeAliasCases = orkasBridgeCases.flatMap(([tool, input, expected]) => [
-    [tool, input, expected],
-    [`orkas.${tool}`, input, expected],
-    [`mcp__orkas__${tool}`, input, expected],
-  ] as Array<[string, Record<string, unknown>, string]>);
+  const orkasBridgeAliasCases = orkasBridgeCases.flatMap(([tool, input, expected, result = `${expected} · Done`]) => [
+    [tool, input, expected, result],
+    [`orkas.${tool}`, input, expected, result],
+    [`mcp__orkas__${tool}`, input, expected, result],
+  ] as Array<[string, Record<string, unknown>, string, string]>);
 
   it('keeps historical split-tool events readable without registering those tools', () => {
     const context = loadConversationRenderer();
@@ -5108,7 +5166,7 @@ describe('conversation process metadata formatting', () => {
 
   it.each(orkasBridgeAliasCases)(
     'classifies Orkas bridge tool %s by its business action across use and result events',
-    (tool, input, expected) => {
+    (tool, input, expected, result) => {
       const context = loadConversationRenderer();
       const displayContext = context._createProcessDisplayContext();
       const callId = `bridge-${tool}`;
@@ -5120,7 +5178,7 @@ describe('conversation process metadata formatting', () => {
       expect(context._formatEventLine({
         stream: 'cli',
         data: { type: 'tool-event', phase: 'result', tool, callId, output: 'ok' },
-      }, displayContext)).toBe(`${expected} · Done`);
+      }, displayContext)).toBe(result);
     },
   );
 
@@ -5166,6 +5224,52 @@ describe('conversation process metadata formatting', () => {
       stream: 'cli',
       data: { type: 'tool-event', phase: 'use', tool, input },
     })).toBe(expected);
+  });
+
+  it('labels streamed speech preflight only once its arguments arrive and keeps that label on completion', () => {
+    const context = loadConversationRenderer();
+    const display = context._createProcessDisplayContext();
+    const event = (data: Record<string, unknown>) => context._formatEventLine({
+      stream: 'tool', data: { name: 'generate_speech', id: 'timing', ...data },
+    }, display);
+
+    expect(event({ phase: 'start', execution_state: 'proposed' })).toBe('Preparing: Run action');
+    expect(event({ phase: 'progress', execution_state: 'running', arguments: {
+      action: 'preflight', lines: [{ text: 'Private narration', target_duration: 2 }],
+    } })).toBe('Started · Check narration timing');
+    expect(event({ phase: 'progress' })).toBe('Started · Check narration timing');
+    expect(event({ phase: 'progress', arguments: {} })).toBe('Started · Check narration timing');
+    expect(event({ phase: 'start', execution_state: 'proposed' })).not.toContain('Generate audio');
+    expect(event({ phase: 'end', duration_ms: 1200 })).toBe('Check narration timing · Done · 1s');
+    expect(event({ phase: 'end' })).toBe('Check narration timing · Done · 1s');
+  });
+
+  it('keeps a speech preparation generic for missing or string arguments and accepts a late structured result', () => {
+    const context = loadConversationRenderer();
+    const display = context._createProcessDisplayContext();
+    const event = (data: Record<string, unknown>) => context._formatEventLine({
+      stream: 'tool', data: { name: 'generate_speech', id: 'late', ...data },
+    }, display);
+
+    expect(event({ phase: 'start', execution_state: 'proposed', arguments: {} })).toBe('Preparing: Run action');
+    expect(event({ phase: 'progress', arguments: '{"action":"preflight"}' })).toBe('Started · Run action');
+    expect(event({ phase: 'end', arguments: { action: 'preflight' }, isError: true }))
+      .toBe('Check narration timing · Failed');
+  });
+
+  it('keeps interleaved generation, a speech preflight and an action-less history entry distinct', () => {
+    const context = loadConversationRenderer();
+    const display = context._createProcessDisplayContext();
+    const event = (id: string, data: Record<string, unknown>) => context._formatEventLine({
+      stream: 'tool', data: { name: 'generate_speech', id, ...data },
+    }, display);
+
+    event('check', { phase: 'start', arguments: { action: 'preflight' } });
+    expect(event('audio', { phase: 'start', arguments: { output_path: 'voice/line.mp3', text: 'preflight' } }))
+      .toBe('Started · Generate audio · voice/line.mp3');
+    expect(event('check', { phase: 'end' })).toBe('Check narration timing · Done');
+    expect(event('audio', { phase: 'end' })).toBe('Generate audio · voice/line.mp3 · Done');
+    expect(event('old', { phase: 'end', output: '{"action":"preflight"}' })).toBe('Run action · Done');
   });
 
   it('labels directory inspection without exposing an internal workspace slug', () => {
@@ -9151,6 +9255,136 @@ function setupConversationStatusController(context: any, cid = 'c1', options = {
 }
 
 describe('conversation controller settlement', () => {
+  it.each([
+    ['before dispatch', 'failure'],
+    ['stream bridge absent', 'failure'],
+    ['explicit rejection', 'failure'],
+    ['transport error, queue receipt found', 'success'],
+    ['transport error, confirmation unavailable', 'unconfirmed'],
+    ['receipt dropped, exact message found', 'success'],
+    ['receipt dropped, only another message found', 'unconfirmed'],
+    ['normal receipt', 'success'],
+  ])('recovers conversation composer sends when %s', async (scenario, outcome) => {
+    const context = loadConversationRenderer();
+    const status = { innerHTML: '', style: {}, textContent: '', setAttribute: vi.fn() };
+    const placeholder = {
+      dataset: {}, style: {}, querySelector: (selector: string) => selector.includes('"final"') ? status : null,
+      remove: vi.fn(),
+    };
+    context.document.getElementById = () => ({ dataset: {}, querySelector: () => null });
+    context.AbortController = AbortController;
+    context.TextDecoder = TextDecoder;
+    context.performance = performance;
+    context.currentCid = 'c1';
+    context.currentView = 'conversation';
+    context.ensureModelConfigured = () => true;
+    context._createStreamingAssistantMessage = () => placeholder;
+    context._handleStreamEvent = vi.fn();
+    context._streamingSetError = vi.fn();
+    context._hideThinking = () => {};
+    context._trackChatResourceMentionTelemetry = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context._updateConvSendUI = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context._observeConversationRunFromPlanAction = () => {};
+    context.startPolling = () => {};
+    context._startRuntimeActorRecovery = () => {};
+    context._finishStreamingMsg = (cid: string) => context.pendingConvs.delete(cid);
+    context._restoreSentComposerSnapshot = vi.fn();
+    context._renderOrClaimPersistedUserMessage = vi.fn();
+    let sentId: string;
+    let sends = 0;
+    let reads = 0;
+    if (scenario === 'before dispatch') {
+      context._observeConversationRunFromPlanAction = () => { throw new Error('display setup interrupted'); };
+    }
+    context.apiFetch = async (url: string, opts: any) => {
+      if (url.includes('/history?')) {
+        reads += 1;
+        expect(url).toContain(encodeURIComponent(sentId));
+        if (scenario === 'transport error, confirmation unavailable') throw new Error('history unavailable');
+        if (scenario === 'transport error, queue receipt found') {
+          return { json: async () => ({ ok: true, history: [], send_receipt: 'accepted' }) };
+        }
+        return { json: async () => ({
+          ok: true,
+          history: [{ id: 'persisted', from: 'user', text: 'same text', client_msg_id:
+            scenario === 'receipt dropped, exact message found' ? sentId : 'older-send',
+          }],
+        }) };
+      }
+      if (scenario === 'stream bridge absent') return { ok: false, streamNotDispatched: true };
+      sends += 1;
+      sentId = JSON.parse(opts.body).client_msg_id;
+      if (scenario.startsWith('transport error')) throw new Error('stream interrupted');
+      const frame = scenario === 'explicit rejection'
+        ? { type: 'error', admission_rejected: true, text: 'private diagnosis' }
+        : scenario === 'normal receipt' ? { type: 'send_accepted' } : null;
+      return { ok: true, body: new ReadableStream({
+        start(stream) {
+          if (frame) stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+          stream.close();
+        },
+      }) };
+    };
+
+    const result = await context.sendInConversation('c1', 'same text', undefined, { restoreComposerOnFailure: true });
+
+    expect(result.result).toBe(outcome);
+    expect(sends).toBe(['before dispatch', 'stream bridge absent'].includes(scenario) ? 0 : 1);
+    expect(context._restoreSentComposerSnapshot).toHaveBeenCalledTimes(outcome === 'failure' ? 1 : 0);
+    expect(reads > 0).toBe(scenario.startsWith('receipt dropped') || scenario.startsWith('transport error'));
+    if (outcome === 'unconfirmed') {
+      expect(status.textContent).toBe('chat.send_unconfirmed');
+      expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
+    }
+    if (outcome === 'success' && scenario !== 'normal receipt') expect(placeholder.remove).toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: 'the accepted run ended', runId: 'run-1', processing: false, show: false },
+    { name: 'a follow-up is still queued', runId: 'run-1', processing: true, show: true },
+    { name: 'only an earlier run ended', runId: 'run-0', processing: false, show: true },
+    { name: 'no terminal run was confirmed', runId: undefined, processing: false, show: true },
+  ])('reconciles the sidebar while replies are still streaming when $name', async ({ runId, processing, show }) => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+    const { hooks, msg, cleanups } = setupConversationStatusController(context);
+    hooks.onStreamEvent({ type: 'send_accepted', run_id: 'run-1' });
+    expect([...context._sidebarRunningConversationIds()]).toContain('c1');
+    context.apiFetch = async () => ({ json: async () => ({
+      processing, in_flight: [], active_turns: [], settled_run_id: runId,
+    }) });
+    context._syncTaskBoardForRuntimeState = () => {};
+
+    await context._syncPendingActorsFromRuntime('c1', { allowController: true });
+
+    expect(context._sidebarRunningConversationIds().has('c1')).toBe(show);
+    expect(context.pendingConvs.has('c1')).toBe(true);
+    expect(cleanups).toEqual([]);
+    hooks.onDone(msg, 'c1');
+    expect(cleanups).toEqual(['c1']);
+  });
+
+  it('keeps newer host work visible when an earlier idle reply arrives late', async () => {
+    const context = loadConversationRenderer();
+    setupRunningObserverTestContext(context);
+    const { hooks, cleanups } = setupConversationStatusController(context);
+    hooks.onStreamEvent({ type: 'send_accepted', run_id: 'run-1' });
+    let respond!: (response: unknown) => void;
+    context.apiFetch = () => new Promise(resolve => { respond = resolve; });
+    context._syncTaskBoardForRuntimeState = () => {};
+    const syncing = context._syncPendingActorsFromRuntime('c1', { allowController: true });
+    // The renderer sees a newer running notification before the first query
+    // returns. The map holds the observation revision for that conversation.
+    context.groupBusyConvs.set('c1', 2);
+    respond({ json: async () => ({ processing: false, in_flight: [], active_turns: [], settled_run_id: 'run-1' }) });
+    await syncing;
+    expect(context.isGroupConversationBusy('c1')).toBe(true);
+    expect(context._sidebarRunningConversationIds().has('c1')).toBe(true);
+    expect(cleanups).toEqual([]);
+  });
+
   it.each([{ superseded: false, observerOnly: false }, { superseded: false, observerOnly: true }, { superseded: true, observerOnly: true }])('reconciles idle recovery without retiring a newer pending state ($superseded, observer controller: $observerOnly)', async ({ superseded, observerOnly }) => {
     const context = loadConversationRenderer();
     setupRunningObserverTestContext(context);
@@ -9183,12 +9417,12 @@ describe('conversation controller settlement', () => {
     let draft = '';
     context._restoreSentComposerSnapshot = () => { if (snapshot) draft = snapshot; };
     context._finishStreamingMsg = () => { snapshot = ''; };
-    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true });
+    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true, sendStatus: 'rejected' });
     expect(draft).toBe('unsent description');
     expect(snapshot).toBe('');
     snapshot = 'newer send'; draft = '';
     vm.runInContext('_convChatCtrls.set("c1", {})', context);
-    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true });
+    hooks.onDone(msg, 'c1', { started: true, accepted: false, errored: true, sendStatus: 'rejected' });
     expect(draft).toBe('');
     expect(snapshot).toBe('newer send');
   });
@@ -10065,7 +10299,7 @@ describe('conversation controller settlement', () => {
   });
 
   it.each([
-    [{ started: true, aborted: false, errored: false }, 'success'],
+    [{ started: true, aborted: false, errored: false, accepted: true }, 'success'],
     [{ started: true, aborted: false, errored: true }, 'failure'],
     [{ started: true, aborted: true, errored: false }, 'cancelled'],
   ])('returns the terminal chat result from controller state %#', async (terminal, expected) => {
@@ -10116,7 +10350,7 @@ describe('conversation controller settlement', () => {
     expect(context._restoreSentComposerSnapshot('c1')).toBe(false);
   });
 
-  it.each([false, true])('restores a rejected composer send only before acceptance=%s', async (accepted) => {
+  it('does not restore accepted composer input when execution later fails', async () => {
     const context = loadConversationRenderer();
     context.performance = performance;
     context._trackChatResourceMentionTelemetry = () => {};
@@ -10125,13 +10359,15 @@ describe('conversation controller settlement', () => {
     context._makeConvChatController = (_cid: string, options: any) => ({
       async send() {
         options.onStarted();
-        options.onDone({ started: true, errored: true });
-        return { started: true, aborted: false, errored: true, accepted };
+        options.onAccepted();
+        const terminal = { started: true, aborted: false, errored: true, accepted: true };
+        options.onDone(terminal);
+        return terminal;
       },
     });
     const result = await context.sendInConversation('c1', '@Writer review', undefined, { restoreComposerOnFailure: true });
     expect(result.result).toBe('failure');
-    expect(restored).toBe(accepted ? '' : 'c1');
+    expect(restored).toBe('');
   });
 
   it('returns a failed result for a controller preflight rejection', async () => {

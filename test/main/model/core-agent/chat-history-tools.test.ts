@@ -267,6 +267,44 @@ describe('grouped history operations', () => {
       expect(JSON.parse(result.content)).toMatchObject({ code: 'unsupported_fields', fields: Object.keys(selector) });
       expect(result.content).not.toContain('RECORD_');
     });
+
+    it('honors nested read controls and replays the same old continuation', async () => {
+      const tool = await recentHistory(['current']);
+      const read = { record_id: 'm4' };
+      const current = await tool.execute({ action: 'read', scope: 'current', read: {
+        ...read, max_tokens: 909, cursor: 0,
+      } }, ctxFor());
+      const old = await tool.execute({ action: 'read', scope: 'current', read, max_tokens: 909, cursor: 0 }, ctxFor());
+      expect(current.isError).toBeFalsy();
+      expect(current.content).toContain(record(4));
+      expect(current.content).not.toContain(record(5));
+      expect(old).toEqual(current);
+
+      const rejected = await tool.execute({ action: 'read', scope: 'current', max_tokens: 909, read: {
+        ...read, max_tokens: 100, cursor: 0,
+      } }, ctxFor());
+      expect(rejected.isError).toBe(true);
+      expect(JSON.parse(rejected.content)).toMatchObject({
+        code: 'conflicting_fields', fields: ['max_tokens'], argument_group: 'read',
+      });
+      expect(rejected.content).not.toContain(record(4));
+      expect(rejected.content).not.toContain('909');
+    });
+
+    it('reports unknown nested fields and allowed enum values without guessing replacements', async () => {
+      const tool = await recentHistory(['current']);
+      const result = await tool.execute({ action: 'read', scope: 'current', read: {
+        page: { mode: 'next', typo: 'private-value' },
+      } }, ctxFor());
+      expect(result.isError).toBe(true);
+      const { issues } = JSON.parse(result.content);
+      expect(issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field: 'read.page.typo', allowed_fields: ['mode', 'index', 'count'] }),
+        expect.objectContaining({ field: 'read.page.mode', allowed_values: ['latest', 'around', 'before', 'from'] }),
+      ]));
+      expect(issues.find((issue: { field: string }) => issue.field === 'read.page.typo')).not.toHaveProperty('expected_path');
+      expect(result.content).not.toContain('private-value');
+    });
   });
 
   it('validates the selected group, retains zero process indexes and rejects mixed old/new formats', async () => {
@@ -744,6 +782,35 @@ describe('chat-history-tools › chat_history(read)', () => {
     expect(allScopeRead.content).toContain('foreign project context');
   });
 
+  it('reads the previous user question with current scope after a missing conversation selector', async () => {
+    writeConversation('primary', 'Current conversation', [
+      { id: 'previous', from: 'user', text: 'Which build did we already verify?' },
+      { id: 'trigger', from: 'user', text: 'Please answer my previous question.' },
+      { id: 'future', from: 'user', text: 'Future marker' },
+    ], 'project-a');
+    writeConversation('sibling', 'Other conversation', [
+      { id: 'sibling-message', from: 'user', text: 'Sibling marker' },
+    ], 'project-a');
+    const [,,tool] = await createChatHistoryActions({
+      userId: TEST_UID,
+      projectId: 'project-a',
+      currentCid: 'primary',
+      currentMessageId: 'trigger',
+    });
+    const request = { action: 'read', read: { page: { mode: 'latest', count: 1 } } };
+
+    const missingSelector = await tool.execute(request, ctxFor());
+    expect(missingSelector.isError).toBe(true);
+    expect(missingSelector.content).toContain('valid `cid` is required');
+
+    const current = await tool.execute({ ...request, scope: 'current' }, ctxFor());
+    expect(current.isError).toBeFalsy();
+    expect(current.content).toContain('Which build did we already verify?');
+    expect(current.content).not.toContain('Please answer my previous question.');
+    expect(current.content).not.toContain('Future marker');
+    expect(current.content).not.toContain('Sibling marker');
+  });
+
   it('rejects unadvertised project read scope outside a project conversation', async () => {
     writeConversation('outside', 'Outside project', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'outside context' },
@@ -925,8 +992,9 @@ describe('chat-history-tools › shape', () => {
     });
     const scope = currentOnly ? 'current' : 'all';
     const search = { action: 'search', scope, search: { query: 'contractword', k: 2 } };
+    const defaultSearch = { action: 'search', scope, search: { query: 'contractword' } };
     const read = { action: 'read', scope, ...(currentOnly ? {} : { cid: 'sibling' }), read: { page: { mode: 'latest', count: 1 } } };
-    for (const valid of [search, read]) {
+    for (const valid of [search, defaultSearch, read]) {
       expect(validate(valid), JSON.stringify(valid)).toEqual(valid);
       const result = await tool.execute(valid, ctxFor());
       expect(result.isError).toBeFalsy();
@@ -956,10 +1024,24 @@ describe('chat-history-tools › shape', () => {
     const [, , tool] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
     const properties = tool.inputSchema.properties as any;
     expect(properties.search.required).toEqual(['query']);
+    const example = JSON.parse(properties.search.description?.match(/\{.*\}/)?.[0] ?? '{}');
+    expect(example).toEqual({ action: 'search', scope: 'current', search: { query: expect.any(String), k: 5 } });
+    for (const group of ['read', 'process', 'output']) {
+      expect(properties[group].properties.cursor).toMatchObject({ type: 'integer', minimum: 0 });
+      expect(properties[group].properties.max_tokens).toMatchObject({ type: 'integer', minimum: 1, maximum: 10000 });
+    }
+    expect(properties).not.toHaveProperty('cursor');
+    expect(properties).not.toHaveProperty('max_tokens');
     expect(properties.read.properties.page.required).toEqual(['mode']);
     expect(properties.process.required).toEqual(['record_id', 'process_index']);
     expect(properties.output.required).toEqual(['record_id', 'tool_call_id']);
     expect(properties.process.properties.process_index.minimum).toBe(0);
+    // The JS safe-integer bound constrains nothing a model sends; execution
+    // still rejects an unsafe index before reading.
+    expect(JSON.stringify(tool.inputSchema)).not.toContain(String(Number.MAX_SAFE_INTEGER));
+    const unsafe = await tool.execute({ action: 'read', scope: 'current', read: { page: { mode: 'around', index: 2 ** 60 } } }, ctxFor());
+    expect(unsafe.isError).toBe(true);
+    expect(JSON.parse(unsafe.content)).toMatchObject({ code: 'invalid_arguments', invalid_fields: ['read.page.index'] });
     expect(properties.search.properties.include_current.type).toBe('boolean');
     expect(properties.scope.enum).toEqual(['current', 'project', 'all']);
     expect(properties).not.toHaveProperty('query');
@@ -1042,9 +1124,9 @@ describe('historical execution retrieval and exact paging', () => {
     const [, read] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'forward-history', currentMessageId: 'now', allowedScopes: ['current'] });
     const decode = (value: string) => value.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
     const recovered = new Map<string, string>();
-    let input: Record<string, unknown> = { turn_id: 'old-0' };
+    let input: Record<string, unknown> = { action: 'read', scope: 'current', read: { turn_id: 'old-0', max_tokens: 1_000 } };
     for (let page = 0; page < 40; page++) {
-      const result = await read.execute({ ...input, scope: 'current', max_tokens: 1_000 }, ctxFor());
+      const result = await read.execute(input, ctxFor());
       expect(result.isError).toBeFalsy();
       for (const match of result.content.matchAll(/<msg[^>]*id="([^"]+)"[^>]*covered="(\d+)-(\d+)"[^>]*>\n([\s\S]*?)\n<\/msg>/g)) {
         const prior = recovered.get(match[1]) || '';
@@ -1171,7 +1253,7 @@ describe('chat history discovery and evidence recovery', () => {
     ], 'p1');
     const [,,tool] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'current', currentMessageId: 'now', projectId: 'p1' });
     const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-    let args: any = {action: 'read', scope, ...(scope !== 'current' ? { cid } : {}), max_tokens: 1000, read: {turn_id: 'report-turn'}};
+    let args: any = {action: 'read', scope, ...(scope !== 'current' ? { cid } : {}), read: {turn_id: 'report-turn', max_tokens: 1000}};
     const restored = new Map<string, string>();
     let pages = 0, done = false;
     for (; pages < 30; pages++) {
@@ -1186,7 +1268,8 @@ describe('chat history discovery and evidence recovery', () => {
       if (next === 'done') { done = true; break; }
       expect(result.content).not.toContain('Older records:');
       args = JSON.parse(next);
-      expect(args).toMatchObject({ action: 'read', scope, read: { turn_id: 'report-turn' }, max_tokens: 1000 });
+      expect(args).toMatchObject({ action: 'read', scope, read: { turn_id: 'report-turn', max_tokens: 1000, cursor: expect.any(Number) } });
+      expect(args).not.toHaveProperty('max_tokens');
       expect(args.cid).toBe(scope === 'current' ? undefined : cid);
     }
     expect(done).toBe(true);
@@ -1206,7 +1289,7 @@ describe('chat history discovery and evidence recovery', () => {
     const locator = JSON.parse(/^    process_read: (.+)$/m.exec(hit.content)![1]);
     expect(locator).toMatchObject({ action: 'read_process', scope: 'current', process: { record_id: 'report', process_index: 2 } });
     const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-    let args = { ...locator, max_tokens: 1000 }, restored = '', pages = 0, done = false;
+    let args = { ...locator, process: { ...locator.process, max_tokens: 1000 } }, restored = '', pages = 0, done = false;
     const { estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
     for (; pages < 30; pages++) {
       const result = await tool.execute(args, ctxFor());
@@ -1220,7 +1303,12 @@ describe('chat history discovery and evidence recovery', () => {
       const next = decode(/<next_read>(.*?)<\/next_read>/.exec(result.content)![1]);
       if (next === 'done') { done = true; break; }
       args = JSON.parse(next);
-      expect(args).toMatchObject({ action: 'read_process', scope: 'current', process: { process_index: 2 }, max_tokens: 1000 });
+      expect(args).toMatchObject({ action: 'read_process', scope: 'current', process: { process_index: 2, max_tokens: 1000 } });
+      if (pages === 0) {
+        const { cursor, max_tokens, ...process } = args.process;
+        const legacy = { ...args, cursor, max_tokens, process };
+        expect(await tool.execute(legacy, ctxFor())).toEqual(await tool.execute(args, ctxFor()));
+      }
     }
     expect(done).toBe(true);
     expect(pages).toBeGreaterThan(1);
@@ -1266,12 +1354,12 @@ describe('chat history discovery and evidence recovery', () => {
     expect(receipt.isError).toBeFalsy();
     const decode = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
     const locator = JSON.parse(decode(/<output_read>(.*?)<\/output_read>/.exec(receipt.content)![1]));
-    expect(locator).toMatchObject({ action: 'read_output', scope: 'current', output: { record_id: 'report', tool_call_id: 'call' }, cursor: 0 });
+    expect(locator).toMatchObject({ action: 'read_output', scope: 'current', output: { record_id: 'report', tool_call_id: 'call', cursor: 0 } });
     expect(locator).not.toHaveProperty('process_index');
     const whole = await tool.execute({ action: 'read', scope: 'current', read: { record_id: 'report', include_process: true } }, ctxFor());
     expect(whole.content).toContain('<output_read>');
     const { estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
-    let args = { ...locator, max_tokens: 800 }, restored = '', done = false;
+    let args = { ...locator, output: { ...locator.output, max_tokens: 800 } }, restored = '', done = false;
     for (let page = 0; page < 20; page++) {
       const output = await tool.execute(args, ctxFor());
       expect(output.isError).toBeFalsy();
@@ -1283,7 +1371,7 @@ describe('chat history discovery and evidence recovery', () => {
       const next = decode(/<next_read>(.*?)<\/next_read>/.exec(output.content)![1]);
       if (next === 'done') { done = true; break; }
       args = JSON.parse(next);
-      expect(args).toMatchObject({ action: 'read_output', output: { record_id: 'report', tool_call_id: 'call' }, max_tokens: 800 });
+      expect(args).toMatchObject({ action: 'read_output', output: { record_id: 'report', tool_call_id: 'call', max_tokens: 800 } });
     }
     expect(done).toBe(true);
     expect(restored).toBe('FULL_RETAINED_OUTPUT ' + 'data '.repeat(3000));
@@ -1405,7 +1493,7 @@ describe('chat history discovery and evidence recovery', () => {
       body += decode(/<msg [^>]*>\n([\s\S]*?)\n<process_read>/.exec(result.content)![1]);
       const next = decode(/<next_read>([\s\S]*?)<\/next_read>/.exec(result.content)![1]);
       if (next === 'done') break;
-      input = {action: 'read', scope: 'current', ...JSON.parse(next), max_tokens: 1000, read: {}};
+      input = JSON.parse(next);
     }
     expect(body).toBe(record.text);
   });

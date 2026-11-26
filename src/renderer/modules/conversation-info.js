@@ -22,7 +22,10 @@ const ConversationInfo = (() => {
   let _panelResize = null;
   let _seq = 0;
   let _fileSeq = 0;
+  const _fileSnapshotReads = new Map();
   let _attachmentSeq = 0;
+  let _appliedAttachmentSeq = 0;
+  let _attachmentInventoryConfirmed = false;
   const _locallyDeletedPaths = new Set();
   const _expandedDirectoryPaths = new Set();
   let _loading = false;
@@ -259,7 +262,7 @@ const ConversationInfo = (() => {
 
   async function _load(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, filesData, attachmentData] = await Promise.all([
+    const [historyData, filesData] = await Promise.all([
       _fetchJson(typeof _historyRequestUrl === 'function'
         ? _historyRequestUrl(cid)
         : `/api/conversations/${enc}/history?limit=10`),
@@ -267,10 +270,7 @@ const ConversationInfo = (() => {
         _infoLog.warn('file list load failed', { cid, error: err && err.message });
         return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
       }),
-      _fetchJson(`/api/conversations/${enc}/attachments?scope=all`).catch((err) => {
-        _infoLog.warn('attachment load failed', { cid, error: err && err.message });
-        return { items: [] };
-      }),
+      _refreshAttachmentInventory(cid),
     ]);
     return {
       conversation: historyData.conversation || null,
@@ -279,11 +279,24 @@ const ConversationInfo = (() => {
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
-      attachments: Array.isArray(attachmentData.items) ? attachmentData.items : [],
     };
   }
 
-  async function _loadFileSnapshot(cid) {
+  function _loadFileSnapshot(cid) {
+    const running = _fileSnapshotReads.get(cid);
+    if (running) {
+      // Keep one follow-up so a change during the current scan is picked up.
+      running.queued ??= running.active.then(() => (
+        _open && _cid === cid ? _loadFileSnapshot(cid) : null
+      ));
+      return running.queued;
+    }
+    const active = _fetchFileSnapshot(cid).finally(() => _fileSnapshotReads.delete(cid));
+    _fileSnapshotReads.set(cid, { active, queued: null });
+    return active;
+  }
+
+  async function _fetchFileSnapshot(cid) {
     const enc = encodeURIComponent(cid);
     const filesData = await _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
       _infoLog.warn('file list load failed', { cid, error: err && err.message });
@@ -622,12 +635,13 @@ const ConversationInfo = (() => {
       _refreshTabCounts();
       return;
     }
-    if (_loading) {
+    const showConfirmedAttachments = _activeTab === 'attachments' && _attachmentInventoryConfirmed;
+    if (_loading && !showConfirmedAttachments) {
       body.innerHTML = `<div class="conversation-info-empty">${escapeHtml(_label('common.loading', 'Loading…'))}</div>`;
       _refreshTabCounts();
       return;
     }
-    if (_error) {
+    if (_error && !showConfirmedAttachments) {
       body.innerHTML = `<div class="conversation-info-empty is-error">${escapeHtml(_label('conversation_info.load_failed', 'Could not load conversation info', { reason: _error }))}</div>`;
       _refreshTabCounts();
       return;
@@ -694,10 +708,8 @@ const ConversationInfo = (() => {
     const target = cid || _cid;
     if (!target || target !== _cid || !_open) return;
     const seq = ++_seq;
-    // Full and partial reads share ownership of each resource. A later read
-    // supersedes only its slice, without discarding the rest of a full load.
+    // A later file read supersedes only the file portion of this load.
     const fileSeq = ++_fileSeq;
-    const attachmentSeq = ++_attachmentSeq;
     const silent = !!opts.silent;
     if (silent && _loadingSource === 'full') {
       _clearLoading('full', seq, { clearAnyForSource: true });
@@ -718,7 +730,7 @@ const ConversationInfo = (() => {
           filesCount: _snapshot.filesCount,
           filesScanSkipped: _snapshot.filesScanSkipped,
         } : {}),
-        ...(attachmentSeq !== _attachmentSeq ? { attachments: _snapshot.attachments } : {}),
+        attachments: _snapshot.attachments,
       };
       _error = '';
     } catch (err) {
@@ -737,10 +749,17 @@ const ConversationInfo = (() => {
     if (!target || target !== _cid || !_open) return;
     // Composer selections contain only unsent files. Always refresh the task
     // inventory so sending/clearing a selection cannot erase earlier uploads.
+    await _refreshAttachmentInventory(target);
+  }
+
+  async function _refreshAttachmentInventory(target) {
     const seq = ++_attachmentSeq;
     try {
       const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments?scope=all`);
-      if (seq !== _attachmentSeq || target !== _cid) return;
+      // Either entry may supply inventory. Only a successful read supersedes it.
+      if (seq <= _appliedAttachmentSeq || target !== _cid) return;
+      _appliedAttachmentSeq = seq;
+      _attachmentInventoryConfirmed = Array.isArray(data.items);
       _snapshot = {
         ..._snapshot,
         attachments: Array.isArray(data.items) ? data.items : [],
@@ -767,7 +786,7 @@ const ConversationInfo = (() => {
     }
     try {
       const partial = await _loadFileSnapshot(target);
-      if (seq !== _fileSeq || target !== _cid) return;
+      if (!partial || seq !== _fileSeq || target !== _cid) return;
       _snapshot = { ..._snapshot, ...partial };
       _error = '';
       if (_activeTab === 'files') _renderBody();
@@ -800,7 +819,8 @@ const ConversationInfo = (() => {
     _resetLoading();
     _seq++;
     _fileSeq++;
-    _attachmentSeq++;
+    _appliedAttachmentSeq = ++_attachmentSeq;
+    _attachmentInventoryConfirmed = false;
     _syncChrome();
     _renderBody();
     if (_open && _cid) refresh(_cid);
@@ -1229,9 +1249,11 @@ const ConversationInfo = (() => {
       if (tab.dataset.bound === '1') return;
       tab.dataset.bound = '1';
       tab.addEventListener('click', () => {
+        const wasBrowser = _activeTab === 'browser';
         _activeTab = tab.dataset.infoTab || 'files';
         _syncChrome();
         _renderBody();
+        if (wasBrowser && _activeTab === 'attachments') return refreshAttachments(_cid);
       });
     });
     if (body && body.dataset.bound !== '1') {
@@ -1312,6 +1334,9 @@ const ConversationInfo = (() => {
   window.addEventListener('i18n-change', () => {
     _syncChrome();
     _renderBody();
+  });
+  window.orkas?.onPushEvent?.('web-assist:download-finished', (event) => {
+    if (event?.conversation_id) void refreshAttachments(event.conversation_id);
   });
 
   // External callers (chat header "详情" button, i18n-change listeners) read

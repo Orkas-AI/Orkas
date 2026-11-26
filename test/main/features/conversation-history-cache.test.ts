@@ -442,6 +442,34 @@ describe('conversation history projection cache', () => {
     expect(fs.readFileSync(sourceFile, 'utf8')).toBe(original);
   });
 
+  it('restores only settled public commentary from an interrupted expanded CLI run', async () => {
+    const notice = { ...message('interrupted'), from: 'kimi-agent', ts: '2026-10-17T12:14:00Z',
+      system_kind: 'reply_interrupted', source_message_id: 'source', text: 'The previous reply was interrupted.' };
+    writeRows([{ ...message('source'), from: 'user', ts: '2026-10-17T01:00:00Z' }, notice]);
+    const paths = await import('../../../src/main/paths');
+    const run = paths.localAgentRunDir(TEST_UID, '123456abcdef');
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, 'meta.json'), JSON.stringify({ cid: 'canonical', currentMessageId: 'source',
+      agentId: 'kimi-agent', cli: 'kimi', startedAt: '2026-10-17T01:00:01Z' }));
+    const commentary = 'Inspect the input.';
+    fs.writeFileSync(path.join(run, 'events.jsonl'), [
+      { type: 'text-delta', phase: 'pending', text: commentary },
+      { type: 'commentary-finalized', text: commentary },
+      { type: 'tool-event', phase: 'use', tool: 'read', callId: 'read-1' },
+      { type: 'text-delta', phase: 'pending', text: 'Unfinished result' },
+    ].map(event => JSON.stringify(event)).join('\n') + '\n');
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const { records: [record] } = await cache.readConversationHistoryPage(TEST_UID, sourceFile, 1);
+    expect(record.text).toBe(notice.text);
+    const part = record.process_parts?.[0];
+    if (!part || !('ref' in part)) throw new Error('Missing recovered CLI process');
+    const { items } = await cache.readConversationProcessPage(TEST_UID, sourceFile, part.ref, 0, record.id);
+    expect(items).toMatchObject([
+      { type: 'progress', text: commentary },
+      { type: 'event', event: { data: { callId: 'read-1' } } },
+    ]);
+  });
+
   it('keeps multiple exactly identified attempts in chronological order without claiming task completion', async () => {
     writeRows([
       { ...message('user-1'), from: 'user', ts: '2026-10-17T01:00:00Z' },

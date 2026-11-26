@@ -111,8 +111,16 @@ const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
 export const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_BYTES_IMAGE = MAX_IMAGE_ATTACHMENT_BYTES;
 const MAX_BYTES_PDF   = 100 * 1024 * 1024;
-export const MAX_VIDEO_ATTACHMENT_BYTES = 200 * 1024 * 1024;
+// A video imported from a path is copied in the main process and never read
+// into memory or by the model, so this cap only bounds the second copy on disk.
+// Footage for an edit is often several hundred MiB: on 2026-11-21 an 800 MB
+// clip could not be attached at the old 200 MiB.
+export const MAX_VIDEO_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_BYTES_VIDEO = MAX_VIDEO_ATTACHMENT_BYTES;
+// Bytes from a path-less File (paste, browser drag) are read whole into the
+// renderer and sent over IPC, and generated media is already a Buffer; both
+// keep the old cap.
+const MAX_BYTES_VIDEO_IN_MEMORY = 200 * 1024 * 1024;
 const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
 // Keep the composer boundary aligned with the authoritative native Skill ZIP
 // importer. The importer still re-checks compressed/uncompressed size, entry
@@ -503,7 +511,7 @@ function saveGeneratedMediaBytes(
   }
   const ext = path.extname(safeName).toLowerCase();
   const allowed = kind === 'image' ? IMAGE_EXTS : VIDEO_EXTS;
-  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO;
+  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO_IN_MEMORY;
   if (!allowed.has(ext)) return { ok: false, error: `generated output must use a supported ${kind} extension` };
   if (!Buffer.isBuffer(buffer) || !buffer.length) return { ok: false, error: `generated ${kind} is empty` };
   if (buffer.length > cap) return { ok: false, error: `generated ${kind} exceeds the attachment size limit` };
@@ -601,7 +609,7 @@ export async function saveGeneratedMediaCacheAttachment(
   }
   const ext = path.extname(safeName).toLowerCase();
   const allowed = kind === 'image' ? IMAGE_EXTS : VIDEO_EXTS;
-  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO;
+  const cap = kind === 'image' ? MAX_BYTES_IMAGE : MAX_BYTES_VIDEO_IN_MEMORY;
   if (!allowed.has(ext)) return { ok: false, error: `generated output must use a supported ${kind} extension` };
   if (!Buffer.isBuffer(buffer) || !buffer.length) return { ok: false, error: `generated ${kind} is empty` };
   if (buffer.length > cap) return { ok: false, error: `generated ${kind} exceeds the attachment size limit` };
@@ -705,7 +713,7 @@ export async function uploadAttachment(
 
   const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || []);
   const ext = path.extname(safeName).toLowerCase();
-  const cap = maxBytesFor(ext);
+  const cap = VIDEO_EXTS.has(ext) ? MAX_BYTES_VIDEO_IN_MEMORY : maxBytesFor(ext);
   if (buf.length > cap) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }), error_code: 'file_too_large' };
   }
@@ -1062,6 +1070,15 @@ function mediaFileFailureCode(error: unknown): MediaFileDiagnostic {
     : code === 'EACCES' || code === 'EPERM' ? 'permission_denied' : 'io_error';
 }
 
+/** Size cap for showing a local media file, or undefined for none. Video and
+ * audio stream through `serveFileRange` in ranges, so their size costs nothing;
+ * an image (and the SVG text that is materialized) is read and decoded whole.
+ * The old video cap left a 275 MB VideoStudio render blank in chat and on the
+ * canvas on 2026-11-21. */
+function localDisplayCap(ext: string): number | undefined {
+  return LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : undefined;
+}
+
 /** Diagnostic only: one async stat, no read, SVG materialization or mutation.
  * stat_available does not establish readability, transport or decode success.
  */
@@ -1101,8 +1118,8 @@ export async function diagnoseMediaFile(
   try {
     const stat = await fs.promises.stat(abs);
     if (!stat.isFile()) return { diagnosis: 'not_file', media_kind, ...context('not_file') };
-    const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
-    if (local && stat.size > cap) return { diagnosis: 'too_large', media_kind, ...context('too_large') };
+    const cap = localDisplayCap(ext);
+    if (local && cap !== undefined && stat.size > cap) return { diagnosis: 'too_large', media_kind, ...context('too_large') };
     return { diagnosis: 'stat_available', media_kind, ...context('stat_available') };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
@@ -1156,16 +1173,16 @@ export function resolveAttachmentAbsPath(
  * Resolve an arbitrary absolute local path → streamable media file, for the
  * `chat-media://local/<abs-path>` protocol route. Unlike per-cid attachments
  * this serves files from anywhere on the user's machine — but only when they
- * look like media (image, video, or audio extension) and aren't obscenely large.
+ * look like media (image, video, or audio extension).
  *
  * Threat model: the user runs the LLM on their own machine; worst case is
  * the LLM asks the renderer to display one of the user's own files. Not
- * exfiltration. No dir whitelist; the extension + size checks are the only
- * gates.
+ * exfiltration. No dir whitelist; the extension check is the gate, plus the
+ * image size cap from `localDisplayCap`.
  *
  * Accepts: absolute path (caller has already decoded URL + OS-normalized)
  * Rejects: relative paths, non-existent targets, non-file targets,
- *          non-media extensions, files over the per-kind cap.
+ *          non-media extensions, images over the image cap.
  */
 export function resolveLocalMediaPath(
   absPath: string,
@@ -1185,8 +1202,8 @@ export function resolveLocalMediaPath(
   try { stat = fs.statSync(normalized); }
   catch (error) { return { ok: false, code: 'not_found', error: 'not found', diagnosticCode: mediaFileFailureCode(error) }; }
   if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file', diagnosticCode: 'not_file' };
-  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
-  if (stat.size > cap) {
+  const cap = localDisplayCap(ext);
+  if (cap !== undefined && stat.size > cap) {
     const mb = Math.round(cap / 1024 / 1024);
     return { ok: false, code: 'too_large', error: `file exceeds ${mb}MB cap` };
   }
@@ -1770,7 +1787,8 @@ export async function buildAttachmentManifest(
         // Candidate providers enforce their own N-image request limit after
         // this manifest is built. `image_order` preserves a deterministic
         // name/path ↔ image-block mapping for whichever prefix is delivered.
-        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="model-bounded" image_order="${images.length}"/>`);
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="model-bounded" image_order="${images.length}" `
+          + `source_dimensions="${compressed.sourceWidth}x${compressed.sourceHeight}" preview_dimensions="${compressed.width}x${compressed.height}"/>`);
       } catch (err) {
         skipped.push({ name: nm, reason: t('attachments.skipped.compress_failed', { message: (err as Error).message }) });
       }

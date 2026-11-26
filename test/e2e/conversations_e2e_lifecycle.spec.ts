@@ -58,6 +58,8 @@ test.describe('conversations and resource picker', () => {
       description: 'Handles the deterministic title-routing regression.',
       category: 'general',
     });
+    // The out-of-band fixture write does not refresh the renderer catalog.
+    await page.evaluate(async () => (window as any).loadAgents(true));
 
     await page.locator('#new-chat-btn').click();
     await page.locator('#new-chat-recipient-chip').click();

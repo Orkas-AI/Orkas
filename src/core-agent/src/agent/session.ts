@@ -4,6 +4,7 @@ import { estimateTextTokenQuarters, estimateTextTokens } from "../shared/token-e
 export { estimateTextTokens } from "../shared/token-estimate.js";
 import * as path from "node:path";
 import type { ImageContent, Message, MessageContent, Usage } from "../shared/types.js";
+import { STABLE_CACHE_HISTORY_END } from "../shared/types.js";
 import type { ToolObservations, ToolResultImage } from "../tools/base.js";
 import {
   appendWorkspaceObservations,
@@ -214,6 +215,7 @@ type ActiveTurnRecord = {
   historyBudget?: { usableInputTokens: number; maxTokens: number };
   checkpointSummary?: string;
   checkpointThroughMessageIndex?: number;
+  checkpointLengthRetryUsed?: true;
   /** Frozen when this turn starts or a checkpoint replaces raw process. */
   continuationContext?: string;
   /** Plan anchor frozen when a mid-turn user correction arrived, keyed by that
@@ -718,6 +720,7 @@ export class Session {
   private historyWindowMemo: { key: unknown[]; messages: Message[]; tokens?: number } | undefined;
   /** Bumped when a history resource is added or updated in place. */
   private historyResourceRevision = 0;
+  private readonly steerToolAdditions = new WeakMap<Message, readonly string[]>();
 
   constructor(opts?: { maxHistoryTurns?: number }) {
     this.maxHistoryTurns = opts?.maxHistoryTurns ?? 50;
@@ -779,6 +782,14 @@ export class Session {
   /** Add a user text message. */
   addUserMessage(text: string): void {
     this.addMessage("user", [{ type: "text", text }]);
+  }
+
+  recordSteerToolAdditions(message: Message, names: readonly string[]): void {
+    if (names.length && message.role === "user" && isPositiveInteger(message.turnId)
+      && message.turnId === this.turnState?.activeTurn?.id) {
+      const previous = this.steerToolAdditions.get(message);
+      this.steerToolAdditions.set(message, previous ? [...new Set([...previous, ...names])] : names);
+    }
   }
 
   /** Host/runtime durability barriers are silent for in-memory sessions. */
@@ -1398,7 +1409,7 @@ export class Session {
    * Legacy sessions with no turn tracking keep the old provider view: raw
    * messages verbatim except stale image bytes are stripped.
    */
-  getMessagesForModel(opts?: { turnContext?: string; includeExecutionPlan?: boolean }): Message[] {
+  getMessagesForModel(opts?: { turnContext?: string; includeExecutionPlan?: boolean; markStableCacheHistory?: boolean }): Message[] {
     // `turnContext` is host-provided per-turn ephemeral text (orchestration
     // ledger, datetime, …). It is injected into THIS turn's user message only
     // and is NEVER persisted — see the injection at the active turn below and
@@ -1421,10 +1432,15 @@ export class Session {
     // Completed dialogue retains the existing image-elision policy. Only the
     // active turn below must remain byte-stable until an explicit reduction.
     const completedHistory = stripOldImages(result);
+    const historyEnd = completedHistory.at(-1);
+    if (opts?.markStableCacheHistory && historyEnd) {
+      completedHistory[completedHistory.length - 1] = { ...historyEnd, [STABLE_CACHE_HISTORY_END]: true };
+    }
     result.splice(0, result.length, ...completedHistory);
 
     const active = state.activeTurn;
     if (active) {
+      let checkpoint: Message | undefined;
       const retained = activeAuthoringImages(this.messages, active.userMessageIndex + 1);
       const user = this.messages[active.userMessageIndex];
       if (user) {
@@ -1445,7 +1461,7 @@ export class Session {
         result.push(cloned);
       }
       if (active.checkpointSummary) {
-        result.push({
+        checkpoint = {
           role: "user",
           content: [{
             type: "text",
@@ -1461,17 +1477,29 @@ export class Session {
                 ? `\n\n[Runtime state captured at checkpoint creation; includes retained recent results below]\n${active.continuationContext}` : ""),
             ),
           }, ...archivedAuthoringImages(retained, active.checkpointThroughMessageIndex ?? active.userMessageIndex)],
-        });
+        };
+        result.push(checkpoint);
       }
       const checkpointThrough = active.checkpointThroughMessageIndex ?? active.userMessageIndex;
+      const archivedToolNames = checkpoint ? new Set<string>() : undefined;
       const roundsAfter = assistantRoundsAfter(this.messages, active.userMessageIndex + 1);
       for (let i = active.userMessageIndex + 1; i < this.messages.length; i++) {
+        const raw = this.messages[i];
         // Skip messages the checkpoint summary already represents — EXCEPT a
         // mid-turn interrupt steer, which the summarizer never captured and
         // must survive verbatim as a user directive.
-        if (i <= checkpointThrough && !isInterruptSteerMessage(this.messages[i])) continue;
-        const raw = this.messages[i];
+        if (i <= checkpointThrough && !isInterruptSteerMessage(raw)) {
+          if (archivedToolNames && raw.role === "user") {
+            for (const part of raw.content) {
+              if (part.type !== "tool_result") continue;
+              for (const name of part.addedToolNames ?? []) archivedToolNames.add(name);
+            }
+          }
+          continue;
+        }
         const cloned = elideStaleActiveImages(cloneMessage(raw), roundsAfter[i], isPositiveInteger(raw.turnId), retained);
+        const additions = this.steerToolAdditions.get(raw);
+        if (additions) cloned.toolsAddedAfter = additions;
         const anchor = i > checkpointThrough && opts?.includeExecutionPlan !== false
           ? active.steerPlanAnchors?.find((entry) => entry.messageIndex === i)
           : undefined;
@@ -1480,6 +1508,7 @@ export class Session {
         }
         result.push(cloned);
       }
+      if (checkpoint && archivedToolNames?.size) checkpoint.toolsAddedAfter = [...archivedToolNames];
 
       // New facts travel in immutable tool receipts or appended host events.
       // Durable ledgers restore omitted facts only at a checkpoint/turn boundary.
@@ -1888,6 +1917,8 @@ export class Session {
   selectPendingActiveCheckpoint(
     budget?: ContextBudget,
     inputTokenBudget?: number,
+    maxGroups?: number,
+    allowClippedGroup = true,
   ): ActiveCheckpointSelection {
     const limits = budget ?? DEFAULT_CONTEXT_BUDGET;
     const state = this.turnState;
@@ -1930,7 +1961,7 @@ export class Session {
       retainedTokens += group.tokens;
     }
 
-    const eligibleArchiveGroups = groups.slice(0, archiveEnd);
+    const eligibleArchiveGroups = groups.slice(0, Math.min(archiveEnd, maxGroups ?? archiveEnd));
     if (!eligibleArchiveGroups.length) return { candidate: null };
 
     const normalizedInputBudget = Number.isFinite(inputTokenBudget) && (inputTokenBudget as number) >= 0
@@ -1962,9 +1993,9 @@ export class Session {
       }
 
       if (selectedGroupCount === 0) {
-        clippedSection = this.buildClippedActiveCheckpointSection(
+        clippedSection = allowClippedGroup ? this.buildClippedActiveCheckpointSection(
           eligibleArchiveGroups[0], checkpointSections.base, normalizedInputBudget,
-        );
+        ) : undefined;
         if (clippedSection === undefined) return {
           candidate: null,
           capacityIssue: {
@@ -2005,6 +2036,15 @@ export class Session {
     };
   }
 
+  /** Reserve the one shortened summary request for this user turn. */
+  claimActiveCheckpointLengthRetry(): boolean {
+    const active = this.turnState?.activeTurn;
+    if (!active || active.checkpointLengthRetryUsed === true) return false;
+    this.invalidateContextSnapshot();
+    active.checkpointLengthRetryUsed = true;
+    return true;
+  }
+
   applyActiveCheckpointSummary(
     summary: string,
     checkpointThroughMessageIndex: number,
@@ -2039,8 +2079,28 @@ export class Session {
     checkpointThroughMessageIndex: number,
     maxSummaryTokens?: number,
   ): number {
+    return this.withActiveCheckpointPreview(summary, checkpointThroughMessageIndex,
+      maxSummaryTokens, () => this.estimateModelTokens());
+  }
+
+  previewActiveCheckpointMessages(
+    summary: string,
+    checkpointThroughMessageIndex: number,
+    maxSummaryTokens: number,
+    opts?: Parameters<Session["getMessagesForModel"]>[0],
+  ): Message[] {
+    return this.withActiveCheckpointPreview(summary, checkpointThroughMessageIndex,
+      maxSummaryTokens, () => this.getMessagesForModel(opts));
+  }
+
+  private withActiveCheckpointPreview<T>(
+    summary: string,
+    checkpointThroughMessageIndex: number,
+    maxSummaryTokens: number | undefined,
+    render: () => T,
+  ): T {
     const active = this.turnState?.activeTurn;
-    if (!active) return this.estimateModelTokens();
+    if (!active) return render();
     const previousSummary = active.checkpointSummary;
     const previousThrough = active.checkpointThroughMessageIndex;
     const previousContext = active.continuationContext;
@@ -2056,7 +2116,7 @@ export class Session {
       active.continuationContext = this.continuationContextText(active.id, visibleToolResultIds(
         this.messages.slice(active.checkpointThroughMessageIndex + 1),
       ));
-      return this.estimateModelTokens();
+      return render();
     } finally {
       active.checkpointSummary = previousSummary;
       active.checkpointThroughMessageIndex = previousThrough;
@@ -2244,6 +2304,7 @@ export class Session {
       preferActiveTail: !!restored.activeTurn,
       activeCheckpointSummary: restored.activeTurn?.checkpointSummary,
       activeCheckpointThroughMessageIndex: restored.activeTurn?.checkpointThroughMessageIndex,
+      activeCheckpointLengthRetryUsed: restored.activeTurn?.checkpointLengthRetryUsed,
       activeContinuationContext: restored.activeTurn?.continuationContext,
       activeHistoryBudget: restored.activeTurn?.historyBudget,
       activeSteerPlanAnchors: restored.activeTurn?.steerPlanAnchors,
@@ -2318,6 +2379,7 @@ export class Session {
     preferActiveTail?: boolean;
     activeCheckpointSummary?: string;
     activeCheckpointThroughMessageIndex?: number;
+    activeCheckpointLengthRetryUsed?: true;
     activeContinuationContext?: string;
     activeHistoryBudget?: ActiveTurnRecord["historyBudget"];
     activeSteerPlanAnchors?: SteerPlanAnchor[];
@@ -2375,6 +2437,7 @@ export class Session {
           continuationContext: preserve.activeContinuationContext,
           historyBudget: preserve.activeHistoryBudget,
         };
+        if (preserve.activeCheckpointLengthRetryUsed === true) active.checkpointLengthRetryUsed = true;
         const anchors = preserve.activeSteerPlanAnchors?.filter((entry) => (
           entry.messageIndex > active.userMessageIndex && entry.messageIndex < this.messages.length
         ));

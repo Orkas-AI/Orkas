@@ -27,8 +27,14 @@ describe('conversation-cost-meter', () => {
     expect(taskTokens(CID)).toBe(155);
   });
 
-  it('prefers totalTokens when provided', () => {
-    recordUsageTokens(CID, { inputTokens: 100, outputTokens: 20, totalTokens: 999 });
+  it('counts cache writes even when there is no fresh input or output', () => {
+    recordUsageTokens(CID, { cacheWriteTokens: 300 });
+    recordUsageTokens(CID, { cacheWriteTokens: 200 });
+    expect(taskTokens(CID)).toBe(500);
+  });
+
+  it('prefers a supplied total without adding cache writes a second time', () => {
+    recordUsageTokens(CID, { inputTokens: 100, outputTokens: 20, cacheWriteTokens: 400, totalTokens: 999 });
     expect(taskTokens(CID)).toBe(999);
   });
 

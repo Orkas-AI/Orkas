@@ -207,7 +207,7 @@ test.describe('new chat composer', () => {
     await expect(continuation.locator('.chat-use-inline-name')).toHaveText('ScopedWriter');
   });
 
-  test('keeps CLI separate and shares model priority selection across composers', async ({ appPage, orkas }) => {
+  test('keeps CLI separate and shares model priority selection across composers', async ({ appPage, orkas }, testInfo) => {
     await expect(appPage.locator('.new-chat-model-choices')).toHaveCount(0);
 
     const modelChips = appPage.locator('[data-composer-model-chip]');
@@ -351,14 +351,13 @@ test.describe('new chat composer', () => {
     expect(await versionList.evaluate((element) => element.parentElement === document.body)).toBe(true);
     const parentHeightAfter = await parentMenu.evaluate((element) => element.getBoundingClientRect().height);
     expect(Math.abs(parentHeightAfter - parentHeightBefore)).toBeLessThan(1);
-    await expect(versionList.locator('.composer-model-menu-version-item')).toHaveCount(8);
     await expect(versionList.locator('.composer-model-menu-version-label'))
-      .toHaveText(['GPT-6 Astra', 'GPT-6.1 Sol', 'GPT-6.1 Terra', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
+      .toHaveText(['GPT-6.2 Astra', 'GPT-6.2 Sol', 'GPT-6.1 Sol', 'GPT-6.1 Terra',
+        'GPT-6 Astra', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']);
     await expect(versionList.locator('.composer-model-menu-version-current-dot')).toHaveCount(1);
     await expect(versionList.locator('.composer-model-menu-version-check')).toHaveCount(0);
-    await versionList.locator(
-      '.composer-model-menu-version-item[data-model="gpt-5.6-luna"]',
-    ).click();
+    await testInfo.attach('composer-model-order', { body: await versionList.screenshot(), contentType: 'image/png' });
+    await versionList.locator('.composer-model-menu-version-item[data-model="gpt-5.6-luna"]').click();
     await expect(versionList).toBeVisible();
     await expect(versionList.locator(
       '.composer-model-menu-version-item[data-model="gpt-5.6-luna"] .composer-model-menu-version-current-dot',
@@ -752,19 +751,19 @@ test.describe('new chat composer', () => {
         id: 'office',
         agentId: 'a19101ba698a',
         agentName: 'OfficeWorker',
-        prompt: 'Create an editable ecommerce sales report using sample data, with core metrics, trend charts, and channel charts.',
+        prompt: 'Create an editable monthly sales report for an ecommerce store using sample data. Include key metrics, trend charts, and charts by sales channel.',
       },
       {
         id: 'image',
         agentId: '814b61b027f0',
         agentName: 'ImageStudio',
-        prompt: 'Design a City Summer Coffee Festival poster for August 16, 2:00–8:00 PM, at Central Plaza, featuring pour-over tastings, a coffee market, and seasonal drinks.',
+        prompt: 'Design a City Summer Coffee Festival poster for August 16, 2–8 PM, at the central plaza. Feature hands-on pour-over brewing, a coffee market, and festival-exclusive specialty drinks.',
       },
       {
         id: 'video',
         agentId: '79df9cc89f5f',
         agentName: 'VideoStudio',
-        prompt: 'Make a 20-second vertical TikTok sales video for this portable blender: 380 mL, USB-C charging, $29.',
+        prompt: 'Make a 20-second vertical TikTok sales video for this portable blender: 380 mL, USB-C charging, CNY 129.',
       },
       {
         id: 'ui_design',
@@ -898,7 +897,18 @@ test.describe('new chat composer', () => {
       const header = rect('.new-chat-header');
       const composer = rect('.new-chat-input-area');
       const quickPanel = rect('#new-chat-scenarios');
-      const quickCard = rect('.new-chat-scenario-chip');
+      const quickCards = Array.from(document.querySelectorAll('.new-chat-scenario-chip'));
+      const cardHeights = quickCards.map(card => card.getBoundingClientRect().height);
+      // Equal grid rows fit the longest localized card.
+      const occupiedHeights = quickCards.map(card => {
+        const style = getComputedStyle(card);
+        const contentHeight = Math.max(...Array.from(card.children, child => {
+          const childStyle = getComputedStyle(child);
+          return child.getBoundingClientRect().height + parseFloat(childStyle.marginTop) + parseFloat(childStyle.marginBottom);
+        }));
+        return contentHeight + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+          + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+      });
       const below = document.querySelector<HTMLElement>('.home-below')!;
       const belowStyle = getComputedStyle(below);
       const landing = rect('.new-chat-center');
@@ -917,8 +927,9 @@ test.describe('new chat composer', () => {
         greetingFontSize: getComputedStyle(document.querySelector('.new-chat-greeting')!).fontSize,
         greetingTextAlign: getComputedStyle(document.querySelector('.new-chat-header')!).textAlign,
         composerHeight: composer.height,
-        quickCardHeight: quickCard.height,
-        quickCardCount: document.querySelectorAll('.new-chat-scenario-chip').length,
+        quickCardHeights: cardHeights,
+        quickCardContentHeight: Math.max(...occupiedHeights),
+        quickCardCount: quickCards.length,
         quickGridColumns: getComputedStyle(document.querySelector('.quick-grid')!).gridTemplateColumns
           .split(' ').length,
         quickTilesFit: Array.from(document.querySelectorAll('.quick-tile'))
@@ -964,9 +975,11 @@ test.describe('new chat composer', () => {
     expect(layout.greetingFontSize).toBe('32px');
     expect(layout.greetingTextAlign).toBe('center');
     expect(layout.composerHeight).toBeLessThanOrEqual(150);
-    expect(layout.quickCardHeight).toBeGreaterThanOrEqual(100);
-    expect(layout.quickCardHeight).toBeLessThanOrEqual(116);
     expect(layout.quickCardCount).toBe(9);
+    const expectedCardHeight = Math.max(100, layout.quickCardContentHeight);
+    for (const height of layout.quickCardHeights) {
+      expect(Math.abs(height - expectedCardHeight)).toBeLessThanOrEqual(1);
+    }
     expect(layout.quickGridColumns).toBe(3);
     expect(layout.quickTilesFit).toBe(true);
     expect(layout.quickTileSizes).toEqual(Array(9).fill('36x36'));

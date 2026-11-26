@@ -96,3 +96,102 @@ test('restores and updates a complete process rail without changing disclosure o
     await app.page!.screenshot({ path: testInfo.outputPath('unchanged-app.png') });
   } finally { await app.dispose(); }
 });
+
+test('restores unsuccessful generic tool results with failure labels', async ({}, testInfo) => {
+  const app = new OrkasTestApp(testInfo, { marketplaceStub: true });
+  try {
+    await app.launch();
+    const result = await app.page!.evaluate(() => {
+      const api = window as any;
+      const host = document.createElement('div');
+      host.className = 'chat-history';
+      host.style.cssText = 'position:fixed;top:80px;left:300px;width:600px;background:var(--bg-primary);z-index:9999';
+      document.body.appendChild(host);
+      const message: HTMLElement = api._createStreamingAssistantMessage(host);
+      api._replayPersistedProcessItems(message, [
+        { type: 'event', event: { stream: 'tool', data: {
+          phase: 'end', name: 'tool_result', callId: 'native-generic-failure', isError: true, duration_ms: 9,
+        } } },
+        { type: 'event', event: { stream: 'cli', data: {
+          type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cli-generic-failure', isError: true,
+        } } },
+        { type: 'event', event: { stream: 'cli', data: {
+          type: 'tool-event', phase: 'result', tool: 'tool_result', callId: 'cli-generic-success', isError: false,
+        } } },
+      ]);
+      message.querySelectorAll<HTMLDetailsElement>('details').forEach(details => { details.open = true; });
+      const rows = Array.from(message.querySelectorAll<HTMLElement>('[data-process-operation="1"]'));
+      return {
+        rows: rows.map(row => ({ kind: row.dataset.processKind, text: row.textContent?.trim() || '' })),
+        failed: api.t('chat.process.status_failed'),
+        done: api.t('chat.process.status_done'),
+      };
+    });
+    expect(result.rows.map(row => row.kind)).toEqual(['err', 'err', 'tool']);
+    expect(result.rows[0].text).toContain(result.failed);
+    expect(result.rows[0].text).toContain('9');
+    expect(result.rows[1].text).toContain(result.failed);
+    expect(result.rows[2].text).toContain(result.done);
+    await app.page!.screenshot({ path: testInfo.outputPath('generic-tool-results.png') });
+  } finally { await app.dispose(); }
+});
+
+test('labels the end of a publish call independently of its outcome', async ({}, testInfo) => {
+  const app = new OrkasTestApp(testInfo, { marketplaceStub: true });
+  try {
+    await app.launch();
+    for (const { lang, width, label } of [
+      { lang: 'en', width: 600, label: 'Publish tool call ended' },
+      { lang: 'zh', width: 320, label: '发布工具调用结束' },
+    ]) {
+      const result = await app.page!.evaluate(async ({ lang, width }) => {
+        const api = window as any;
+        await api.setLang(lang);
+        document.querySelector('#publish-process-fixture')?.remove();
+        const host = document.createElement('div');
+        host.id = 'publish-process-fixture';
+        host.className = 'chat-history';
+        host.style.cssText = `position:fixed;top:80px;left:300px;width:${width}px;padding-inline:16px;background:var(--bg);z-index:9999`;
+        document.body.appendChild(host);
+        const live: HTMLElement = api._createStreamingAssistantMessage(host);
+        const replayed: HTMLElement = api._createStreamingAssistantMessage(host);
+        const receipt = JSON.stringify({ published: 0, requested: 1, outputs: [] });
+        const items = [
+          { type: 'event', event: { stream: 'tool', data: {
+            name: 'publish_outputs', phase: 'end', callId: 'publish-zero', output: receipt, duration_ms: 17,
+          } } },
+          { type: 'event', event: { stream: 'cli', data: {
+            type: 'tool-event', tool: 'mcp__orkas__publish_outputs', phase: 'result', callId: 'publish-cli',
+            output: { published: 1, requested: 1, outputs: [{ name: 'report.txt' }] },
+          } } },
+          { type: 'event', event: { stream: 'tool', data: {
+            name: 'publish_outputs', phase: 'end', callId: 'publish-failed', isError: true,
+          } } },
+          { type: 'event', event: { stream: 'tool', data: {
+            name: 'publish_outputs', phase: 'end', callId: 'publish-skipped', execution_state: 'skipped',
+          } } },
+        ];
+        for (const item of items) api._handleStreamEvent('publish-test', live, item);
+        api._replayPersistedProcessItems(replayed, items);
+        host.querySelectorAll<HTMLDetailsElement>('details').forEach(details => { details.open = true; });
+        const rows = (message: HTMLElement) => Array.from(
+          message.querySelectorAll<HTMLElement>('[data-process-operation="1"]'),
+          node => ({ text: node.textContent?.trim(), output: (node as any)._fullOutput }),
+        );
+        return {
+          live: rows(live), replayed: rows(replayed), receipt,
+          failed: api.t('chat.process.status_failed'), skipped: api.t('chat.process.status_not_executed'),
+        };
+      }, { lang, width });
+      expect(result.live).toEqual(result.replayed);
+      expect(result.live).toHaveLength(4);
+      expect(result.live[0].text).toContain(label);
+      expect(result.live[0].text).toContain('17');
+      expect(result.live[0].output).toBe(result.receipt);
+      expect(result.live[1].text).toBe(label);
+      expect(result.live[2].text).toContain(result.failed);
+      expect(result.live[3].text).toContain(result.skipped);
+      await app.page!.locator('#publish-process-fixture').screenshot({ path: testInfo.outputPath(`publish-${lang}.png`) });
+    }
+  } finally { await app.dispose(); }
+});

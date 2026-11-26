@@ -3,6 +3,49 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 
+test('opens completed todos at full column width from the conversation header', async ({ orkas: app }, testInfo) => {
+  const page = app.page!;
+  const { conversation } = await app.invoke<any>('conversations.create', { title: 'Review release readiness' });
+  const cid = conversation.conversation_id;
+  const content = 'Review release readiness and confirm the remaining rollout details';
+  const { task } = await app.invoke<any>('projects.tasks.create', { content, status: 'done' });
+  const uid = await page.evaluate<string>('currentUserId');
+  const file = path.join(app.workspaceRoot, uid, 'cloud', 'tasks', `${task.id}.json`);
+  // Seed the execution association without a model call.
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), origin_cid: cid }));
+  await page.evaluate(() => (window as any).loadConversations({ fresh: true }));
+
+  const completed = page.locator('#todos-content .todo-column.is-done');
+  const pending = page.locator('#todos-content .todo-column.is-todo');
+  const toggle = completed.locator('.todo-collapse');
+  const card = completed.locator(`[data-tid="${task.id}"]`);
+  for (const [grouping, width, height, locale] of [
+    ['project', 1440, 900, 'en'], ['status', 1024, 600, 'zh'],
+  ] as const) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(locale => (window as any).setLang(locale), locale);
+    await openSidebarEntry(page, '#todos-btn');
+    await page.locator(`[data-todo-group="${grouping}"]`).click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card).toBeHidden();
+
+    await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
+    await page.locator(`#chat-header [data-header-task-id="${task.id}"]`).click();
+    await expect(card).toHaveClass(/\bis-highlighted\b/);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator(`[data-todo-group="${grouping}"]`)).toHaveAttribute('aria-pressed', 'true');
+    const [completedBox, pendingBox] = await Promise.all([card.boundingBox(), pending.boundingBox()]);
+    expect(completedBox!.width).toBeCloseTo(pendingBox!.width, 0);
+    await expect(card.getByText(content, { exact: true })).toBeInViewport();
+    await page.screenshot({ path: testInfo.outputPath(`completed-todo-shortcut-${locale}.png`) });
+
+    await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
+    await openSidebarEntry(page, '#todos-btn');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card).toBeHidden();
+  }
+});
+
 test('keeps file and related resource glyphs readable within their shared icon box', async ({ orkas: app }, testInfo) => {
   const page = app.page!;
   const files = ['report.md', 'report.pdf', 'report.docx', 'report.xlsx', 'report.pptx',
@@ -173,6 +216,8 @@ test('shows clickable task content previews without changing code examples, link
   }, { cid: conversation.conversation_id, content });
   await message.locator('button.chat-task-reference').nth(1).click();
   await expect(page.locator(`#auto-list [data-task-id="${automation}"]`)).toHaveClass(/\bis-highlighted\b/);
+  await page.locator('#panel-auto').getByRole('button', { name: '返回', exact: true }).click();
+  await expect(page.locator('#chat-header-title')).toHaveText('Task reference display');
 });
 
 test('recovers the completed reply without leaving the page when terminal delivery is lost', async ({ modelOrkas: app }) => {
@@ -239,6 +284,7 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   expect(links.map(link => [link.kind, link.title])).toEqual([
     ['automation', 'Nightly review'], ['todo', 'Review release notes'],
   ]);
+  // Saving creates message shortcuts. The header belongs to an actual task run.
   const automation = links.find(link => link.kind === 'automation')!;
   const todo = links.find(link => link.kind === 'todo')!;
   const storedAutomations = await app.invoke<{
@@ -260,7 +306,7 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   expect(globalTodos.tasks).toEqual([]);
   await app.invoke('projects.tasks.create', { projectId: project.project.project_id, content: 'Another release check' });
   await expect(page.locator('#chat-history [data-saved-task-key]')).toHaveCount(2);
-  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveCount(1);
+  await expect(page.locator('#chat-header-task-links')).toBeHidden();
   await page.evaluate(() => (window as any).setLang('zh'));
   await expect(page.locator('#chat-history [data-saved-task-key] .chat-msg-created-agent-label').first()).toContainText('打开');
   await page.evaluate(() => (window as any).setLang('en'));
@@ -318,8 +364,11 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   await expect(todoCard).toHaveCSS('box-shadow', restingStyle.shadow);
   await expect(page.locator('[data-todo-group="status"]')).toHaveAttribute('aria-pressed', 'true');
   // Reopening the shortcut should reveal the highlight again in a narrow window.
+  await page.locator('#panel-todos').getByRole('button', { name: 'Back', exact: true }).click();
+  await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body'))
+    .toContainText('The tasks have been saved.');
   await page.setViewportSize({ width: 1024, height: 720 });
-  await page.evaluate((id) => { (window as any).setLang('zh'); (window as any).setView('conversation', id); }, cid);
+  await page.evaluate(() => (window as any).setLang('zh'));
   await page.locator('#chat-history [data-saved-task-key]', { hasText: 'Review release notes' }).click();
   await expect(todoCard).toBeInViewport();
   await expect(todoCard).not.toHaveCSS('background-color', restingStyle.background, { timeout: 1500 });
@@ -335,11 +384,10 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   }>('conversations.list');
   expect(restored.conversations.find(item => item.conversation_id === cid)?.project_id)
     .toBe(project.project.project_id);
-  // Project conversations live in their project's sidebar, not the global
-  // conversation list. Reopen through the same public route used above.
-  await page.evaluate(id => (window as any).setView('conversation', id), cid);
+  await page.evaluate((pid) => (window as any).setView('project', pid), project.project.project_id);
+  await page.locator(`#project-tasks-list .conv-item[data-cid="${cid}"]`).click();
   await expect(page.locator('#chat-history [data-saved-task-key]')).toHaveCount(2);
-  await expect(page.locator('#chat-header [data-header-task-id]')).toHaveCount(1);
+  await expect(page.locator('#chat-header-task-links')).toBeHidden();
   await page.locator('#chat-history [data-saved-task-key]', { hasText: 'Nightly review' }).click();
   await expectAutomationFocused();
 });
@@ -412,13 +460,46 @@ test('shows conversation source icons and header shortcuts together without crow
     await expect(page.locator('#conversation-info-toggle')).toBeInViewport();
     await page.screenshot({ path: testInfo.outputPath(`conversation-task-links-${locale}.png`) });
   }
-  await page.locator(`#chat-header [data-header-task-id="${todo.id}"]`).focus();
+  const draft = page.locator('#chat-input');
+  const draftText = 'Changes to review before release';
+  await draft.fill(draftText);
+  const sourceRow = page.locator(`#today-list .conv-item[data-cid="${cid}"]`);
+  const todoShortcut = page.locator(`#chat-header [data-header-task-id="${todo.id}"]`);
+  const automationShortcut = page.locator(`#chat-header [data-header-task-id="${automation.id}"]`);
+  const todoBack = page.locator('#panel-todos').getByRole('button', { name: '返回', exact: true });
+  await todoShortcut.focus();
   await page.keyboard.press('Enter');
   await expect(page.locator(`#todos-content [data-tid="${todo.id}"]`)).toHaveClass(/\bis-highlighted\b/);
-  await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
-  await page.locator(`#chat-header [data-header-task-id="${automation.id}"]`).click();
+  await expect(todoBack).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('todo-return-zh-narrow.png') });
+  await todoBack.focus();
+  await page.keyboard.press('Enter');
+  await expect(sourceRow).toHaveClass(/\bactive\b/);
+  await expect(draft).toBeVisible();
+  await expect(draft).toHaveText(draftText);
+  await openSidebarEntry(page, '#todos-btn');
+  await expect(page.locator('#panel-todos')).toBeVisible();
+  await expect(todoBack).toBeHidden();
+
+  await sourceRow.click();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.evaluate(() => (window as any).setLang('en'));
+  const autoBack = page.locator('#panel-auto').getByRole('button', { name: 'Back', exact: true });
+  await automationShortcut.click();
   await expect(page.locator(`#auto-list [data-task-id="${automation.id}"]`)).toHaveClass(/\bis-highlighted\b/);
-  await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
+  await expect(autoBack).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('automation-return-en-wide.png') });
+  await autoBack.click();
+  await expect(sourceRow).toHaveClass(/\bactive\b/);
+  await expect(draft).toBeVisible();
+  await expect(draft).toHaveText(draftText);
+  await automationShortcut.click();
+  await expect(autoBack).toBeVisible();
+  await openSidebarEntry(page, '#auto-btn');
+  await expect(page.locator('#panel-auto')).toBeVisible();
+  await expect(autoBack).toBeHidden();
+
+  await sourceRow.click();
   await app.invoke('projects.tasks.delete', { taskId: todo.id });
   await expect(links).toHaveCount(1);
   await expect(page.locator('#chat-header [data-header-task-id]')).toHaveAttribute('data-header-task-id', automation.id);

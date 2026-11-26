@@ -4,6 +4,124 @@ import { expect, test } from './fixtures/orkas';
 import { composerText } from './fixtures/composer';
 
 
+test('shows an unconfirmed composer send inline without sending it again', async ({ modelOrkas }, testInfo) => {
+  const page = modelOrkas.page!;
+  const created = await modelOrkas.invoke<{ conversation: { conversation_id: string } }>(
+    'conversations.create', { title: 'Send confirmation' },
+  );
+  const cid = created.conversation.conversation_id;
+  await page.evaluate(async () => (window as any).loadConversations());
+  await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+  await expect(page.locator('#chat-header-title')).toHaveText('Send confirmation');
+  await page.evaluate(async () => {
+    const app = window as any;
+    await app.setLang('zh');
+    const fetch = app.apiFetch;
+    let release!: () => void;
+    const historyGate = new Promise<void>((resolve) => { release = resolve; });
+    app.__sendConfirmationTest = { release, sends: 0 };
+    app.apiFetch = async (url: string, options: unknown) => {
+      if (url.endsWith('/send/stream')) {
+        app.__sendConfirmationTest.sends += 1;
+        return new Response('');
+      }
+      if (url.includes('receipt_client_msg_id=')) await historyGate;
+      return fetch(url, options);
+    };
+  });
+  const input = page.locator('#chat-input');
+  const send = page.locator('#chat-send-btn');
+  const status = page.locator('#chat-history [data-i18n="chat.send_unconfirmed"]');
+  await input.fill('Prepare the full launch checklist.');
+  await send.click();
+  await expect(status).toBeVisible();
+  await expect(status).toHaveText('发送结果待确认');
+  await expect(status.locator('..').locator('.stream-process')).toBeHidden();
+  await expect(send).toBeDisabled();
+  await input.fill('Keep this separate draft.');
+  await input.press('Enter');
+  await page.evaluate(() => (window as any).__sendConfirmationTest.release());
+  await expect(send).toBeEnabled();
+  expect(await composerText(input)).toBe('Keep this separate draft.');
+  expect(await page.evaluate(() => (window as any).__sendConfirmationTest.sends)).toBe(1);
+  expect(modelOrkas.modelRequests).toHaveLength(0);
+  const history = await modelOrkas.invoke<{ history: Array<{ from: string }> }>('conversations.history', { cid });
+  expect(history.history.filter((row) => row.from === 'user')).toHaveLength(0);
+  await page.locator('#new-chat-btn').click();
+  await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+  await expect(status).toBeVisible();
+  await expect(page.locator('#chat-history .empty')).toBeHidden();
+  expect(await composerText(input)).toBe('Keep this separate draft.');
+  await page.screenshot({ path: testInfo.outputPath('chat-send-unconfirmed-zh.png') });
+
+  const nativeWindow = await modelOrkas.electronApp!.browserWindow(page);
+  try { await nativeWindow.evaluate(win => win.setContentSize(900, 640)); }
+  finally { await nativeWindow.dispose(); }
+  await page.setViewportSize({ width: 900, height: 640 });
+  await page.evaluate(() => (window as any).setLang('en'));
+  await expect(status).toBeVisible();
+  await expect(status).toHaveText('Send not yet confirmed');
+  await expect(send).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('chat-send-unconfirmed-en-narrow.png') });
+});
+
+test('clears the sidebar after host settlement while the reply stream is still open', async ({ modelOrkas }, testInfo) => {
+  const page = modelOrkas.page!;
+  modelOrkas.setModelMode('controlled-slow');
+  // Keep the controller's EOF and the separate history fallback pending.
+  // The host, IPC events, reply and runtime reconciliation take their normal path.
+  await page.evaluate(() => {
+    const app = window as any;
+    const fetch = app.apiFetch;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    app.__releaseConversationEof = () => { app.apiFetch = fetch; release(); };
+    app.apiFetch = async (url: string, options: unknown) => {
+      if (/^\/api\/conversations\/[^/]+\/runtime\?project_id=/.test(url)) await gate;
+      const response = await fetch(url, options);
+      if (!/^\/api\/conversations\/[^/]+\/send\/stream$/.test(url) || !response.body) return response;
+      const reader = response.body.getReader();
+      return new Response(new ReadableStream({
+        async pull(controller) {
+          const next = await reader.read();
+          if (!next.done) return controller.enqueue(next.value);
+          app.__conversationEofHeld = true;
+          await gate;
+          controller.close();
+        },
+        cancel: (reason) => reader.cancel(reason),
+      }), { status: response.status, headers: response.headers });
+    };
+  });
+
+  try {
+    await page.locator('#new-chat-btn').click();
+    await page.locator('#new-chat-input').fill('Keep my completed reply visible.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 30_000 }).toBe(1);
+    const cid = await page.evaluate<string>('currentCid');
+    const badge = page.locator(`.conv-item[data-cid="${cid}"] .conv-status-badge.is-streaming`);
+    await expect(badge.first()).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('sidebar-running.png') });
+
+    modelOrkas.releaseControlledModelChunk();
+    modelOrkas.finishControlledModelStream();
+    await expect.poll(() => page.evaluate(() => (window as any).__conversationEofHeld)).toBe(true);
+    const reply = page.locator('#chat-history .chat-message.assistant [data-role="final"]');
+    await expect(reply).toHaveText('Hello from the local E2E model.');
+    await expect(badge).toHaveCount(0);
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    await page.screenshot({ path: testInfo.outputPath('sidebar-idle-reply-visible.png') });
+
+    await page.evaluate(() => (window as any).__releaseConversationEof());
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    await expect(reply).toHaveText('Hello from the local E2E model.');
+    expect(modelOrkas.modelRequests).toHaveLength(1);
+  } finally {
+    await page.evaluate(() => (window as any).__releaseConversationEof?.());
+  }
+});
+
 test('keeps a visible unfocused window streaming before the task completes', async ({ modelOrkas }, testInfo) => {
   const page = modelOrkas.page!;
   const nativeWindow = await modelOrkas.electronApp!.browserWindow(page);
@@ -124,6 +242,12 @@ test('recovers a lost terminal notification while a queued follow-up remains liv
   });
   modelOrkas.setModelMode('controlled-slow');
   await page.locator('#new-chat-btn').click();
+  // Direct IPC setup bypasses the catalog refresh done by the Agent creation form.
+  await page.evaluate(async () => {
+    const app = window as any;
+    await app.loadRendererFeature('agents');
+    await app.loadAgents(true);
+  });
   await page.locator('#new-chat-recipient-chip').click();
   await page.locator(`#agent-picker [data-kind="agent"][data-id="${agent.agent_id}"]`).click();
   const input = page.locator('#new-chat-input');

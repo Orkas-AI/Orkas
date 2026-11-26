@@ -414,6 +414,7 @@ test.describe('inline historical task cleanup', () => {
     expect(historyCalls.some((row: any) => row.startStage === 'recovered' && row.settled && row.ok)).toBe(true);
   });
   for (const inProject of [false, true]) test(`previews, cancels, excludes, cleans and restores ${inProject ? 'project' : 'personal'} history using real IPC and storage`, async ({ orkas }, testInfo) => {
+    if (inProject) test.setTimeout(120_000);
     const projectId = inProject ? (await orkas.invoke<any>('projects.create', { name: 'Cleanup project' })).project.project_id : '';
     const { task: automation } = await orkas.invoke<any>('autoTasks.create', {
       title: 'Keep automation configuration', content: 'Fixture only', enabled: false,

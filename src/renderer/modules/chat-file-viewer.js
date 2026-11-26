@@ -1176,13 +1176,24 @@ async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOp
   return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), displayName, { ...playbackOpts, absPath, cid, projectId });
 }
 
-async function openChatVideoUrlViewer(src, displayName, opts) {
+async function openChatVideoUrlViewer(src, displayName, opts, fileInfo) {
   const url = String(src || '').trim();
   if (!url) return;
-  if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.open({ kind: 'video', src: url, title: displayName || '', options: window.OrkasPreviewWindows.options(opts) });
-  const absPath = (opts && opts.absPath) || _viewerAbsPathFromChatMediaLocalUrl(url);
+  const localPath = _viewerAbsPathFromChatMediaLocalUrl(url);
+  const absPath = opts?.absPath || localPath;
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
+  if (window.OrkasPreviewWindows) {
+    let fileRevision = fileInfo?.fileRevision;
+    if (localPath && !fileInfo) {
+      // The media protocol owns playback. The stat only helps decide whether
+      // the existing window needs to load the source again.
+      const stat = await _statViewerFile(localPath, cid, projectId).catch(() => null);
+      if (stat?.ok && stat.exists) fileRevision = stat.fileRevision;
+    }
+    return window.OrkasPreviewWindows.open({ kind: 'video', src: url, title: displayName || '',
+      options: window.OrkasPreviewWindows.options({ ...opts, fileRevision }) });
+  }
   const seq = await _openViewerShell(displayName || 'video', { kind: 'video', absPath, cid, projectId });
   if (!seq) return;
   const wrap = document.createElement('div');
@@ -1410,14 +1421,18 @@ async function _showUnsupportedDialog(absPath, cid, projectId, opts) {
   }
 }
 
+async function _statViewerFile(absPath, cid, projectId) {
+  const payload = { path: absPath };
+  if (cid) payload.cid = cid;
+  if (projectId) payload.projectId = projectId;
+  return window.orkas.invoke('workspace.statPath', payload);
+}
+
 async function _ensureViewerFileExists(absPath, cid, projectId) {
   if (!window.orkas || typeof window.orkas.invoke !== 'function') return {};
   try {
-    const payload = { path: absPath };
-    if (cid) payload.cid = cid;
-    if (projectId) payload.projectId = projectId;
-    const res = await window.orkas.invoke('workspace.statPath', payload);
-    if (res && res.ok && res.exists) return { readOnly: res.readOnly === true };
+    const res = await _statViewerFile(absPath, cid, projectId);
+    if (res && res.ok && res.exists) return { readOnly: res.readOnly === true, fileRevision: res.fileRevision };
     const name = String(absPath || '').split(/[\\/]/).pop() || String(absPath || '');
     if (!res || !res.ok) {
       await _showUnsupportedDialog(absPath, cid, projectId, {
@@ -1458,8 +1473,9 @@ async function openChatFileViewer(absPath, displayName, opts) {
   if (kind === 'unsupported') return _showUnsupportedDialog(absPath, cid, projectId, {});
   if (window.OrkasPreviewWindows) {
     if (kind === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), name, { ...opts, absPath });
-    if (kind === 'video') return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), name, { ...opts, absPath });
-    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: name, options: window.OrkasPreviewWindows.options(opts) });
+    if (kind === 'video') return openChatVideoUrlViewer(_chatMediaLocalUrl(absPath), name, { ...opts, absPath }, exists);
+    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: name,
+      options: window.OrkasPreviewWindows.options({ ...opts, fileRevision: exists.fileRevision }) });
   }
 
   if (kind === 'image') {

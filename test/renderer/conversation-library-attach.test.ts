@@ -25,7 +25,6 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     _chatAttachmentSelectionSequence: 0,
     _chatAttachOrderKey: () => '',
     _chatAttachmentOperations: new Map(),
-    _chatAttachmentSendLocks: new Set(),
     _chatAttachmentRevisions: new Map(),
     _chatAttachHostIdFor: () => 'chips',
     _chatFileIconHtml: () => '',
@@ -48,7 +47,9 @@ function harness(invoke: ReturnType<typeof vi.fn>) {
     functions.push(declaration(`async function ${name}(`));
   }
   functions.push(declaration('window.attachKbFileToDraft ='));
-  vm.runInContext(functions.join('\n'), context);
+  const sendLocks = source.match(/^const _chatAttachmentSendLocks\s*=[^;\n]+;/m)?.[0];
+  if (!sendLocks) throw new Error('Missing renderer attachment send locks');
+  vm.runInContext([sendLocks, ...functions].join('\n'), context);
   const picker = readFileSync(path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
   const pickerStart = picker.indexOf('async function _triggerLibraryFile(');
   const pickerEnd = picker.indexOf('\n}', pickerStart);
