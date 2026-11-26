@@ -92,6 +92,27 @@ describe('chat-file-viewer › _kindOf', () => {
 });
 
 describe('file preview availability feedback', () => {
+  it('carries the current local video version and leaves playback available when stat fails', async () => {
+    const open = vi.fn();
+    const invoke = vi.fn()
+      .mockResolvedValueOnce({ ok: true, exists: true, fileRevision: 'initial' })
+      .mockResolvedValueOnce({ ok: true, exists: true, fileRevision: 'replaced' })
+      .mockRejectedValueOnce(new Error('stat unavailable'));
+    const context = vm.createContext({
+      URL,
+      window: { orkas: { invoke }, OrkasPreviewWindows: { open, options: (value: unknown) => value } },
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    const src = 'chat-media://local/work/clip.webm';
+    const playback = { autoplay: true, startTime: 3 };
+    await context.openChatVideoUrlViewer(src, 'Clip', playback);
+    await context.openChatVideoUrlViewer(src, 'Clip', playback);
+    await context.openChatVideoUrlViewer(src, 'Clip', playback);
+    expect(open.mock.calls).toEqual(['initial', 'replaced', undefined].map(fileRevision => [
+      { kind: 'video', src, title: 'Clip', options: { ...playback, fileRevision } },
+    ]));
+  });
+
   it.each([true, false])('carries authoritative read-only=%s into the native preview without changing caller options', async readOnly => {
     const open = vi.fn();
     const opts = { cid: 'task', readOnly: false };

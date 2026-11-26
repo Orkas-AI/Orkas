@@ -23,6 +23,7 @@ let sandboxEnv: Record<string, string>;
 let oldRoot: string | undefined;
 let bp: typeof import('../../../../src/main/model/core-agent/bash-permissions');
 let bash: import('../../../../src/core-agent/src/tools/base').AgentTool;
+let writeFile: typeof bash;
 let requests: import('../../../../src/main/model/core-agent/bash-permissions').BashPermissionInfo[];
 let pendingDecision: 'allow_once' | 'allow_run' | 'deny';
 let stateBeforeDecision: string[];
@@ -89,8 +90,10 @@ beforeEach(async () => {
   const { buildSkillSandboxEnv } = await import('../../../../src/main/model/core-agent/client');
   sandboxEnv = { ...buildSkillSandboxEnv(UID, 'model-eval'), ORKAS_OUTPUT_DIR: workspace };
   const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
-  bash = createLocalTools({ userId: UID, cid: 'permission-journey', agentId: 'model-eval' }).find(tool => tool.name === 'bash')!;
-});
+  const tools = createLocalTools({ userId: UID, cid: 'permission-journey', agentId: 'model-eval' });
+  bash = tools.find(tool => tool.name === 'bash')!;
+  writeFile = tools.find(tool => tool.name === 'write_file')!;
+}, 60_000); // Allow cold loading of the native tool graph on Windows.
 
 afterEach(() => {
   bp?._setBroadcastForTest(null);
@@ -236,19 +239,20 @@ describe('bash permission journey — deterministic native execution', () => {
       const permissions = await import('../../../../src/main/features/permissions');
       permissions.setLocalExecMode(mode);
       pendingDecision = 'deny';
-      const create = process.platform === 'win32'
-        ? "New-Item -ItemType Directory -Path task-build; Set-Content -LiteralPath task-build/output.txt -Value generated"
-        : "mkdir task-build; printf generated > task-build/output.txt";
       const remove = process.platform === 'win32'
         ? 'Remove-Item -LiteralPath task-build -Recurse -Force' : 'rm -rf task-build';
-      expect((await bash.execute({ command: create }, context())).isError).toBeFalsy();
+      // Only the host write tool can establish ownership of the file it creates.
+      const output = path.join(workspace, 'task-build', 'output.txt');
+      const created = await writeFile.execute({ path: output, content: 'generated' }, context());
+      expect(created.isError, created.content).toBeFalsy();
       const foreign = path.join(workspace, 'task-build', 'user.txt');
       fs.writeFileSync(foreign, 'keep user work');
       const denied = await bash.execute({ command: remove }, context());
       expect(denied.isError).toBe(true);
       expect(requests).toHaveLength(1);
       expect(fs.readFileSync(foreign, 'utf8')).toBe('keep user work');
-      // The user removes their file; the remaining tree is the observed output.
+      expect(fs.readFileSync(output, 'utf8')).toBe('generated');
+      // The user removes their file, leaving only entries this runner created.
       fs.unlinkSync(foreign);
       const cleaned = await bash.execute({ command: remove }, context());
       expect(cleaned.isError, cleaned.content).toBeFalsy();
@@ -515,6 +519,27 @@ describe('bash permission journey — deterministic native execution', () => {
     // remain scope denials that approval cannot override.
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+  });
+
+  it.runIf(process.platform !== 'win32').each([
+    "grep -F 'cd' input-a.txt", 'grep -F "cd" input-a.txt', "printf '%s' cd",
+  ])('keeps the real working directory after the data-only command %s', async prefix => {
+    fs.writeFileSync(path.join(workspace, 'input-a.txt'), 'cd\n');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: `${prefix}; printf done > report.txt` }, context());
+    expect(requests).toHaveLength(0);
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+    expect(fs.readFileSync(path.join(workspace, 'report.txt'), 'utf8')).toBe('done');
+  });
+
+  it.runIf(process.platform !== 'win32')('still asks if a command list really can change the working directory', async () => {
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: `if cd "$UNKNOWN_DIRECTORY"; then :; fi; printf '%s' cd; printf changed > report.txt`,
+    }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests[0].path_diagnostics).toMatchObject({ cause: 'working_directory' });
+    expect(fs.existsSync(path.join(workspace, 'report.txt'))).toBe(false);
   });
 
   it.runIf(process.platform !== 'win32')('checks removal relative to the changed directory and retains a failed-cd alternative', async () => {
@@ -902,12 +927,219 @@ describe('bash permission journey — deterministic native execution', () => {
     expect(dynamic.content).toContain('E_BASH_RISK_DENIED');
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    expect(requests[0].path_diagnostics).toEqual({ operation: 'output_redirect', cause: 'expansion', count: 1 });
 
     const outside = path.join(root, 'outside.py');
     const scoped = await bash.execute({ command: `cat > ${outside} <<'PY'\nprint('data')\nPY` }, context());
     expect(scoped.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
     expect(requests).toHaveLength(1);
     expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('reads a media manifest and writes its summary through composed workspace paths without approval', async () => {
+    const production = path.join(workspace, 'video production', 'staging');
+    fs.mkdirSync(production, { recursive: true });
+    fs.writeFileSync(path.join(production, 'assets.json'), '{"title":"intro"}\n');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: [
+      "base='./video production'", 'work="${base}/staging"', 'manifest="${work}/assets.json"',
+      'grep title "$manifest" > "$work/en-timing.json"',
+    ].join('\n') }, context());
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+    expect(requests).toHaveLength(0);
+    expect(fs.readFileSync(path.join(production, 'en-timing.json'), 'utf8')).toBe('{"title":"intro"}\n');
+  });
+
+  it.runIf(process.platform !== 'win32')('checks a composed path outside the workspace before a media manifest can be overwritten', async () => {
+    expectedMainWarnings.push('bash filesystem mutation scope reject');
+    const outside = path.join(root, 'assets.json');
+    fs.writeFileSync(outside, 'keep\n');
+    pendingDecision = 'allow_once';
+    const result = await bash.execute({
+      command: `base='${root}'; output="$base/assets.json"; printf changed > "$output"`,
+    }, context());
+    expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+    expect(requests).toHaveLength(0);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('keep\n');
+  });
+
+  it.runIf(process.platform !== 'win32')('retains sensitive-path approval for a composed workspace path', async () => {
+    expectedMainWarnings.push('bash filesystem mutation scope reject');
+    const sensitive = path.join(workspace, '.env');
+    fs.writeFileSync(sensitive, 'KEEP=1\n');
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: 'base=.; output="$base/.env"; printf changed > "$output"',
+    }, context());
+    expect(result.content).toContain('E_SENSITIVE_PATH_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].reasons).toContain('sensitive_path');
+    expect(fs.readFileSync(sensitive, 'utf8')).toBe('KEEP=1\n');
+  });
+
+  it.runIf(process.platform === 'darwin').each([
+    {
+      kind: 'directory', child: 'en-timing.json',
+      command: ['work=$(mktemp -d) && cat > "$work/en-timing.json" <<\'TIMING\'', '{"duration_sec":40}', 'TIMING'].join('\n'),
+    },
+    { kind: 'file', command: 'work=$(mktemp); printf \'{"duration_sec":40}\\n\' > "$work"', child: '' },
+  ])('writes timing JSON in a freshly allocated $kind without pausing the original shell command', async ({ command, child }) => {
+    const { setLocalExecMode } = await import('../../../../src/main/features/permissions');
+    setLocalExecMode('all_files_approval');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: `${command}\nprintf "created=%s\\n" "$work"` },
+      { ...context(), state: { sandboxEnv: { ...sandboxEnv, PATH: '/usr/bin:/bin' } } });
+    const created = result.content.match(/^created=(.+)$/m)?.[1];
+    const target = created && path.join(created, child);
+    try {
+      expect(requests).toHaveLength(0);
+      expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+      expect(target).toBeTruthy();
+      expect(fs.readFileSync(target!, 'utf8')).toBe('{"duration_sec":40}\n');
+    } finally {
+      if (created && path.isAbsolute(created) && /^tmp\.[A-Za-z0-9]+$/.test(path.basename(created))) {
+        fs.rmSync(target!, { force: true });
+        if (child) fs.rmdirSync(created);
+      }
+    }
+  });
+
+  it.runIf(process.platform === 'darwin').each(['workspace_approval', 'all_files_approval'] as const)(
+    'writes a fresh workspace template without replacing an existing draft in %s', async mode => {
+      const { setLocalExecMode } = await import('../../../../src/main/features/permissions');
+      setLocalExecMode(mode);
+      const staging = path.join(workspace, 'staging');
+      fs.mkdirSync(staging);
+      fs.writeFileSync(path.join(staging, 'timing.draft'), 'existing');
+      pendingDecision = 'deny';
+      const result = await bash.execute({ command: [
+        'prefix=staging', 'work=$(mktemp "$prefix/timing.XXXXXX")', 'printf new > "$work"',
+      ].join('; ') }, { ...context(), state: { sandboxEnv: { ...sandboxEnv, PATH: '/usr/bin:/bin' } } });
+      expect(requests).toHaveLength(0);
+      expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+      expect(fs.readFileSync(path.join(staging, 'timing.draft'), 'utf8')).toBe('existing');
+      const files = fs.readdirSync(staging).filter(name => name !== 'timing.draft');
+      expect(files).toHaveLength(1);
+      expect(fs.readFileSync(path.join(staging, files[0]), 'utf8')).toBe('new');
+    },
+  );
+
+  it.runIf(process.platform === 'darwin').each([
+    ['failure can escape to the filesystem root', 'work=$(mktemp -d); printf new > "$work/timing.json"'],
+    ['a parent path escapes the fresh directory', 'work=$(mktemp -d) && printf new > "$work/../timing.json"'],
+    ['the allocation is only a dry run', 'work=$(mktemp -u) && printf new > "$work"'],
+    ['the generated name hits a sensitive path rule', 'work=$(mktemp -d) && printf new > "$work/private.pem"'],
+    ['the path is rebound before use', 'work=$(mktemp -d) && work="$UNKNOWN" && printf new > "$work/timing.json"'],
+    ['the allocation is followed by an independent external write', 'work=$(mktemp -d) && printf new > "$work/timing.json"; git push origin main'],
+    ['an unrelated write still has an unknown target', 'work=$(mktemp -d) && printf new > "$work/timing.json"; printf new > "$UNKNOWN"'],
+  ])('keeps approval when %s', async (scenario, command) => {
+    const { setLocalExecMode } = await import('../../../../src/main/features/permissions');
+    setLocalExecMode('all_files_approval');
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command }, {
+      ...context(), state: { sandboxEnv: { ...sandboxEnv, PATH: '/usr/bin:/bin' } },
+    });
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    if (scenario.includes('external')) expect(requests[0].reasons).toContain('external_mutation');
+    expect(fs.readdirSync(workspace).sort()).toEqual(['input-a.txt', 'input-b.txt']);
+  });
+
+  it.runIf(process.platform === 'darwin').each(['mktemp directly', 'mktemp through a link and parent traversal', 'cat'])('retains approval when PATH shadows %s', async (kind) => {
+    const { setLocalExecMode } = await import('../../../../src/main/features/permissions');
+    setLocalExecMode('all_files_approval');
+    const bin = path.join(root, 'test-bin');
+    fs.mkdirSync(bin);
+    const original = path.join(workspace, 'original');
+    fs.writeFileSync(original, 'keep');
+    const executable = kind === 'cat' ? 'cat' : 'mktemp';
+    fs.writeFileSync(path.join(bin, executable), `#!/bin/sh\nprintf '%s\\n' '${original}'\n`, { mode: 0o700 });
+    let pathEntry = bin;
+    if (kind.includes('traversal')) {
+      fs.mkdirSync(path.join(root, 'nested'));
+      fs.mkdirSync(path.join(workspace, 'path-root'));
+      const link = path.join(workspace, 'path-root', 'link');
+      fs.symlinkSync(path.join(root, 'nested'), link);
+      pathEntry = `${link}/../test-bin`;
+    }
+    pendingDecision = 'deny';
+    const command = kind === 'cat' ? 'work=$(mktemp -d) && cat > "$work/timing.json" <<\'END\'\nnew\nEND'
+      : 'work=$(mktemp); printf new > "$work"';
+    const result = await bash.execute({ command }, {
+      ...context(), state: { sandboxEnv: { ...sandboxEnv, ORKAS_PATH_PREPEND: pathEntry, PATH: '/usr/bin:/bin' } },
+    });
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    expect(fs.readFileSync(original, 'utf8')).toBe('keep');
+  });
+
+  it.runIf(process.platform === 'darwin').each(['workspace scope', 'custom path policy'])('retains approval under %s', async (boundary) => {
+    if (boundary === 'custom path policy') {
+      const { setLocalExecMode } = await import('../../../../src/main/features/permissions');
+      const { clientConfig } = await import('../../../../src/main/features/client_config');
+      setLocalExecMode('all_files_approval');
+      clientConfig.applyServerPayload({ immediate: { 'local_access.sensitive_policy': {
+        sensitive_write_path_patterns: ['/tmp\\.[A-Za-z0-9]+/'],
+      } }, restart: {}, config_hash: 'sha256:temporary-policy' }, 'temporary-policy');
+    }
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: 'work=$(mktemp -d) && printf new > "$work/timing.json"' }, {
+      ...context(), state: { sandboxEnv: { ...sandboxEnv, PATH: '/usr/bin:/bin' } },
+    });
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+  });
+
+  it.runIf(process.platform !== 'win32').each([
+    ['temporary path chosen at runtime', 'base=$(mktemp -d); output="$base/assets.json"; printf changed > "$output"'],
+    ['assignment skipped by a branch', 'base=.; false && output="$base/assets.json"; printf changed > "$output"'],
+    ['unquoted variable with spaces', "base='./video production'; output=\"$base/assets.json\"; printf changed > $output"],
+    ['case-mismatched variable', 'base=.; output="$base/assets.json"; printf changed > "$Output"'],
+    ['loop that can change the target', 'base=.; output="$base/assets.json"; while cat > "$output"; do output=other.json; done'],
+    ['expansion that can change the target', 'base=.; output="$base/assets.json"; printf %s "$((output=1))" > "$output"'],
+  ])('preserves one-time approval for %s', async (_scenario, command) => {
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ unresolved_paths: true, can_allow_run: false });
+    expect(fs.readdirSync(workspace).sort()).toEqual(['input-a.txt', 'input-b.txt']);
+  });
+
+  it.runIf(process.platform !== 'win32')('resolves single-quoted input and output redirections as literal filenames', async () => {
+    fs.writeFileSync(path.join(workspace, 'source-$draft.txt'), 'draft\n');
+    pendingDecision = 'deny';
+    const result = await bash.execute({
+      command: `base=.; output="$base/assets.json"; cat < 'source-$draft.txt' > '$output'`,
+    }, context());
+    expect(requests).toHaveLength(0);
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+    expect(fs.readFileSync(path.join(workspace, '$output'), 'utf8')).toBe('draft\n');
+    expect(fs.existsSync(path.join(workspace, 'assets.json'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('checks the actual single-quoted redirection target instead of its expanded look-alike', async () => {
+    expectedMainWarnings.push('bash filesystem mutation scope reject');
+    const outside = path.join(root, 'outside.txt');
+    fs.writeFileSync(outside, 'keep\n');
+    fs.symlinkSync(outside, path.join(workspace, 'report-$draft.txt'));
+    const result = await bash.execute({ command: "printf changed > 'report-$draft.txt'" }, {
+      ...context(), state: { sandboxEnv: { ...sandboxEnv, draft: 'inside' } },
+    });
+    expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+    expect(requests).toHaveLength(0);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('keep\n');
+    expect(fs.existsSync(path.join(workspace, 'report-inside.txt'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('distinguishes an unknown working directory from an unresolved shell expansion', async () => {
+    pendingDecision = 'deny';
+    const result = await bash.execute({ command: 'cd "$UNKNOWN_DIRECTORY"; printf draft > report.txt' }, context());
+    expect(result.content).toContain('E_BASH_RISK_DENIED');
+    expect(requests[0].path_diagnostics).toEqual({ operation: 'mixed', cause: 'mixed', count: 2 });
+    expect(fs.existsSync(path.join(workspace, 'report.txt'))).toBe(false);
   });
 
   it.runIf(process.platform !== 'win32')('still requires sensitive-path approval for a literal cat heredoc target', async () => {

@@ -37,7 +37,18 @@
     function failure(error){if(error?.code==='E_CLOSED')active=false;notice(error?.userMessageKey||(error?.message==='LIMIT'?'limit':'error'),true);}
     function button(key,fn,className){const b=node('button',t(key),className);b.type='button';b.addEventListener('click',()=>Promise.resolve().then(fn).catch(failure));return b;}
     function enqueue(fn){const op=saving.catch(()=>{}).then(fn);saving=op;return op;}
-    function row(w){return{id:w.id,title:m.displayTitle(w),summary:w.brief.trim().slice(0,160)||w.title,kind:w.kind,...w.productId?{productId:w.productId}:{},updatedAt:w.updatedAt,status:w.jobs[0]?.status||'',...w.jobs[0]?.status==='failed'&&w.jobs[0].errorCode?{errorCode:w.jobs[0].errorCode}:{},failureText:plainFailure(m.failureText(w.jobs[0])).slice(0,320),assetIds:[...w.assetIds],resultAssetIds:w.results.map(r=>r.assetId),collectionPending:m.uncollected(w).length>0||m.needsReply(w),collectionError:!!w.collectionError,collectionFailures:w.collectionFailures||0,autoSaved:true};}
+    function row(w){
+        const job=w.jobs[0],failure=m.failureContent(job);
+        return {
+            id:w.id,title:m.displayTitle(w),summary:w.brief.trim().slice(0,160)||w.title,
+            kind:w.kind,...w.productId?{productId:w.productId}:{},updatedAt:w.updatedAt,status:job?.status||'',
+            ...job?.status==='failed'&&job.errorCode?{errorCode:job.errorCode}:{},
+            failureText:decodeFailureNotice(failure.notice).slice(0,320),replyExcerpt:failure.reply.slice(0,320),
+            assetIds:[...w.assetIds],resultAssetIds:w.results.map(r=>r.assetId),
+            collectionPending:m.uncollected(w).length>0||m.needsReply(w),collectionError:!!w.collectionError,
+            collectionFailures:w.collectionFailures||0,autoSaved:true
+        };
+    }
     async function writeIndex(){await api.storage.set({key:KEY,value:index,scope:'cloud'});}
     function persistIndex(){return enqueue(writeIndex);}
     async function persist(w){
@@ -91,7 +102,7 @@
     async function resetWork(){
         if(!active||submitting||navigating||managing||importing)return;
         navigating=true;renderControls();
-        const next=m.draft(current.kind,locale);
+        const next=m.draft(current.kind,locale,current.kind==='video'?current.settings:undefined);
         try{
             if(hasContent(current)&&!await confirmAction('reset','resetConfirm','reset'))return;
             clearTimeout(debounce);await storeDraft(next);
@@ -128,7 +139,6 @@
         menu.style.top=Math.max(8,bounds.bottom+height+8<=window.innerHeight?bounds.bottom+4:bounds.top-height-4)+'px';
         const items=[...menu.querySelectorAll('button:not(:disabled)')];items[last?items.length-1:0]?.focus();
     }
-    function serviceLabel(service){return m.serviceLabel(service,locale);}
     async function configureModels(){
         if(!editable())return;
         const kind=current.kind;await flush();modelsConfigured=true;
@@ -144,11 +154,19 @@
     function renderServices(w,locked,textOnly){
         $('service-field').hidden=textOnly||!api.tasks.services;if($('service-field').hidden)return;
         const list=serviceLists.get(w.kind),loading=serviceLoads.has(w.kind),chosen=list?.services.find(s=>s.id===w.settings.serviceId),missing=!!w.settings.serviceId&&!chosen;
-        const options=(list?.services||[]).map(s=>({value:s.id,label:serviceLabel(s),hint:s.available?t('configuredService'):t('serviceUnavailable'),disabled:!s.available}));
-        if(missing)options.push({value:w.settings.serviceId,label:w.settings.serviceName||t('serviceUnavailable'),disabled:true});
+        const video=w.kind==='video',services=list?.services||[];
+        const visibleServices=video?services.filter(s=>s.available):services;
+        const options=visibleServices.map(s=>({
+            value:s.id,
+            label:m.serviceLabel(s,locale,w.kind),
+            ...(!video?{hint:s.available?t('configuredService'):t('serviceUnavailable')} : {}),
+            disabled:!s.available,
+        }));
+        if(!video&&missing)options.push({value:w.settings.serviceId,label:w.settings.serviceName||t('serviceUnavailable'),disabled:true});
         const label=t(w.kind==='audio'?'speechService':'service');$('service-label').textContent=label;
         if(typeof api.configureModels==='function')options.push({value:'configure-models',label:t('configureModels'),iconName:'settings',action:()=>{void configureModels().catch(failure);}});
-        select('service',options,w.settings.serviceId||'',label,locked||loading||!options.length,value=>{if(!editable())return;const service=serviceLists.get(w.kind)?.services.find(s=>s.id===value&&s.available);if(!service)return;w.settings.serviceId=value;w.settings.serviceName=serviceLabel(service).slice(0,240);touch();renderControls();},w.settings.serviceName||label);
+        const placeholder=video?label:w.settings.serviceName||label;
+        select('service',options,w.settings.serviceId||'',label,locked||loading||!options.length,value=>{if(!editable())return;const service=serviceLists.get(w.kind)?.services.find(s=>s.id===value&&s.available);if(!service)return;w.settings.serviceId=value;w.settings.serviceName=m.serviceLabel(service,locale,w.kind).slice(0,240);touch();renderControls();},placeholder);
         $('refresh-services').disabled=locked||loading;$('refresh-services').textContent=t(loading?'loading':'refresh');$('refresh-services').setAttribute('aria-busy',String(loading));
         const message=loading?'':w.settings.serviceId&&!serviceAvailable(w)?'serviceUnavailable':list?.failed?'servicesUnavailable':'';
         $('service-state').textContent=message?t(message):'';$('service-state').hidden=!message;
@@ -209,17 +227,43 @@
         finally{clearTimeout(timer);img.src='';URL.revokeObjectURL(url);}
     }
 
-    function plainFailure(value){const template=document.createElement('template');template.innerHTML=value;return template.content.textContent||'';}
-    function taskFailure(job){return job?.errorCode==='E_OUTPUT_MISSING'?t('noOutput'):job?.errorCode==='E_OUTPUT_MISMATCH'?t('outputMismatch'):['E_OUTPUT_UNVERIFIED','E_INTERACTION_REQUIRED'].includes(job?.errorCode)?t('error'):'';}
+    function decodeFailureNotice(value){
+        if(!value)return '';
+        const template=document.createElement('template');template.innerHTML=value;return template.content.textContent||'';
+    }
+    function taskFailure(job,work){
+        if(job?.errorCode==='E_OUTPUT_SAVE_FAILED')return t('resultSaveFailed');
+        if(job?.errorCode==='E_OUTPUT_MISSING')return work?missingOutputStatus(work):t('noOutput');
+        return job?.errorCode==='E_OUTPUT_MISMATCH'?t('outputMismatch'):['E_OUTPUT_UNVERIFIED','E_INTERACTION_REQUIRED'].includes(job?.errorCode)?t('error'):'';
+    }
+    function replyAgent(kind){return agents.find(agent=>agent.id===m.agents[kind])?.name||'';}
+    function missingOutputStatus(w){
+        if(['txt','srt','json'].includes(w.settings.format))return t('missingOutput');
+        return t({image:'missingImageOutput',video:'missingVideoOutput',audio:'missingAudioOutput'}[w.kind]||'missingOutput');
+    }
+    function renderFailureSummary(element,record,expanded){
+        const reply=record.replyExcerpt||'';
+        const agent=reply&&replyAgent(record.kind);
+        element.classList.toggle('is-agent-reply',!!reply);
+        element.textContent=agent?t('agentReplySummary').replace(/\{(agent|reply)\}/g,(_,key)=>key==='agent'?agent:reply)
+            :reply||taskFailure(record)||record.failureText||t('error');
+        element.hidden=expanded||record.status!=='failed'||!element.textContent;
+    }
     function renderTask(){
         const host=$('output-list'),w=opened,job=w?.jobs[0];
-        const key=JSON.stringify([w?.id,w?.results,job?.outputs,job?.status,job?.text,job?.errorCode,w?.collectionError,locale]);if(host.dataset.work===key)return;
+        const agent=w&&replyAgent(w.kind);
+        const key=JSON.stringify([w?.id,w?.results,job?.outputs,job?.status,job?.text,job?.errorCode,w?.collectionError,agent,locale]);if(host.dataset.work===key)return;
         const previous=host.querySelector('.result-tools'),previousId=host.dataset.record;
         if(previous&&previousId){if(previous.open)moreFilesOpen.add(previousId);else moreFilesOpen.delete(previousId);}
         const summaryFocused=previous?.querySelector('summary')===document.activeElement;
         host.dataset.work=key;host.dataset.record=w?.id||'';host.setAttribute('aria-label',t('results'));host.replaceChildren();
         if(!w)return;
-        $('record-error').hidden=job?.status!=='failed';$('record-error').textContent=taskFailure(job)||plainFailure(m.failureText(job))||t(job?.errorCode==='E_FILE'?'fileMissing':job?.errorCode==='E_UNAVAILABLE'&&w.settings.serviceId?'serviceUnavailable':'error');
+        const {reply,notice}=m.failureContent(job);
+        $('record-error').hidden=job?.status!=='failed';
+        $('record-error').textContent=taskFailure(job,w)||decodeFailureNotice(notice)||t(job?.errorCode==='E_FILE'?'fileMissing':job?.errorCode==='E_UNAVAILABLE'&&w.settings.serviceId?'serviceUnavailable':'error');
+        $('record-reply').hidden=!reply;
+        $('record-reply-label').textContent=reply?(agent?t('agentReplyFrom').replace('{agent}',()=>agent):t('agentReply')):'';
+        $('record-reply-text').textContent=reply;
         const groups=m.resultGroups(w),pendingOutputs=m.uncollected(w),versions=new Map(),positions=new Map();
         for(const result of w.results)if(result.outputId)versions.set(result.outputId,(versions.get(result.outputId)||0)+1);
         const renderFile=(result,target)=>{
@@ -238,7 +282,7 @@
             details.addEventListener('toggle',()=>{if(!details.isConnected)return;if(details.open){moreFilesOpen.add(w.id);populate();}else{moreFilesOpen.delete(w.id);if(details.contains(menuTrigger)){closeRecordMenu();summary.focus({preventScroll:true});}}});
             if(summaryFocused&&previousId===w.id)summary.focus({preventScroll:true});
         }
-        $('no-output').hidden=!!host.children.length;
+        $('no-output').hidden=!!host.children.length||!!reply;
         $('no-output').textContent=t(pending.includes(job?.status)?'status_'+job.status:job?.status==='completed'?'noOutput':job?.status==='failed'?'status_failed':'draftStatus');
     }
     function visibleHistory(){return m.historyRows(index.works,current.kind).filter(r=>productFilter==='*'||(r.productId||'')===productFilter);}
@@ -274,8 +318,8 @@
                 const more=button('moreActions',()=>recordMenu(more,w.id),'history-menu-trigger');more.innerHTML=window.uiIconHtml('more-horizontal');more.setAttribute('aria-haspopup','menu');more.setAttribute('aria-expanded','false');head.append(mark,main,more);r.append(head);host.append(r);}
             if(host.children[at]!==r)host.insertBefore(r,host.children[at]);
             const expanded=opened?.id===w.id,summary=r.querySelector('.record-summary'),status=r.querySelector('.record-status'),content=expanded?opened.brief||w.summary||w.title||t(w.kind):w.summary||w.title||t(w.kind);if(summary.textContent!==content)summary.textContent=content;if(expanded)summary.id='record-brief';else summary.removeAttribute('id');summary.title=t(expanded?'collapse':'expand');summary.setAttribute('aria-expanded',String(expanded));summary.setAttribute('aria-controls','record-detail');r.querySelector('.history-menu-trigger').setAttribute('aria-label',t('moreActions')+' '+(w.summary||w.title||t(w.kind)));const count=r.querySelector('.record-result-count');const resultCount=works.has(w.id)?works.get(w.id).results.length:w.resultAssetIds?.length||0;count.hidden=!resultCount;count.textContent=t('results')+' '+resultCount;
-            r.classList.toggle('is-expanded',expanded);const failure=r.querySelector('.record-failure-summary');failure.textContent=taskFailure(works.get(w.id)?.jobs[0]||w)||plainFailure(m.failureText(works.get(w.id)?.jobs[0]))||w.failureText||'';failure.hidden=expanded||w.status!=='failed'||!failure.textContent;
-            status.id=at===0?'job-status':'';status.setAttribute('role','status');status.textContent=w.collectionError?t('resultSaveFailed'):w.collectionPending?t('savingResult'):w.status?t('status_'+w.status):t('draftStatus');status.className='record-status'+(['submitting','submitted','running'].includes(w.status)?' is-pending':'');status.dataset.status=w.collectionError?'failed':w.status||'draft';r.querySelector('time').textContent=w.updatedAt?new Date(w.updatedAt).toLocaleString(locale):'';
+            r.classList.toggle('is-expanded',expanded);renderFailureSummary(r.querySelector('.record-failure-summary'),w,expanded);
+            status.id=at===0?'job-status':'';status.setAttribute('role','status');status.textContent=w.collectionError||w.errorCode==='E_OUTPUT_SAVE_FAILED'?t('resultSaveFailed'):w.collectionPending?t('savingResult'):w.status?t('status_'+w.status):t('draftStatus');status.className='record-status'+(['submitting','submitted','running'].includes(w.status)?' is-pending':'');status.dataset.status=w.collectionError?'failed':w.status||'draft';r.querySelector('time').textContent=w.updatedAt?new Date(w.updatedAt).toLocaleString(locale):'';
             const sources=r.querySelector('.record-input-assets'),sourceKey=locale+':'+expanded+':'+(w.assetIds||[]).join(',');if(expanded)sources.id='record-assets';else sources.removeAttribute('id');if(sources.dataset.key!==sourceKey){sources.replaceChildren(...(w.assetIds||[]).slice(0,expanded?19:3).map(id=>attachment(index.assets.find(a=>a.id===id),id)));if(!expanded&&w.assetIds?.length>3)sources.append(button('expand',()=>openWork(w.id),'text-button'));sources.dataset.key=sourceKey;}
             if(expanded){const detail=$('record-detail');if(detail.parentElement!==r)r.append(detail);detail.hidden=false;}
         }
@@ -435,6 +479,7 @@
     async function addImportedMaterial(owner,file,read){
         // Validate metadata before decoding or allocating the selected file's bytes.
         if(index.assets.length>=1000||owner&&owner.assetIds.length>=19)throw Error('LIMIT');
+        const problem=m.importProblem(file.name,file.size);if(problem)throw Error(problem);
         const id=crypto.randomUUID(),ext=file.name.split('.').pop().toLowerCase(),candidate=m.asset({id,name:file.name,path:'media/'+id+'.'+ext,bytes:file.size,createdAt:new Date().toISOString()});
         const base64=await read(),bytes=decode(base64);if(bytes.length!==candidate.bytes)throw Error('FILE');
         const hash=await digest(bytes);let a=index.assets.find(a=>a.digest===hash&&a.kind===candidate.kind);
@@ -529,7 +574,7 @@
                 // No task has been dispatched; restore an explicitly retryable draft.
                 w.jobs=[];try{await persist(w);}catch(recovery){}throw error;
             }
-            if(current===w){opened=null;current={...m.draft(w.kind,locale),...w.productId?{productId:w.productId}:{}};if(w.settings.serviceId){current.settings.serviceId=w.settings.serviceId;current.settings.serviceName=w.settings.serviceName;}index.drafts[w.kind]=JSON.parse(JSON.stringify(current));render();$('works-list').firstElementChild?.scrollIntoView({block:'nearest'});}
+            if(current===w){opened=null;current={...m.draft(w.kind,locale,w.settings),...w.productId?{productId:w.productId}:{}};index.drafts[w.kind]=JSON.parse(JSON.stringify(current));render();$('works-list').firstElementChild?.scrollIntoView({block:'nearest'});}
             try{await api.tasks.start({requestId,title:m.displayTitle(w)||t(w.kind),agentId:request.agentId,prompt:request.prompt,deliverable:['txt','srt','json'].includes(w.settings.format)?'text':w.kind,...request.output?{output:request.output}:{},...request.media?{media:request.media}:{},files:[briefPath,...request.files]});job.status='submitted';}
             catch(error){job.status='unknown';}
             await persist(w);if(opened===w)renderTask();void refresh(w).catch(failure);

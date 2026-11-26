@@ -1,6 +1,11 @@
 /** Fixed isolated-world execution in task-owned Chromium frames. No model scripts. */
-import { ipcMain, type IpcMainEvent, type WebContents } from 'electron';
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { Semaphore } from 'async-mutex';
+import { BrowserWindow, ipcMain, type IpcMainEvent, type MessagePortMain, type WebContents } from 'electron';
+import { acquireWithAbort } from '../util/locks';
 import { withOperationTimeout } from '../util/operation-timeout';
+import { hardenedWebPreferences } from '../util/window-security';
 import { createLogger } from '../logger';
 const log = createLogger('web-assist-protocol');
 
@@ -14,6 +19,7 @@ export interface WebAssistFrame {
 interface ProtocolState {
   ready: Promise<void>;
   sessions: Map<string, Promise<void>>;
+  preloadContexts: Map<string, Map<number, string>>;
 }
 const states = new WeakMap<WebContents, ProtocolState>();
 
@@ -184,7 +190,7 @@ async function protocol(contents: WebContents): Promise<ProtocolState> {
   if (state) { await state.ready; return state; }
   if (contents.debugger.isAttached()) throw new Error('browser_debugger_in_use');
   contents.debugger.attach('1.3');
-  state = { ready: Promise.resolve(), sessions: new Map() };
+  state = { ready: Promise.resolve(), sessions: new Map(), preloadContexts: new Map() };
   states.set(contents, state);
   const current = state;
   const debuggerSession = contents.debugger;
@@ -199,13 +205,26 @@ async function protocol(contents: WebContents): Promise<ProtocolState> {
     }, sessionId);
   };
   const message = (_event: unknown, method: string, params: any, sessionId?: string) => {
-    if (method === 'Target.attachedToTarget' && params.targetInfo?.type === 'iframe') {
+    const key = sessionId || '';
+    if (method === 'Runtime.executionContextCreated') {
+      const context = params.context;
+      if (context?.name !== 'Electron Isolated Context' || context.auxData?.type !== 'isolated'
+        || typeof context.auxData.frameId !== 'string' || !Number.isSafeInteger(context.id)) return;
+      let contexts = current.preloadContexts.get(key);
+      if (!contexts) current.preloadContexts.set(key, contexts = new Map());
+      contexts.set(context.id, context.auxData.frameId);
+    } else if (method === 'Runtime.executionContextDestroyed') {
+      current.preloadContexts.get(key)?.delete(params.executionContextId);
+    } else if (method === 'Runtime.executionContextsCleared') {
+      current.preloadContexts.delete(key);
+    } else if (method === 'Target.attachedToTarget' && params.targetInfo?.type === 'iframe') {
       const ready = setup(params.sessionId);
       current.sessions.set(params.sessionId, ready);
       // Inventory/evaluation reports setup failure; never leave an unhandled promise.
       void ready.catch(() => {});
     } else if (method === 'Target.detachedFromTarget') {
       current.sessions.delete(params.sessionId);
+      current.preloadContexts.delete(params.sessionId);
       const controller = fileChoosers.get(contents);
       controller?.applied.delete(params.sessionId);
       if (controller?.pending?.sessionId === params.sessionId) clearWebAssistFileChooser(contents);
@@ -233,6 +252,7 @@ async function protocol(contents: WebContents): Promise<ProtocolState> {
   const cleanup = () => {
     if (states.get(contents) === current) states.delete(contents);
     current.sessions.clear();
+    current.preloadContexts.clear();
     clearWebAssistFileChooser(contents);
     fileChoosers.get(contents)?.applied.clear();
     debuggerSession.removeListener('message', message);
@@ -301,7 +321,7 @@ export async function webAssistEvaluate(
     returnByValue, awaitPromise: true, userGesture,
   }, frame.sessionId, 30_000);
   if (result.exceptionDetails) throw new Error('browser_page_script_failed');
-  return returnByValue ? result.result?.value : { ...result.result, sessionId: frame.sessionId };
+  return returnByValue ? result.result?.value : { ...result.result, sessionId: frame.sessionId, frameId: frame.id };
 }
 
 /** Frame-local checked pointer -> root viewport, using the actual iframe box. */
@@ -369,15 +389,153 @@ export async function webAssistPointPointer(contents: WebContents, result: any):
   } } };
 }
 
+const UPLOAD_TIMEOUT_MS = 600_000;
+const DIRECTORY_PORT_RECEIVER = 'web-assist:directory-receiver';
+const DIRECTORY_PORT_SOURCE = 'web-assist:directory-source';
+const DIRECTORY_PATH_BATCH_SIZE = 128;
+const directorySources = new Semaphore(2);
+
+interface BackgroundDirectoryUpload {
+  enabled: () => boolean;
+  signal?: AbortSignal;
+  verifyFiles: (directory: string, files: string[], signal: AbortSignal) => Promise<void>;
+}
+
+/** Enumerate with Chromium offscreen and commit its file-backed FileList to
+ * the original input in the exact target frame's isolated preload world. */
+async function uploadBackgroundDirectory(
+  contents: WebContents, target: { objectId: string; sessionId?: string }, frameId: string,
+  folder: string, pending: boolean, validate: () => Record<string, unknown> | null, background: BackgroundDirectoryUpload,
+): Promise<number> {
+  const deadline = AbortSignal.timeout(UPLOAD_TIMEOUT_MS);
+  const signal = background.signal ? AbortSignal.any([deadline, background.signal]) : deadline;
+  const checked = () => {
+    signal.throwIfAborted();
+    if (validate()) throw new Error('browser_upload_scope_changed');
+  };
+  const command = (method: string, args: Record<string, unknown>, timeoutMs?: number) =>
+    webAssistCommand(contents, method, args, target.sessionId, timeoutMs);
+  const contexts = states.get(contents)?.preloadContexts.get(target.sessionId || '');
+  const contextId = contexts && [...contexts].find(([, id]) => id === frameId)?.[0];
+  if (contextId === undefined) throw new Error('browser_upload_target_unavailable');
+  const nonce = randomUUID();
+  const objectGroup = `orkas-directory-${nonce}`;
+  const ipc = contents.ipc;
+  let port: MessagePortMain | undefined;
+  let source: BrowserWindow | undefined;
+  let receiverId: string | undefined;
+  let releaseSource: (() => void) | undefined;
+  let acceptPort!: (port: MessagePortMain) => void;
+  const receivedPort = new Promise<MessagePortMain>(resolve => { acceptPort = resolve; });
+  const onPort = (event: IpcMainEvent, ticket: unknown) => {
+    if (ticket !== nonce || event.sender !== contents || contents.isDestroyed()
+      || !event.senderFrame || event.senderFrame.top !== contents.mainFrame || event.ports.length !== 1) return;
+    ipc.removeListener(DIRECTORY_PORT_RECEIVER, onPort);
+    port = event.ports[0];
+    acceptPort(port);
+  };
+  try {
+    releaseSource = await acquireWithAbort(async () => (await directorySources.acquire())[1], signal);
+    checked();
+    const { node } = await command('DOM.describeNode', { objectId: target.objectId });
+    const { object: input } = await command('DOM.resolveNode', {
+      backendNodeId: node.backendNodeId, executionContextId: contextId, objectGroup,
+    });
+    if (!input?.objectId) throw new Error('browser_upload_target_unavailable');
+    checked();
+    ipc.on(DIRECTORY_PORT_RECEIVER, onPort);
+    source = new BrowserWindow({ show: false, focusable: false, skipTaskbar: true, width: 16, height: 16,
+      webPreferences: hardenedWebPreferences({ offscreen: true, devTools: false, partition: 'orkas-directory-upload',
+        preload: path.join(__dirname, 'web_assist_directory_preload.js') }) });
+    const sourceContents = source.webContents;
+    sourceContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    sourceContents.on('will-navigate', event => event.preventDefault());
+    const upload = async () => {
+      const html = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'"><input type="file" webkitdirectory>`;
+      await sourceContents.loadURL(`data:text/html,${encodeURIComponent(html)}`);
+      checked();
+      const count = await setWebAssistInputFiles(sourceContents, 'document.querySelector("input")', [folder], undefined,
+        () => signal.aborted ? { ok: false } : validate());
+      checked();
+      const receiver = await command('Runtime.callFunctionOn', { objectId: input.objectId,
+        functionDeclaration: 'function(nonce){ return globalThis.__orkasReceiveDirectory(nonce); }',
+        arguments: [{ value: nonce }], objectGroup });
+      receiverId = receiver.result?.objectId;
+      if (!receiverId || receiver.exceptionDetails) throw new Error('browser_upload_target_unavailable');
+      const transferPort = await withOperationTimeout(receivedPort, {
+        timeoutMs: 5000, code: 'browser_upload_target_unavailable', stage: 'browser directory receiver', signal,
+      });
+      checked();
+      sourceContents.mainFrame.postMessage(DIRECTORY_PORT_SOURCE, null, [transferPort]);
+      port = undefined;
+      const prepared = await command('Runtime.callFunctionOn', { objectId: receiverId,
+        functionDeclaration: 'function(){ return this.count; }', returnByValue: true, awaitPromise: true }, UPLOAD_TIMEOUT_MS);
+      if (prepared.result?.value !== count) throw new Error('browser_upload_not_retained');
+      checked();
+      if (process.platform === 'win32' || process.platform === 'darwin') {
+        const files: string[] = [];
+        for (let offset = 0; offset < count; offset += DIRECTORY_PATH_BATCH_SIZE) {
+          checked();
+          const limit = Math.min(DIRECTORY_PATH_BATCH_SIZE, count - offset);
+          const result = await command('Runtime.callFunctionOn', {
+            objectId: receiverId, functionDeclaration: 'function(offset, limit){ return this.paths(offset, limit); }',
+            arguments: [{ value: offset }, { value: limit }], returnByValue: true,
+          });
+          const paths = result.result?.value;
+          if (!Array.isArray(paths) || paths.length !== limit) throw new Error('browser_upload_not_retained');
+          files.push(...paths);
+        }
+        await background.verifyFiles(folder, files, signal);
+        checked();
+        // Chromium validates file-backed page state against permissions in the
+        // receiving renderer. Select only the verified files using a detached
+        // native control so the page sees events only on the original input.
+        const { result: nativeInput, exceptionDetails } = await command('Runtime.callFunctionOn', {
+          objectId: input.objectId, objectGroup,
+          functionDeclaration: 'function(){ const input = this.ownerDocument.createElement("input"); input.type = "file"; input.multiple = true; return input; }',
+        });
+        if (exceptionDetails || !nativeInput?.objectId) throw new Error('browser_upload_target_unavailable');
+        for (let offset = 0; offset < files.length; offset += DIRECTORY_PATH_BATCH_SIZE) {
+          checked();
+          await command('DOM.setFileInputFiles', { objectId: nativeInput.objectId,
+            files: files.slice(offset, offset + DIRECTORY_PATH_BATCH_SIZE) });
+        }
+        checked();
+      }
+      const receipt = await command('Runtime.callFunctionOn', { objectId: receiverId,
+        functionDeclaration: 'function(input,pending){ return this.apply(input,pending); }',
+        arguments: [{ objectId: input.objectId }, { value: pending }], returnByValue: true });
+      const applied = receipt.result?.value;
+      if (applied?.status === 'cancelled') throw new Error('browser_upload_cancelled');
+      if (applied?.status !== 'applied' || applied.count !== count || validate()) throw new Error('browser_upload_not_retained');
+      return count;
+    };
+    return await withOperationTimeout(upload(), {
+      timeoutMs: UPLOAD_TIMEOUT_MS, code: 'browser_protocol_timeout', stage: 'browser directory upload', signal,
+    });
+  } finally {
+    ipc.removeListener(DIRECTORY_PORT_RECEIVER, onPort);
+    port?.close();
+    if (source && !source.isDestroyed()) source.destroy();
+    releaseSource?.();
+    if (receiverId) {
+      await command('Runtime.callFunctionOn', { objectId: receiverId, functionDeclaration: 'function(){ this.close(); }' }).catch(() => {});
+    }
+    await command('Runtime.releaseObjectGroup', { objectGroup }).catch(() => {});
+  }
+}
+
 export async function setWebAssistInputFiles(
   contents: WebContents, code: string | WebAssistFileChooser, files: string[], frameId?: string,
   validate: () => Record<string, unknown> | null = () => null,
+  backgroundDirectory?: BackgroundDirectoryUpload,
 ): Promise<number> {
   const pending = typeof code !== 'string';
   const target = pending
     ? await code.target
     : await webAssistEvaluate(contents, code, frameId, false, true);
   if (!target?.objectId) throw new Error('browser_upload_target_unavailable');
+  let listening = false;
   try {
     const properties = await webAssistCommand(contents, 'Runtime.callFunctionOn', {
       objectId: target.objectId, returnByValue: true,
@@ -386,16 +544,21 @@ export async function setWebAssistInputFiles(
     }, target.sessionId);
     const control = properties.result?.value;
     if (!control?.valid || (!control.multiple && files.length > 1)) throw new Error('browser_upload_target_unavailable');
+    if (control.directory && files.length === 1 && backgroundDirectory?.enabled()) {
+      return await uploadBackgroundDirectory(contents, target, pending ? code.frameId : target.frameId,
+        files[0], pending, validate, backgroundDirectory);
+    }
+    listening = true;
     await webAssistCommand(contents, 'Runtime.callFunctionOn', {
       objectId: target.objectId, returnByValue: true,
       functionDeclaration: 'function(){const state={};state.promise=new Promise(resolve=>{const done=event=>{this.removeEventListener("change",done);this.removeEventListener("cancel",done);queueMicrotask(()=>resolve({connected:this.isConnected,count:this.files.length,cancelled:event.type==="cancel",hidden:document.visibilityState==="hidden"}));};this.addEventListener("change",done);this.addEventListener("cancel",done);state.clean=()=>{this.removeEventListener("change",done);this.removeEventListener("cancel",done);};});(globalThis.__orkasFileSelections ||= new WeakMap()).set(this,state);}',
     }, target.sessionId);
     if (validate()) throw new Error('browser_upload_scope_changed');
-    await webAssistCommand(contents, 'DOM.setFileInputFiles', { objectId: target.objectId, files }, target.sessionId, 600_000);
+    await webAssistCommand(contents, 'DOM.setFileInputFiles', { objectId: target.objectId, files }, target.sessionId, UPLOAD_TIMEOUT_MS);
     const receipt = await webAssistCommand(contents, 'Runtime.callFunctionOn', {
       objectId: target.objectId, returnByValue: true, awaitPromise: true,
       functionDeclaration: 'function(){return globalThis.__orkasFileSelections.get(this).promise}',
-    }, target.sessionId, 600_000);
+    }, target.sessionId, UPLOAD_TIMEOUT_MS);
     if (receipt.result?.value?.cancelled) {
       // Chromium emits cancel when the same files are selected again. Verify
       // their actual native paths before accepting that idempotent selection;
@@ -418,7 +581,7 @@ export async function setWebAssistInputFiles(
     if ((!pending && !receipt.result?.value?.connected) || (!control.directory && receipt.result?.value?.count !== files.length) || validate()) throw new Error('browser_upload_not_retained');
     return receipt.result.value.count;
   } finally {
-    await webAssistCommand(contents, 'Runtime.callFunctionOn', { objectId: target.objectId, functionDeclaration: 'function(){globalThis.__orkasFileSelections?.get(this)?.clean();globalThis.__orkasFileSelections?.delete(this)}' }, target.sessionId).catch(() => {});
+    if (listening) await webAssistCommand(contents, 'Runtime.callFunctionOn', { objectId: target.objectId, functionDeclaration: 'function(){globalThis.__orkasFileSelections?.get(this)?.clean();globalThis.__orkasFileSelections?.delete(this)}' }, target.sessionId).catch(() => {});
     if (!pending) await webAssistCommand(contents, 'Runtime.releaseObject', { objectId: target.objectId }, target.sessionId).catch(() => {});
   }
 }

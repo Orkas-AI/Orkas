@@ -6,7 +6,7 @@
  * how many turns a runtime takes, but not the COST of a task: one user request
  * can fan out to many nested agent turns, each burning a large context, and a
  * near-duplicate spin can churn turns that each cost real tokens. This meter
- * adds one number — cumulative in+out tokens for the current task — so the
+ * counts fresh input, output and cache writes for the current task so the
  * worker loop can hard-stop a task that has burned an unreasonable amount before
  * starting the next turn. It deliberately does NOT allocate per-agent budgets or
  * price by model; it only catches the pathological "this single task burned a
@@ -19,7 +19,7 @@
  * no task identity, per-agent allocation or persistence.
  */
 
-/** Default per-task ceiling (input+output tokens). Generous on purpose — far
+/** Default per-task ceiling (fresh input, output and cache writes). Generous on purpose — far
  *  above any normal heavy task (deep research, video), so it only trips on a
  *  runaway. Override with ORKAS_MAX_TASK_TOKENS (0 or negative disables). */
 const DEFAULT_MAX_TASK_TOKENS = 25_000_000;
@@ -32,26 +32,28 @@ function resolveMaxTaskTokens(): number {
   return n; // <= 0 disables the backstop (checked in isOverTaskBudget)
 }
 
-// cid → cumulative in+out tokens for the current task.
+// cid → cumulative metered tokens for the current task.
 const _taskTokens = new Map<string, number>();
 
 /** Record one model request's token usage against a conversation's current task.
  *  No-op without a cid (anonymous/reflection/memory sessions that don't belong
- *  to a user conversation). Uses input+output as the cost proxy: cache-read
- *  tokens are ~10% the price, so excluding them keeps the meter aligned with
- *  real spend without per-model pricing. */
+ *  to a user conversation). Counts cache writes with the other fresh work.
+ *  Native callers omit provider totals to exclude cache reads from this proxy. */
 export function recordUsageTokens(cid: string | undefined, usage: {
-  inputTokens?: number; outputTokens?: number; totalTokens?: number;
+  inputTokens?: number; outputTokens?: number; cacheWriteTokens?: number; totalTokens?: number;
 } | undefined): void {
   if (!cid || !usage) return;
+  const cacheWrites = Number.isFinite(usage.cacheWriteTokens)
+    ? Math.max(0, Number(usage.cacheWriteTokens))
+    : 0;
   const total = Number.isFinite(usage.totalTokens)
     ? Number(usage.totalTokens)
-    : (Number(usage.inputTokens) || 0) + (Number(usage.outputTokens) || 0);
+    : (Number(usage.inputTokens) || 0) + (Number(usage.outputTokens) || 0) + cacheWrites;
   if (!(total > 0)) return;
   _taskTokens.set(cid, (_taskTokens.get(cid) || 0) + total);
 }
 
-/** Cumulative in+out tokens for a conversation's current task. */
+/** Cumulative metered tokens for a conversation's current task. */
 export function taskTokens(cid: string): number {
   return _taskTokens.get(cid) || 0;
 }

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Locator } from '@playwright/test';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
@@ -26,21 +26,37 @@ test('offers CLI upgrade on creation, details and execution failures', async ({ 
   const versionFile = path.join(app.root, 'upgrade-version');
   const modeFile = path.join(app.root, 'upgrade-mode');
   const updatesFile = path.join(app.root, 'upgrade-calls');
+  const holdVerification = path.join(app.root, 'hold-upgrade-verification');
   const bin = path.join(app.root, '.codex/packages/standalone/current/bin/codex');
   const failureText = 'Installer could not download the update\n' + 'LongDiagnostic'.repeat(160) + '\nRetry later';
   mkdirSync(path.dirname(bin), { recursive: true });
-  writeFileSync(versionFile, '0.144.0'); writeFileSync(modeFile, 'success');
+  writeFileSync(versionFile, '0.144.0'); writeFileSync(modeFile, 'pending');
+  writeFileSync(holdVerification, '');
   const source = `#!${process.env.ORKAS_TEST_NODE || process.execPath}\n
 const fs = require('node:fs'); const cp = require('node:child_process');
 const versionFile = ${JSON.stringify(versionFile)}; const modeFile = ${JSON.stringify(modeFile)};
-if (process.argv.includes('--version')) console.log(fs.readFileSync(versionFile, 'utf8'));
+if (process.argv.includes('--version')) {
+  const version = fs.readFileSync(versionFile, 'utf8');
+  const hold = ${JSON.stringify(holdVerification)};
+  if (version === '0.159.3' && fs.existsSync(hold)) {
+    const timer = setInterval(() => {
+      if (fs.existsSync(hold)) return;
+      clearInterval(timer); console.log(version);
+    }, 50);
+  } else console.log(version);
+}
 else if (process.argv.includes('--help')) console.log('Commands:\\n  update  Upgrade Codex');
 else if (process.argv.includes('update')) {
   fs.appendFileSync(${JSON.stringify(updatesFile)}, 'update\\n');
-  setTimeout(() => { if (fs.readFileSync(modeFile, 'utf8') === 'failure') {
-    process.stderr.write(${JSON.stringify(failureText)}); process.exitCode = 7; return;
-  }
-    fs.writeFileSync(versionFile, '0.159.3'); }, 2000);
+  const timer = setInterval(() => {
+    const mode = fs.readFileSync(modeFile, 'utf8');
+    if (mode === 'pending') return;
+    clearInterval(timer);
+    if (mode === 'failure') {
+      process.stderr.write(${JSON.stringify(failureText)}); process.exitCode = 7; return;
+    }
+    if (mode === 'success') fs.writeFileSync(versionFile, '0.159.3');
+  }, 100);
 } else {
   const child = cp.spawn(${JSON.stringify(app.fakeCodexPath)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });
   child.on('exit', code => process.exit(code || 0));
@@ -59,9 +75,15 @@ else if (process.argv.includes('update')) {
   await creation.locator('.local-cli-upgrade-btn').click();
   await expect(creation.locator('.local-cli-upgrade-btn')).toHaveText('升级中…');
   await expect(creation.locator('.local-cli-upgrade-btn')).toBeDisabled();
-  await expect(creation.locator('[role="status"]')).toBeEmpty();
+  await expect(creation.getByRole('timer')).toHaveText(/已用时 0:0[1-9]/);
   await page.screenshot({ path: testInfo.outputPath('02-upgrade-progress.png') });
+  writeFileSync(modeFile, 'success');
+  await expect(creation.locator('.local-cli-upgrade-btn')).toHaveText('正在验证版本…');
+  await expect(creation.locator('.local-cli-upgrade-btn')).toBeDisabled();
+  await page.screenshot({ path: testInfo.outputPath('02b-upgrade-verification.png') });
+  unlinkSync(holdVerification);
   await expect(creation.locator('[role="status"]')).toHaveText('升级成功', { timeout: 30_000 });
+  await expect(creation.getByRole('timer')).toBeHidden();
   await page.locator('#agent-modal-ext-cli-select .ai-select-trigger').click();
   const codexChoice = page.locator('.ai-select-popover:visible .ai-select-item[data-value="codex"]');
   await expect(codexChoice).toContainText('0.159.3');
@@ -100,14 +122,17 @@ else if (process.argv.includes('update')) {
   const recovery = page.locator('#chat-history .chat-message[data-failure-code="version_too_old"] .chat-bubble .chat-app-nav-row');
   await expect(recovery.locator('.local-cli-upgrade-btn')).toHaveText('升级 Codex CLI', { timeout: 30_000 });
   await page.screenshot({ path: testInfo.outputPath('06-execution-upgrade.png') });
+  writeFileSync(modeFile, 'pending');
   await recovery.locator('.local-cli-upgrade-btn').click();
   await expect(recovery.locator('.local-cli-upgrade-btn')).toHaveText('升级中…');
-  await expect(recovery.locator('[role="status"]')).toBeEmpty();
+  await expect(recovery.getByRole('timer')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('07-execution-progress.png') });
   // Reconcile durable history while maintenance still owns the visible action.
   await page.evaluate(async () => {
     await (window as any).loadConversationHistory(currentCid, { preserveScroll: true });
   });
+  await expect(recovery.getByRole('timer')).toBeVisible();
+  writeFileSync(modeFile, 'success');
   await expect(recovery.locator('[role="status"]')).toHaveText('升级成功', { timeout: 30_000 });
   await page.evaluate(async () => {
     await (window as any).loadConversationHistory(currentCid, { preserveScroll: true });
@@ -138,9 +163,14 @@ else if (process.argv.includes('update')) {
   await expect(recovery.locator('.local-cli-upgrade-error')).toBeVisible();
   expect(await recovery.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('08c-execution-error.png') });
+  writeFileSync(versionFile, '0.144.0'); writeFileSync(modeFile, 'unchanged');
+  await recovery.locator('.local-cli-upgrade-btn').click();
+  await expect(recovery.locator('[role="status"]')).toHaveText('无法验证升级后的 CLI');
+  await expect(recovery.locator('.local-cli-upgrade-btn')).toBeEnabled();
+  expect(readFileSync(versionFile, 'utf8')).toBe('0.144.0');
   // Upgrade is maintenance only: no task replay/model request follows it.
   expect(app.readCliState().invocations).toHaveLength(0);
-  expect(readFileSync(updatesFile, 'utf8').trim().split('\n')).toHaveLength(5);
+  expect(readFileSync(updatesFile, 'utf8').trim().split('\n')).toHaveLength(6);
   // Source/custom installations keep their owner instead of installing a second CLI.
   const customBin = path.join(app.root, 'custom-codex');
   writeFileSync(customBin, source); chmodSync(customBin, 0o755);
@@ -148,11 +178,11 @@ else if (process.argv.includes('update')) {
   await app.invoke('localAgents.detect', { type: 'codex' });
   await page.evaluate(async id => { await (window as any).openAgentDetail(id); }, created.agent.agent_id);
   await detail.locator('.local-cli-upgrade-btn').click();
-  await expect(detail.locator('[role="status"]')).toHaveText('升级失败');
+  await expect(detail.locator('[role="status"]')).toHaveText('此安装方式需手动升级 CLI');
   await expect(detail.locator('.local-cli-upgrade-details')).toBeHidden();
   await expect(detail.locator('.local-cli-upgrade-btn')).toHaveText('升级 CLI');
   await expect(page.getByText('查看升级说明', { exact: true })).toHaveCount(0);
-  expect(readFileSync(updatesFile, 'utf8').trim().split('\n')).toHaveLength(5);
+  expect(readFileSync(updatesFile, 'utf8').trim().split('\n')).toHaveLength(6);
 });
 
 test('adapts supported CLI defaults and keeps unavailable selections out of upgrade recovery', async ({ cliOrkas }, testInfo) => {
@@ -231,6 +261,7 @@ test('upgrades native Claude through its advertised alias and refreshes the deta
   const bin = path.join(app.root, '.local/bin/claude');
   const next = path.join(directory, '2.1.113');
   const calls = path.join(app.root, 'claude-update-calls');
+  const holdUpdate = path.join(app.root, 'hold-claude-update');
   mkdirSync(directory, { recursive: true }); mkdirSync(path.dirname(bin), { recursive: true });
   for (const version of ['2.1.112', '2.1.113']) {
     const file = path.join(directory, version);
@@ -241,7 +272,11 @@ else if (process.argv.slice(2).join(' ') === 'update --help') console.log('Usage
 else if (process.argv.includes('--help')) console.log('Usage: claude [options] [command]\\nCommands:\\n  agents [options] List co');
 else if (process.argv.slice(2).join(' ') === 'update') {
   fs.appendFileSync(${JSON.stringify(calls)}, 'update\\n');
-  setTimeout(() => { fs.unlinkSync(${JSON.stringify(bin)}); fs.symlinkSync(${JSON.stringify(next)}, ${JSON.stringify(bin)}); }, 1000);
+  const timer = setInterval(() => {
+    if (fs.existsSync(${JSON.stringify(holdUpdate)})) return;
+    clearInterval(timer);
+    fs.unlinkSync(${JSON.stringify(bin)}); fs.symlinkSync(${JSON.stringify(next)}, ${JSON.stringify(bin)});
+  }, 50);
 } else process.exit(8);
 `); chmodSync(file, 0o755);
   }
@@ -260,8 +295,11 @@ else if (process.argv.slice(2).join(' ') === 'update') {
   }, created.agent.agent_id);
   const control = page.locator('#agents-detail-runtime .local-cli-upgrade-control');
   await expect(control.locator('.local-cli-upgrade-btn')).toHaveText('升级 CLI');
+  writeFileSync(holdUpdate, '');
   await control.locator('.local-cli-upgrade-btn').click();
   await expect(control.locator('.local-cli-upgrade-btn')).toHaveText('升级中…');
+  await expect(control.getByRole('timer')).toBeVisible();
+  unlinkSync(holdUpdate);
   await expect(control.locator('[role="status"]')).toHaveText('升级成功', { timeout: 30_000 });
   await expect(page.locator('#agents-detail-runtime .ai-select-trigger')).toContainText('2.1.113');
   expect(readFileSync(calls, 'utf8')).toBe('update\n');
@@ -311,9 +349,11 @@ else if (process.argv.slice(2).join(' ') === 'update') {
   }
   await page.evaluate(async () => { await (window as any).setLang('zh'); });
   // Repeat maintenance on the installed version: no update must be claimed.
+  writeFileSync(holdUpdate, '');
   await control.locator('.local-cli-upgrade-btn').click();
   await expect(control.locator('.local-cli-upgrade-btn')).toHaveText('升级中…');
   await expect(control.locator('[role="status"]')).toBeEmpty();
+  unlinkSync(holdUpdate);
   await expect(control.locator('[role="status"]')).toHaveText('当前已是最新版', { timeout: 30_000 });
   await expect(control.locator('.local-cli-upgrade-btn')).toBeEnabled();
   await page.screenshot({ path: testInfo.outputPath('15-claude-up-to-date-zh.png') });
@@ -468,6 +508,15 @@ const timer = setInterval(() => {
   await expect(openclaw.locator('.local-cli-upgrade-warning')).toContainText('2026.2.4');
   await expect(openclaw.locator('.local-cli-upgrade-btn')).toBeDisabled();
   await expect(openclaw.locator('.local-cli-upgrade-btn')).toHaveText('Upgrading…');
+  await expect(openclaw.getByRole('timer')).toHaveText(/Elapsed /);
+  await page.setViewportSize({ width: 560, height: 700 });
+  await page.screenshot({ path: testInfo.outputPath('grouped-progress-en-560.png') });
+  await page.evaluate(async () => { await (window as any).setLang('ar'); });
+  await expect(openclaw.getByRole('timer')).toHaveText(/الوقت المنقضي [٠-٩]+:[٠-٩]{2}/);
+  await expect(openclaw.getByRole('timer')).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('grouped-progress-ar-560.png') });
+  await page.evaluate(async () => { await (window as any).setLang('en'); });
+  await page.setViewportSize({ width: 1280, height: 800 });
   await openclaw.locator('.local-cli-upgrade-btn').evaluate(button => {
     button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -476,8 +525,9 @@ const timer = setInterval(() => {
   expect(readFileSync(calls, 'utf8')).toBe('install\n');
   // A second outdated CLI can fail independently, without installer detail.
   // Its unsupported source installation must not block or reset OpenClaw.
+  const manualUpdateStatus = 'This installation method requires a manual CLI update';
   await codexRow.locator('.local-cli-upgrade-btn').click();
-  await expect(codexRow.locator('[role="status"]')).toHaveText('Upgrade failed');
+  await expect(codexRow.locator('[role="status"]')).toHaveText(manualUpdateStatus);
   await expect(codexRow.locator('.local-cli-upgrade-error')).toBeHidden();
   await expect(codexRow.locator('.local-cli-upgrade-btn')).toBeEnabled();
   await expect(openclaw.locator('.local-cli-upgrade-btn')).toBeDisabled();
@@ -490,7 +540,7 @@ const timer = setInterval(() => {
   await expect(error.locator('img')).toHaveCount(0);
   await expect(error).not.toContainText('fixture-private-token');
   await expect(error).not.toContainText('/Users/test');
-  await expect(codexRow.locator('[role="status"]')).toHaveText('Upgrade failed');
+  await expect(codexRow.locator('[role="status"]')).toHaveText(manualUpdateStatus);
   // Background discovery may fill in a version while the user upgrades a
   // different CLI. The selected identity, not the transient label, must stay.
   await expect(selector).toHaveAttribute('data-value', selected!);
@@ -525,7 +575,7 @@ const timer = setInterval(() => {
   await expect(error).toBeHidden();
   await expect(error).toBeEmpty();
   await expect(openclaw.locator('.local-cli-upgrade-details')).toBeHidden();
-  await expect(openclaw.locator('[role="status"]')).toBeEmpty();
+  await expect(openclaw.getByRole('timer')).toBeVisible();
   await expect.poll(() => readFileSync(calls, 'utf8')).toBe('install\ninstall\n');
   writeFileSync(mode, 'empty');
   await expect(openclaw.locator('[role="status"]')).toHaveText('升级失败');
@@ -534,7 +584,7 @@ const timer = setInterval(() => {
   await openclaw.locator('.local-cli-upgrade-details').click();
   await expect(error).toBeVisible();
   await expect(openclaw.locator('.local-cli-upgrade-btn')).toBeEnabled();
-  await expect(codexRow.locator('[role="status"]')).toHaveText('升级失败');
+  await expect(codexRow.locator('[role="status"]')).toHaveText('此安装方式需手动升级 CLI');
   writeFileSync(mode, 'success');
   await openclaw.locator('.local-cli-upgrade-btn').click();
   await expect(error).toBeHidden();

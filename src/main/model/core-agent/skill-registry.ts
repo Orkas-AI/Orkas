@@ -405,7 +405,7 @@ async function renderSkillLines(
     if (runtimeRefBySpec) {
       lines.push(
         '`read_files({"paths":[{"path":"@skill/<read-ref>"}]})` loads that skill\'s SKILL.md for this run.',
-        '`read_files({"paths":[{"path":"@skill/<read-ref>/<relative-path>"}]})` loads a referenced file, template, asset, or script inside the same skill.',
+        'For relative links within a Skill, resolve from the linking document\'s directory. Read the target with `read_files({"paths":[{"path":"@skill/<read-ref>/<path-from-skill-root>"}]})`.',
         'Use the exact read ref shown on the matching entry. Do not discover or reconstruct physical skill paths.',
         'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
         '',

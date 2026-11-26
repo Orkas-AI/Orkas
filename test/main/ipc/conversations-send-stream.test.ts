@@ -69,6 +69,7 @@ vi.mock('../../../src/main/features/group_chat', () => ({
     groupChatMock.sendCalls.push(input);
     groupChatMock.resolveSendStarted?.();
     await new Promise<void>((resolve) => { groupChatMock.releaseSend = resolve; });
+    await (input as { beforeDispatch?: (run: { runId: string }) => Promise<void> }).beforeDispatch?.({ runId: 'task-run-send' });
     groupChatMock.resolveSendFinished?.();
     return { ok: true };
   }),
@@ -76,10 +77,12 @@ vi.mock('../../../src/main/features/group_chat', () => ({
     groupChatMock.retryCalls.push(input);
     groupChatMock.resolveSendStarted?.();
     await new Promise<void>((resolve) => { groupChatMock.releaseSend = resolve; });
+    await (input as { beforeDispatch?: (run: { runId: string }) => Promise<void> }).beforeDispatch?.({ runId: 'task-run-retry' });
     groupChatMock.resolveSendFinished?.();
     return { ok: true, mode: 'resume' };
   }),
   busIsQuiescent: vi.fn(() => groupChatMock.quiescent),
+  runtimeStatus: vi.fn(async () => ({ processing: false })),
   streamEvents: vi.fn(async function* () {}),
 }));
 
@@ -249,6 +252,49 @@ describe('ipc › groupChat.send active-turn control', () => {
 });
 
 describe('ipc › conversations.sendStream', () => {
+  it('recovers a queued send by exact identity after the original stream closes without a receipt', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const first = await chats.createConversation(TEST_UID, {});
+    const second = await chats.createConversation(TEST_UID, {});
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const cid = first.conversation_id;
+    const clientMsgId = 'client-queued';
+    const readReceipt = (conversation: string, id: string) => invokeHandler!({ sender }, {
+      channel: 'conversations.history',
+      payload: { cid: conversation, receipt_client_msg_id: id },
+    });
+    const run = streamStartHandler!({ sender }, {
+      requestId: 'stream-that-closes',
+      channel: 'conversations.sendStream',
+      payload: { cid, content: 'Prepare notes', client_msg_id: clientMsgId },
+    });
+    await groupChatMock.sendStarted;
+    expect(await readReceipt(cid, clientMsgId)).not.toHaveProperty('send_receipt');
+    streamCancelHandler!({ sender }, 'stream-that-closes');
+    await run;
+    groupChatMock.releaseSend?.();
+    await groupChatMock.sendFinished;
+
+    expect(await readReceipt(cid, clientMsgId)).toMatchObject({ ok: true, history: [], send_receipt: 'accepted' });
+    expect(await readReceipt(cid, 'another-send')).not.toHaveProperty('send_receipt');
+    expect(await readReceipt(second.conversation_id, clientMsgId)).not.toHaveProperty('send_receipt');
+    expect(groupChatMock.sendCalls).toHaveLength(1);
+    expect(sender.send).not.toHaveBeenCalledWith('stream:stream-that-closes', expect.objectContaining({ type: 'send_accepted' }));
+  });
+
+  it('reports a pre-admission empty request as rejected without sending it to the bus', async () => {
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    await streamStartHandler!({ sender }, {
+      requestId: 'empty-request',
+      channel: 'conversations.sendStream',
+      payload: { cid: 'c123abc', content: ' ', client_msg_id: 'client-empty' },
+    });
+    expect(sender.send).toHaveBeenCalledWith('stream:empty-request', {
+      type: 'error', text: 'empty message', admission_rejected: true,
+    });
+    expect(groupChatMock.sendCalls).toHaveLength(0);
+  });
+
   it.each(['Modify app X using attached app-source.md:\nAdd reset', '  ', 42])('preserves validated hidden app context on both send paths: %s', async modelText => {
     const payload = { cid: 'c123abc', content: 'Add reset', model_text: modelText };
     const expected = typeof modelText === 'string' && modelText.trim() ? modelText.trim() : undefined;
@@ -314,6 +360,7 @@ describe('ipc › conversations.sendStream', () => {
       cid: 'c123abc',
       text: '@VideoStudio Draft the launch video',
       title_text: 'Draft the launch video',
+      beforeDispatch: expect.any(Function),
     }]);
 
     groupChatMock.quiescent = true;
@@ -345,6 +392,7 @@ describe('ipc › conversations.sendStream', () => {
       text: 'Please use these messages as reference.',
       title_text: '',
       references: [{ source_cid: 'source123abc', source_msg_id: 'msg123abc' }],
+      beforeDispatch: expect.any(Function),
     }]);
 
     groupChatMock.quiescent = true;
@@ -354,7 +402,8 @@ describe('ipc › conversations.sendStream', () => {
 
   it('routes a failed-message retry to the smart retry path instead of a normal send', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
-    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const send = vi.fn();
+    const sender = trustedIpcSender({ isDestroyed: () => false, send });
     const run = streamStartHandler(
       { sender },
       {
@@ -374,12 +423,14 @@ describe('ipc › conversations.sendStream', () => {
       cid: 'c123abc',
       failedMessageId: 'failed-message-1',
       visibleText: 'Continue',
+      beforeDispatch: expect.any(Function),
     }]);
     expect(groupChatMock.sendCalls).toEqual([]);
 
     groupChatMock.quiescent = true;
     groupChatMock.releaseSend?.();
     await run;
+    expect(send).toHaveBeenCalledWith('stream:retry-request', { type: 'send_accepted', run_id: 'task-run-retry' });
   });
 
   it('ignores stream starts from an untrusted sender', async () => {
@@ -534,8 +585,36 @@ describe('ipc › conversations.sendStream', () => {
     groupChatMock.releaseSend?.();
     await run;
 
-    expect(sent.filter((item) => item.payload?.type === 'send_accepted')).toHaveLength(1);
+    expect(sent.filter((item) => item.payload?.type === 'send_accepted')).toEqual([
+      { channel: 'stream:req1', payload: { type: 'send_accepted', run_id: 'task-run-send' } },
+    ]);
     expect(sent.at(-1)).toEqual({ channel: 'stream:req1', payload: { type: 'done' } });
+  });
+
+  it('delivers the final reply buffered while the send acceptance is being delivered', async () => {
+    if (!streamStartHandler) throw new Error('stream handlers not registered');
+    const sent: any[] = [];
+    const reply = { type: 'message', cid: 'c123abc', msg: { id: 'reply-1', from: 'commander', text: 'Final reply' } };
+    const sender = trustedIpcSender({
+      isDestroyed: () => false,
+      send: (_channel: string, payload: any) => {
+        sent.push(payload);
+        if (payload.type !== 'send_accepted') return;
+        groupChatMock.quiescent = true;
+        for (const notify of groupChatMock.subscribers) notify(reply);
+      },
+    });
+
+    const handling = streamStartHandler({ sender }, {
+      requestId: 'buffered-reply', channel: 'conversations.sendStream',
+      payload: { cid: 'c123abc', content: 'go' },
+    });
+    await groupChatMock.sendStarted;
+    groupChatMock.releaseSend?.();
+    await handling;
+
+    expect(sent.map(frame => frame.type)).toEqual(['send_accepted', 'event', 'done']);
+    expect(sent[1].event.data).toEqual(reply);
   });
 
   it('keeps relaying after groupChat.send resolves while the bus is still active', async () => {

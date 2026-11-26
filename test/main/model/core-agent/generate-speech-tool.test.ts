@@ -13,21 +13,30 @@ const speechMock = vi.hoisted(() => ({
   estimateNarrationDuration: vi.fn(),
   assessNarrationFit: vi.fn(),
   listTtsCapabilities: vi.fn(),
+  resolveTtsSelection: vi.fn(),
 }));
 
 vi.mock('../../../../src/main/features/tts_capabilities', async (original) => ({
   ...await original<typeof import('../../../../src/main/features/tts_capabilities')>(),
   getTtsAvailabilityDetails: () => ({ available: true }),
   listTtsCapabilities: speechMock.listTtsCapabilities,
+  resolveTtsSelection: speechMock.resolveTtsSelection,
 }));
 
-vi.mock('../../../../src/main/features/tts', () => ({
-  hasConfiguredTtsProvider: () => true,
-  generateSpeech: speechMock.generateSpeech,
-  estimateNarrationDuration: speechMock.estimateNarrationDuration,
-  assessNarrationFit: speechMock.assessNarrationFit,
-  measureNarrationUnits: (text: string) => ({ unit: 'characters', units: text.length }),
-}));
+vi.mock('../../../../src/main/features/tts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/features/tts')>();
+  return {
+    hasConfiguredTtsProvider: () => true,
+    generateSpeech: speechMock.generateSpeech,
+    estimateNarrationDuration: speechMock.estimateNarrationDuration,
+    assessNarrationFit: speechMock.assessNarrationFit,
+    measureNarrationUnits: (text: string) => ({ unit: 'characters', units: text.length }),
+    narrationDurationCalibrationScale: actual.narrationDurationCalibrationScale,
+    NARRATION_ESTIMATE_OVER_RATIO: actual.NARRATION_ESTIMATE_OVER_RATIO,
+    NARRATION_FILL_RETRY_LIMIT: actual.NARRATION_FILL_RETRY_LIMIT,
+    NARRATION_MEASURED_OVER_RATIO: actual.NARRATION_MEASURED_OVER_RATIO,
+  };
+});
 
 const UID = 'u-gspeech-001';
 const CID = 'conv-speech';
@@ -43,6 +52,7 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = path.join(tmpDir, 'data');
   vi.resetModules();
   speechMock.generateSpeech.mockReset();
+  speechMock.resolveTtsSelection.mockReset().mockResolvedValue({ ok: true });
   speechMock.estimateNarrationDuration.mockReset();
   speechMock.assessNarrationFit.mockReset();
   speechMock.estimateNarrationDuration.mockReturnValue({
@@ -92,6 +102,7 @@ async function createTool(opts: {
   projectId?: string;
   agentId?: string;
   onFileWritten?: (absPath: string, info?: { billedToOwnAccount?: boolean }) => void;
+  hasProducedPath?: (absPath: string) => boolean;
 }) {
   const mod = await import('../../../../src/main/model/core-agent/generate-speech-tool');
   return mod.createGenerateSpeechTool({ userId: UID, ...opts });
@@ -253,55 +264,119 @@ describe('generate_speech output paths', () => {
     expect(speechMock.generateSpeech).not.toHaveBeenCalled();
   });
 
-  it('keeps VideoStudio estimate refusal factual and permits correction without spending on the refused text', async () => {
-    speechMock.estimateNarrationDuration.mockReturnValueOnce({ estimatedSec: 21.78, unit: 'words', units: 48, unitsPerSec: 2.5 });
+  // 2026-11-16 merge of release_2.5.0 into release_2.8.0: the requester chose 2.8.0's timing
+  // feedback for VideoStudio too (shorten by N% before synthesis; after it, fill a short line
+  // and keep its scene, or lengthen the scene for a long one) over 2.5.0's facts-only text.
+  it('refuses a VideoStudio line estimated well over its target, says how much to shorten, and spends nothing on it', async () => {
+    speechMock.estimateNarrationDuration.mockReturnValueOnce({ estimatedSec: 25, unit: 'words', units: 48, unitsPerSec: 2.5 });
     const cwd = path.join(tmpDir, 'user-workspace');
     const tool = await createTool({ agentId: VIDEO_STUDIO_AGENT_ID });
     const input = { text: 'A complete translation', output_path: 'line.mp3', target_duration: 20 };
     const refused = await tool.execute(input, { workingDir: cwd } as any);
     expect(refused.isError).toBe(true);
     expect(refused.content).toContain('E_TTS_TEXT_TOO_LONG');
-    expect(refused.content).toContain('21.78s');
+    expect(refused.content).toContain('25s');
     expect(refused.content).toContain('20s');
-    expect(refused.content).toMatch(/estimate.*not.*measured/i);
-    expect(refused.content).not.toMatch(/Shorten by|roughly \d+ words/);
+    expect(refused.content).toMatch(/Shorten by about \d+%/);
     expect(speechMock.generateSpeech).not.toHaveBeenCalled();
     const corrected = await tool.execute({ ...input, text: 'Corrected translation' }, { workingDir: cwd } as any);
     expect(corrected.isError).toBeFalsy();
     expect(speechMock.generateSpeech).toHaveBeenCalledOnce();
   });
 
-  it.each([1.25, 5.5, 7])('reports VideoStudio measured %ss audio without prescribing picture or script edits', async (seconds) => {
-    speechMock.generateSpeech.mockImplementationOnce(async ({ outputAbsPath }) => ({
-      ok: true, path: outputAbsPath, bytes: 12, backend: 'mock', durationSec: seconds,
-    }));
-    const written = vi.fn(), cwd = path.join(tmpDir, 'user-workspace');
+  it('tells VideoStudio to fill a short line and keep its scene, and to lengthen the scene for a long one', async () => {
+    const cwd = path.join(tmpDir, 'user-workspace');
+    const written = vi.fn();
     const tool = await createTool({ agentId: VIDEO_STUDIO_AGENT_ID, onFileWritten: written });
-    const result = await tool.execute({ text: 'An unchanged line', output_path: 'line.mp3', target_duration: 6, speed: 1.2 }, { workingDir: cwd } as any);
-    expect(result.isError).toBeFalsy();
-    expect(result.content).toContain(`measured_duration_sec: ${seconds.toFixed(2)}`);
-    expect(result.content).toContain('target_duration_sec: 6.00');
-    expect(result.content).toContain(`duration_delta_sec: ${(seconds - 6).toFixed(2)}`);
-    expect(result.content).not.toMatch(/lengthen|shorten|add ~|trim the|reads better|timing_action:/i);
-    expect(speechMock.generateSpeech).toHaveBeenCalledOnce();
-    expect(speechMock.generateSpeech.mock.calls[0][0]).toMatchObject({ text: 'An unchanged line', speed: 1.2 });
-    expect(written).toHaveBeenCalledOnce();
+    speechMock.generateSpeech.mockImplementationOnce(async ({ outputAbsPath }) => ({ ok: true, path: outputAbsPath, bytes: 12, backend: 'mock', durationSec: 1.25 }));
+    const short = await tool.execute({ text: 'An unchanged line', output_path: 'short.mp3', target_duration: 6 }, { workingDir: cwd } as any);
+    expect(short.isError).toBeFalsy();
+    expect(short.content).toContain('measured_duration_sec: 1.25');
+    expect(short.content).toContain('⚠️ fit basis 1.25s / 6.00s');
+    expect(short.content).toContain("timing_action: This is the audio's real length. When the user asked for this video's length, keep the scene at its planned length");
+    speechMock.generateSpeech.mockImplementationOnce(async ({ outputAbsPath }) => ({ ok: true, path: outputAbsPath, bytes: 12, backend: 'mock', durationSec: 8.4 }));
+    const long = await tool.execute({ text: 'Another line', output_path: 'long.mp3', target_duration: 6 }, { workingDir: cwd } as any);
+    expect(long.isError).toBeFalsy();
+    expect(long.content).toContain('measured_duration_sec: 8.40');
+    expect(long.content).toContain('lengthen the scene or shorten the line');
+    expect(speechMock.generateSpeech).toHaveBeenCalledTimes(2);
+    expect(written).toHaveBeenCalledTimes(2);
   });
 
   it('does not bill twice by overwriting the same output path in one turn', async () => {
     const tool = await createTool({ cid: CID });
-    const input = { text: 'hello', output_path: 'narration.mp3', target_duration: 10 };
+    // The mock voice reads it in 1s, so it fits; only a short line's file takes a second line.
+    const input = { text: 'hello', output_path: 'narration.mp3', target_duration: 1 };
 
     const first = await tool.execute(input, { workingDir: tmpDir } as any);
     const second = await tool.execute({ ...input, text: 'revised hello' }, { workingDir: tmpDir } as any);
 
     expect(first.isError).toBeFalsy();
     expect(first.content).toContain('measured_duration_sec: 1.00');
-    expect(first.content).toContain('lengthen the scene or shorten the line');
-    expect(first.content).toContain('do not regenerate it just to change the timing');
     expect(second.isError).toBe(true);
     expect(second.content).toContain('E_TTS_ALREADY_GENERATED_THIS_TURN');
+    // On 2026-11-17 a changed line sent to the same path was refused with no way to voice it.
+    expect(second.content).toContain('To voice a changed line, give it a new output_path, such as voice/hook-2.mp3.');
     expect(speechMock.generateSpeech).toHaveBeenCalledTimes(1);
+  });
+
+  // 2026-11-16: a 72 s explainer the user gave no length kept every planned scene, and each
+  // ended in 1.2-2.6 s of silence. Without a requested length a scene ends with its line.
+  it('keeps a short line\'s scene when the user asked for a length, else ends each scene with its line', async () => {
+    const tool = await createTool({ cid: CID });
+    // The mock voice reads every line in 1s; the long line is estimated short enough to pass the precheck.
+    const short = await tool.execute({ text: 'hello', output_path: 'short.mp3', target_duration: 10 }, { workingDir: tmpDir } as any);
+    const fitting = await tool.execute({ text: 'hello', output_path: 'fitting.mp3', target_duration: 1 }, { workingDir: tmpDir } as any);
+    speechMock.estimateNarrationDuration.mockReturnValueOnce({ ...speechMock.estimateNarrationDuration('', 1), estimatedSec: 0.4 });
+    const long = await tool.execute({ text: 'hello', output_path: 'long.mp3', target_duration: 0.5 }, { workingDir: tmpDir } as any);
+
+    expect(short.content).toContain("timing_action: This is the audio's real length. When the user asked for this video's length, keep the scene at its planned length: "
+      + 'replace this line with the longer one rather than cutting the scene to this audio. Otherwise make the scene this audio plus about half a second and keep this audio.');
+    expect(short.content).not.toContain('do not regenerate');
+    expect(speechMock.generateSpeech).toHaveBeenCalledTimes(3);
+    for (const result of [long, fitting]) {
+      expect(result.content).toContain("timing_action: This is the audio's real length. Its scene must be at least that long: "
+        + "lengthen the scene or shorten the line. When the user did not ask for this video's length, make the scene this audio plus about half a second. "
+        + 'Reuse this audio; do not regenerate it just to change the timing.');
+    }
+  });
+
+  it('lets a short line take its own file again at most twice a turn, whatever its target, and counts each file apart', async () => {
+    const fill = 'keep the scene at its planned length: replace this line with the longer one';
+    const capped = "timing_action: This is the audio's real length. Keep this audio and the scene's planned length; do not generate this line again this turn.";
+    const say = (tool: any, file: string, target: number) => tool.execute({ text: 'hello', output_path: file, target_duration: target }, { workingDir: tmpDir } as any);
+    const tool = await createTool({ cid: CID, hasProducedPath: () => true });
+    // The mock voice reads every line in 1s, so each take below is short. A fill may change its target (2026-11-15).
+    const takes = [await say(tool, 'a.mp3', 10), await say(tool, 'a.mp3', 12), await say(tool, 'a.mp3', 8)];
+    const fourth = await say(tool, 'a.mp3', 8);
+
+    expect(takes.slice(0, 2).every((take) => take.content.includes(fill))).toBe(true);
+    expect(takes[2].content).toContain(capped);
+    expect(takes[2].content).not.toContain(fill);
+    expect(fourth.content).toContain('E_TTS_ALREADY_GENERATED_THIS_TURN');
+    expect(speechMock.assessNarrationFit.mock.calls.map(([input]) => input.fillLimitReached)).toEqual([false, false, true]);
+    // Each fill overwrote the first take in place.
+    expect(new Set(speechMock.generateSpeech.mock.calls.map(([input]) => input.outputAbsPath)).size).toBe(1);
+    // Another scene of the same voice and length is its own line (2026-11-15), and a new turn starts over.
+    expect((await say(tool, 'b.mp3', 8)).content).toContain(fill);
+    expect((await say(await createTool({ cid: CID, hasProducedPath: () => true }), 'a.mp3', 10)).content).toContain(fill);
+    expect(speechMock.generateSpeech).toHaveBeenCalledTimes(5);
+  });
+
+  it('opens a file again only for the fill a short result asked for, and keeps it open past a refused estimate', async () => {
+    const say = (tool: any, file: string, target: number) => tool.execute({ text: 'hello', output_path: file, target_duration: target }, { workingDir: tmpDir } as any);
+    const tool = await createTool({ cid: CID });
+    await say(tool, 'fitting.mp3', 1);
+    speechMock.estimateNarrationDuration.mockReturnValueOnce({ ...speechMock.estimateNarrationDuration('', 1), estimatedSec: 0.4 });
+    await say(tool, 'long.mp3', 0.5);
+    await say(tool, 'short.mp3', 10);
+    expect((await say(tool, 'fitting.mp3', 1)).content).toContain('E_TTS_ALREADY_GENERATED_THIS_TURN');
+    expect((await say(tool, 'long.mp3', 1)).content).toContain('E_TTS_ALREADY_GENERATED_THIS_TURN');
+
+    speechMock.estimateNarrationDuration.mockReturnValueOnce({ ...speechMock.estimateNarrationDuration('', 1), estimatedSec: 20 });
+    expect((await say(tool, 'short.mp3', 10)).content).toContain('E_TTS_TEXT_TOO_LONG');
+    expect((await say(tool, 'short.mp3', 10)).isError).toBeFalsy();
+    expect(speechMock.generateSpeech).toHaveBeenCalledTimes(4);
   });
 
   it('does not retry an already-dispatched request whose charge status is unknown', async () => {
@@ -407,6 +482,183 @@ describe('generate_speech output paths', () => {
       .not.toContain(`${path.sep}PC${path.sep}bin${path.sep}`);
     expect(lastOutputPath())
       .not.toBe(path.join(projectWs, 'morning.mp3'));
+  });
+});
+
+// In the 2026-11-14 recreation runs the voice read Chinese about 1.5x faster than the estimate,
+// so lines that would have fit were refused, the model cut them short, and two videos went
+// silent for their second half. One run's longer retry, after a line had been measured, was
+// refused by the same estimate.
+describe('generate_speech narration length precheck', () => {
+  const VOICE_A = { route_ref: 'env:tts', voice_ref: 'voice-a', language: 'zh-CN' };
+  const VOICE_B = { route_ref: 'env:tts', voice_ref: 'voice-b', language: 'zh-CN' };
+  /** Estimated and measured seconds per line; a line with no measured value fails or reports no length. */
+  function voiceLines(lines: Record<string, { est: number; measured?: number | 'fail' }>) {
+    speechMock.estimateNarrationDuration.mockImplementation((text: string) => ({
+      estimatedSec: lines[text]?.est ?? 1, unit: 'characters', units: text.length, unitsPerSec: 4,
+    }));
+    speechMock.generateSpeech.mockImplementation(async ({ text, outputAbsPath }: { text: string; outputAbsPath: string }) => {
+      const measured = lines[text]?.measured;
+      if (measured === 'fail') {
+        return { ok: false, errorCode: 'E_TTS_PROVIDER', message: 'failed', requestDisposition: 'not_sent', chargeStatus: 'not_charged' };
+      }
+      return { ok: true, path: outputAbsPath, bytes: 12, backend: 'mock', ...(measured ? { durationSec: measured } : {}) };
+    });
+  }
+  async function say(tool: Awaited<ReturnType<typeof createTool>>, text: string, target: number, voice = VOICE_A) {
+    return tool.execute({ text, output_path: `${text}.mp3`, target_duration: target, ...voice }, { workingDir: tmpDir } as any);
+  }
+  function voiced(): string[] {
+    return speechMock.generateSpeech.mock.calls.map((call) => (call[0] as { text: string }).text);
+  }
+
+  it('voices a first line estimated up to a fifth over its target, and refuses one past that without a request', async () => {
+    voiceLines({ below: { est: 11.5, measured: 8 }, at: { est: 12, measured: 8 }, above: { est: 12.1, measured: 8 } });
+    const tool = await createTool({ cid: CID });
+
+    expect((await say(tool, 'below', 10)).isError).toBeFalsy();
+    expect((await say(tool, 'at', 10, VOICE_B)).isError).toBeFalsy();
+    const refused = await say(tool, 'above', 10, { ...VOICE_B, voice_ref: 'voice-c' });
+
+    expect(refused.isError).toBe(true);
+    expect(refused.content).toContain('E_TTS_TEXT_TOO_LONG');
+    expect(refused.content).toContain('No speech request was sent');
+    expect(voiced()).toEqual(['below', 'at']);
+  });
+
+  it('judges a later line by the pace this voice was measured at, so a longer retry is voiced', async () => {
+    voiceLines({ first: { est: 10, measured: 6.5 }, longer: { est: 15, measured: 9.8 } });
+    const tool = await createTool({ cid: CID });
+
+    expect((await say(tool, 'first', 10)).isError).toBeFalsy();
+    const longer = await say(tool, 'longer', 10);
+
+    expect(longer.isError).toBeFalsy();
+    expect(voiced()).toEqual(['first', 'longer']);
+  });
+
+  it('refuses a line this voice reads slower than estimated, before any request, and a new turn starts over', async () => {
+    voiceLines({ first: { est: 10, measured: 13 }, same: { est: 10, measured: 13 } });
+    const tool = await createTool({ cid: CID });
+
+    expect((await say(tool, 'first', 13)).isError).toBeFalsy();
+    const refused = await say(tool, 'same', 10);
+
+    expect(refused.isError).toBe(true);
+    expect(refused.content).toContain('Estimated natural narration is 13s for a 10s target');
+    expect(voiced()).toEqual(['first']);
+
+    const nextTurn = await createTool({ cid: CID });
+    expect((await say(nextTurn, 'same', 10)).isError).toBeFalsy();
+    expect(voiced()).toEqual(['first', 'same']);
+  });
+
+  it('keeps each voice\'s measured pace to that voice', async () => {
+    voiceLines({ slow: { est: 10, measured: 13 }, other: { est: 11, measured: 8 } });
+    const tool = await createTool({ cid: CID });
+
+    await say(tool, 'slow', 13);
+    const onSlowVoice = await say(tool, 'other', 10);
+    const onOtherVoice = await say(tool, 'other', 10, VOICE_B);
+
+    expect(onSlowVoice.isError).toBe(true);
+    expect(onOtherVoice.isError).toBeFalsy();
+    expect(voiced()).toEqual(['slow', 'other']);
+  });
+
+  it('weighs a voice\'s lines by length, so a short line\'s silence does not swing its pace', async () => {
+    voiceLines({ long: { est: 10, measured: 6 }, tiny: { est: 1, measured: 1.9 }, next: { est: 13, measured: 9 } });
+    const tool = await createTool({ cid: CID });
+
+    await say(tool, 'long', 10);
+    await say(tool, 'tiny', 2);
+    const next = await say(tool, 'next', 10);
+
+    expect(next.isError).toBeFalsy();
+    expect(voiced()).toEqual(['long', 'tiny', 'next']);
+  });
+
+  it('learns no pace from a failed line or one with no measured length', async () => {
+    voiceLines({ failed: { est: 10, measured: 'fail' }, unmeasured: { est: 10 }, next: { est: 13, measured: 9 } });
+    const tool = await createTool({ cid: CID });
+
+    expect((await say(tool, 'failed', 10)).isError).toBe(true);
+    expect((await say(tool, 'unmeasured', 10)).isError).toBeFalsy();
+    const next = await say(tool, 'next', 10);
+
+    expect(next.isError).toBe(true);
+    expect(next.content).toContain('Estimated natural narration is 13s for a 10s target');
+    expect(voiced()).toEqual(['failed', 'unmeasured']);
+  });
+
+  it('preflights all remaining scenes at the first take’s measured pace without synthesizing them', async () => {
+    voiceLines({ opening: { est: 2, measured: 2.6 }, short: { est: 1 }, long: { est: 2 }, longest: { est: 3 } });
+    const tool = await createTool({ cid: CID });
+    await say(tool, 'opening', 2.6);
+    const ctx = { workingDir: tmpDir } as any;
+    const result = await tool.execute({ action: 'preflight', ...VOICE_A, lines: [
+      { text: 'short', target_duration: 2 },
+      { text: 'long', target_duration: 2 },
+      { text: 'longest', target_duration: 3 },
+    ] }, ctx);
+
+    expect(JSON.parse(result.content as string)).toMatchObject({
+      ok: false, code: 'E_TTS_TEXT_TOO_LONG', calibrated: true, lines: [
+        { index: 2, estimated_sec: 2.6, target_sec: 2, over_by_sec: 0.6 },
+        { index: 3, estimated_sec: 3.9, target_sec: 3, over_by_sec: 0.9 },
+      ],
+    });
+    expect(voiced()).toEqual(['opening']);
+    const revised = await tool.execute({ action: 'preflight', ...VOICE_A, lines: [
+      { text: 'long', target_duration: 2.6 },
+      { text: 'longest', target_duration: 3.9 },
+    ] }, ctx);
+    expect(JSON.parse(revised.content as string)).toMatchObject({ ok: true, calibrated: true });
+    expect(voiced()).toEqual(['opening']);
+    expect((await say(tool, 'long', 2.6)).isError).toBeFalsy();
+    expect(voiced()).toEqual(['opening', 'long']);
+  });
+
+  it('returns one refusal for a missing configured voice before touching any scene', async () => {
+    speechMock.resolveTtsSelection.mockResolvedValue({ ok: false, errorCode: 'E_TTS_VOICE_UNRESOLVED', message: 'Select a configured voice.' });
+    const tool = await createTool({ cid: CID });
+    const result = await tool.execute({ action: 'preflight', ...VOICE_A, lines: [
+      { text: 'A', target_duration: 2 }, { text: 'B', target_duration: 2 },
+    ] }, { workingDir: tmpDir } as any);
+
+    expect(JSON.parse(result.content as string)).toMatchObject({ ok: false, code: 'E_TTS_VOICE_UNRESOLVED', synthesis_sent: false });
+    expect(speechMock.resolveTtsSelection).toHaveBeenCalledTimes(1);
+    expect(voiced()).toEqual([]);
+  });
+
+  it('checks the last line in a full 50-line batch without generating audio', async () => {
+    const tool = await createTool({ cid: CID });
+    const lines = Array.from({ length: 50 }, (_, index) => ({
+      text: `Line ${index + 1}`, target_duration: index === 49 ? 0.5 : 2,
+    }));
+    const result = await tool.execute({ action: 'preflight', ...VOICE_A, lines }, { workingDir: tmpDir } as any);
+
+    expect(JSON.parse(result.content as string)).toMatchObject({
+      ok: false, calibrated: false, synthesis_sent: false,
+      lines: [{ index: 50, target_sec: 0.5, estimated_sec: 1 }],
+    });
+    expect(voiced()).toEqual([]);
+  });
+
+  it.each([
+    { name: 'empty list', lines: [] },
+    { name: 'blank text', lines: [{ text: ' ', target_duration: 1 }] },
+    { name: 'zero duration', lines: [{ text: 'A', target_duration: 0 }] },
+    { name: 'unbounded duration', lines: [{ text: 'A', target_duration: Infinity }] },
+    { name: '51 lines', lines: Array.from({ length: 51 }, () => ({ text: 'A', target_duration: 1 })) },
+  ])('rejects $name before reading the voice catalog', async ({ lines }) => {
+    const tool = await createTool({ cid: CID });
+    const result = await tool.execute({ action: 'preflight', ...VOICE_A, lines }, { workingDir: tmpDir } as any);
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content as string)).toMatchObject({ code: 'E_BAD_INPUT' });
+    expect(speechMock.resolveTtsSelection).not.toHaveBeenCalled();
+    expect(voiced()).toEqual([]);
   });
 });
 

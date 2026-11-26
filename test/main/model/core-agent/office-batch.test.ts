@@ -15,6 +15,10 @@ describe('buildDocxBatch', () => {
       { text: '步骤一', list: 'ordered' },
     ]);
     expect(ops).toEqual([
+      {
+        command: 'add', parent: '/styles', type: 'style',
+        props: { id: 'Heading1', name: 'Heading 1', type: 'paragraph', basedOn: 'Normal', next: 'Normal', outlineLvl: '0' },
+      },
       { command: 'add', parent: '/body', type: 'p', props: { text: '季度报告', style: 'Heading1' } },
       { command: 'add', parent: '/body', type: 'p', props: { text: '正文段落 繁體 😀', align: 'justify' } },
       { command: 'add', parent: '/body', type: 'p', props: { text: '第一项', listStyle: 'bullet' } },

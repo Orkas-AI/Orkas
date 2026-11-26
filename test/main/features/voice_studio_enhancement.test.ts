@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { bundledRuntimeEnv } from '../../../src/main/util/bundled-runtime';
-import { enhancementCases, enhancementWav, enhancementMatches, decodeEnhancement } from '../../../eval/model-eval/regression/voice-enhancement-fixtures';
+import { enhancementCases, enhancementWav, enhancementMatches, enhancementMeasures, decodeEnhancement } from '../../../eval/model-eval/regression/voice-enhancement-fixtures';
 const require = createRequire(import.meta.url);
 const audio = require('../../../resources/builtin/marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/audio.js');
 const { settings } = require('../../../resources/builtin/marketplace/agents/5f890bd72ac4/skills/voice-project/scripts/processing.js');
@@ -24,7 +24,15 @@ async function render() {
 it.each(enhancementCases)('delivers the requested audible change without changing timing or unrelated signal: %s', async id => {
   await save(id === enhancementCases[3] ? steps : [steps[enhancementCases.indexOf(id)]]);
   const result = await render();
-  expect(enhancementMatches(id, decodeEnhancement(result.file))).toBe(true);
+  const samples = decodeEnhancement(result.file);
+  expect(enhancementMatches(id, samples)).toBe(true);
+  expect(result.receipt.export.normalize_loudness).toBe(false);
+  if (id === 'voice-deess') {
+    const source = enhancementMeasures(decodeEnhancement(path.join(root, 'source.wav')));
+    const enhanced = enhancementMeasures(samples);
+    expect(Math.abs(enhanced.quietVoice - source.quietVoice)).toBeLessThanOrEqual(4 / 32768);
+    expect(Math.abs(enhanced.loudVoice - source.loudVoice)).toBeLessThanOrEqual(4 / 32768);
+  }
   expect(result.receipt.processing.map((p: any) => p.settings.type)).toEqual(id === enhancementCases[3] ? ['highpass', 'deesser', 'compressor'] : [steps[enhancementCases.indexOf(id)].type]);
   for (const step of result.receipt.processing) {
     expect(step.removed_sec).toBe(0); expect(step.silent_intervals).toBe(0);

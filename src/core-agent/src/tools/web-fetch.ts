@@ -59,10 +59,30 @@ type WebFetchCacheEntry = {
   epoch: number;
   result: Promise<ToolResult>;
   githubSnapshot?: Promise<GitHubRepositorySnapshot>;
-  /** End of the furthest character range already returned for this URL. After
-   * context compaction, only windows at or beyond it are served again. */
-  servedThrough?: number;
+  servedRanges?: Array<{ start: number; end: number }>;
+  furthestServedEnd?: number;
 };
+
+const MAX_SERVED_RANGES = 64;
+const CACHE_GAP_READ_CHARS = 4_000;
+
+function recordServedRange(entry: WebFetchCacheEntry, start: number, end: number): void {
+  if (start >= end) return;
+  const ranges = entry.servedRanges ??= [];
+  let first = ranges.findIndex(range => range.end >= start);
+  if (first === -1) first = ranges.length;
+  let last = first;
+  while (last < ranges.length && ranges[last].start <= end) {
+    start = Math.min(start, ranges[last].start);
+    end = Math.max(end, ranges[last].end);
+    last++;
+  }
+  ranges.splice(first, last - first, { start, end });
+  // Keep the gaps nearest the beginning precise. Discarded ranges are never
+  // treated as read, and the high-water mark still prevents an unbounded replay.
+  if (ranges.length > MAX_SERVED_RANGES) ranges.pop();
+  entry.furthestServedEnd = Math.max(entry.furthestServedEnd ?? 0, end);
+}
 
 type WebFetchFailurePolicyState = {
   authFailuresByOrigin: Map<string, number>;
@@ -398,7 +418,7 @@ function parseOffset(value: unknown): number | string {
     + "use 0 or the offset a truncated result reported.";
 }
 
-function compactCacheReplay(result: ToolResult, servedThrough: number): ToolResult {
+function compactCacheReplay(result: ToolResult, servedThrough: number, hasGap: boolean): ToolResult {
   const total = result.content.length;
   return {
     content: [
@@ -406,7 +426,9 @@ function compactCacheReplay(result: ToolResult, servedThrough: number): ToolResu
       reusableHeader(result.content),
       "The full page is intentionally not re-injected after context compaction. Use the durable evidence/file ledger and saved exact quotes. Do not request this URL again merely to recover compacted context.",
       servedThrough < total
-        ? `Characters ${servedThrough}-${total} have not been read in order yet; to continue, call web_fetch with "offset": ${servedThrough}.`
+        ? hasGap
+          ? `The next unread window starts at character ${servedThrough}. Use web_fetch with "maxChars": ${CACHE_GAP_READ_CHARS} and "offset": ${servedThrough}.`
+          : `Characters ${servedThrough}-${total} have not been read in order yet; to continue, call web_fetch with "offset": ${servedThrough}.`
         : "",
     ].filter(Boolean).join("\n"),
   };
@@ -861,25 +883,26 @@ export const webFetchTool: AgentTool = defineTool({
     const epoch = contextEpoch(ctx.state);
     const serveView = (entry: WebFetchCacheEntry, result: ToolResult): ToolResult => {
       const view = renderFetchView(result, maxChars, offset, githubSnapshot);
-      if (view.servedEnd !== null) {
-        entry.servedThrough = Math.max(entry.servedThrough ?? 0, view.servedEnd);
-      }
+      if (view.servedEnd !== null) recordServedRange(entry, offset, view.servedEnd);
       return view.result;
     };
     const cached = fetchCache.get(requestKey);
     if (cached) {
-      const servedThrough = cached.servedThrough ?? 0;
-      // After compaction a window is served only to continue past what was
-      // already returned, never to re-inject text the model has seen.
-      const compactReplay = epoch > cached.epoch && !(offset > 0 && offset >= servedThrough);
+      const result = await cached.result;
+      if (result.isError) return failedCacheReplay(result);
+      if (ctx.signal?.aborted) return { content: `Fetch of ${url} was cancelled`, isError: true };
+      const first = cached.servedRanges?.[0];
+      const servedThrough = first?.start === 0 ? first.end : 0;
+      const furthest = cached.furthestServedEnd ?? 0;
+      const unreadAtOffset = !cached.servedRanges?.some(range => range.start <= offset && offset < range.end);
+      const canRead = (offset > 0 && offset >= furthest) || (maxChars !== null && unreadAtOffset);
+      const compactReplay = epoch > cached.epoch && !canRead;
       log.info("run cache hit; skipped network request", {
         maxChars: maxChars ?? "complete",
         offset,
         compactReplay,
       });
-      const result = await cached.result;
-      if (result.isError) return failedCacheReplay(result);
-      return compactReplay ? compactCacheReplay(result, servedThrough) : serveView(cached, result);
+      return compactReplay ? compactCacheReplay(result, servedThrough, servedThrough < furthest) : serveView(cached, result);
     }
 
     const priorGitHubSnapshot = githubResource?.snapshotComponent

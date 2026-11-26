@@ -24,24 +24,36 @@
         const values=w.kind==='image'?['png','jpg','webp','pdf','psd']:w.kind==='video'?['mp4','txt','srt']:['wav','mp3','flac','m4a','aac','ogg','opus','txt','srt','json'];
         return ['any',...values];
     }
-    function draft(kind, language) {
+    function draft(kind, language, service) {
         if (!Object.hasOwn(operations, kind)) throw Error('KIND');
-        return { schemaVersion:1,id:'',title:'',kind,operation:'auto',brief:'',settings:{aspect:kind==='video'?'9:16':'4:5',duration:kind==='audio'?null:30,language:language||'en',format:kind==='copy'?'txt':kind==='audio'?'wav':kind==='image'?'png':'mp4'},assetIds:[],jobs:[],results:[],sourceWorkId:'',revision:0,createdAt:'',updatedAt:'' };
+        const settings={aspect:kind==='video'?'9:16':'4:5',duration:kind==='audio'?null:30,language:language||'en',format:kind==='copy'?'txt':kind==='audio'?'wav':kind==='image'?'png':'mp4'};
+        if(service?.serviceId){settings.serviceId=service.serviceId;settings.serviceName=service.serviceName;}
+        return { schemaVersion:1,id:'',title:'',kind,operation:'auto',brief:'',settings,assetIds:[],jobs:[],results:[],sourceWorkId:'',revision:0,createdAt:'',updatedAt:'' };
     }
-    function serviceLabel(service, language) {
+    function serviceLabel(service, language, kind) {
         if(service.provider==='orkas-api'&&service.model==='orkas-tts-1')return 'Orkas·Voice';
+        if(kind==='video')return service.name;
         return (service.label?service.label+' · ':'')+service.name;
     }
     function selectFirstService(work, services, language) {
         if(work.jobs.length||work.settings.serviceId||['txt','srt','json'].includes(work.settings.format))return false;
-        const first=services.find(service=>service.available);if(!first)return false;
-        work.settings.serviceId=first.id;work.settings.serviceName=serviceLabel(first,language).slice(0,240);return true;
+        const selected=services.find(service=>service.available);
+        if(!selected)return false;
+        work.settings.serviceId=selected.id;work.settings.serviceName=serviceLabel(selected,language,work.kind).slice(0,240);return true;
     }
     const savedResultPath = value => typeof value==='string'&&/^results\/[a-f0-9]{64}\/[a-f0-9]{16}-[a-f0-9]{16}(?:\.[a-zA-Z0-9]{1,15})?$/.test(value);
+    const maxAssetBytes = kind => (kind==='image'?20:200)*1024*1024;
+    // Validate the selected file name and size before reading its bytes.
+    function importProblem(name, bytes) {
+        const kind = mediaKind(name);
+        if (!kind) return 'FORMAT';
+        if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > maxAssetBytes(kind)) return 'SIZE';
+        return '';
+    }
     function asset(value) {
         const generated=validId(value?.origin?.requestId)&&/^[a-f0-9]{64}$/.test(value?.origin?.outputId);
         const kind = mediaKind(value?.name)||(generated?'document':null);
-        if (!kind || !validId(value.id) || typeof value.name !== 'string' || !value.name || value.name.length > 512 || !Number.isSafeInteger(value.bytes) || value.bytes < 0 || value.bytes > (kind==='image'?20:200)*1024*1024) throw Error('FILE');
+        if (!kind || !validId(value.id) || typeof value.name !== 'string' || !value.name || value.name.length > 512 || !Number.isSafeInteger(value.bytes) || value.bytes < 0 || value.bytes > maxAssetBytes(kind)) throw Error('FILE');
         if (typeof value.path !== 'string' || !/^media\/[a-zA-Z0-9_-]{1,64}\.[a-z0-9]{1,8}$/.test(value.path)&&!savedResultPath(value.path)) throw Error('FILE');
         if (value.libraryHidden!==undefined&&typeof value.libraryHidden!=='boolean')throw Error('FILE');
         if (value.digest && !/^[a-f0-9]{64}$/.test(value.digest)) throw Error('FILE');
@@ -62,7 +74,7 @@
         const ids = new Set();
         for (const row of value.works) {
             if (!row || !validId(row.id) || ids.has(row.id) || !Object.hasOwn(operations,row.kind) || typeof row.title!=='string' || row.title.length>160) throw Error('DATA');
-            if(row.failureText!==undefined&&(typeof row.failureText!=='string'||row.failureText.length>320))throw Error('DATA');
+            for(const field of ['failureText','replyExcerpt'])if(row[field]!==undefined&&(typeof row[field]!=='string'||row[field].length>320))throw Error('DATA');
             if(row.errorCode!==undefined&&(typeof row.errorCode!=='string'||!/^E_[A-Z0-9_]{1,60}$/.test(row.errorCode)))throw Error('DATA');
             if(row.summary!==undefined&&(typeof row.summary!=='string'||row.summary.length>160))throw Error('DATA');
             for(const [field,max]of [['assetIds',19],['resultAssetIds',500]])if(row[field]!==undefined&&(!Array.isArray(row[field])||row[field].length>max||!row[field].every(validId)))throw Error('DATA');
@@ -160,6 +172,14 @@
     }
     function canStart(work) { return work.jobs.length===0; }
     function failureText(job) { return job?.status==='failed'&&typeof job.text==='string'?job.text.slice(0,40000).trim():''; }
+    function failureContent(job) {
+        const text=failureText(job);
+        // The group-chat executor appends its own error pill after any reply.
+        // Its optional private diagnostic belongs to chat, outside the app history.
+        const host=/(?:^|\n\n)<span style="color:var\(--danger\)">([^<]*)(?:<\/span>|$)/.exec(text);
+        if(!host)return {reply:text,notice:''};
+        return {reply:text.slice(0,host.index).trimEnd(),notice:host[1]};
+    }
     function displayTitle(work) { return (work.title.trim()||work.brief.trim()).slice(0,160); }
     function historyRows(rows,kind) { return rows.filter(r=>r.kind===kind).sort((a,b)=>(b.updatedAt||'').localeCompare(a.updatedAt||'')); }
     function accept(work, file) {
@@ -177,7 +197,7 @@
         const next=reuse(work,assetId,work.kind,work.settings.language);
         return {...next,operation:work.operation,brief:work.brief,settings:clone(work.settings)};
     }
-    const api={outputPreferred,resultGroups,libraryAssets,edit,uncollected,needsReply,operations,agents,defaultKinds,outputFormats,draft,serviceLabel,selectFirstService,asset,mediaKind,readWork,readIndex,request,inspect,canStart,failureText,displayTitle,historyRows,accept,libraryEntry,libraryContent,materialCount,applyLibrary};
+    const api={importProblem,outputPreferred,resultGroups,libraryAssets,edit,uncollected,needsReply,operations,agents,defaultKinds,outputFormats,draft,serviceLabel,selectFirstService,asset,mediaKind,readWork,readIndex,request,inspect,canStart,failureText,failureContent,displayTitle,historyRows,accept,libraryEntry,libraryContent,materialCount,applyLibrary};
     api.reuse=reuse;
     if (typeof module==='object' && module.exports) module.exports=api;else root.ContentModel=Object.freeze(api);
 })(typeof window==='object'?window:globalThis);

@@ -361,7 +361,17 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
           prompt: providerPrompt,
           ...(imageProfileId ? { profileId: imageProfileId } : {}),
           outputAbsPath: outputAbs,
-          ...(refAbs.length ? { referenceImagePaths: refAbs } : {}),
+          ...(videoStudioControlled ? {
+            assertNewOutputPath: (file: string) => {
+              if (!isPathAllowed(file, roots)) throw new Error('The image output is outside the current scope.');
+            },
+          } : {}),
+          ...(refAbs.length ? {
+            referenceImagePaths: refAbs,
+            assertReferencePath: (file: string) => {
+              if (!isPathAllowed(file, roots)) throw new Error('A reference image is outside the current scope.');
+            },
+          } : {}),
           ...(referenceImageUrls.length ? { referenceImageUrls } : {}),
           ...(referenceBindings.length ? { referenceBindings } : {}),
           ...(negativePrompt.length ? { negativePrompt } : {}),

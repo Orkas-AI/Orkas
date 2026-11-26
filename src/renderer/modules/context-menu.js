@@ -5,6 +5,7 @@
 // structured Agent `avatar`, and/or a `trailingIcon` for selection state.
 // Dismissers: outside click, Escape, scroll,
 // resize, and the i18n-change broadcast (label text may need refreshing).
+// An optional scrollAnchor keeps the menu open during scrolling in other panes.
 //
 // IME guard (CLAUDE.md §8): the up/down/Enter shortcuts early-return when a
 // composition is active so a half-typed Chinese candidate doesn't trigger
@@ -17,6 +18,7 @@ let _ctxMenuItems = [];
 let _ctxMenuActiveIdx = -1;
 let _ctxMenuOpen = false;
 let _ctxMenuPreviousFocus = null;
+let _ctxMenuScrollAnchor = null;
 
 function _runContextMenuAction(item) {
   if (!item || item.disabled) return;
@@ -30,7 +32,7 @@ function _runContextMenuAction(item) {
   }
 }
 
-function showContextMenu(event, items) {
+function showContextMenu(event, items, { scrollAnchor = null } = {}) {
   closeContextMenu();
   if (!Array.isArray(items) || items.length === 0) return;
   _ctxMenuItems = items.filter((it) => it && typeof it.label === 'string' && typeof it.onClick === 'function');
@@ -76,6 +78,7 @@ function showContextMenu(event, items) {
     menu.appendChild(btn);
   });
   _ctxMenuPreviousFocus = document.activeElement;
+  _ctxMenuScrollAnchor = scrollAnchor;
   document.body.appendChild(menu);
   _ctxMenuEl = menu;
   _ctxMenuOpen = true;
@@ -131,6 +134,7 @@ function closeContextMenu() {
   _ctxMenuItems = [];
   const previousFocus = _ctxMenuPreviousFocus;
   _ctxMenuPreviousFocus = null;
+  _ctxMenuScrollAnchor = null;
   try { previousFocus?.focus?.(); } catch (_) {}
 }
 
@@ -208,7 +212,11 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-window.addEventListener('scroll', () => closeContextMenu(), true);
+window.addEventListener('scroll', (event) => {
+  const target = event?.target;
+  if (_ctxMenuScrollAnchor && typeof target?.contains === 'function' && !target.contains(_ctxMenuScrollAnchor)) return;
+  closeContextMenu();
+}, true);
 window.addEventListener('resize', () => closeContextMenu());
 window.addEventListener('i18n-change', () => closeContextMenu());
 

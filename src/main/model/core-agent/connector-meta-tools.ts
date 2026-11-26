@@ -33,7 +33,7 @@ import { createConnectorToolDiscovery, validateDiscoveryParams, ConnectorDiscove
 import * as manager from '../../features/connectors/manager';
 import {
   resolveVisibleConnectors,
-  stringifyMcpResult,
+  formatNativeMcpResult,
 } from '../../features/connectors/tools-adapter';
 import { validateCustomTransport, validateDisplayName, CustomTransportError } from '../../features/connectors/custom-transport';
 import { requestInstallConfirm } from '../../features/connectors/install_confirm';
@@ -276,9 +276,13 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
         );
       }
       if (!match.tools.length) {
-        return {
-          content: `Connector "${cid}" reports no actions. Ask the user to refresh it from the Connectors panel.`,
-        };
+        if (Array.isArray(match.instance.enabled_subtools) && match.instance.enabled_subtools.length === 0) {
+          return { content: `All actions for connector "${cid}" are disabled. Check its action settings in the Connectors panel.` };
+        }
+        if (match.instance.tools_cache.length === 0) {
+          return { content: `Connector "${cid}" has no cached actions. Ask the user to refresh it from the Connectors panel.` };
+        }
+        return { content: `Connector "${cid}" currently has no available actions.` };
       }
       if (requestedTool) {
         const tool = match.tools.find((t) => t.name === requestedTool);
@@ -430,9 +434,16 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
         }
         const raw = await manager.callTool(opts.userId, cid, toolName, normalizedArgs, { signal: ctx.signal, conversationId: opts.cid });
         if (!ctx.signal?.aborted) observeTaskDraftResult(draftScope, toolName, normalizedArgs, raw);
-        const content = stringifyMcpResult(raw);
-        const protocolError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
-        return protocolError ? { content, isError: true } : { content };
+        let legacyProgramByteLimit = 0;
+        if (ctx.state) {
+          const { isProgrammaticToolCallContext, DEFAULT_RUN_PROGRAM_LIMITS } = await import('#core-agent');
+          if (isProgrammaticToolCallContext(ctx)) legacyProgramByteLimit = DEFAULT_RUN_PROGRAM_LIMITS.maxToolResultBytes;
+        }
+        const formatted = formatNativeMcpResult(raw, legacyProgramByteLimit);
+        const protocolError = !!raw
+          && typeof raw === 'object'
+          && (raw as { isError?: unknown }).isError === true;
+        return protocolError ? { ...formatted, isError: true } : formatted;
       } catch (err) {
         const msg = (err as Error).message;
         log.warn('call_connector_tool failed', { connector_id: maskId(cid), tool: toolName, error: logErrorRef(err) });
@@ -539,7 +550,7 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
 
       const approved = await requestInstallConfirm({ cid: opts.cid, displayName, transport });
       if (!approved) {
-        return { content: 'The user declined to add this connector. Do not retry; ask if they want to adjust it.' };
+        return { content: 'Installation was not confirmed. The connector was not installed. The user can start a new installation if needed.' };
       }
       try {
         const inst = await manager.addCustomInstance(opts.userId, { display_name: displayName, transport });

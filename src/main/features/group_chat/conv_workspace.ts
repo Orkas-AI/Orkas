@@ -36,7 +36,7 @@ import * as path from 'node:path';
 import { appConversationRoot } from '../../paths';
 
 import { getWorkspacePath } from '../user_workspace';
-import { getConversation } from '../chats';
+import { getConversationMetadata } from '../chats';
 import { readState, setWorkspaceDirOnce } from './state';
 import { PLACEHOLDER_TITLES } from './conv_title';
 import { createLogger } from '../../logger';
@@ -170,7 +170,7 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
   let projectId: string | undefined;
   let title = '';
   try {
-    const conv = await getConversation(uid, cid);
+    const conv = await getConversationMetadata(uid, cid);
     if (conv) {
       title = conv.title || '';
       const pid = (conv as any).project_id;
@@ -249,11 +249,11 @@ export async function readConversationAuthoringDir(uid: string, cid: string): Pr
   if (!state.workspace_dir) return '';
   let projectId: string | undefined;
   try {
-    const conv = await getConversation(uid, cid);
+    const conv = await getConversationMetadata(uid, cid);
     const pid = (conv as { project_id?: unknown } | null)?.project_id;
     if (typeof pid === 'string' && pid) projectId = pid;
   } catch (err) {
-    log.warn('read authoring dir: getConversation failed', {
+    log.warn('read authoring dir: conversation metadata lookup failed', {
       cid: maskId(cid),
       error: logErrorSummary(err),
     });

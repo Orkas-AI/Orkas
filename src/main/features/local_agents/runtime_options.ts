@@ -703,6 +703,7 @@ async function discover(entry: LocalCliEntry, cwd: string, force: boolean, custo
     out.allow_custom_thinking = out.can_select_thinking;
     return out;
   }
+  if (entry.type !== 'hermes') return { ...out, status: 'partial' };
   const status = await captureCli(entry, ['status'], cwd);
   const model = parseHermesDefaultModel(status.stdout + status.stderr);
   out.status = status.ok ? 'ready' : 'partial';

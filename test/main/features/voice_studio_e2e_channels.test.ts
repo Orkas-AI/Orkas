@@ -54,21 +54,23 @@ function amp(b: Buffer, at: number, hz: number, channel = 0, channels = 1) {
 }
 it.each([1, 2, 3])('retains exact mono samples through a schema %i trim and fresh-process re-export', async schema_version => {
   const b = await source('voice.wav', 2, [t => t < 1 ? tone(440)(t) : tone(660)(t)]);
-  await save({ schema_version, segments: [{ id: 'cut', path: 'voice.wav', start_sec: .5, end_sec: 1.5 }] });
+  await save({ schema_version, segments: [{ id: 'cut', path: 'voice.wav', start_sec: .5, end_sec: 1.5 }], export: { format: 'wav' } });
   const plan = await fs.readFile(project), first = await render(), expected = b.subarray(44 + rate, 44 + rate * 3);
   expect(first.r.channels).toBe(1); expect(pcm(first.file).equals(expected), 'Retained mono PCM must match the source samples.').toBe(true);
   await fs.writeFile(path.join(root, 'request.json'), JSON.stringify({ project }));
   const node = bundledNodeExecutable(); expect(node).toBeTruthy();
   const next = spawnSync(node!, [script, 'render', path.join(root, 'request.json')], { env: process.env, encoding: 'utf8', timeout: 30000 });
   expect(next.status, next.stderr).toBe(0); expect(next.stderr).toBe('');
-  expect(pcm(path.join(root, JSON.parse(next.stdout).files[0])).equals(expected)).toBe(true);
+  const reopened = JSON.parse(next.stdout);
+  expect(reopened.channels).toBe(1);
+  expect(pcm(path.join(root, reopened.files[0])).equals(expected)).toBe(true);
   expect(await fs.readFile(project)).toEqual(plan); expect(await fs.readFile(path.join(root, 'voice.wav'))).toEqual(b);
 });
-it.each([1, 2])('keeps distinct stereo channel levels with %i-channel export and no normalization', async channels => {
+it.each([undefined, 1, 2])('keeps distinct stereo channel levels with export.channels set to %s', async channels => {
   const b = await source('voice.wav', 1, [tone(330, .16), tone(880, .08)]);
   await save({ export: { format: 'wav', channels, normalize_loudness: false } });
-  const result = await render(), actual = pcm(result.file); expect(result.r.channels).toBe(channels);
-  if (channels === 2) expect(actual).toEqual(b.subarray(44));
+  const result = await render(), actual = pcm(result.file); expect(result.r.channels).toBe(channels ?? 2);
+  if (channels !== 1) expect(actual).toEqual(b.subarray(44));
   else { expect(amp(actual, .2, 330)).toBeCloseTo(.08, 3); expect(amp(actual, .2, 880)).toBeCloseTo(.04, 3); }
 });
 it.each([
@@ -84,14 +86,29 @@ it.each([
   expect(pcm(first.file)).toEqual(actual); expect(await fs.readFile(path.join(root, 'voice.wav'))).toEqual(b);
 });
 it('switches export channels without changing the saved profile or attenuating a cached mono result', async () => {
-  await source('voice.wav', 1, [tone(660)]); await save({ processing: [{ type: 'compressor', ratio: 1 }] });
+  await source('voice.wav', 1, [tone(660)]);
+  await save({ processing: [{ type: 'compressor', ratio: 1 }], export: { format: 'wav' } });
   const plan = await fs.readFile(project);
   const mono = await render(), stereo = await render({ export: { channels: 2 } }), restored = await render();
   expect(mono.r.channels).toBe(1); expect(amp(pcm(mono.file), .2, 660)).toBeCloseTo(.2, 3);
   expect(stereo.r.channels).toBe(2);
+  expect(mono.receipt.export.channels).toBe(1); expect(stereo.receipt.export.channels).toBe(2);
   for (const channel of [0, 1]) expect(amp(pcm(stereo.file), .2, 660, channel, 2)).toBeCloseTo(.2 / Math.sqrt(2), 3);
   expect(restored.receipt.processing[0].reused).toBe(true); expect(pcm(restored.file)).toEqual(pcm(mono.file));
   expect(await fs.readFile(project)).toEqual(plan);
+});
+it('retains stereo as the implicit layout for multiple recorded segments', async () => {
+  await source('voice.wav', 1, [tone(440)]);
+  await source('other.wav', 1, [tone(660)]);
+  await save({ segments: [{ id: 'first', path: 'voice.wav' }, { id: 'second', path: 'other.wav' }], export: { format: 'wav' } });
+  const result = await render();
+  expect(result.r.channels).toBe(2);
+  const samples = pcm(result.file);
+  expect(samples.length).toBe(2 * rate * 2 * 2);
+  for (const channel of [0, 1]) {
+    expect(amp(samples, .2, 440, channel, 2)).toBeCloseTo(.2 / Math.sqrt(2), 3);
+    expect(amp(samples, 1.2, 660, channel, 2)).toBeCloseTo(.2 / Math.sqrt(2), 3);
+  }
 });
 it.each(['legacy', 'timeline'])('preserves mono speech and stereo music levels in the %s mixer with optional ducking', async mixer => {
   await source('voice.wav', 3, [t => t >= 1 && t < 2 ? tone(660)(t) : 0]);

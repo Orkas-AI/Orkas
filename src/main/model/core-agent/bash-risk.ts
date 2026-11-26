@@ -36,7 +36,7 @@
  * it stays unit-testable without Electron and cheap to call per command.
  */
 
-import { tokenize } from '../../../core-agent/src/sandbox/shell-words';
+import { tokenize, tokenizePowerShellStructure, type Tok } from '../../../core-agent/src/sandbox/shell-words';
 
 import {
   classifyExternalMutationCommand,
@@ -404,6 +404,98 @@ export function hasDestructiveBashRedirection(targets: readonly string[]): boole
 }
 const POSIX_PROCESS_TERMINATORS = new Set(['kill', 'pkill', 'killall']);
 const POWERSHELL_STOP_PROCESS_CMDS = new Set(['stop-process', 'spps']);
+const POWERSHELL_CONTROL_CMDS = new Set([
+  'try', 'catch', 'finally', 'if', 'elseif', 'else', 'while', 'for', 'do', 'until',
+]);
+
+type ProcessSyntax = Tok | { type: 'group'; block: boolean; items: ProcessSyntax[] };
+
+/** Retain selector and executable-block structure for process termination only.
+ * This augments the existing classifier without evaluating variables, traversing
+ * quoted blocks, or expanding the policy for an unknown dynamic PID. */
+function structuredProcessRisks(command: string): Array<{ operation: string; broad: boolean }> {
+  const root: ProcessSyntax[] = [];
+  const stack = [root];
+  for (const token of tokenizePowerShellStructure(command)) {
+    if (token.type === 'op' && (token.value === '{' || token.value === '(')) {
+      const group: ProcessSyntax = { type: 'group', block: token.value === '{', items: [] };
+      stack[stack.length - 1].push(group); stack.push(group.items);
+    } else if (token.type === 'op' && (token.value === '}' || token.value === ')')) {
+      if (stack.length > 1) stack.pop();
+    } else stack[stack.length - 1].push(token);
+  }
+  const words = (nodes: ProcessSyntax[]) => nodes.flatMap(node => node.type === 'word' ? [node.value] : []);
+  const stages = (nodes: ProcessSyntax[]) => {
+    const out: Array<{ items: ProcessSyntax[]; piped: boolean }> = [];
+    let items: ProcessSyntax[] = [];
+    let piped = false;
+    for (const node of nodes) {
+      if (node.type === 'op' && (SEGMENT_SEPS.has(node.value) || PIPE_OPS.has(node.value))) {
+        if (items.length) out.push({ items, piped });
+        items = []; piped = PIPE_OPS.has(node.value);
+      } else items.push(node);
+    }
+    if (items.length) out.push({ items, piped });
+    return out;
+  };
+  const enumeration = (nodes: ProcessSyntax[]) => {
+    const effective = effectiveCommand(words(nodes));
+    return !!effective && ['get-process', 'gps'].includes(effective.cmd)
+      && !effective.args.some(arg => /^-id(?::|$)/i.test(arg));
+  };
+  // Iterative walks visit each group's own items once, without a call-stack
+  // limit that a semantically equivalent extra pair of braces could bypass.
+  const broadExpression = (nodes: ProcessSyntax[]): boolean => {
+    const pending = [nodes];
+    while (pending.length) {
+      const current = pending.pop()!;
+      if (stages(current).some(stage => enumeration(stage.items))) return true;
+      for (const node of current) if (node.type === 'group' && !node.block) pending.push(node.items);
+    }
+    return false;
+  };
+  const risks: Array<{ operation: string; broad: boolean }> = [];
+  const pending = [{ nodes: root, selected: false }];
+  while (pending.length) {
+    const { nodes, selected } = pending.pop()!;
+    let pipelineSelection = false;
+    for (const stage of stages(nodes)) {
+      if (!stage.piped) pipelineSelection = false;
+      const effective = effectiveCommand(words(stage.items));
+      if (!effective) continue;
+      const { cmd, args } = effective;
+      if (POWERSHELL_STOP_PROCESS_CMDS.has(cmd) && matchProcessTermination(cmd, args)) {
+        const id = stage.items.findIndex(node => node.type === 'word' && /^-id(?::|$)/i.test(node.value));
+        const value = stage.items[id + 1];
+        const property = stage.items[id + 2];
+        const fromEnumeration = id >= 0 && value?.type === 'group' && !value.block
+          && property?.type === 'word' && !property.literal && /^\.id$/i.test(property.value)
+          && broadExpression(value.items);
+        const fromPipeline = selected && id >= 0 && value?.type === 'word' && !value.literal
+          && /^\$(?:_|psitem)(?:\.id)?$/i.test(value.value);
+        risks.push({ operation: cmd, broad: fromEnumeration || fromPipeline
+          || matchIrreversible(cmd, args) === 'untargeted_process_kill' });
+      }
+      const forEach = cmd === 'foreach-object' || cmd === '%';
+      if (forEach || POWERSHELL_CONTROL_CMDS.has(cmd)) {
+        const inherited = forEach ? pipelineSelection : selected;
+        for (const [index, node] of stage.items.entries()) {
+          const parameter = stage.items[index - 1];
+          const outsideProcess = forEach && parameter?.type === 'word'
+            && /^-(?:begin|end)$/i.test(parameter.value);
+          // Language controls execute both their conditions and bodies. An
+          // arbitrary command's script-block argument remains data here.
+          if (node.type === 'group' && (node.block || !forEach)) {
+            pending.push({ nodes: node.items, selected: outsideProcess ? selected : inherited });
+          }
+        }
+      }
+      if (enumeration(stage.items)) pipelineSelection = true;
+      else if (!['where-object', '?', 'sort-object'].includes(cmd)) pipelineSelection = false;
+    }
+  }
+  return risks;
+}
 const SIGNAL_NAME_RE = /^-(?:sig)?(?:abrt|alrm|bus|chld|cld|cont|emt|fpe|hup|ill|info|int|io|iot|kill|lost|pipe|poll|prof|pwr|quit|segv|stkflt|stop|sys|term|trap|tstp|ttin|ttou|urg|usr1|usr2|vtalrm|winch|xcpu|xfsz)$/i;
 
 function hasRecursiveFlag(args: string[]): boolean {
@@ -602,6 +694,9 @@ function matchIrreversible(cmd: string, args: string[]): IrreversibleAction | nu
   }
   if (POWERSHELL_STOP_PROCESS_CMDS.has(cmd)) {
     if (lower.some((arg) => arg === '-whatif' || arg === '-whatif:$true')) return null;
+    // A number passed to another parameter is not a PID selector. An explicit
+    // name selection stays broad even when another argument happens to be numeric.
+    if (lower.some(arg => arg === '-name' || arg.startsWith('-name:'))) return 'untargeted_process_kill';
     // `-Id 123` names the process; so does the positional form `Stop-Process 123`.
     if (lower.some((arg) => arg === '-id') || lower.some((arg) => /^\d+$/.test(arg))) return null;
     return 'untargeted_process_kill';
@@ -1032,6 +1127,11 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
   if (despaced.includes(':(){') || despaced.includes(':|:&')) reasons.add('destructive');
 
   const segments = parse(cmd);
+  for (const process of structuredProcessRisks(cmd)) {
+    reasons.add('destructive');
+    if (process.broad) irreversible.add('untargeted_process_kill');
+    evidence.push({ reason: 'destructive', operation: process.operation, detail: 'Process termination in executable command structure' });
+  }
   for (const seg of segments) {
     if (matchPipeToShell(seg)) reasons.add('network_egress');
 

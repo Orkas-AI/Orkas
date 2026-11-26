@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import sharp from 'sharp';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { inspectPsdBytes } from '../../../eval/model-eval/regression/psd-inspection';
@@ -34,6 +35,25 @@ async function invoke(request: any) {
 const render = (output = 'preview.png') => invoke({ op: 'render', document_path: 'design.json', output_path: output });
 const exportPsd = (output = 'design.psd', preview = 'preview.png') => invoke({ op: 'export_psd', document_path: 'design.json', preview_path: preview, output_path: output });
 const readPsd = () => psd.readPsd(fs.readFileSync(path.join(root, 'design.psd')), { useImageData: true });
+
+it('reports the exact files created as layered candidates to the host', async () => {
+  const manifest = path.join(root, '.orkas-output-manifest-test');
+  vi.stubEnv('ORKAS_OUTPUT_MANIFEST', manifest);
+  try {
+    writeDoc();
+    await render();
+    await exportPsd();
+    expect(fs.existsSync(manifest)).toBe(true);
+    const records = fs.readFileSync(manifest, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(records).toEqual(['preview.png', 'design.psd'].map(name => {
+      const file = path.join(root, name);
+      const stats = fs.statSync(file);
+      return { kind: 'image-studio-layered-candidate', path: file,
+        identity: `${stats.dev}:${stats.ino}:${stats.birthtimeMs}`, size: stats.size,
+        sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') };
+    }));
+  } finally { vi.unstubAllEnvs(); }
+});
 
 it('reports an older host without the PSD writer and retains its useful preview', async () => {
   writeDoc(); await render();

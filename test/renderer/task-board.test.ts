@@ -19,7 +19,7 @@ const source = fs.readFileSync(
 );
 
 function extractFunction(name: string): string {
-  const marker = `function ${name}`;
+  const marker = `function ${name}(`;
   const start = source.indexOf(marker);
   if (start < 0) throw new Error(`missing ${name}`);
   const braceStart = source.indexOf('{', start);
@@ -185,6 +185,85 @@ describe('renderer task board › Send now eligibility', () => {
     expect(queuedRow).toContain('data-act="task-edit"');
     expect(queuedRow).toContain('data-act="task-cancel"');
     expect(list.innerHTML.match(/data-act="task-send-now"/g)).toHaveLength(1);
+  });
+
+  it('announces the shortcut without adding the visual hint to the button name', () => {
+    const { context, list, board } = boardHarness();
+    context._latestActiveTurns = new Map([['c1', [{ actor: 'agentA', steerable: true }]]]);
+    board.onEvent('c1', { task: { task_id: 'correction', assignee: 'agentA', created_by: 'user',
+      status: 'queued', instruction: 'Correct the draft.' } });
+    expect(list.innerHTML).toContain('aria-keyshortcuts="Shift+Enter"');
+    expect(list.innerHTML).toContain('class="chat-queue-shortcut" aria-hidden="true"');
+    expect(list.innerHTML).toContain('chat.queue_send_now');
+  });
+
+  it('promotes a single eligible queued message once and recovers failed persistence', async () => {
+    const { context, list, board } = boardHarness();
+    context._latestActiveTurns = new Map([['c1', [{ actor: 'agentA', steerable: true }]]]);
+    board.onEvent('c1', { task: { task_id: 'q1', assignee: 'agentA', created_by: 'user',
+      status: 'queued', instruction: 'Keep this correction.' } });
+    const requests: any[] = [];
+    let finish: (result: any) => void;
+    context.apiFetch = (url: string, options: any) => {
+      requests.push({ url, body: JSON.parse(options.body) });
+      return new Promise(resolve => { finish = resolve; });
+    };
+    context.uiAlert = vi.fn();
+    const key = { key: 'Enter', shiftKey: true };
+    expect(board.sendNowShortcut('c1', key)).toBe(true);
+    expect(board.sendNowShortcut('c1', key)).toBe(true);
+    expect(board.sendNowShortcut('c1', { ...key, repeat: true })).toBe(true);
+    expect(requests).toEqual([{ url: '/api/conversations/c1/tasks/send-now', body: { task_id: 'q1' } }]);
+    expect(list.innerHTML).toContain(' disabled');
+    finish!({ json: async () => ({ ok: false, error: 'turn_not_steerable' }) });
+    await vi.waitFor(() => expect(context.uiAlert).toHaveBeenCalledOnce());
+    expect(list.innerHTML).toContain('Keep this correction.');
+    expect(list.innerHTML).toContain('aria-keyshortcuts="Shift+Enter"');
+    expect(board.sendNowShortcut('c1', { ...key, repeat: true })).toBe(true);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('promotes the first eligible message in queue order, skipping unavailable rows', async () => {
+    const { context, list, board } = boardHarness();
+    context._latestActiveTurns = new Map([['c1', [
+      { actor: 'agentA', steerable: true }, { actor: 'agentB', steerable: true },
+    ]]]);
+    for (const task of [
+      { task_id: 'later', assignee: 'agentA', order: 30 },
+      { task_id: 'unavailable', assignee: 'agentC', order: 0 },
+      { task_id: 'dependent', assignee: 'agentA', order: 5, after: ['running'] },
+      { task_id: 'first', assignee: 'agentB', order: 10 },
+    ]) board.onEvent('c1', { task: { ...task, created_by: 'user', status: 'queued' } });
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true,
+      task: { task_id: 'first', status: 'queued', message_sent_at: '2026-11-17T12:00:00Z' } }) }));
+    expect(list.innerHTML.match(/aria-keyshortcuts=/g)).toHaveLength(1);
+    expect(list.innerHTML.split('data-task-id="first"')[1].split('chat-queue-item')[0])
+      .toContain('aria-keyshortcuts="Shift+Enter"');
+    expect(board.sendNowShortcut('c1', { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(JSON.parse(context.apiFetch.mock.calls[0][1].body)).toEqual({ task_id: 'first' });
+    await vi.waitFor(() => expect(list.innerHTML).not.toContain('data-task-id="first"'));
+    expect(list.innerHTML.split('data-task-id="later"')[1].split('chat-queue-item')[0])
+      .toContain('aria-keyshortcuts="Shift+Enter"');
+  });
+
+  it('ignores other conversations, composition, extra modifiers and queue editing', () => {
+    const { context, board } = boardHarness();
+    context._latestActiveTurns = new Map([['c1', [{ actor: 'agentA', steerable: true }]]]);
+    board.onEvent('c1', { task: { task_id: 'q1', assignee: 'agentA', created_by: 'user', status: 'queued' } });
+    context.apiFetch = vi.fn();
+    for (const event of [{ key: 'Enter' }, { key: 'Enter', shiftKey: true, isComposing: true },
+      { key: 'Enter', shiftKey: true, keyCode: 229 }, { key: 'Enter', shiftKey: true, ctrlKey: true },
+      { key: 'Enter', shiftKey: true, metaKey: true }, { key: 'Enter', shiftKey: true, altKey: true }]) {
+      expect(board.sendNowShortcut('c1', event)).toBe(false);
+    }
+    expect(board.sendNowShortcut('other', { key: 'Enter', shiftKey: true })).toBe(false);
+    context._queueComposerEditFor = () => ({ taskId: 'q1' });
+    expect(board.sendNowShortcut('c1', { key: 'Enter', shiftKey: true })).toBe(false);
+    board.render('c1');
+    context._queueComposerEditFor = () => null;
+    context._latestActiveTurns = new Map();
+    expect(board.sendNowShortcut('c1', { key: 'Enter', shiftKey: true })).toBe(false);
+    expect(context.apiFetch).not.toHaveBeenCalled();
   });
 
   it('finishes sending on persistence without waiting for model acceptance, and restores failed sends', async () => {
@@ -771,6 +850,7 @@ describe('renderer task board › latest-batch display while the multi-task boar
     return vm.runInNewContext(
       `const _TASK_BOARD_TERMINAL = new Set(['done', 'stopped', 'failed', 'cancelled']);
        ${extractFunction('_taskBoardLiveRows')};
+       ${extractFunction('_taskBoardRetryOriginal')};
        ${extractFunction('_taskBoardDisplayRows')};
        _taskBoardDisplayRows(${JSON.stringify(tasks)}, new Set(${JSON.stringify(batchIds)})).map((t) => t.task_id);`,
       {},
@@ -811,6 +891,36 @@ describe('renderer task board › latest-batch display while the multi-task boar
       },
     ], ['primary', 'absorbed']);
     expect(rows).toEqual(['primary']);
+  });
+
+  it('shows the latest delegated retry outcome without hiding other work or exposing ordinary completions', () => {
+    const root = { task_id: 'original', status: 'failed', parent_task_id: 'parent', assignee: 'a', created_at: 't1' };
+    const retry = { task_id: 'retry', status: 'done', retry_of_task_id: 'original', assignee: 'a', created_at: 't2' };
+    const later = { ...retry, task_id: 'later', status: 'running', created_at: 't3' };
+    const other = { task_id: 'other', status: 'failed', assignee: 'a', created_at: 't1' };
+    const wrongAgent = { ...retry, task_id: 'wrong', assignee: 'b' };
+    const batch = [root, other, retry, wrongAgent];
+    expect(runDisplayRows(batch, batch.map(row => row.task_id))).toEqual(['other', 'retry']);
+    expect(runDisplayRows([...batch, later], [...batch.map(row => row.task_id), 'later'])).toEqual(['other', 'later']);
+    expect(runDisplayRows([...batch, { ...later, status: 'failed' }], [...batch.map(row => row.task_id), 'later'])).toEqual(['other', 'later']);
+    expect(runDisplayRows([...batch, { ...later, status: 'cancelled' }], [...batch.map(row => row.task_id), 'later'])).toEqual(['other', 'retry']);
+    expect(runDisplayRows(batch, ['original', 'other'])).toEqual(['original', 'other']);
+  });
+
+  it('shows the completed retry with its dispatch origin while the board stays active', () => {
+    const { board, panel, list } = boardHarness();
+    const event = (task: Record<string, unknown>) => board.onEvent('c1', { task });
+    event({ task_id: 'parent', status: 'done', assignee: 'commander', instruction: 'Prepare the report.' });
+    event({ task_id: 'queue', status: 'queued', assignee: 'b', instruction: 'Separate work' });
+    event({ task_id: 'original', status: 'failed', assignee: 'a', created_by: 'commander', parent_task_id: 'parent', created_at: 't1' });
+    event({ task_id: 'retry', status: 'done', assignee: 'a', created_by: 'user', retry_of_task_id: 'original', created_at: 't2' });
+    expect(list.innerHTML).not.toContain('data-task-id="original"');
+    expect(list.innerHTML).toContain('data-task-id="retry"');
+    expect(list.innerHTML).toContain('chat.task_status_done');
+    expect(list.innerHTML).toContain('title="chat.recipient_commander: Prepare the report."');
+    expect(list.innerHTML).toContain('chat.task_dispatched');
+    event({ task_id: 'queue', status: 'done', assignee: 'b' });
+    expect(panel.style.display).toBe('none');
   });
 });
 

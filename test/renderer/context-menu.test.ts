@@ -295,4 +295,25 @@ describe('context menu', () => {
     expect(harness.menu()).toBeNull();
     expect(harness.document.activeElement).toBe(harness.priorFocus);
   });
+
+  it('keeps an anchored menu open while another pane scrolls and closes when its own pane scrolls', () => {
+    const harness = createHarness();
+    const canvas = harness.document.createElement('div');
+    const anchor = canvas.appendChild(harness.document.createElement('button'));
+    const chat = harness.document.createElement('div');
+    harness.document.body.appendChild(canvas);
+    harness.document.body.appendChild(chat);
+    harness.window.showContextMenu(
+      { clientX: 20, clientY: 20 },
+      [{ label: 'Upload footage', onClick: vi.fn() }],
+      { scrollAnchor: anchor },
+    );
+
+    harness.dispatchWindow('scroll', { target: chat });
+    expect(harness.menu()).not.toBeNull();
+
+    harness.dispatchWindow('scroll', { target: canvas });
+    expect(harness.menu()).toBeNull();
+    expect(harness.document.activeElement).toBe(harness.priorFocus);
+  });
 });

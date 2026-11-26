@@ -66,6 +66,22 @@ afterEach(async () => {
 });
 
 describe('task_board › planned split note (D29)', () => {
+  it('keeps bounded request history on a parked task before and after reload', async () => {
+    const tb = await board();
+    const created = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'agent-a', instruction: 'Check the source.', createdBy: 'commander' });
+    await tb.claimTask(TEST_UID, TEST_CID, created.task_id);
+    const request_history = Array.from({ length: 12 }, (_, i) => ({ source_message_id: `request-${i}`, text: String(i).padEnd(4000, 'x') }));
+    await tb.finishTask(TEST_UID, TEST_CID, created.task_id, 'waiting_input', { resume: {
+      form_id: 'aabbccdd11223344', user_goal: 'Report progress, then continue.', request_history,
+    } });
+    const snapshot = (await readSnapshot())[0];
+    expect(snapshot.resume.request_history.map((r: any) => r.source_message_id)).toEqual(request_history.map(r => r.source_message_id));
+    expect(snapshot.resume.request_history.reduce((n: number, r: any) => n + (r.text?.length || 0), 0)).toBeLessThanOrEqual(40_000);
+    expect(snapshot.resume.request_history.some((r: any) => r.text_omitted)).toBe(true);
+    tb._resetForTest();
+    expect((await tb.listTasks(TEST_UID, TEST_CID))[0].resume).toEqual(snapshot.resume);
+  });
+
   it('keeps a planned task\'s split note across a reload so a later reply still gets it', async () => {
     const tb = await board();
     const created = await tb.createTask(TEST_UID, TEST_CID, {
@@ -684,11 +700,13 @@ describe('task_board › P4 reorder + reassign', () => {
 
   it('reassignQueued swaps the assignee on queued rows only, keeping the task id', async () => {
     const tb = await board();
-    const a = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'x', instruction: 'a', createdBy: 'user' });
+    const a = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'x', instruction: 'a', createdBy: 'user', retryOfTaskId: 'original' });
+    expect((await tb.reassignQueued(TEST_UID, TEST_CID, a.task_id, 'x')).task?.retry_of_task_id).toBe('original');
     const res = await tb.reassignQueued(TEST_UID, TEST_CID, a.task_id, 'agent-new');
     expect(res.task?.task_id).toBe(a.task_id);
     expect(res.task?.assignee).toBe('agent-new');
-    expect((await readSnapshot())[0].assignee).toBe('agent-new');
+    expect((await readSnapshot())[0]).toMatchObject({ assignee: 'agent-new' });
+    expect((await readSnapshot())[0].retry_of_task_id).toBeUndefined();
 
     // Same-assignee is an accepted no-op; running rows are frozen.
     expect((await tb.reassignQueued(TEST_UID, TEST_CID, a.task_id, 'agent-new')).task?.assignee).toBe('agent-new');
@@ -936,12 +954,14 @@ describe('task_board › queued message edits', () => {
     const predecessor = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'commander', instruction: 'first', createdBy: 'user' });
     const queued = await tb.createTask(TEST_UID, TEST_CID, {
       assignee: 'commander', instruction: 'original', createdBy: 'user', after: [predecessor.task_id], attachments: ['file.txt'],
+      retryOfTaskId: 'original-delegated-assignment',
     });
     const apply = vi.fn(() => ({ sourceMsgId: 'edited-source' }));
     expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, 'new text', 'original', apply))
       .toMatchObject({ task: { task_id: queued.task_id, instruction: 'new text', after: [predecessor.task_id], attachments: ['file.txt'], instruction_revision: 1 } });
-    expect((await readSnapshot()).find((row) => row.task_id === queued.task_id))
-      .toMatchObject({ instruction: 'new text', source_msg_id: 'edited-source', instruction_revision: 1 });
+    const persisted = (await readSnapshot()).find((row) => row.task_id === queued.task_id);
+    expect(persisted).toMatchObject({ instruction: 'new text', source_msg_id: 'edited-source', instruction_revision: 1 });
+    expect(persisted?.retry_of_task_id).toBeUndefined();
     tb.dropBoard(TEST_UID, TEST_CID, { persistPending: false });
     expect((await tb.listTasks(TEST_UID, TEST_CID)).find((row) => row.task_id === queued.task_id)?.instruction_revision).toBe(1);
     expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, 'overwrite', 'original', apply)).toMatchObject({ error: 'edit_conflict' });

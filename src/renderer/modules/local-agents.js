@@ -202,6 +202,7 @@ async function loadLocalCliEntries(options = {}) {
 let _extCliSelectApi = null;
 let _externalCliLastOnChange = null;
 let _cliUpgradeControlId = 0;
+const _cliUpgradeProgressListeners = new Map();
 
 function _setExternalCliDetectionBusy(
   busy,
@@ -225,7 +226,7 @@ function _externalCliOptions(entries) {
   return entries
     .map(e => ({
       value: e.type,
-      label: `${(getCliDefaults(e.type)?.name) || e.type}${e.version ? ` (${e.version})` : ''}`,
+      label: `${getCliDefaults(e.type)?.label || getCliDefaults(e.type)?.name || e.type}${e.version ? ` (${e.version})` : ''}`,
       ...(e.available !== true
         ? {
             hint: e.error === 'version_too_old'
@@ -476,6 +477,9 @@ function createLocalCliUpgradeControl(target, { cli = target.type, chip = false,
   status.className = 'agents-detail-cli-note';
   status.setAttribute('role', 'status');
   status.setAttribute('aria-live', 'polite');
+  const elapsed = document.createElement('span');
+  elapsed.className = 'agents-detail-cli-note local-cli-upgrade-elapsed';
+  elapsed.setAttribute('role', 'timer');
   const feedback = document.createElement('span');
   feedback.className = 'local-cli-upgrade-feedback';
   const details = document.createElement('button');
@@ -491,7 +495,7 @@ function createLocalCliUpgradeControl(target, { cli = target.type, chip = false,
   error.id = 'local-cli-upgrade-error-' + (++_cliUpgradeControlId);
   error.tabIndex = 0;
   details.setAttribute('aria-controls', error.id);
-  feedback.append(status, details);
+  feedback.append(status, elapsed, details);
   root.append(button, feedback, error);
   details.addEventListener('click', () => {
     if (details.hidden) return;
@@ -502,11 +506,23 @@ function createLocalCliUpgradeControl(target, { cli = target.type, chip = false,
   button.addEventListener('click', async () => {
     if (button.disabled) return;
     root.dataset.state = 'upgrading';
+    root.dataset.phase = 'checking';
+    root.dataset.upgradeStartedAt = String(performance.now());
+    delete root.dataset.upgradeError;
     details.setAttribute('aria-expanded', 'false');
     error.textContent = '';
     _renderCliUpgradeState(root);
+    const progressId = crypto.randomUUID();
+    const timer = setInterval(() => {
+      if (root.isConnected) _renderCliUpgradeElapsed(root);
+    }, 1000);
+    _cliUpgradeProgressListeners.set(progressId, event => {
+      root.dataset.phase = event.phase;
+      root.dataset.upgradeStartedAt = String(Math.min(Number(root.dataset.upgradeStartedAt), performance.now() - event.elapsed_ms));
+      _renderCliUpgradeState(root);
+    });
     try {
-      const result = await window.orkas.invoke('localAgents.upgrade', target);
+      const result = await window.orkas.invoke('localAgents.upgrade', { ...target, progress_id: progressId });
       if (result?.ok && result.entry?.available) {
         root.dataset.state = result.outcome === 'up_to_date' ? 'up_to_date' : 'success';
         // Discovery refresh is separate from the updater's authoritative result.
@@ -514,28 +530,55 @@ function createLocalCliUpgradeControl(target, { cli = target.type, chip = false,
         window.dispatchEvent(new CustomEvent('local-cli-upgraded', { detail: { type: result.type } }));
       } else {
         root.dataset.state = 'failure';
+        root.dataset.upgradeError = result?.error_code || '';
         // Main owns redaction. Treat installer output strictly as bounded text,
-        // never Markdown/HTML, and never include it in the telemetry above.
+        // never Markdown or HTML.
         error.textContent = typeof result?.error_detail === 'string' ? result.error_detail.slice(0, 8192) : '';
       }
     } catch (_) {
       root.dataset.state = 'failure';
-    } finally { _renderCliUpgradeState(root); }
+    } finally {
+      clearInterval(timer);
+      _cliUpgradeProgressListeners.delete(progressId);
+      _renderCliUpgradeState(root);
+    }
   });
   return root;
+}
+function _cliUpgradeFailureText(code) {
+  switch (code) {
+    case 'timeout': return t('cli_upgrade.timeout');
+    case 'output_limit': return t('cli_upgrade.output_limit');
+    case 'unavailable': return t('cli_upgrade.unavailable');
+    case 'verification_failed': return t('cli_upgrade.verification_failed');
+    case 'changed_installation': return t('cli_upgrade.changed_installation');
+    default: return t('cli_upgrade.failed');
+  }
+}
+function _renderCliUpgradeElapsed(root) {
+  const label = root.querySelector('.local-cli-upgrade-elapsed');
+  label.hidden = root.dataset.state !== 'upgrading';
+  if (label.hidden) return;
+  const seconds = Math.floor((performance.now() - Number(root.dataset.upgradeStartedAt)) / 1000);
+  const digits = new Intl.NumberFormat(getLocaleMeta(getLang()).intlLocale, { useGrouping: false });
+  const time = `${digits.format(Math.floor(seconds / 60))}:${digits.format(seconds % 60).padStart(2, digits.format(0))}`;
+  label.textContent = t('cli_upgrade.elapsed', { time });
 }
 function _renderCliUpgradeState(root) {
   const button = root.querySelector('.local-cli-upgrade-btn');
   const pending = root.dataset.state === 'upgrading';
   const cli = t('agent_modal.runtime_cli_' + root.dataset.cli);
-  button.textContent = t(pending ? 'cli_upgrade.pending'
-    : root.dataset.named === '1' ? 'cli_upgrade.named_action' : 'cli_upgrade.action', { cli });
+  const phase = root.dataset.phase;
+  button.textContent = pending
+    ? t(phase === 'checking' ? 'cli_upgrade.checking' : phase === 'verifying' ? 'cli_upgrade.verifying' : 'cli_upgrade.pending')
+    : t(root.dataset.named === '1' ? 'cli_upgrade.named_action' : 'cli_upgrade.action', { cli });
   button.disabled = pending;
   button.classList.toggle('is-loading', pending);
   button.setAttribute('aria-busy', String(pending));
-  root.querySelector('[role="status"]').textContent = root.dataset.state === 'up_to_date'
+  const status = root.querySelector('[role="status"]');
+  status.textContent = root.dataset.state === 'up_to_date'
     ? t('cli_upgrade.up_to_date') : root.dataset.state === 'success'
-      ? t('cli_upgrade.success') : root.dataset.state === 'failure' ? t('cli_upgrade.failed') : '';
+      ? t('cli_upgrade.success') : root.dataset.state === 'failure' ? _cliUpgradeFailureText(root.dataset.upgradeError) : '';
   const warning = root.querySelector('.local-cli-upgrade-warning');
   if (warning) {
     warning.hidden = !root.dataset.warningVersion;
@@ -547,7 +590,8 @@ function _renderCliUpgradeState(root) {
   details.hidden = root.dataset.state !== 'failure' || !error.textContent;
   if (details.hidden) details.setAttribute('aria-expanded', 'false');
   error.hidden = details.hidden || details.getAttribute('aria-expanded') !== 'true';
-  root.querySelector('.local-cli-upgrade-feedback').hidden = !root.querySelector('[role="status"]').textContent;
+  _renderCliUpgradeElapsed(root);
+  root.querySelector('.local-cli-upgrade-feedback').hidden = !pending && !status.textContent;
   root.querySelector('.local-cli-upgrade-error-label').textContent = t('cli_upgrade.error_details');
 }
 function _renderExternalCliUpgrades(entries) {
@@ -568,6 +612,9 @@ function _renderExternalCliUpgrades(entries) {
   }
 }
 window.createLocalCliUpgradeControl = createLocalCliUpgradeControl;
+window.orkas?.onPushEvent?.('local-agent:upgrade-progress', event => {
+  _cliUpgradeProgressListeners.get(event?.progress_id)?.(event);
+});
 if (typeof window.addEventListener === 'function') {
   window.addEventListener('i18n-change', () => {
     for (const root of document.querySelectorAll('.local-cli-upgrade-control')) {

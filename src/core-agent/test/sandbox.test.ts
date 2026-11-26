@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import {
@@ -9,6 +10,7 @@ import {
   buildSandboxEnv,
   buildShellInvocation,
   decodeProcessOutput,
+  createProcessOutputDecoder,
   DEFAULT_SANDBOX_TIMEOUT_MS,
   defaultShellForPlatform,
   killProcessTree,
@@ -18,6 +20,18 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const IS_WINDOWS = process.platform === "win32";
 const NATIVE_SHELL_STARTUP_BUDGET_MS = IS_WINDOWS ? 15_000 : 5_000;
 const NATIVE_SHELL_TEST_TIMEOUT_MS = IS_WINDOWS ? 25_000 : 10_000;
+
+function nativeShellFixtureEnv(): Record<string, string> | undefined {
+  if (!IS_WINDOWS || process.env.ORKAS_TEST_USE_HOSTED_POWERSHELL_CACHE !== "1") return undefined;
+  const cachePath = process.env.PSModuleAnalysisCachePath;
+  if (process.env.GITHUB_ACTIONS !== "true" || !cachePath || !path.win32.isAbsolute(cachePath)
+    || !statSync(cachePath, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error("Hosted Windows shell tests require the runner's PowerShell module cache file");
+  }
+  // The runner prepares a non-default cache. Pass only that fixture input
+  // through the executor's existing explicit environment option.
+  return { PSModuleAnalysisCachePath: cachePath };
+}
 
 function shellQuote(value: string): string {
   return IS_WINDOWS
@@ -50,7 +64,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("executes a simple command", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir(), env: nativeShellFixtureEnv() });
     const result = await sandbox.execute("echo hello");
     expect(result.stdout.trim()).toBe("hello");
     expect(result.exitCode).toBe(0);
@@ -251,21 +265,23 @@ describe("SandboxExecutor", () => {
     expect((sandbox as any).checkBlockedCommand(command)).not.toBeNull();
   });
 
-  it("prints a blocked command name as data in foreground and detached execution", async () => {
+  it("prints a blocked command name as data in foreground execution", async () => {
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir(), env: nativeShellFixtureEnv() });
+    const result = await sandbox.execute("echo shutdown");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("shutdown");
+  }, NATIVE_SHELL_TEST_TIMEOUT_MS);
+
+  it("prints a blocked command name as data in detached execution", async ({ onTestFinished }) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-"));
-    const sandbox = new SandboxExecutor({ workingDir: dir });
-    const command = "echo shutdown";
-    try {
-      const foreground = await sandbox.execute(command);
-      expect(foreground.exitCode).toBe(0);
-      expect(foreground.stdout.trim()).toBe("shutdown");
-      const logPath = path.join(dir, "output.log");
-      const background = sandbox.executeBackground(command, logPath);
-      expect(background.error).toBeUndefined();
-      expect(background.pid).toBeGreaterThan(0);
-      await expect.poll(async () => (await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
-      await waitForProcessExit(background.pid!);
-    } finally { await removeTree(dir); }
+    onTestFinished(() => removeTree(dir));
+    const sandbox = new SandboxExecutor({ workingDir: dir, env: nativeShellFixtureEnv() });
+    const logPath = path.join(dir, "output.log");
+    const { pid, error } = sandbox.executeBackground("echo shutdown", logPath);
+    expect(error).toBeUndefined();
+    expect(pid).toBeGreaterThan(0);
+    await waitForProcessExit(pid!, NATIVE_SHELL_STARTUP_BUDGET_MS);
+    expect((await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
   }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 
   it("blocks custom commands", async () => {
@@ -393,7 +409,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("reports duration", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir(), env: nativeShellFixtureEnv() });
     const result = await sandbox.execute("echo fast");
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(result.durationMs).toBeLessThan(NATIVE_SHELL_STARTUP_BUDGET_MS);
@@ -549,6 +565,28 @@ describe("augmentPath", () => {
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin");
   });
 
+  it("keeps host architecture available to Windows programs without exposing unrelated variables", () => {
+    vi.stubEnv("PROCESSOR_ARCHITECTURE", "x86");
+    vi.stubEnv("PROCESSOR_ARCHITEW6432", "ARM64");
+    vi.stubEnv("ORKAS_TEST_ENV_UNRELATED", "test-only-value");
+    try {
+      const windows = buildSandboxEnv(undefined, "win32");
+      expect(windows).toMatchObject({ PROCESSOR_ARCHITECTURE: "x86", PROCESSOR_ARCHITEW6432: "ARM64" });
+      expect(windows).not.toHaveProperty("ORKAS_TEST_ENV_UNRELATED");
+      const posix = buildSandboxEnv(undefined, "linux");
+      expect(posix).not.toHaveProperty("PROCESSOR_ARCHITECTURE");
+      expect(posix).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
+      vi.stubEnv("PROCESSOR_ARCHITEW6432", undefined);
+      const native = buildSandboxEnv(undefined, "win32");
+      expect(native.PROCESSOR_ARCHITECTURE).toBe("x86");
+      expect(native).not.toHaveProperty("PROCESSOR_ARCHITEW6432");
+      vi.stubEnv("PROCESSOR_ARCHITECTURE", undefined);
+      expect(buildSandboxEnv(undefined, "win32")).not.toHaveProperty("PROCESSOR_ARCHITECTURE");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("defaults Windows Python subprocesses to UTF-8 stdio", () => {
     const env = buildSandboxEnv(undefined, "win32");
     expect(env.PYTHONIOENCODING).toBe("utf-8");
@@ -676,6 +714,40 @@ describe("augmentPath", () => {
 });
 
 describe("decodeProcessOutput", () => {
+  it.each(["darwin", "win32"] as const)("preserves UTF-8 at every split boundary on %s", platform => {
+    const text = "中文 café 😀\n";
+    const bytes = Buffer.from(text);
+    for (let split = 0; split <= bytes.length; split++) {
+      const decoder = createProcessOutputDecoder(platform);
+      expect(decoder.write(bytes.subarray(0, split)) + decoder.write(Buffer.alloc(0))
+        + decoder.write(bytes.subarray(split)) + decoder.end()).toBe(text);
+      expect(decoder.end()).toBe("");
+    }
+    const decoder = createProcessOutputDecoder(platform);
+    expect([...bytes].map(byte => decoder.write(Buffer.from([byte]))).join("") + decoder.end()).toBe(text);
+  });
+
+  it("retains Windows legacy fallback and flushes an incomplete tail once", () => {
+    const decoder = createProcessOutputDecoder("win32", { ORKAS_UI_LANG: "zh" });
+    const gbkVersion = Buffer.from([0xb0, 0xe6, 0xb1, 0xbe]);
+    expect(decoder.write(gbkVersion)).toBe("版本");
+    expect(decoder.write(Buffer.from("中文"))).toBe("中文");
+    const tail = Buffer.from([0xe4, 0xb8]);
+    expect(decoder.write(tail)).toBe("");
+    expect(decoder.end()).toBe(decodeProcessOutput(tail, "win32", { ORKAS_UI_LANG: "zh" }));
+    expect(decoder.end()).toBe("");
+    const utf8 = createProcessOutputDecoder("darwin");
+    expect(utf8.write(tail)).toBe("");
+    expect(utf8.end()).toBe("\uFFFD");
+    expect(utf8.end()).toBe("");
+  });
+
+  it("drops only the leading Windows BOM while preserving later BOMs across chunks", () => {
+    const decoder = createProcessOutputDecoder("win32");
+    const bytes = Buffer.from("\uFEFF中文\uFEFF😀");
+    expect([...bytes].map(byte => decoder.write(Buffer.from([byte]))).join("") + decoder.end()).toBe("中文\uFEFF😀");
+  });
+
   it("falls back to GB18030 for Chinese Windows console output", () => {
     const gbkVersion = Buffer.from([0xb0, 0xe6, 0xb1, 0xbe]);
     expect(decodeProcessOutput(gbkVersion, "win32", { ORKAS_UI_LANG: "zh" })).toBe("版本");

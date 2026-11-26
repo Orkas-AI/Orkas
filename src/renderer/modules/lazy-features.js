@@ -24,6 +24,8 @@ const _rendererFeatureManifest = Object.freeze({
     { src: './modules/library-transfer.js' },
     { src: './modules/date-picker.js' },
     { src: './modules/project-detail.js' },
+    { src: './modules/project-goal.js' },
+    { src: './modules/project-recap.js' },
     { src: './modules/todos.js' },
     { src: './modules/todo-cleanup.js' },
   ],

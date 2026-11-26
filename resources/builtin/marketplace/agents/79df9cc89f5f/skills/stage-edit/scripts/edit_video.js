@@ -5,6 +5,9 @@ const path = require('node:path');
 
 const OPS = new Set(['probe', 'trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'loudness', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers', 'reframe']);
 const OUTPUT_OPS = new Set(['trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers', 'reframe']);
+// The ops that read --start and --duration; every other op works on the whole input.
+const START_OPS = new Set(['trim', 'extract_frame', 'mix']);
+const DURATION_OPS = new Set(['trim']);
 const REFRAME_MODES = ['pad', 'crop', 'blur'];
 
 function fail(code, message, extra = {}) {
@@ -56,7 +59,9 @@ function parseJsonOrFile(raw, label) {
   try {
     return JSON.parse(jsonText);
   } catch (err) {
-    fail('E_ARGS', `${label} is not valid JSON: ${err.message}`);
+    // A run passed paths here and then reported the edit tool as broken (2026-11-14).
+    const example = label === '--audio-segments' ? `, for example '[{"path": "voice/1.mp3", "start": 0}]'` : '';
+    fail('E_ARGS', `${label} is not valid JSON (${err.message}). Pass the JSON itself, or @ and a file holding it${example}, and run it again.`);
   }
 }
 
@@ -74,6 +79,32 @@ function acceptedOptions() {
   return [...new Set(source.match(/--[a-z][a-z0-9-]+/g) || [])]
     .filter((flag) => flag !== '--help')
     .sort();
+}
+
+// Options whose value is a file path, for a path the shell split at its spaces.
+const PATH_OPTIONS = new Set(['--input', '--input-path', '-i', '--output', '--output-path', '--audio', '--audio-path',
+  '--subtitles', '--subtitles-path', '--cover', '--overlay', '--overlay-path', '--transcript', '--transcript-path']);
+
+/**
+ * The path option an unexpected word belongs to, and the existing file its words make together.
+ * 2026-11-19: an attachment named "导出带商品图片的 PDF 清单-录屏.mp4" passed unquoted came back as
+ * "unexpected argument: PDF", twice, with nothing saying the path had been split.
+ */
+function splitPath(args, at) {
+  let option = at - 1;
+  while (option >= 0 && !String(args[option]).startsWith('-')) option -= 1;
+  if (option < 0 || !PATH_OPTIONS.has(args[option])) return null;
+  for (let end = at; end < args.length && !String(args[end]).startsWith('-'); end += 1) {
+    const joined = args.slice(option + 1, end + 1).join(' ');
+    if (fs.existsSync(resolvePath(joined))) return { option: args[option], path: joined };
+  }
+  return null;
+}
+
+function unexpectedArgument(args, at) {
+  const split = splitPath(args, at);
+  if (split) fail('E_ARGS', `unexpected argument: ${args[at]}. The path after ${split.option} has spaces, so the shell split it: quote it, as in ${split.option} '${split.path}', and run it again.`);
+  fail('E_ARGS', `unexpected argument: ${args[at]}; accepted options are ${acceptedOptions().join(' ')}`);
 }
 
 function parseArgs(args) {
@@ -110,6 +141,7 @@ function parseArgs(args) {
     else if (a.startsWith('--transcript-path=')) out.transcriptPath = a.slice('--transcript-path='.length);
     else if (a === '--on-existing-audio') { out.onExistingAudio = nextValue(args, i, a); i += 1; }
     else if (a === '--duck') out.duck = true;
+    else if (a === '--fit-dub') out.fitDub = true;
     else if (a.startsWith('--on-existing-audio=')) out.onExistingAudio = a.slice('--on-existing-audio='.length);
     else if (a === '--start') { out.start = parseNumber(nextValue(args, i, a), a); i += 1; }
     else if (a.startsWith('--start=')) out.start = parseNumber(a.slice('--start='.length), '--start');
@@ -147,7 +179,7 @@ function parseArgs(args) {
     else if (a.startsWith('--pad-color=')) out.padColor = a.slice('--pad-color='.length);
     else if (!out.op) out.op = a;
     else if (!out.inputPath) out.inputPath = a;
-    else fail('E_ARGS', `unexpected argument: ${a}; accepted options are ${acceptedOptions().join(' ')}`);
+    else unexpectedArgument(args, i);
   }
   return out;
 }
@@ -159,7 +191,7 @@ function resolvePath(raw) {
 function inputFile(raw, label) {
   const abs = resolvePath(raw);
   const st = fs.existsSync(abs) ? fs.statSync(abs) : null;
-  if (!st || !st.isFile()) fail('E_INPUT', `${label} is not a file: ${abs}`, { path: abs });
+  if (!st || !st.isFile()) fail('E_INPUT', `${label} is not a file: ${abs}. Paths are read from ${process.cwd()}; check the name with ls and run it again.`, { path: abs });
   return abs;
 }
 
@@ -189,6 +221,15 @@ function normalizeAudioSegments(raw) {
     const rawPath = item.audio_path || item.audioPath || item.path;
     if (!rawPath) fail('E_ARGS', `audio_segments[${index}] requires audio_path`);
     const segment = { audioAbsPath: inputFile(rawPath, `audio_segments[${index}].audio_path`) };
+    if (item.caption !== undefined) {
+      if (typeof item.caption !== 'string' || !item.caption.trim()) fail('E_ARGS', `audio_segments[${index}].caption must be text`);
+      segment.caption = item.caption;
+    }
+    for (const [key, property] of [['source_start', 'sourceStartSec'], ['source_end', 'sourceEndSec']]) {
+      if (item[key] === undefined) continue;
+      if (typeof item[key] !== 'number' || !Number.isFinite(item[key])) fail('E_ARGS', `audio_segments[${index}].${key} must be finite seconds`);
+      segment[property] = item[key];
+    }
     if (typeof item.start === 'number') segment.startSec = item.start;
     if (typeof item.start_sec === 'number') segment.startSec = item.start_sec;
     if (typeof item.startSec === 'number') segment.startSec = item.startSec;
@@ -209,7 +250,7 @@ function normalizeAudioSegments(raw) {
 function normalizeEditFailure(opts, result) {
   const message = String(result && result.message || '');
   if (
-    opts.op === 'burnsubs'
+    (opts.op === 'burnsubs' || (opts.op === 'mix' && Array.isArray(opts.audioSegments) && opts.audioSegments.some(line => line?.caption !== undefined)))
     && /No such filter:\s*'subtitles'|No such filter:\s*"subtitles"|not found.*subtitles|subtitles.*not found/i.test(message)
   ) {
     return {
@@ -225,6 +266,15 @@ module.exports = async function editVideoScript({ args }) {
   const opts = parseArgs(args || []);
   if (opts.help) return help();
   if (!OPS.has(opts.op)) fail('E_ARGS', `op must be one of: ${[...OPS].join(', ')}`);
+  if (opts.fitDub && opts.op !== 'mix') fail('E_ARGS', '--fit-dub is only available for captioned mix');
+  const ignoredRange = [
+    ...(opts.start !== undefined && !START_OPS.has(opts.op) ? ['--start'] : []),
+    ...(opts.duration !== undefined && !DURATION_OPS.has(opts.op) ? ['--duration'] : []),
+  ];
+  if (ignoredRange.length) {
+    if (START_OPS.has(opts.op)) fail('E_ARGS', `${opts.op} takes --start but not --duration.`);
+    fail('E_ARGS', `${opts.op} does not take ${ignoredRange.join(' or ')}: it works on the whole input. Cut the part you want with --op trim first, then run ${opts.op} on that file.`);
+  }
 
   const params = { op: opts.op };
 
@@ -249,7 +299,7 @@ module.exports = async function editVideoScript({ args }) {
     params.overlayAbsPath = inputFile(opts.overlayPath, 'overlay');
   }
   if (opts.op === 'remove_fillers') {
-    if (!opts.transcriptPath) fail('E_ARGS', 'remove_fillers requires --transcript');
+    if (!opts.transcriptPath) fail('E_ARGS', 'remove_fillers requires --transcript: the video_studio speech.transcribe JSON for this input, made with timestamps "word". Pass its transcript_path and run it again.');
     params.transcriptAbsPath = inputFile(opts.transcriptPath, 'transcript');
   }
   if (opts.op === 'mix') {
@@ -261,6 +311,11 @@ module.exports = async function editVideoScript({ args }) {
     }
     if (['reject', 'mix', 'replace'].includes(opts.onExistingAudio)) params.onExistingAudio = opts.onExistingAudio;
     if (opts.duck) params.duck = true;
+    if (opts.fitDub) params.fitDub = true;
+    if (segments?.some(segment => segment.caption !== undefined) && opts.cover !== undefined) {
+      const [top, bottom] = String(opts.cover).split(',').map((v) => Number(v.trim()));
+      params.cover = { top, bottom };
+    }
   }
   if (opts.op === 'reframe') {
     const hasSize = typeof opts.width === 'number' && typeof opts.height === 'number';
@@ -303,7 +358,9 @@ module.exports = async function editVideoScript({ args }) {
   const { requestedOutputAbsPath, outputRenamed, ...editParams } = params;
   const { editVideo } = require('./lib/video_edit_core.cjs');
   const result = normalizeEditFailure(opts, await editVideo(editParams));
-  if (result.ok === false) fail(result.errorCode, result.message);
+  if (result.ok === false) {
+    fail(result.errorCode, result.message, result.dub_fit_issues ? { dub_fit_issues: result.dub_fit_issues } : {});
+  }
 
   const payload = { ok: true, op: opts.op, ...result };
   if (opts.op === 'probe') payload.text = 'probe metadata is available in probe.';
@@ -315,7 +372,10 @@ module.exports = async function editVideoScript({ args }) {
   else if (result.path) {
     payload.media = `chat-media://local/${result.path}`;
     const reframed = result.reframe ? ` at ${result.reframe.canvas} (${result.reframe.mode})` : '';
-    payload.text = `${opts.op} wrote ${result.path}${reframed}${outputRenamed ? ` (renamed from ${requestedOutputAbsPath})` : ''}.`;
+    const length = typeof result.duration_sec === 'number' ? `, ${result.duration_sec}s long` : '';
+    payload.text = `${opts.op} wrote ${result.path}${reframed}${outputRenamed ? ` (renamed from ${requestedOutputAbsPath})` : ''}${length}.`
+      + (result.caption_cues ? ` Contains ${result.caption_cues.length} burned captions timed to the placed dub.` : '')
+      + (result.warning ? ` ${result.warning}` : '');
   }
   return payload;
 };

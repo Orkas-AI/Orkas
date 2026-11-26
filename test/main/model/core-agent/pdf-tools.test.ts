@@ -5,6 +5,18 @@ import * as path from 'node:path';
 import { PDFDocument, StandardFonts, degrees } from 'pdf-lib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The access setting reads files outside the workspace by; null cannot be read, which keeps
+// reads to the workspace, as for a user who chose that.
+const access = vi.hoisted(() => ({ mode: null as null | 'workspace_approval' | 'all_files_approval' | 'all_files_auto' }));
+vi.mock('../../../../src/main/features/permissions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../../src/main/features/permissions')>()),
+  localAccessAllowsOutsideWorkspace: () => {
+    if (!access.mode) throw new Error('no active user');
+    return access.mode !== 'workspace_approval';
+  },
+  localAccessRequiresSensitiveApproval: () => access.mode !== 'all_files_auto',
+}));
+
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
 import { runProgramWithTools } from '../../../helpers/programmatic-tools';
 
@@ -73,6 +85,33 @@ describe('PDF built-in tools', () => {
     }
     expect(written).toEqual([]);
   });
+  // 2026-11-23: a PDF the user names elsewhere on the computer follows the access setting the
+  // file tools follow; what an edit writes stays inside.
+  it('reads a PDF elsewhere on the computer by the access setting, and writes only inside', async () => {
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-pdf-elsewhere-'));
+    const outside = path.join(elsewhere, 'quotas.pdf');
+    await makePdf(outside, [300, 400]);
+    try {
+      access.mode = 'workspace_approval';
+      const refused = await tool('pdf_render').execute({ path: outside, page: 1 }, context());
+      expect(refused.isError).toBe(true);
+      expect(String(refused.content)).toContain('Ask the user to attach it, or to allow files outside the workspace in Settings.');
+      access.mode = 'all_files_approval';
+      const rendered = await tool('pdf_render').execute({ path: outside, page: 1 }, context());
+      expect(rendered.isError, String(rendered.content)).toBeFalsy();
+      expect(rendered.images).toHaveLength(1);
+      const extracted = await tool('edit_pdf').execute({ action: 'extract_pages', input_path: outside, output_path: 'mine.pdf', pages: [2] }, context());
+      expect(extracted.isError, String(extracted.content)).toBeFalsy();
+      expect(written).toEqual([path.join(root, 'mine.pdf')]);
+      const besideIt = await tool('edit_pdf').execute({ action: 'extract_pages', input_path: outside, output_path: path.join(elsewhere, 'out.pdf'), pages: [1] }, context());
+      expect(besideIt.isError).toBe(true);
+      expect(fs.readdirSync(elsewhere)).toEqual(['quotas.pdf']);
+    } finally {
+      access.mode = null;
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
   it('exposes edit_pdf and pdf_render', () => {
     expect(createPdfTools({}).map((entry) => entry.name)).toEqual(['edit_pdf', 'pdf_render']);
   });

@@ -427,10 +427,8 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
     await page.locator('#chat-send-btn').click();
-    const liveInterrupted = page.locator(
-      '#chat-history .chat-message.assistant [data-role="final"]',
-    );
-    await expect(liveInterrupted).toHaveText('Interrupted');
+    const liveInterrupted = page.locator('#chat-history .chat-message.assistant[data-interrupted="1"]');
+    await expect(liveInterrupted.locator('[data-role="final"]')).toHaveText('Run aborted');
     // Stopping hands the interrupted message back so it can be corrected and
     // sent again; the copy that was already sent stays in the transcript.
     await expectComposerText(page.locator('#chat-input'), 'E2E stop this deliberately slow response.');
@@ -616,6 +614,62 @@ test.describe('real chat pipeline with a local model', () => {
     expect(modelOrkas.modelRequests).toHaveLength(requestsAfterFailure + 1);
   });
 
+  accountTest('retries a truncated Responses stream with the original file write result', async ({ modelOrkas }) => {
+    await modelOrkas.selectLocalResponsesModel();
+    const filePath = modelOrkas.createWorkspaceFile('stream-retry/report.txt', 'Report\n');
+    const writeCallId = 'stream-retry-append';
+    const receiptMarker = 'report append completed';
+    const command = process.platform === 'win32'
+      ? `Add-Content -LiteralPath '${filePath.replace(/'/g, "''")}' -Value 'Written once' -ErrorAction Stop; Write-Output '${receiptMarker}'`
+      : `printf '%s\\n' 'Written once' >> ${JSON.stringify(filePath)} && printf '%s\\n' '${receiptMarker}'`;
+    function writeReceipts(request: Record<string, unknown> | undefined): unknown[] {
+      const input = request?.input;
+      if (!Array.isArray(input)) return [];
+      return input.filter(item => item?.type === 'function_call_output' && item.call_id === writeCallId);
+    }
+
+    modelOrkas.setModelMode('truncated');
+    let writeIssued = false;
+    modelOrkas.setModelRequestScript((_request, tools) => {
+      if (writeIssued) return undefined; // The stream closes in the round after the tool returns.
+      if (!tools.has('bash') && tools.has('tool_load')) {
+        return { calls: [{ callId: 'load-stream-retry-bash', name: 'tool_load', args: {
+          groups: ['workspace.execute.command'],
+        } }] };
+      }
+      writeIssued = true;
+      return { calls: [{ callId: writeCallId, name: 'bash', args: { command } }] };
+    });
+
+    let page = await sendNewChat(modelOrkas, 'Append “Written once” to stream-retry/report.txt, then tell me what changed.');
+    const failed = page.locator('#chat-history .chat-message.assistant[data-failed="1"]');
+    await expect(failed).toBeVisible({ timeout: 30_000 });
+    const requestsAfterFailure = modelOrkas.modelRequests.length;
+    const originalReceipts = writeReceipts(modelOrkas.modelRequests.at(-1));
+    expect(originalReceipts).toEqual([expect.objectContaining({ output: expect.stringContaining(receiptMarker) })]);
+    expect(readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n')).toBe('Report\nWritten once\n');
+
+    const cid = await page.evaluate(() => currentCid);
+    page = await modelOrkas.relaunch();
+    const conversation = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await conversation.click();
+    const restoredFailure = page.locator('#chat-history .chat-message.assistant[data-failed="1"]');
+    await expect(restoredFailure).toBeVisible();
+    expect(modelOrkas.modelRequests).toHaveLength(requestsAfterFailure);
+
+    modelOrkas.setModelRequestScript(null);
+    modelOrkas.setModelMode('success');
+    await restoredFailure.hover();
+    await restoredFailure.locator('.bubble-retry-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])', {
+      hasText: 'Hello from the local E2E model.',
+    })).toBeVisible({ timeout: 20_000 });
+    await expect(conversation.locator('.conv-item-status-label.is-failed')).toHaveCount(0);
+    expect(readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n')).toBe('Report\nWritten once\n');
+    expect(writeReceipts(modelOrkas.modelRequests[requestsAfterFailure])).toEqual(originalReceipts);
+    expect(modelOrkas.modelRequests).toHaveLength(requestsAfterFailure + 1);
+  });
+
   test('board-queues a second message while streaming and runs it in order', async ({ modelOrkas }) => {
     modelOrkas.setModelMode('slow');
     const page = await sendNewChat(modelOrkas, 'E2E first slow queued turn.');
@@ -663,6 +717,35 @@ test.describe('real chat pipeline with a local model', () => {
     await relaunchedPage.waitForTimeout(500);
     expect(modelOrkas.modelRequests).toHaveLength(2);
   });
+
+  for (const surface of ['composer', 'task board'] as const) {
+    test(`keeps queued work after Stop from the ${surface}`, async ({ modelOrkas }, testInfo) => {
+      modelOrkas.setModelMode('slow');
+      const first = 'E2E work to stop.';
+      const next = 'E2E queued work to keep.';
+      const page = await sendNewChat(modelOrkas, first);
+      await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
+      await page.locator('#chat-input').fill(next);
+      await page.locator('#chat-input').press('Enter');
+      const rows = page.locator('#chat-task-board-list .chat-queue-item');
+      await expect(rows).toHaveCount(2);
+      await expect(page.locator('#chat-history .chat-message.user')).toHaveCount(1);
+
+      modelOrkas.setModelMode('success');
+      const stop = surface === 'composer' ? page.locator('#chat-send-btn')
+        : rows.filter({ hasText: first }).locator('[data-act="task-cancel"]');
+      await stop.click();
+
+      await expect(page.locator('#chat-history .chat-message.assistant[data-interrupted="1"]')).toHaveCount(1);
+      await expect(page.locator('#chat-history .chat-message.user').last()).toContainText(next);
+      await expect(page.locator('#chat-history .chat-message.assistant').last())
+        .toContainText('Hello from the local E2E model.');
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+      expect(modelOrkas.modelRequests).toHaveLength(2);
+      expect(JSON.stringify(modelOrkas.modelRequests[1])).toContain(next);
+      await testInfo.attach('stopped-and-continued', { body: await page.screenshot(), contentType: 'image/png' });
+    });
+  }
 
   test('steers a text-reference composer update and preserves reply order across task switches', async ({ modelOrkas }, testInfo) => {
     modelOrkas.setModelMode('controlled-slow');
@@ -1016,6 +1099,37 @@ test.describe('real chat pipeline with a local model', () => {
     expect(modelOrkas.modelRequests).toHaveLength(4);
   });
 
+  test('delivers an explicitly selected shell output and leaves supporting files out of the reply', async ({ modelOrkas }) => {
+    const selectedName = 'script-deliverable.md';
+    const supportingName = 'script-support.md';
+    const shellCommand = process.platform === 'win32'
+      ? `Set-Content -LiteralPath ${selectedName} -Value 'Script result' -NoNewline; Set-Content -LiteralPath ${supportingName} -Value 'Working notes' -NoNewline`
+      : `printf 'Script result' > ${selectedName}; printf 'Working notes' > ${supportingName}`;
+    let sentShell = false;
+    let sentPublication = false;
+    modelOrkas.setModelRequestScript((_request, tools) => {
+      if (!sentShell && tools.has('bash')) {
+        sentShell = true;
+        return { calls: [{ callId: 'create-files', name: 'bash', args: { command: shellCommand } }] };
+      }
+      if (!sentPublication && tools.has('publish_outputs')) {
+        sentPublication = true;
+        return { calls: [{ callId: 'deliver-file', name: 'publish_outputs', args: { paths: [selectedName] } }] };
+      }
+      return { text: 'The script result is ready.' };
+    });
+    const page = await sendNewChat(modelOrkas, 'Run a script and deliver its report, leaving the working notes in the workspace.');
+    const produced = page.locator('#chat-history .chat-msg-produced-item');
+    await expect(produced).toHaveCount(1);
+    await expect(produced).toContainText(selectedName);
+    const deliveredPath = await produced.getAttribute('data-produced-path');
+    expect(path.basename(deliveredPath!)).toBe(selectedName);
+    const relative = path.relative(modelOrkas.root, deliveredPath!);
+    expect(relative.startsWith('..') || path.isAbsolute(relative)).toBe(false);
+    expect(readFileSync(deliveredPath!, 'utf8')).toBe('Script result');
+    expect(readFileSync(path.join(path.dirname(deliveredPath!), supportingName), 'utf8')).toBe('Working notes');
+  });
+
   test('stopping a task closes its pending permission dialog without executing the command', async ({ modelOrkas }) => {
     const protectedPath = modelOrkas.createWorkspaceFile(
       'approval-stop/protected.txt',
@@ -1032,14 +1146,9 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(dialog).toContainText('protected.txt', { timeout: 20_000 });
     expect(existsSync(protectedPath)).toBe(true);
 
-    // The modal intentionally owns pointer input. Invoke the same main-process
-    // abort boundary used by the Stop control so this exercises cancellation
-    // while the renderer is blocked on an approval decision.
-    const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
-    expect(conversationId).toBeTruthy();
-    await page.evaluate(async (cid) => {
-      await (window as any).orkas.invoke('groupChat.abort', { cid });
-    }, conversationId);
+    // The modal owns pointer input. Trigger the composer control's real
+    // handler while its turn is blocked on the approval decision.
+    await page.evaluate(() => document.getElementById('chat-send-btn')?.click());
     await expect(dialog).toHaveCount(0);
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
     expect(existsSync(protectedPath)).toBe(true);

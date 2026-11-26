@@ -25,25 +25,104 @@ import { findCatalogEntry } from './catalog';
 import { isConnectorActionBlocked } from './action_policy';
 import { isConnectorUsable } from './types';
 import type { ConnectorInstance, ToolSchema } from './types';
+import type { ToolResult, ToolResultImage } from '#core-agent';
 
-/** Convert MCP `callTool`'s raw result into a single string the LLM can read.
- *  MCP result shape: `{ content: [{type, text|data, …}], isError? }`. Text parts are flattened;
- *  anything else is JSON-serialised so the LLM still sees structure. Image / resource parts are
- *  dropped (no multimodal in tool results yet — see plan §10 in connectors.md). */
+/** Preserve protocol receipts alongside the human-readable description. */
 export function stringifyMcpResult(raw: unknown): string {
   if (raw == null) return '';
   if (typeof raw === 'string') return raw;
   if (typeof raw === 'object') {
-    const obj = raw as { content?: Array<{ type?: string; text?: string }> };
+    const obj = raw as { content?: Array<{ type?: string; text?: string }>; structuredContent?: unknown };
     if (Array.isArray(obj.content)) {
       const textParts = obj.content
         .filter((p) => p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string')
         .map((p) => p.text as string);
-      if (textParts.length) return textParts.join('\n');
+      if (textParts.length) {
+        if (obj.structuredContent !== undefined) {
+          try { textParts.push(JSON.stringify({ structuredContent: obj.structuredContent })); }
+          catch { /* Non-serializable inputs cannot carry a protocol receipt. */ }
+        }
+        return textParts.join('\n');
+      }
     }
     try { return JSON.stringify(raw); } catch { return String(raw); }
   }
   return String(raw);
+}
+
+const MAX_CONNECTOR_IMAGE_COUNT = 4;
+const MAX_CONNECTOR_IMAGE_BYTES = 5 * 1024 * 1024;
+const CONNECTOR_IMAGE_SIGNATURES: Record<string, (bytes: Buffer) => boolean> = {
+  'image/png': bytes => bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
+  'image/jpeg': bytes => bytes.subarray(0, 3).equals(Buffer.from([255, 216, 255])),
+  'image/gif': bytes => /^(GIF87a|GIF89a)$/.test(bytes.toString('ascii', 0, 6)),
+  'image/webp': bytes => bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP',
+};
+
+type McpContentPart = {
+  type?: string;
+  mimeType?: unknown;
+  data?: unknown;
+  annotations?: { audience?: unknown };
+};
+
+function isMcpImage(part: McpContentPart | null): part is McpContentPart {
+  return part?.type === 'image';
+}
+
+/** MCP images use the existing ToolResult transport, including program previews. */
+export function formatNativeMcpResult(
+  raw: unknown,
+  legacyProgramByteLimit = 0,
+): Pick<ToolResult, 'content' | 'images'> {
+  const envelope = raw && typeof raw === 'object' ? raw as { content?: Array<McpContentPart | null> } : undefined;
+  if (!Array.isArray(envelope?.content) || !envelope.content.some(isMcpImage)) {
+    return { content: stringifyMcpResult(raw) };
+  }
+
+  let bytesLeft = MAX_CONNECTOR_IMAGE_BYTES;
+  let omitted = 0;
+  const images: ToolResultImage[] = [];
+  const blocks = envelope.content.filter(part => {
+    if (!isMcpImage(part)) return true;
+    const { data, annotations } = part;
+    const mimeType = typeof part.mimeType === 'string' ? part.mimeType.toLowerCase() : '';
+    const check = Object.hasOwn(CONNECTOR_IMAGE_SIGNATURES, mimeType)
+      ? CONNECTOR_IMAGE_SIGNATURES[mimeType] : undefined;
+    const audience = annotations?.audience;
+    if (check && (!Array.isArray(audience) || audience.includes('assistant')) && typeof data === 'string'
+      && data.length <= 4 * Math.ceil(bytesLeft / 3) && images.length < MAX_CONNECTOR_IMAGE_COUNT) {
+      const bytes = Buffer.from(data, 'base64');
+      if (bytes.length <= bytesLeft && check(bytes) && bytes.toString('base64') === data) {
+        bytesLeft -= bytes.length;
+        images.push({ data, mediaType: mimeType });
+        return false;
+      }
+    }
+    omitted++;
+    return false;
+  });
+  const content = blocks.length || 'structuredContent' in envelope
+    ? stringifyMcpResult({ ...envelope, content: blocks })
+    : images.length ? `Connector returned ${images.length} image(s).` : '';
+  if (legacyProgramByteLimit && images.length && !omitted && !blocks.length) {
+    // Existing scripts can decode a pure image receipt. Keep that copy only
+    // when it fits beside the preview under the existing child result limit.
+    const encodedBytes = images.reduce((bytes, image) => bytes + image.data.length, 0);
+    const imageBytes = images.reduce((bytes, image, index) => bytes + (index ? 1 : 0)
+      + Buffer.byteLength(JSON.stringify({ ...image, data: '' })), 2 + encodedBytes);
+    // Skip serializing a duplicate payload that already exceeds the limit
+    // before envelope overhead.
+    if (encodedBytes + imageBytes <= legacyProgramByteLimit) {
+      const legacy = stringifyMcpResult(raw);
+      if (Buffer.byteLength(legacy) + imageBytes <= legacyProgramByteLimit) {
+        return { content: legacy, images };
+      }
+    }
+    return { content: [content, 'Connector images are attached to the model result. The legacy inline copy exceeds the program result limit.'].join('\n'), images };
+  }
+  const notice = omitted ? `Connector images omitted due to format, size, or audience limits: ${omitted}.` : '';
+  return { content: [content, notice].filter(Boolean).join('\n'), ...(images.length ? { images } : {}) };
 }
 
 /** Resolve the connectors visible to a given actor + the tool subset each one exposes.

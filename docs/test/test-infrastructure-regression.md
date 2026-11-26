@@ -110,3 +110,7 @@ records no URLs, profiles or environment values. Use the raw native failure and
 resource samples to diagnose a recurrence; a successful retry does not establish
 its cause.
 
+
+### E2E attempt retention
+
+Normal E2E runs retain separate first-attempt success, retry recovery, final failure, skipped and unstarted outcomes in `attempt-summary.json` under a unique output directory. Recovered attempts do not become reusable checkpoints. The owning cases are `test/main/quality/e2e-attempt-reporter.test.ts`, `test/main/e2e-runner.test.ts` and `test/main/quality/test-runner-checkpoint.test.ts`.

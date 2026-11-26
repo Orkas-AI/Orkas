@@ -53,7 +53,7 @@ function fixture(kind: 'python' | 'e2e') {
   write('package.json', '{}');
   for (const name of fs.readdirSync(path.join(pcRoot, 'scripts'))) {
     if (['test-checkpoint.mjs', 'test-stderr-receipt.mjs', 'test-runtime-env.mjs', 'model-eval-log-policy.mjs',
-      'run-python-tests.mjs', 'run-e2e.cjs', 'runner-checkpoint.mjs', 'pytest_checkpoint.py', 'checkpoint-reporter.ts'].includes(name)) {
+      'run-python-tests.mjs', 'run-e2e.cjs', 'runner-checkpoint.mjs', 'pytest_checkpoint.py', 'checkpoint-reporter.ts', 'e2e-attempt-reporter.ts'].includes(name)) {
       write(`scripts/${name}`, fs.readFileSync(path.join(pcRoot, 'scripts', name), 'utf8'));
     }
   }
@@ -410,3 +410,19 @@ it('keeps a completed tool receipt without a terminal turn in the real interrupt
   expect(records.filter(row => row.method === 'turn/completed')).toEqual([]);
   expect(records.filter(row => row.method === 'item/agentMessage/delta')).toEqual([]);
 });
+
+it('records first-attempt failure and retry recovery without certifying a recovered checkpoint for reuse', () => {
+  const f = fixture('e2e');
+  f.write('playwright.config.ts', `export default { testDir: './test/e2e', workers: 1, retries: 1, reporter: 'list' };`);
+  const result = f.run();
+  expect(result.status, result.stdout + result.stderr).toBe(1);
+  const base = path.join(f.pc, 'test-results/checkpoints', path.dirname(f.stateFile()));
+  const reports = fs.readdirSync(base, { recursive: true }).map(String)
+    .filter(file => /^batch-\d+\.json$/.test(path.basename(file)))
+    .map(file => JSON.parse(fs.readFileSync(path.join(base, file), 'utf8')));
+  const recovered = reports.find(report => report.attemptSummary?.retryRecovered === 1);
+  expect(recovered).toBeDefined();
+  expect(recovered.attemptSummary).toMatchObject({ firstAttemptPassed: 0, retryRecovered: 1, finalFailed: 0 });
+  expect(recovered.attemptSummary.cases[0].attempts.map((row: any) => row.status)).toEqual(['failed', 'passed']);
+  expect(recovered.files[0].state).toBe('failed');
+}, 30_000);

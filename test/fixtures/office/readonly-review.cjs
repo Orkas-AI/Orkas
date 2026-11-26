@@ -99,6 +99,36 @@ function fourSheetWorkbook() {
     names.slice(1).map((_, index) => `<Override PartName="/xl/worksheets/sheet${index + 2}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('') + '</Types>')));
   return zip.toBuffer();
 }
+async function layeredContrastDeck(file) {
+  const title = { x: '2in', y: '2in', width: '4in', height: '1in', fill: 'none', size: '28pt', color: '#101010', text: 'Fixture Title' };
+  const backing = { x: '1in', y: '1in', width: '6in', height: '3in', fill: '#F5C14E' };
+  const scenes = [
+    [backing, title],
+    [title],
+    [{ ...backing, x: '8in', width: '2in' }, title],
+    [{ ...backing, opacity: '50' }, title],
+    [{ ...backing, width: '3in' }, title],
+    [title, backing],
+  ];
+  const batch = scenes.flatMap((shapes, index) => [
+    { command: 'add', parent: '/', type: 'slide', props: { layout: 'blank', background: '#101010' } },
+    ...shapes.map(props => ({ command: 'add', parent: '/slide[' + (index + 1) + ']', type: 'shape', props: { geometry: 'rect', ...props } })),
+  ]);
+  try {
+    const created = await engine.runOfficeCli(['create', file, '--locale', 'en-US'], { cwd: root });
+    assert.equal(created.code, 0, created.stdout);
+    assert.equal(created.stderr, '');
+    const result = await engine.runOfficeCli(['batch', file, '--json'], { cwd: root, stdin: JSON.stringify(batch) });
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(result.stderr, '');
+    assert.equal(JSON.parse(result.stdout).success, true, result.stdout);
+  } finally {
+    const closed = await engine.runOfficeCli(['close', file], { cwd: root });
+    assert.equal(closed.code, 0, closed.stdout);
+    assert.equal(closed.stderr, '');
+  }
+  return fs.readFileSync(file);
+}
 function checkReceipt(result, bytes) {
   const block = result.content.match(/<office-check>\n([\s\S]*?)\n<\/office-check>/);
   const receipt = JSON.parse(block ? block[1] : result.content);
@@ -146,7 +176,8 @@ app.whenReady().then(async () => {
     assert.deepEqual(consoleProbe.browserLogs, [{ level: 'warning', message: 'Office console capture probe' }]);
   } finally { probeWindow.destroy(); active = undefined; }
   const rows = [];
-  const scenarioIds = ['combined-review', 'partial-page-retry', 'cancel-after-check', 'invalid-document', 'edit-then-review', 'xlsx-render', 'pptx-render', 'edit-10-paragraphs', 'edit-1000-paragraphs', 'create-centered-footer', 'read-notes-foot', 'read-notes-end', 'read-notes-both', 'read-notes-none', 'read-notes-many', 'creation-recovery-pptx', 'ppt-crop-percentages', 'ppt-parameter-recovery', 'saved-before-record-docx', 'saved-before-record-xlsx', 'saved-before-record-pptx', 'ppt-native-production', 'ppt-native-recovery', 'ppt-unit-contract', 'ppt-native-append'];
+  const scenarioIds = ['combined-review', 'partial-page-retry', 'cancel-after-check', 'invalid-document', 'edit-then-review', 'xlsx-render', 'pptx-render', 'edit-10-paragraphs', 'edit-1000-paragraphs', 'create-centered-footer', 'read-notes-foot', 'read-notes-end', 'read-notes-both', 'read-notes-none', 'read-notes-many', 'creation-recovery-pptx', 'ppt-crop-percentages', 'ppt-parameter-recovery', 'saved-before-record-docx', 'saved-before-record-xlsx', 'saved-before-record-pptx', 'ppt-native-production', 'ppt-native-recovery', 'ppt-unit-contract', 'ppt-native-append', 'create-docx-heading-outline'];
+  scenarioIds.push('read-tables', 'ppt-image-format-preflight', 'ppt-layered-contrast');
   const selectedCases = process.argv[4] === undefined ? scenarioIds : JSON.parse(process.argv[4]);
   assert(Array.isArray(selectedCases) && selectedCases.length > 0
     && new Set(selectedCases).size === selectedCases.length
@@ -154,7 +185,7 @@ app.whenReady().then(async () => {
   for (const id of selectedCases) {
     const row = { id, logs: [], browserLogs: [], commands: [], renderErrors: [] };
     active = row;
-    const format = id === 'xlsx-render' ? 'xlsx' : id === 'pptx-render' ? 'pptx' : 'docx';
+    const format = id === 'xlsx-render' ? 'xlsx' : ['pptx-render', 'ppt-layered-contrast'].includes(id) ? 'pptx' : 'docx';
     const file = path.join(root, `${id}.${format}`);
     // Use a populated worksheet: a single short cell has fewer painted dark
     // pixels than the document-oriented nonblank image oracle below.
@@ -162,17 +193,44 @@ app.whenReady().then(async () => {
       id === 'read-notes-both' || id === 'read-notes-many' ? ['footnote', 'endnote']
         : id === 'read-notes-foot' ? ['footnote'] : id === 'read-notes-end' ? ['endnote'] : [], id === 'read-notes-many' ? 80 : 1,
     ) : format === 'xlsx' ? fourSheetWorkbook()
-      : format === 'pptx' ? makeMinimalPptx({ slides: [['Review fixture content']], placed: true }) : foreignDocxBytes(true);
+      : id === 'ppt-layered-contrast' ? await layeredContrastDeck(file)
+        : format === 'pptx' ? makeMinimalPptx({ slides: [['Review fixture content']], placed: true }) : foreignDocxBytes(true);
     if (id === 'invalid-document') {
       const zip = new AdmZip(original);
       zip.updateFile('word/document.xml', Buffer.from(zip.readAsText('word/document.xml').replace('<w:body>', '<w:body><w:invalidElement/>')));
+      fs.writeFileSync(file, zip.toBuffer());
+    } else if (id === 'read-tables') {
+      const zip = new AdmZip(original);
+      const table = '<w:tbl><w:tblPr><w:tblW w:w="4800" w:type="dxa"/></w:tblPr>'
+        + '<w:tblGrid><w:gridCol w:w="4800"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4800" w:type="dxa"/></w:tcPr>'
+        + '<w:p><w:r><w:t>TABLE_EVIDENCE_726</w:t></w:r></w:p></w:tc></w:tr></w:tbl>';
+      zip.updateFile('word/document.xml', Buffer.from(zip.readAsText('word/document.xml')
+        .replace('<w:sectPr>', table + '<w:sectPr>')));
       fs.writeFileSync(file, zip.toBuffer());
     } else fs.writeFileSync(file, original);
     const before = fs.readFileSync(file);
     const mtime = fs.statSync(file, { bigint: true }).mtimeNs;
     const writtenBefore = written.length;
     try {
-      if (id === 'ppt-native-append') {
+      if (id === 'ppt-layered-contrast') {
+        const result = await review.execute({ action: 'check_and_render', path: file, pages: ['1', '4'] }, context);
+        assert(!result.isError, result.content);
+        const receipt = checkReceipt(result, before);
+        assert.deepEqual(receipt.issue_severity_counts, { blocker: 2, warning: 4, info: 0, unknown: 0 });
+        const issues = receipt.issues.data.issues;
+        assert(issues.some(issue => /hidden behind overlapping shape/.test(issue.message)), 'preserve the native occlusion warning');
+        const contrastIssues = issues.filter(issue => issue.subtype === 'low_contrast' || issue.subtype === 'contrast_needs_visual_review')
+          .map(({ path, subtype, severity, contrast_ratio }) => ({ slide: path.split('/')[1], subtype, severity, contrast_ratio }));
+        assert.deepEqual(contrastIssues, [
+          ...[2, 3].map(page => ({ slide: `slide[${page}]`, subtype: 'low_contrast', severity: 'blocker', contrast_ratio: 1 })),
+          ...[4, 5, 6].map(page => ({ slide: `slide[${page}]`, subtype: 'contrast_needs_visual_review', severity: 'warning', contrast_ratio: undefined })),
+        ]);
+        assert.equal(receipt.structural_review_status, 'blockers_found');
+        assert.equal(result.images.length, 2);
+        result.images.forEach(checkImage);
+        assert.notEqual(hash(Buffer.from(result.images[0].data, 'base64')), hash(Buffer.from(result.images[1].data, 'base64')));
+        assert.deepEqual(row.commands.filter(({ verb }) => verb === 'get').map(({ target }) => target), ['/']);
+      } else if (id === 'ppt-native-append') {
         const target = path.join(root, 'placeholder-source.pptx');
         const outputPath = path.join(root, 'placeholder-output.pptx');
         const create = tools.find(tool => tool.name === 'create_pptx');
@@ -191,6 +249,7 @@ app.whenReady().then(async () => {
         assert.match(styled, /sz="2800"/);
         assert.match(styled, /cx="10058400" cy="548640"/);
         const sourceCheck = await review.execute({ action: 'check', path: target }, context);
+        assert(!sourceCheck.isError, sourceCheck.content);
         const receipt = JSON.parse(sourceCheck.content);
         assert.equal(receipt.valid, true);
         const issues = receipt.issues.data.issues;
@@ -330,6 +389,42 @@ app.whenReady().then(async () => {
         checked.images.forEach(checkImage);
         assert.deepEqual(fs.readFileSync(target), bytes, 'review must preserve the created deck');
         row.measurement = { nativeGraphs: 2, editable: true, renderedPages: 2, recovery };
+        await noResident(target);
+      } else if (id === 'create-docx-heading-outline') {
+        const target = path.join(root, 'handbook.docx');
+        const create = tools.find(tool => tool.name === 'create_docx');
+        const input = {
+          path: target, title: 'Welcome handbook', locale: 'en-US', preview: false,
+          paragraphs: [
+            { text: 'Arrival', style: 'Heading2' },
+            { text: 'Bring your badge.', style: 'Normal' },
+            { text: 'Questions', style: 'Heading2' },
+            { text: 'Contact details', style: 'Heading9' },
+          ],
+        };
+        const created = await create.execute(input, context);
+        assert(!created.isError, created.content);
+        assert.deepEqual(written.slice(writtenBefore), [target]);
+        const bytes = fs.readFileSync(target);
+        const zip = new AdmZip(bytes);
+        const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
+        const styleList = parser.parse(zip.readAsText('word/styles.xml')).styles.style;
+        const styles = Array.isArray(styleList) ? styleList : [styleList];
+        const headings = styles.filter(style => /^Heading[1-9]$/.test(style['@_styleId']));
+        assert.deepEqual(headings.map(style => [
+          style['@_styleId'], style['@_type'], style.pPr?.outlineLvl?.['@_val'],
+        ]), [['Heading1', 'paragraph', '0'], ['Heading2', 'paragraph', '1'], ['Heading9', 'paragraph', '8']]);
+        const body = parser.parse(zip.readAsText('word/document.xml')).document.body;
+        assert.deepEqual(body.p.map(paragraph => [
+          paragraph.pPr?.pStyle?.['@_val'], paragraph.r.t['#text'] ?? paragraph.r.t,
+        ]), [
+          ['Heading1', 'Welcome handbook'], ['Heading2', 'Arrival'], ['Normal', 'Bring your badge.'],
+          ['Heading2', 'Questions'], ['Heading9', 'Contact details'],
+        ]);
+        const checked = await review.execute({ path: target, action: 'check' }, context);
+        assert(!checked.isError, checked.content);
+        assert.equal(checkReceipt(checked, bytes).valid, true);
+        assert.deepEqual(fs.readFileSync(target), bytes, 'native review must preserve the generated bytes');
         await noResident(target);
       } else if (id.startsWith('saved-before-record-')) {
         const format = id.slice('saved-before-record-'.length);
@@ -500,6 +595,48 @@ app.whenReady().then(async () => {
         assert.equal(fs.existsSync(target), false);
         assert.equal(row.commands.length, commands, 'deleted successful file must not dispatch another native create');
         assert.deepEqual(written.slice(writtenBefore), [target]);
+      } else if (id === 'ppt-image-format-preflight') {
+        const target = path.join(root, 'same-output.pptx');
+        const pixels = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+        const wrong = path.join(root, 'sample.jpg');
+        const correct = path.join(root, 'sample.png');
+        fs.writeFileSync(wrong, pixels);
+        fs.writeFileSync(correct, pixels);
+        const create = tools.find(tool => tool.name === 'create_pptx');
+        const createWith = src => create.execute({ path: target, preview: false,
+          slides: [{ title: 'Image format fixture', images: [{ src }] }] }, context);
+        const commandsBefore = row.commands.length;
+        const rejected = await createWith(wrong);
+        assert.equal(rejected.isError, true);
+        assert.match(rejected.content, /E_OFFICE_IMAGE/);
+        assert.equal(row.commands.length, commandsBefore);
+        assert.equal(fs.existsSync(target), false);
+        assert.equal(written.length, writtenBefore);
+        const result = await createWith(correct);
+        assert(!result.isError, result.content);
+        const deck = new AdmZip(fs.readFileSync(target));
+        const embedded = deck.getEntries().filter(entry => entry.entryName.startsWith('ppt/media/') && !entry.isDirectory);
+        assert.equal(embedded.length, 1);
+        assert.deepEqual(embedded[0].getData(), pixels);
+        assert.deepEqual(written.slice(writtenBefore), [target]);
+        await noResident(target);
+      } else if (id === 'read-tables') {
+        const read = tools.find(tool => tool.name === 'office_read');
+        const initial = await read.execute({ path: file }, context);
+        assert(!initial.isError, initial.content);
+        const result = JSON.parse(initial.content);
+        assert.equal(result.status, 'partial');
+        assert.deepEqual(result.unread_sections, ['/body']);
+        const body = result.sections.find(section => section.target === '/body');
+        assert.equal(body.status, 'partial');
+        assert(body.content.includes('Stable text 123'));
+        assert(!body.content.includes('TABLE_EVIDENCE_726'));
+        assert.deepEqual(body.unread_table_paths, ['/body/tbl[1]']);
+        const targeted = await read.execute({ path: file, mode: 'get',
+          targets: [body.unread_table_paths[0] + '/tr[1]/tc[1]/p[1]'] }, context);
+        assert(!targeted.isError, targeted.content);
+        assert(targeted.content.includes('TABLE_EVIDENCE_726'));
+        await noResident(file);
       } else if (id.startsWith('read-notes-')) {
         const checked = await review.execute({ action: 'check', path: file }, context);
         assert(!checked.isError, checked.content);
@@ -684,7 +821,7 @@ app.whenReady().then(async () => {
         }
       }
       preserved(file, before, mtime);
-      if (id !== 'edit-then-review' && id !== 'create-centered-footer' && id !== 'creation-recovery-pptx'
+      if (id !== 'edit-then-review' && id !== 'create-centered-footer' && id !== 'create-docx-heading-outline' && id !== 'creation-recovery-pptx' && id !== 'ppt-image-format-preflight'
         && !id.startsWith('ppt-native-') && id !== 'ppt-unit-contract' && id !== 'ppt-crop-percentages' && id !== 'ppt-parameter-recovery' && !id.startsWith('saved-before-record-') && !id.endsWith('-paragraphs')) assert.equal(written.length, writtenBefore, 'review must not register a write');
       await noResident(file);
       assert.equal(BrowserWindow.getAllWindows().length, 0, 'review must release its preview windows');

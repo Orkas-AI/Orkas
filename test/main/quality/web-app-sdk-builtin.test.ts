@@ -152,4 +152,14 @@ describe('Web app authoring package', () => {
       expect(JSON.parse(fs.readFileSync(path.join(isolated, target), 'utf8'))).toEqual(catalogDocument());
     } finally { fs.rmSync(temporary, {recursive:true, force:true}); }
   });
+  // 2026-11-19: local.md said task/Agent execution had no adapter while the
+  // generated contract supports tasks.*. The contract is the oracle.
+  it('does not list supported app tasks among the local families without an adapter', () => {
+    const contract = JSON.parse(fs.readFileSync(path.join(skill, 'references/api.json'), 'utf8'));
+    expect(contract.methods.some((method: any) => method.capability === 'tasks' && method.status === 'supported')).toBe(true);
+    const text = fs.readFileSync(path.join(skill, 'references/local.md'), 'utf8').replace(/\s+/g, ' ');
+    const listed = /Read `unsupported` in the reference[^.]*\.([^.]*have no v1 adapter)/.exec(text)?.[1];
+    expect(listed).toBeTruthy();
+    expect(listed!.replace(/\([^)]*\)/g, '')).not.toMatch(/\btasks?\b|\bAgent execution/i);
+  });
 });

@@ -1406,6 +1406,46 @@ describe('global request attribution', () => {
 });
 
 describe('shell approval key facts and queued grants', () => {
+  it('counts an unresolved approval at receipt, presentation, and verdict with only closed diagnostics', async () => {
+    const h = loadHarness({ choice: 'allow_once' });
+    h.pushHandler({
+      request_id: 'private-request', cid: 'private-conversation', agent_id: 'private-agent-id',
+      agent_name: 'private-agent-name', command: 'PRIVATE=secret-private-command',
+      reasons: [], unresolved_paths: true, working_directory: '/private-working-directory',
+      key_facts: [{ kind: 'write', operation: 'redirection', target: '/private-output-file', detail: 'private-expression' }],
+      path_diagnostics: { operation: 'output_redirect', cause: 'assignment_expansion', count: 2, path: '/private-extra' },
+    });
+    await flush();
+    const events = h.monitorEvent.mock.calls.filter(([name]) => name.startsWith('bash_risk_prompt_'));
+    expect(events.map(([name]) => name)).toEqual([
+      'bash_risk_prompt_requested', 'bash_risk_prompt_presented', 'bash_risk_prompt_result',
+    ]);
+    for (const [, data] of events) expect(data).toMatchObject({
+      has_unresolved_path: true, unresolved_path_operation: 'output_redirect',
+      unresolved_path_cause: 'assignment_expansion', unresolved_path_count: 2,
+    });
+    expect(events[2][1]).toMatchObject({ result: 'success', effective_decision: 'allow_once' });
+    expect(JSON.stringify(events)).not.toContain('private-');
+  });
+
+  it('falls back to safe categories for malformed or missing analysis and counts a queued cancellation only as a result', async () => {
+    const h = loadHarness('pending');
+    h.pushHandler({ request_id: 'ordinary', reasons: ['destructive'] });
+    h.pushHandler({ request_id: 'queued', unresolved_paths: true, reasons: [],
+      path_diagnostics: { operation: '/private-operation', cause: 'private-expression', count: 100000 } });
+    await flush();
+    h.cancelHandler({ request_ids: ['queued'] });
+    await flush();
+    const unresolved = h.monitorEvent.mock.calls.filter(([, data]) => data.has_unresolved_path === true);
+    expect(unresolved.map(([name]) => name)).toEqual(['bash_risk_prompt_requested', 'bash_risk_prompt_result']);
+    expect(unresolved[1][1]).toMatchObject({ result: 'cancelled', unresolved_path_operation: 'unknown',
+      unresolved_path_cause: 'unknown', unresolved_path_count: 100 });
+    expect(JSON.stringify(unresolved)).not.toContain('private-');
+    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_presented', expect.objectContaining({ has_unresolved_path: false }));
+    h.cancelHandler({ request_ids: ['ordinary'] });
+    await flush();
+  });
+
   it('shows the uncertain write, expression and folder ahead of the collapsed command preview', async () => {
     const h = loadHarness('pending', undefined, { locale: 'zh' });
     h.pushHandler({

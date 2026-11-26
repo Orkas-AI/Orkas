@@ -157,14 +157,14 @@ it.each([
   });
 it('uses complete model names in the catalog and picker without changing option identities', () => {
     const expected = [
-      ['doubao', 'Doubao Seedance 2.5', 'Doubao Seedance 2.5 Flash', 'Doubao Seedance 2.0', 'Doubao Seedance 2.0 Fast', 'Doubao Seedance 2.0 Mini'],
+      ['doubao', 'Seedance 2.5', 'Seedance 2.5 Flash', 'Doubao Seedance 2.0', 'Doubao Seedance 2.0 Fast', 'Doubao Seedance 2.0 Mini'],
       ['minimax', 'MiniMax H3', 'MiniMax H3 Highspeed', 'MiniMax H3 Lite', 'MiniMax H3 Max'],
       ['vidu', 'Vidu Q3 Pro', 'Vidu Q3 Turbo'],
       ['kling', 'Kling 4.0', 'Kling 4.0 Flash'],
-      ['google', 'Google Gemini Omni 1.1 Flash'],
+      ['google', 'Gemini Omni 1.1 Flash'],
       ['google-cloud', 'Google Cloud Veo 3.1', 'Google Cloud Veo 3.1 Fast', 'Google Cloud Veo 3.1 Lite'],
       ['runway', 'Runway Gen-4.5'],
-      ['aliyun', 'Alibaba Cloud Wan 3.0', 'Alibaba Cloud Wan 3.0 Prime'],
+      ['aliyun', 'Wan 3.0', 'Wan 3.0 Prime'],
     ];
     const options = flattenVideoProviderOptions(listVideoProviderOptions());
     expect(options.filter(option => option.provider !== 'orkas-api')).toHaveLength(20);

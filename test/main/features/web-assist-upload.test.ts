@@ -14,7 +14,7 @@ vi.mock('../../../src/main/util/project-layout', () => ({
 }));
 vi.mock('../../../src/main/features/user_workspace', () => ({ getWorkspacePath: (uid: string, pid: string) => path.join(root, 'workspace', uid, pid) }));
 vi.mock('../../../src/main/features/group_chat/conv_workspace', () => ({ readConversationAuthoringDir: async () => path.join(root, 'authoring') }));
-import { loadWebAssistUploadFiles } from '../../../src/main/features/web_assist_upload';
+import { loadWebAssistUploadFiles, verifyWebAssistDirectoryFiles } from '../../../src/main/features/web_assist_upload';
 afterAll(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(external, { recursive: true, force: true }); });
 function write(relative: string, content = 'exact upload\n中文\0', base = root) {
   const filename = path.join(base, relative); fs.mkdirSync(path.dirname(filename), { recursive: true }); fs.writeFileSync(filename, content); return filename;
@@ -44,6 +44,20 @@ describe('native browser upload authorization', () => {
     expect(await loadWebAssistUploadFiles('u1', 'c1', [dir])).toEqual([{ path: fs.realpathSync.native(dir), name: 'tree', directory: true }]);
     fs.symlinkSync(write('foreign/private.txt'), path.join(dir, 'escape'));
     await expect(loadWebAssistUploadFiles('u1', 'c1', [dir])).rejects.toThrow('upload_outside_task');
+  });
+  it('validates only regular files from the selected directory for the receiving frame', async () => {
+    const leaf = write('attachments/u1/c1/chosen/nested/report.txt');
+    const sibling = write('attachments/u1/c1/chosen-other/private.txt');
+    const foreign = write('attachments/u1/c2/private.txt');
+    const directory = path.dirname(path.dirname(leaf));
+    const signal = new AbortController().signal;
+    const verify = (files: string[]) => verifyWebAssistDirectoryFiles('u1', 'c1', directory, files, signal);
+    await expect(verify([leaf])).resolves.toBeUndefined();
+    await expect(verify([leaf, sibling])).rejects.toThrow('upload_outside_task');
+    await expect(verify([path.dirname(leaf)])).rejects.toThrow('upload_file_type');
+    const link = path.join(directory, 'outside.txt');
+    fs.symlinkSync(foreign, link);
+    await expect(verify([leaf, link])).rejects.toThrow('upload_outside_task');
   });
   it('rejects foreign tasks, accounts, projects and relative paths', async () => {
     for (const candidate of [write('attachments/u1/c2/foreign.txt'), write('attachments/u2/c1/foreign.txt'), write('workspace/u1/project-other/foreign.txt'), '../relative.txt']) {

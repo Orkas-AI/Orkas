@@ -250,7 +250,8 @@ describe('stop and settlement wiring', () => {
       _stopRuntimeActorRecovery: vi.fn(),
       _stopGroupEventObserver: vi.fn(),
       setGroupConversationBusy: vi.fn(),
-      apiFetch: vi.fn(() => ({ catch: () => ({ finally: () => {} }) })),
+      apiFetch: vi.fn(async () => ({})),
+      _cancelChatSendPreflight: vi.fn(),
       _refreshTaskSurfacesAfterAbort: vi.fn(),
       _beginTaskSurfaceAbortRefresh: vi.fn(() => ({ settled: false })),
       _updateConvSidebarBadge: vi.fn(),
@@ -276,8 +277,19 @@ describe('stop and settlement wiring', () => {
     expect(runAbort({}).restore).not.toHaveBeenCalled();
   });
 
-  it.each([true, false])('expires questions only for the stopped conversation after streams detach (tracked=%s)', tracked => {
+  it.each([true, false])('leaves the stream and question state to the task lifecycle on a user stop (tracked=%s)', tracked => {
     const { context } = runAbort({ userInitiated: true }, tracked);
+    expect(context._latestActiveTurns.get('conv-a')).toEqual([{ actor: 'cli-a', turn_id: 'old-turn', steerable: true }]);
+    expect(context.window.CliAsyncInput.setActiveTurns).not.toHaveBeenCalled();
+    expect(context._stopGroupEventObserver).not.toHaveBeenCalled();
+    expect(context._cancelChatSendPreflight).toHaveBeenCalledExactlyOnceWith('conv-a');
+    expect(context.apiFetch).toHaveBeenCalledExactlyOnceWith('/api/conversations/conv-a/abort', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"keep_queue":true}',
+    });
+  });
+
+  it.each([true, false])('expires questions only for the torn-down conversation (tracked=%s)', tracked => {
+    const { context } = runAbort({}, tracked);
     expect(context._latestActiveTurns.get('conv-a')).toEqual([]);
     expect(context._latestActiveTurns.get('conv-other')).toEqual([
       { actor: 'cli-b', turn_id: 'other-turn', steerable: true },
@@ -355,6 +367,7 @@ function loadAbortTaskSurfaceLifecycle() {
     _groupPlaceholders: new Map(), _recipientByCid: {},
     _saveRecipientMap: vi.fn(), setGroupConversationBusy: vi.fn(),
     _stopRuntimeActorRecovery: vi.fn(), _stopGroupEventObserver: vi.fn(),
+    _cancelChatSendPreflight: vi.fn(),
     _restoreSentComposerSnapshot: vi.fn(), _updateConvSidebarBadge: vi.fn(),
     _updateConvSendUI: vi.fn(), stopPolling: vi.fn(),
     document: { getElementById: () => null },

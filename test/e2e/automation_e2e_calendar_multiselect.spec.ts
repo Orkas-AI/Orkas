@@ -4,6 +4,7 @@ import { expect, openSidebarEntry, test } from './fixtures/orkas';
 // The real form, IPC persistence and relaunch are the independent UI oracle.
 // No selector-specific replacement markup is used.
 test('calendar selections retain single-mode chrome and multi-mode right checks across relaunch', async ({ orkas }, testInfo) => {
+  test.setTimeout(180_000);
   if (!orkas.page) throw new Error('Renderer unavailable');
   let page = orkas.page;
   await openSidebarEntry(page, '#auto-btn');

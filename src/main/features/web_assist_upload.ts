@@ -9,6 +9,20 @@ import { readConversationAuthoringDir } from './group_chat/conv_workspace';
 
 export interface WebAssistUploadFile { name: string; path: string; directory: boolean }
 
+export async function verifyWebAssistDirectoryFiles(
+  userId: string, conversationId: string, directory: string, files: string[], signal: AbortSignal,
+): Promise<void> {
+  for (const file of files) {
+    if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error('invalid_upload_files');
+    const relative = path.relative(directory, file);
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('upload_outside_task');
+    }
+  }
+  const selected = await loadWebAssistUploadFiles(userId, conversationId, files, signal);
+  if (selected.some(file => file.directory)) throw new Error('upload_file_type');
+}
+
 export async function loadWebAssistUploadFiles(
   userId: string, conversationId: string, paths: unknown, signal?: AbortSignal,
 ): Promise<WebAssistUploadFile[]> {

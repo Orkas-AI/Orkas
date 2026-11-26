@@ -2,7 +2,9 @@
 (function () {
   const defaults = {
     claude: {
-      name: 'ClaudeCode',
+      name: 'Claude-Code',
+      label: 'Claude Code',
+      legacyName: 'ClaudeCode',
       description_zh: '理解和维护项目代码，解答代码问题、开发功能、修复缺陷和审查改动，提供代码修改或分析建议。',
       description_en: 'Understands and maintains project code, answers code questions, develops features, fixes bugs, and reviews changes, providing code changes or analysis and recommendations.',
       isCoding: true,
@@ -32,6 +34,18 @@
       isCoding: false,
     },
   };
+  const codingCliBrands = {
+    kimi: ['Kimi-Code', 'Kimi Code', 'KimiCode'],
+    dsh: ['DeepSeek-Harness', 'DeepSeek Harness', 'DeepSeekHarness'],
+    traecli: ['TraeCode', 'TraeCode'],
+    zcode: ['ZCode', 'ZCode'],
+    copilot: ['GitHub-Copilot', 'GitHub Copilot', 'GitHubCopilot'],
+    cursor: ['Cursor', 'Cursor'],
+    antigravity: ['Antigravity', 'Antigravity'],
+  };
+  for (const [type, [name, label, legacyName]] of Object.entries(codingCliBrands)) {
+    defaults[type] = { ...defaults.codex, name, label, legacyName };
+  }
   if (typeof module !== 'undefined' && module.exports) module.exports = defaults;
   if (typeof window !== 'undefined') window.LOCAL_CLI_DEFAULTS = defaults;
 })();

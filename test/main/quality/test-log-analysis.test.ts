@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createStderrReceipt } from '../../../scripts/test-stderr-receipt.mjs';
+import { reconcileTestFileSelection } from '../../log-analysis-reporter';
 
 // Scenario: a maintainer runs any PC Vitest entry (`npm test`, `npm run
 // test:apps`, `run-tests.mjs suite <files>`). Emitted logs must be attributed
@@ -49,6 +50,40 @@ function runFixtures(files: string[], env: Record<string, string> = {}, args: st
 }
 
 describe('default Vitest log analysis', () => {
+  it('distinguishes an incremental watch rerun from a missing terminal selection', () => {
+    const filters = ['test/a.test.ts', 'test/b.test.ts'];
+    const moduleIds = [path.join(pcRoot, 'test/a.test.ts')];
+    expect(reconcileTestFileSelection(filters, moduleIds, pcRoot)).toEqual({ requested: 2, missing: [1], incremental: false });
+    expect(reconcileTestFileSelection(filters, moduleIds, pcRoot, true)).toEqual({ requested: 2, missing: [], incremental: true });
+  });
+
+  it.each([
+    { name: 'nonexistent', file: 'missing.fixture.ts', args: [] },
+    { name: 'excluded', file: 'phase.fixture.ts', args: ['--exclude', `${fixtureDir}/phase.fixture.ts`] },
+  ])('rejects a $name explicitly requested file even when another selected file passes', ({ file, args }) => {
+    const run = runFixtures(['expected.fixture.ts', file], {}, args);
+    expect(run.cases.size).toBe(4);
+    expect([...run.cases.values()].every(item => item.status === 'passed')).toBe(true);
+    expect(run.status).toBe(1);
+    expect(run.stdout).toContain('[test-selection] FAIL requested file was not discovered');
+    expect(run.batch.selection).toMatchObject({ requested: 2, missing: [1] });
+  }, 120_000);
+
+  it('keeps supported sharding without requiring this shard to execute every requested file', () => {
+    const run = runFixtures(['expected.fixture.ts', 'stateful.fixture.ts'], {}, [
+      '--shard=1/2', '--testNamePattern', 'passes a declared recoverable warning|matches every repeated',
+    ]);
+    expect(run.status).toBe(0);
+    expect(run.batch.selection).toMatchObject({ requested: 2, missing: [] });
+    expect(run.batch.inventory).toHaveLength(1);
+  }, 120_000);
+
+  it('does not mistake an option value for a requested test file', () => {
+    const run = runFixtures(['expected.fixture.ts'], {}, ['--testNamePattern', 'not-a-file.fixture.ts']);
+    expect(run.stdout).not.toContain('[test-selection] FAIL');
+    expect(run.batch.selection).toMatchObject({ requested: 1, missing: [] });
+  }, 120_000);
+
   it('preserves declared Server faults and still rejects independent unexpected faults', () => {
     const run = runFixtures(['server.fixture.ts']);
     expect(run.status).toBe(1); // independent unexpected control
@@ -74,6 +109,24 @@ describe('default Vitest log analysis', () => {
     expect(audit).toMatchObject({ schema: 1, expectedStatus: 'valid', drainTimedOut: false,
       actual: actual.finish(), expected: run.batch.stderr });
     expect(audit.actual.bytes).toBeGreaterThan(audit.expected.bytes);
+  }, 120_000);
+
+  it('accounts for Vitest failure diagnostics while retaining the failed case and native stderr guard', () => {
+    const failed = runFixtures(['unexpected.fixture.ts']);
+    expect(failed.status).toBe(1);
+    expect(failed.cases.get('fails on an unexpected error')?.status).toBe('failed');
+    expect(failed.stderr).toContain('Failed Tests');
+    expect(failed.summary).not.toContain('[test-process-log-analysis] FAIL');
+    const receipt = createStderrReceipt();
+    receipt.ingest(failed.stderr);
+    expect(failed.batch.stderr).toEqual(receipt.finish());
+
+    const mixed = runFixtures(['unexpected.fixture.ts', 'native.fixture.ts']);
+    expect(mixed.status).toBe(1);
+    expect(mixed.stderr).toContain('Failed Tests');
+    expect(mixed.stderr).toContain('fixture-native-private-value');
+    expect(mixed.summary).toContain('[test-process-log-analysis] FAIL');
+    expect(mixed.summary).not.toContain('fixture-native-private-value');
   }, 120_000);
 
   it('rejects a successful invocation whose custom reporter omits the process receipt', () => {

@@ -125,6 +125,8 @@
     square: '<rect x="5" y="5" width="14" height="14" rx="3"></rect>',
     eye: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path><circle cx="12" cy="12" r="2.5"></circle>',
     command: '<path d="M9 9H6.5a3 3 0 1 1 3-3V18a3 3 0 1 1-3-3H18a3 3 0 1 1-3 3V6a3 3 0 1 1 3 3H9z"></path>',
+    shift: '<path d="M12 4 2 13h6v7h8v-7h6z"></path>',
+    enter: '<path d="M20 4v6a5 5 0 0 1-5 5H4m5-5-5 5 5 5"></path>',
     link: '<path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1"></path>',
     'share-2': '<circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"></path>',
     image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"></rect><circle cx="8.5" cy="9" r="1.6"></circle><path d="M5 17l4.4-4.4a1.5 1.5 0 0 1 2.1 0L14 15l2-2a1.5 1.5 0 0 1 2.1 0L20 14.9"></path>',

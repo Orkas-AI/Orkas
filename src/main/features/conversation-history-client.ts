@@ -2,8 +2,10 @@ import { Worker } from 'node:worker_threads';
 import * as path from 'node:path';
 import { WS_ROOT } from '../paths';
 
+export type ProducedPathRecord = { stored: string[]; cited: string[] };
+
 export type HistoryCommand = {
-  kind: 'page' | 'window' | 'window-at-message' | 'project' | 'purge' | 'turns' | 'turn-purge' | 'process-page';
+  kind: 'page' | 'window' | 'window-at-message' | 'project' | 'purge' | 'turns' | 'turn-purge' | 'process-page' | 'produced-paths';
   userId: string;
   sourceFile: string;
   cid?: string;

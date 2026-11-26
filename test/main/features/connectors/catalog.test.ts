@@ -7,6 +7,27 @@ import { readFileSync } from 'node:fs';
 const require = createRequire(import.meta.url);
 
 describe('connector catalog', () => {
+  it('ships the official OpenSEO icon, OAuth endpoint and complete reviewed business tool inventory', async () => {
+    const { findCatalogEntry } = await import('../../../../src/main/features/connectors/catalog');
+    const fixture = JSON.parse(readFileSync(new URL('../../../fixtures/connectors/official-contracts/openseo-20261124.json', import.meta.url), 'utf8'));
+    const entry = findCatalogEntry('openseo');
+    expect(entry).toMatchObject({
+      display_name: 'OpenSEO',
+      icon_asset: 'openseo',
+      icon_source_url: fixture.icon_source,
+      icon_source_sha256: fixture.icon_sha256,
+      category: 'search',
+      auth_mode: 'mcp_dcr',
+      required_oauth_scopes: ['mcp', 'offline_access'],
+      transport_template: { kind: 'streamable-http', url: 'https://app.openseo.so/mcp', oauth_header_key: 'Authorization' },
+    });
+    expect(entry?.allowed_tools?.slice().sort()).toEqual(fixture.tools.slice().sort());
+    expect(Object.keys(entry?.tool_policies || {}).sort()).toEqual(fixture.tools.slice().sort());
+    expect(entry?.usage_metering).toBeUndefined();
+    const png = readFileSync(new URL('../../../../src/renderer/assets/connectors/openseo.png', import.meta.url));
+    expect(createHash('sha256').update(png).digest('hex')).toBe(fixture.icon_sha256);
+  });
+
   it('ships complete ten-locale copy for every built-in card and setup surface', async () => {
     const { CONNECTOR_CATALOG } = await import('../../../../src/main/features/connectors/catalog');
     const missingCopy = (items: unknown[]) => {
@@ -266,8 +287,8 @@ describe('connector catalog', () => {
 
   it('renders every connector icon as visible ink at the card size', async () => {
     const { CONNECTOR_CATALOG } = await import('../../../../src/main/features/connectors/catalog');
-    const visibleInkPixels = async (svg: string) => {
-      const pixels = await sharp(Buffer.from(svg))
+    const visibleInkPixels = async (art: Buffer) => {
+      const pixels = await sharp(art)
         .resize(20, 20, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 0 } })
         .flatten({ background: '#fff' })
         .removeAlpha()
@@ -281,10 +302,13 @@ describe('connector catalog', () => {
     };
 
     const emptyClip = '<svg viewBox="0 0 20 20"><defs><clipPath id="empty"><rect /></clipPath></defs><g clip-path="url(#empty)"><rect width="20" height="20" fill="black" /></g></svg>';
-    expect(await visibleInkPixels(emptyClip)).toBe(0);
+    expect(await visibleInkPixels(Buffer.from(emptyClip))).toBe(0);
     for (const entry of CONNECTOR_CATALOG) {
-      expect(entry.icon_svg, entry.id).toBeTruthy();
-      expect(await visibleInkPixels(entry.icon_svg!), entry.id).toBeGreaterThan(0);
+      const art = entry.icon_asset
+        ? readFileSync(new URL(`../../../../src/renderer/assets/connectors/${entry.icon_asset}.png`, import.meta.url))
+        : Buffer.from(entry.icon_svg || '');
+      expect(art.length, entry.id).toBeGreaterThan(0);
+      expect(await visibleInkPixels(art), entry.id).toBeGreaterThan(0);
     }
   });
 

@@ -23,7 +23,7 @@ MONITOR completion invariant: when an existing baseline is supplied, the run is 
 
 ## Preconditions
 
-- `snapshot`: a `seo-crawl` JSON (optionally pass the run's `--health`/`--geo` scores to record them). `compare`: two snapshot files. Python 3.9+ stdlib only.
+- `snapshot`: a `seo-crawl` JSON (optionally pass the run's `--health`/`--geo` scores to record them). `compare`: two snapshot files.
 
 ## How to call
 

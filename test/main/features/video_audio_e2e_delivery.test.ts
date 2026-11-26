@@ -270,3 +270,49 @@ describe('required sound in the delivered bytes', () => {
     expect(studio.shouldNormalizeLoudness(report, 'draft')).toEqual({ normalize: false, reason: 'loudness analysis unavailable' });
   });
 });
+
+// 2026-11-17 benchmark: an ad's page render (a music bed under a 2 s voice-over, -28 LUFS) was
+// normalized in one loudnorm pass and came out at -18.4 LUFS. Delivery asked for normalization,
+// the Agent ran it on the delivered file, and the render after a price change lost it again.
+// The render's own measurement now drives a second, measured pass that reaches the target.
+describe('a quiet render brought to the delivery loudness', () => {
+  function quietMix(file: string): void {
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'anoisesrc=d=20:c=pink:a=0.03:seed=7',
+      '-f', 'lavfi', '-i', 'sine=f=300:d=2.5,volume=0.35,tremolo=f=5:d=0.8',
+      '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=25:d=20',
+      '-filter_complex', '[1:a]adelay=300|300,apad[v];[0:a][v]amix=inputs=2:duration=first:normalize=0,aformat=channel_layouts=stereo[a]',
+      '-map', '2:v', '-map', '[a]', '-t', '20', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', file,
+    ]);
+  }
+  const deliver = async (root: string, file: string) => shipVideoFile({ productionDirAbs: root, allowedRoots: [root], videoPathAbs: file, expect: { hasAudio: true } });
+
+  it('needs no further normalization at delivery once measured and normalized in place', async () => {
+    const root = makeRoot();
+    const file = path.join(root, 'render.mp4');
+    quietMix(file);
+    const before = await studio.analyzeLoudness(bundledFfmpegPaths().ffmpeg!, file);
+    expect(before.input_i).toBeLessThan(-30);
+    expect(await studio.normalizeAudioInPlace(bundledFfmpegPaths().ffmpeg!, file, undefined, before)).toMatchObject({ skipped: false });
+    const result: any = await deliver(root, file);
+    expect(result.ok).toBe(true);
+    expect(codes(result, 'warnings')).not.toContain('DELIVERY_LOUDNESS_OFF_TARGET');
+    expect(Math.abs(result.version.integrated_lufs + 14)).toBeLessThanOrEqual(2);
+  }, 120_000);
+
+  it('is still off target after one unmeasured pass, as the render was', async () => {
+    const root = makeRoot();
+    const file = path.join(root, 'render.mp4');
+    quietMix(file);
+    await studio.normalizeAudioInPlace(bundledFfmpegPaths().ffmpeg!, file);
+    const result: any = await deliver(root, file);
+    expect(codes(result, 'warnings')).toContain('DELIVERY_LOUDNESS_OFF_TARGET');
+  }, 120_000);
+
+  it('takes the second pass only from a complete measurement', () => {
+    const report = studio.loudnessReportFromJson({ input_i: '-28.25', input_tp: '-6.16', input_lra: '11.00', input_thresh: '-38.57', target_offset: '4.43' });
+    expect(studio.loudnormSecondPassOptions(report)).toBe('measured_I=-28.25:measured_TP=-6.16:measured_LRA=11:measured_thresh=-38.57:offset=4.43:linear=true');
+    expect(studio.loudnormSecondPassOptions(studio.loudnessReportFromJson({ input_i: '-inf', input_tp: '-inf', input_lra: '0.00', input_thresh: '-70.00', target_offset: '0.00' }))).toBeNull();
+    expect(studio.loudnormSecondPassOptions(null)).toBeNull();
+  });
+});

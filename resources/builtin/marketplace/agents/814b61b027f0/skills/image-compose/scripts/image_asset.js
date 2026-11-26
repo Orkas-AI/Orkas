@@ -1,7 +1,6 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const rawPhoto = require('./raw_photo');
@@ -11,7 +10,6 @@ const MAX_DIMENSION = 16_384;
 const MAX_OPERATIONS = 16;
 const MAX_LAYERS = 16;
 const MAX_BATCH_ITEMS = 128;
-const MAX_COMMAND_OUTPUT = 8192;
 const OUTPUT_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.avif', '.tif', '.tiff']);
 
 function fail(code, message) {
@@ -63,7 +61,13 @@ function projectPath(root, raw, label) {
   const value = String(raw || '').trim();
   if (!value) fail('E_IMAGE_ASSET_PATH', `${label} is required`);
   const candidate = realOrResolve(path.resolve(root, value));
-  if (!inside(root, candidate)) fail('E_IMAGE_ASSET_PATH', `${label} must stay inside the project`);
+  if (!inside(root, candidate)) {
+    const recovery = label === 'request'
+      ? '. Create the operation JSON inside --project and pass its path to --request relative to --project.'
+        + ' For a capability check, create asset-capabilities.json containing {"op":"capabilities"}.'
+      : '';
+    fail('E_IMAGE_ASSET_PATH', `${label} must stay inside the project${recovery}`);
+  }
   return candidate;
 }
 
@@ -75,12 +79,6 @@ function integer(value, label, min = 0, max = MAX_DIMENSION) {
 
 function optionalInteger(value, label, min = 0, max = MAX_DIMENSION) {
   return value === undefined ? undefined : integer(value, label, min, max);
-}
-
-function safeCommand(raw, label, fallback = '') {
-  const command = String(raw || fallback).trim();
-  if (!command || /[\r\n\0]/.test(command)) fail('E_IMAGE_ASSET_CONFIG', `${label} is not configured safely`);
-  return command;
 }
 
 async function sharpFactory() {
@@ -467,64 +465,8 @@ async function batchAssets(root, request, signal) {
     ...(count('pending') ? { pending: count('pending') } : {}), items: results };
 }
 
-function runCommand(command, args, timeoutMs) {
-  return new Promise((resolve) => {
-    let settled = false; let stdout = ''; let stderr = ''; let timer;
-    const finish = (ok, detail) => {
-      if (settled) return; settled = true; clearTimeout(timer); resolve({ ok, detail: String(detail || '').trim().slice(0, 2048) });
-    };
-    let child;
-    try { child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); }
-    catch (error) { finish(false, error.message); return; }
-    child.stdout.on('data', (chunk) => { stdout = (stdout + String(chunk)).slice(-MAX_COMMAND_OUTPUT); });
-    child.stderr.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-MAX_COMMAND_OUTPUT); });
-    child.once('error', (error) => finish(false, error.message));
-    child.once('close', (code) => finish(code === 0, stdout || stderr || `process exited with code ${code}`));
-    timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } finish(false, `process timed out after ${timeoutMs} ms`); }, timeoutMs);
-  });
-}
-
-async function externalTransform(root, request, kind) {
-  const input = projectPath(root, request.input_path, 'input_path');
-  const output = projectPath(root, request.output_path, 'output_path');
-  if (!fs.existsSync(input) || !fs.statSync(input).isFile()) fail('E_IMAGE_ASSET_MISSING', 'input_path is not a file');
-  if (fs.existsSync(output) && request.overwrite !== true) fail('E_IMAGE_ASSET_EXISTS', 'output_path already exists; choose a new path or explicitly set overwrite=true');
-  fs.mkdirSync(path.dirname(output), { recursive: true });
-  const temporary = `${output}.${process.pid}.${Date.now()}.tmp${path.extname(output) || '.png'}`;
-  let command; let args; let engine;
-  if (kind === 'remove_background') {
-    command = safeCommand(process.env.ORKAS_REMBG_BIN, 'ORKAS_REMBG_BIN', 'rembg');
-    args = ['i', input, temporary]; engine = 'rembg';
-  } else {
-    command = safeCommand(process.env.ORKAS_REALESRGAN_BIN, 'ORKAS_REALESRGAN_BIN');
-    const scale = integer(request.scale === undefined ? 4 : request.scale, 'scale', 2, 4);
-    const model = String(request.model || 'realesrgan-x4plus').trim();
-    if (!/^[A-Za-z0-9._-]{1,80}$/.test(model)) fail('E_IMAGE_ASSET_ARGUMENT', 'model is invalid');
-    const extension = path.extname(output).toLowerCase().replace(/^\./, '') || 'png';
-    if (!['png', 'jpg', 'jpeg', 'webp'].includes(extension)) fail('E_IMAGE_ASSET_FORMAT', 'Real-ESRGAN output must be png, jpg, jpeg, or webp');
-    args = ['-i', input, '-o', temporary, '-s', String(scale), '-n', model, '-f', extension === 'jpeg' ? 'jpg' : extension]; engine = 'real-esrgan-ncnn-vulkan';
-  }
-  const result = await runCommand(command, args, integer(request.timeout_ms === undefined ? 600_000 : request.timeout_ms, 'timeout_ms', 1_000, 1_800_000));
-  if (!result.ok || !fs.existsSync(temporary)) {
-    try { fs.unlinkSync(temporary); } catch { /* ignore */ }
-    fail(kind === 'remove_background' ? 'E_REMBG_UNAVAILABLE' : 'E_REALESRGAN_UNAVAILABLE', result.detail || `${engine} did not write output`);
-  }
-  try {
-    const info = await inspectImage(temporary);
-    // Keep the existing file intact when permissions or file locks deny replacement.
-    fs.renameSync(temporary, output);
-    return { ok: true, op: kind, output_path: output, ...info, engine, model_calls: 0 };
-  } catch (error) {
-    try { fs.unlinkSync(temporary); } catch { /* ignore */ }
-    throw error;
-  }
-}
-
 async function capabilities() {
   const sharp = await sharpFactory();
-  const rembg = await runCommand(safeCommand(process.env.ORKAS_REMBG_BIN, 'ORKAS_REMBG_BIN', 'rembg'), ['--version'], 2_000);
-  let realesrgan = { ok: false, detail: 'ORKAS_REALESRGAN_BIN is not configured' };
-  if (String(process.env.ORKAS_REALESRGAN_BIN || '').trim()) realesrgan = await runCommand(safeCommand(process.env.ORKAS_REALESRGAN_BIN, 'ORKAS_REALESRGAN_BIN'), ['-v'], 2_000);
   let raw;
   try { const runtime = rawPhoto.engine(); raw = { available: true, engine: 'libraw', version: runtime.version,
     exposure_ev: [-2, 3], white_balance: ['camera', 'auto', 'rgbg_multipliers'], highlights: ['clip', 'blend', 'rebuild'],
@@ -546,8 +488,6 @@ async function capabilities() {
       color: { output: ['srgb'], icc_embedded: true, untagged_input: 'assumed_srgb' },
     },
     masked_composite: { available: true, input_fields: ['input_path', 'background_path', 'mask_path', 'output_path'], mask: 'opaque_binary_white_replaces_black_preserves', input_color: '8_bit_srgb', output_format: 'png', max_pixels: 16_777_216, protected_rgba: 'exact' },
-    background_removal: { available: rembg.ok, engine: 'rembg', ...(rembg.ok ? { version: rembg.detail } : { reason: rembg.detail }) },
-    upscale: { available: realesrgan.ok, engine: 'real-esrgan-ncnn-vulkan', ...(realesrgan.ok ? { version: realesrgan.detail } : { reason: realesrgan.detail }) },
   };
 }
 
@@ -556,10 +496,18 @@ async function runImageAsset({ args }) {
   const root = realOrResolve(path.resolve(process.cwd(), opts.project));
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) fail('E_IMAGE_ASSET_PATH', 'project is not a directory');
   const requestPath = projectPath(root, opts.request, 'request');
+  let requestText;
+  try { requestText = fs.readFileSync(requestPath, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      fail('E_IMAGE_ASSET_READ', 'Request file not found. Create the JSON first, then pass its path as --request relative to --project.');
+    }
+    fail('E_IMAGE_ASSET_READ', 'Could not read the request file. Check that --request points to a readable JSON file.');
+  }
   let request;
-  try { request = JSON.parse(fs.readFileSync(requestPath, 'utf8')); }
-  catch (error) { fail('E_IMAGE_ASSET_READ', `could not read request JSON: ${error.message}`); }
-  if (!record(request)) fail('E_IMAGE_ASSET_ARGUMENT', 'request must be an object');
+  try { request = JSON.parse(requestText); }
+  catch { fail('E_IMAGE_ASSET_READ', 'Request file contains invalid JSON. Correct the JSON and rerun the request.'); }
+  if (!record(request)) fail('E_IMAGE_ASSET_ARGUMENT', 'Request JSON must contain a single object.');
   const op = String(request.op || '').trim();
   if (op === 'capabilities') return await capabilities();
   if (op === 'process' || op === 'batch') {
@@ -574,9 +522,7 @@ async function runImageAsset({ args }) {
     finally { process.removeListener('SIGTERM', cancel); process.removeListener('SIGINT', cancel); }
   }
   if (op === 'masked_composite') return await maskedComposite(root, request);
-  if (op === 'remove_background') return await externalTransform(root, request, op);
-  if (op === 'upscale') return await externalTransform(root, request, op);
-  fail('E_IMAGE_ASSET_ARGUMENT', 'op must be capabilities, process, batch, masked_composite, remove_background, or upscale');
+  fail('E_IMAGE_ASSET_ARGUMENT', 'op must be capabilities, process, batch, or masked_composite');
 }
 
 module.exports = runImageAsset;

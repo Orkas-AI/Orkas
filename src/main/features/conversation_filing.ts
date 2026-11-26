@@ -290,12 +290,21 @@ export function pendingCreatedProjectId(userId: string, cid: string): string | u
 
 /** Rename the conversation's existing project, including one just created in
  * this turn. The host-bound conversation selects identity, never model input. */
-export async function renameConversationProject(userId: string, cid: string, name: string) {
+/** The project this conversation belongs to, or the one created for it this
+ *  turn whose filing is still pending. Model input never selects it. */
+export async function conversationProjectId(userId: string, cid: string): Promise<{ ok: true; projectId: string } | { ok: false; error: 'not_found' | 'not_in_project' }> {
   const conversation = await chats.getConversationMetadata(userId, cid);
-  if (!conversation) return { ok: false as const, error: 'not_found' };
+  if (!conversation) return { ok: false, error: 'not_found' };
   const pending = _pendingFilings.get(_pendingKey(userId, cid));
   const projectId = pending?.kind === 'file' ? pending.projectId : conversation.project_id;
-  if (!projectId) return { ok: false as const, error: 'not_in_project' };
+  return projectId ? { ok: true, projectId } : { ok: false, error: 'not_in_project' };
+}
+
+export async function renameConversationProject(userId: string, cid: string, name: string) {
+  const resolved = await conversationProjectId(userId, cid);
+  if (!resolved.ok) return { ok: false as const, error: (resolved as { error: string }).error };
+  const pending = _pendingFilings.get(_pendingKey(userId, cid));
+  const projectId = (resolved as { projectId: string }).projectId;
   const result = await projects.renameProjectForUser(userId, projectId, name);
   if (result.ok && pending?.kind === 'file') {
     // A later filing failure must name the project the user can actually find.

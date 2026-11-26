@@ -5,6 +5,7 @@
  * file would no longer match. Finished scenes stay cached, so the next Update renders only what
  * changed.
  */
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
@@ -34,12 +35,13 @@ import {
   VIDEO_RESOLUTIONS,
 } from './video_canvas';
 import { effectiveVideoSettings, listVideoGenCandidates, videoGenerationInputError, type GenerateVideoInput } from './video_gen';
-import { videoFrameSupport, videoModelSpec, type VideoFrames } from './video_models';
+import { VEO_DURATIONS, videoFrameSupport, videoModelSpec, type VideoFrames } from './video_models';
+import { fitVideoDuration, fitVideoResolution } from './video_parameter_compatibility';
 import { hasPendingProductionRequest } from './video_production_budget';
 import { isExternallyBilled, quoteProductionIntents } from './video_production_spend';
 import type { VideoProductionServiceAvailability, VideoProductionGenerationIntent } from './video_production_services';
 import { renderVideoTimeline, type VideoProgress } from './video_timeline_render';
-import { shipVideoFile, type ShipIssue, type VideoVersion } from './video_timeline_ship';
+import { shipVideoFile, type HeldStillsFinding, type ShipIssue, type VideoVersion } from './video_timeline_ship';
 import type { VideoAssetRecord } from './video_timeline';
 
 const log = createLogger('video-canvas-jobs');
@@ -65,7 +67,8 @@ export type VideoCanvasJobState = {
   video_id?: string;
   /** `new_shot`: a new shot drawn from footage on the canvas (2026-11-10). */
   kind: 'render' | 'redo' | 'new_shot';
-  status: 'running' | 'failed';
+  status: 'running' | 'failed' | 'review';
+  review?: HeldStillsFinding & { id: string; preview_path: string };
   /** The shot card a new take is being made for, or the new shot's draft card. */
   shot?: string;
   phase?: VideoCanvasJobPhase;
@@ -81,7 +84,7 @@ export type VideoCanvasJobEvent = Omit<VideoCanvasJobState, 'status'> & {
   userId: string;
   cid: string;
   /** `stopped`: a change made the render pointless, and the video waits for the next Update. */
-  status: 'running' | 'failed' | 'done' | 'stopped';
+  status: VideoCanvasJobState['status'] | 'done' | 'stopped';
   /** The version a finished render delivered. */
   version?: string;
   /** A finished take, and whether the videos that showed its shot now show it. */
@@ -100,6 +103,7 @@ type RenderJob = {
   state: VideoCanvasJobState;
   timer?: NodeJS.Timeout;
   controller?: AbortController;
+  answerReview?: (isCurrent: (() => boolean) | null) => void;
   running: boolean;
   /** The user updated again during this render. */
   again: boolean;
@@ -112,6 +116,44 @@ type RedoJob = { ctx: VideoCanvasJobContext; state: VideoCanvasJobState; control
 
 const renders = new Map<string, RenderJob>();
 const redos = new Map<string, RedoJob>();
+/** Renders and takes still running, so a quit can wait for them to let go of FFmpeg and partial files. */
+const unwinding = new Set<Promise<void>>();
+const QUIT_UNWIND_MS = 5_000;
+
+function track(work: Promise<void>): void {
+  const settled = work.catch(() => {});
+  unwinding.add(settled);
+  void settled.finally(() => unwinding.delete(settled));
+}
+
+function abortAllJobs(): void {
+  for (const job of renders.values()) {
+    job.cancelled = true;
+    job.again = false;
+    if (job.timer) clearTimeout(job.timer);
+    job.controller?.abort();
+  }
+  renders.clear();
+  for (const job of redos.values()) job.controller.abort();
+  redos.clear();
+}
+
+/**
+ * Quit: stop every render and take the canvas started, as the Agent's own turns are stopped, and
+ * wait up to five seconds for them to stop FFmpeg and remove partial files. A stopped take is not
+ * cancelled at the service; it ends as any interrupted generation request does.
+ */
+export async function stopVideoCanvasJobsForQuit(): Promise<void> {
+  abortAllJobs();
+  const pending = [...unwinding];
+  if (!pending.length) return;
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    Promise.all(pending),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, QUIT_UNWIND_MS); timer.unref?.(); }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
 
 registerUserSwitchHook('video-canvas-jobs', (previousUid) => {
   for (const [key, job] of renders) {
@@ -165,6 +207,10 @@ export function videoCanvasJobs(uid: string, cid: string, options: { busy: boole
       if (job.ctx.uid !== uid || job.ctx.cid !== cid) return [];
       // Still letting go of a render nobody waits for.
       if ('stopped' in job && job.stopped) return [];
+      if (job.state.status === 'review' && options.busy && 'video' in job) {
+        stopVideoCanvasRender(job.ctx, job.video);
+        return [];
+      }
       if (job.state.status === 'failed' && options.busy) {
         jobs.delete(key);
         return [];
@@ -202,7 +248,7 @@ export function scheduleVideoCanvasRender(ctx: VideoCanvasJobContext, video: str
       job.again = true;
       return;
     }
-    void runRenderJob(key, job);
+    track(runRenderJob(key, job));
   }, options.delayMs ?? 0);
 }
 
@@ -215,10 +261,32 @@ export async function updateVideoCanvasVideo(ctx: VideoCanvasJobContext, video: 
   if (!ownsActiveAccount(ctx)) return { ok: false, code: 'not_found' };
   const located = await locateProduction(ctx.uid, ctx.cid, ctx.dir);
   if (!located || !videoDirIn(located.productionAbs, video) || !ownsActiveAccount(ctx)) return { ok: false, code: 'not_found' };
-  const unchanged = await videoUpToDate(located.productionAbs, video);
+  const { allowedRoots } = await import('../model/core-agent/video-studio-tool');
+  if (!ownsActiveAccount(ctx)) return { ok: false, code: 'not_found' };
+  const unchanged = await videoUpToDate(located.productionAbs, video, allowedRoots({ userId: ctx.uid, cid: ctx.cid, projectId: ctx.projectId }));
   if (!ownsActiveAccount(ctx)) return { ok: false, code: 'not_found' };
   if (unchanged) return { ok: true, unchanged: true };
   scheduleVideoCanvasRender(ctx, video, { delayMs: 0 });
+  return { ok: true };
+}
+
+/** Resolves one review owned by the current account and canvas job. */
+export function resolveVideoCanvasDelivery(
+  ctx: VideoCanvasJobContext, video: string, reviewId: unknown, decision: unknown, isBusy: () => boolean,
+): { ok: true } | VideoCanvasRefusal {
+  if (!ownsActiveAccount(ctx)) return { ok: false, code: 'not_found' };
+  if (decision !== 'deliver' && decision !== 'edit') return { ok: false, code: 'invalid' };
+  const job = renders.get(jobKey(ctx, video));
+  if (!job?.answerReview || job.state.review?.id !== reviewId) return { ok: false, code: 'changed' };
+  if (isBusy()) return { ok: false, code: 'busy' };
+  if (decision === 'edit') {
+    stopVideoCanvasRender(ctx, video);
+    return { ok: true };
+  }
+  const { review: _review, ...state } = job.state;
+  job.state = { ...state, status: 'running', phase: 'deliver' };
+  job.answerReview(() => ownsActiveAccount(ctx) && !isBusy());
+  emit(ctx, job.state);
   return { ok: true };
 }
 
@@ -335,6 +403,24 @@ async function renderOnce(job: RenderJob): Promise<void> {
     allowedRoots: roots,
     videoPathAbs: outputAbsPath,
     videoDirAbs,
+    reviewHeldStills: (finding) => {
+      if (superseded() || !ownsActiveAccount(ctx)) return Promise.resolve(null);
+      return new Promise((resolve) => {
+        const abort = () => settle(null);
+        const settle = (isCurrent: (() => boolean) | null) => {
+          controller.signal.removeEventListener('abort', abort);
+          job.answerReview = undefined;
+          resolve(isCurrent);
+        };
+        controller.signal.addEventListener('abort', abort, { once: true });
+        job.answerReview = settle;
+        job.state = {
+          dir: ctx.dir, video_id: video, kind: 'render', status: 'review',
+          review: { ...finding, id: randomUUID(), preview_path: outputAbsPath },
+        };
+        emit(ctx, job.state);
+      });
+    },
     finalize: async (fileAbs) => {
       if (superseded()) return;
       await finalizeProducedFile(fileAbs, {
@@ -448,21 +534,9 @@ const ENVELOPE_WITHOUT_SPEC = {
   autoDuration: false,
 };
 
-const RESOLUTION_LINES: Readonly<Record<string, number>> = {
-  '360p': 360, '480p': 480, '540p': 540, '720p': 720, '768p': 768, '1080p': 1080, '2k': 1440, '4k': 2160,
-};
-
-/** The resolution a service offers nearest the one asked for; on a tie, the sharper. */
-function nearestResolution(asked: string, offered: readonly string[]): string {
-  const lines = RESOLUTION_LINES[asked];
-  if (offered.includes(asked) || lines === undefined) return asked;
-  return offered
-    .filter((item) => RESOLUTION_LINES[item] !== undefined)
-    .sort((a, b) => Math.abs(RESOLUTION_LINES[a] - lines) - Math.abs(RESOLUTION_LINES[b] - lines) || RESOLUTION_LINES[b] - RESOLUTION_LINES[a])[0] ?? asked;
-}
-
 /** Why a service cannot make a take as it was asked for. A length, shape, resolution or sound it
- *  does not make moves to the nearest it does (decided 2026-11-10, plan 27.21). */
+ *  does not make moves to one it does (decided 2026-11-10, plan 27.21; fitted as the Agent's
+ *  generation fits it since 2026-11-18, review S4-6). */
 export type VideoCanvasUnavailable =
   | { code: 'images' | 'videos'; max: number }
   /** The take opens or ends on frames this service cannot take as asked (2026-11-10), or frames
@@ -541,8 +615,10 @@ function followsFrame(profile: VideoProfile): boolean {
 
 // ── Generation settings (decided 2026-11-10, plan 27.21) ────────────────────
 // The panel sets a video's shape, resolution, length and sound, as TapNow's settings do. Each
-// service lists what it makes; a setting it does not make becomes the nearest one it does, so
-// only footage that does not fit greys a service out.
+// service lists what it makes; a setting it does not make becomes one it does, so only footage
+// that does not fit greys a service out. Resolution and length are fitted by the rule the Agent's
+// generation uses (video_parameter_compatibility, review S4-6); shape keeps the canvas's own
+// tie-break toward the production's video.
 
 /** The settings the user picked for a take made again; one not picked stays as recorded. */
 export type VideoCanvasSettings = { ratio?: string; resolution?: string; duration?: number; audio?: boolean };
@@ -560,7 +636,7 @@ function askedSettings(value: unknown): VideoCanvasSettings | VideoCanvasRefusal
   const { ratio, resolution, duration, audio } = value as Record<string, unknown>;
   const readable = (ratio === undefined || (typeof ratio === 'string' && SETTING_RATIOS.includes(ratio)))
     && (resolution === undefined || (typeof resolution === 'string' && VIDEO_RESOLUTIONS.includes(resolution)))
-    && (duration === undefined || (typeof duration === 'number' && Number.isInteger(duration) && duration >= 1 && duration <= MAX_SETTING_SECONDS))
+    && (duration === undefined || (typeof duration === 'number' && Number.isInteger(duration) && (duration === -1 || (duration >= 1 && duration <= MAX_SETTING_SECONDS))))
     && (audio === undefined || typeof audio === 'boolean');
   if (!readable) return { ok: false, code: 'invalid' };
   return {
@@ -591,7 +667,9 @@ function nearestRatioTo(asked: string, offered: readonly string[], shape: Shape)
 
 /**
  * A video call with the user's settings, as one service makes it. Each setting is the one asked
- * for where the service makes it, else the nearest it makes; sound is on where it cannot be left
+ * for where the service makes it, else: the nearest shape it makes; the lowest resolution it
+ * makes not below the one asked, else its sharpest; a length rounded up as the Agent's generation
+ * rounds it, else the next it offers, else its longest; sound is on where it cannot be left
  * out; a framed call on a service that takes its first frame's shape asks for none. The service's
  * own check decides which shapes it makes for this call, and which lengths at this resolution
  * (Veo makes 1080p at 8 seconds only). A setting neither the call nor the user named stays out,
@@ -620,7 +698,7 @@ function settingsOn(
   // Sound and resolution first: they depend on nothing else.
   if (request.generate_audio === false && !envelope.silent) request.generate_audio = true;
   const resolutions = [...envelope.resolutions];
-  if (typeof request.resolution === 'string') request.resolution = nearestResolution(request.resolution, resolutions);
+  if (typeof request.resolution === 'string') request.resolution = fitVideoResolution(request.resolution, resolutions);
 
   let ratios: string[] = [];
   let durations: number[] = [];
@@ -642,12 +720,17 @@ function settingsOn(
       // Omni times a video from its prompt.
       delete request.duration;
     } else {
-      const lengthFits = (seconds: number) => makes({ ...request, duration: seconds });
+      const lengthFits = (seconds: number) => (seconds !== -1 || envelope.autoDuration === true) && makes({ ...request, duration: seconds });
       const allowed = steps.filter(lengthFits);
       const listed = allowed.length ? allowed : steps;
       const wanted = request.duration;
       if (typeof wanted === 'number' && !listed.includes(wanted) && !(Number.isInteger(wanted) && lengthFits(wanted))) {
-        request.duration = nearestNumber(wanted, listed);
+        // One still not made (above the longest, where the Agent would split the shot, or Veo's
+        // 1080p at 8 seconds only) takes the next it offers, else its longest.
+        const fitted = fitVideoDuration(wanted, envelope, profile.provider);
+        request.duration = listed.includes(fitted) || (Number.isInteger(fitted) && lengthFits(fitted))
+          ? fitted
+          : listed.find((seconds) => seconds >= fitted) ?? listed[listed.length - 1];
       }
       // A length it makes without a step, as a take on record may have, stays listed.
       durations = typeof request.duration === 'number' && !listed.includes(request.duration)
@@ -1068,7 +1151,7 @@ async function launchJob(input: {
   if (job.controller.signal.aborted) return refuse({ ok: false, code: 'not_found' });
   if (input.isBusy()) return refuse({ ok: false, code: 'busy' });
   emit(ctx, job.state);
-  void runCanvasJob({
+  track(runCanvasJob({
     key,
     job,
     kind: input.kind,
@@ -1076,7 +1159,7 @@ async function launchJob(input: {
     request: input.request,
     ...(planned?.profileId ? { videoRoute: planned.profileId } : {}),
     place: input.place,
-  });
+  }));
   return { ok: true };
 }
 
@@ -1165,8 +1248,7 @@ export async function startVideoCanvasRedo(input: {
 // ── New shots drawn from footage (decided 2026-11-10, plan 27.20) ─────────────────────────────
 
 /** The lengths offered for a new shot, within what each service makes. */
-const DURATION_STEPS = [3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30];
-const VEO_SECONDS = [4, 6, 8];
+const DURATION_STEPS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30];
 const DEFAULT_SECONDS = 5;
 const VEO_DEFAULT_SECONDS = 8;
 const DEFAULT_RESOLUTION = '720p';
@@ -1194,10 +1276,6 @@ async function findDraft(ctx: VideoCanvasJobContext, id: unknown): Promise<Draft
   return { ...found, id: id as string, located };
 }
 
-function nearestNumber(value: number, offered: readonly number[]): number | undefined {
-  return [...offered].sort((a, b) => Math.abs(a - value) - Math.abs(b - value) || b - a)[0];
-}
-
 /** The aspect ratio nearest the production's video among those offered; 16:9 without one. */
 function nearestRatio(shape: DraftSource['shape'], offered: readonly string[]): string | undefined {
   const concrete = offered.filter((ratio) => ratio !== 'adaptive');
@@ -1211,10 +1289,12 @@ function nearestRatio(shape: DraftSource['shape'], offered: readonly string[]): 
 }
 
 /** The lengths a service makes a new shot at. Omni times a video from its prompt. */
-function draftDurations(profile: VideoProfile, envelope: { minDuration: number; maxDuration: number }): number[] {
+function draftDurations(profile: VideoProfile, envelope: { minDuration: number; maxDuration: number; autoDuration?: boolean }): number[] {
   if (profile.provider === 'google') return [];
-  const steps = profile.provider === 'google-cloud' ? VEO_SECONDS : DURATION_STEPS;
-  return steps.filter((seconds) => seconds >= envelope.minDuration && seconds <= envelope.maxDuration);
+  const steps = profile.provider === 'google-cloud' ? VEO_DURATIONS : DURATION_STEPS;
+  const durations = steps.filter((seconds) => seconds >= envelope.minDuration && seconds <= envelope.maxDuration);
+  if (envelope.autoDuration) durations.unshift(-1);
+  return durations;
 }
 
 /** The new shot has a stable output identity; unresolved requests are never replayed. */
@@ -1246,10 +1326,10 @@ function stillSize(shape: DraftSource['shape'], withReferences: boolean): string
   return first ? imageSizeForAspect(first.capability, shape.width / shape.height) : undefined;
 }
 
-/** A new shot as one service would make it: the user's settings where it makes them, else the
- *  nearest it makes, from the defaults decided (the production's shape, or on frames the first
- *  frame's, kept by the service or the nearest it makes; 5 seconds, 8 on Veo; the resolution
- *  nearest 720p; no sound where it can leave sound out). */
+/** A new shot as one service would make it: the user's settings where it makes them, else fitted
+ *  as `settingsOn` fits them, from the defaults decided (the production's shape, or on frames the
+ *  first frame's, kept by the service or the nearest it makes; 5 seconds, 8 on Veo; 720p; no
+ *  sound where it can leave sound out). */
 function draftRouteOf(source: DraftSource, profile: VideoProfile): Pick<DraftRoute, 'request'> & Omit<VideoCanvasDraftChoice, 'id' | 'name' | 'frames'> {
   const { draft, inputs, shape, frameShape } = source;
   const envelope = videoModelSpec(profile.provider, profile.model) ?? ENVELOPE_WITHOUT_SPEC;
@@ -1292,7 +1372,8 @@ export async function videoCanvasDraftOptions(ctx: VideoCanvasJobContext, id: un
     ok: true,
     kind: 'video',
     choices: routes.map((route) => route.choice),
-    current: defaultRoute(routes)?.choice.id ?? '',
+    current: (draft.choice ? routes.find(route => route.choice.id === draft.choice) : defaultRoute(routes))?.choice.id ?? '',
+    ...(draft.choice && !routes.some(route => route.choice.id === draft.choice) ? { unavailable: { code: 'other' as const } } : {}),
     method: draft.method,
     frames_fit: inputs.length <= 2 && inputs.every((input) => input.kind === 'image'),
   };
@@ -1308,7 +1389,7 @@ function planDraft(source: DraftSource, { pricing = false } = {}): PlannedCall |
     return source.inputs.length > STILL_MAX_IMAGES ? { ok: false, code: 'unsupported' } : { request: draftCall(source) };
   }
   const routes = draftRoutes(source);
-  const route = routes.find((item) => item.choice.id === source.draft.choice) ?? defaultRoute(routes);
+  const route = source.draft.choice ? routes.find((item) => item.choice.id === source.draft.choice) : defaultRoute(routes);
   if (!route) return { ok: false, code: 'route_unavailable' };
   if (route.choice.unavailable) return { ok: false, code: 'unsupported' };
   return { request: route.request, profileId: route.profileId };
@@ -1443,14 +1524,8 @@ async function runCanvasJob(input: {
 
 /** Test seam: forget everything between cases. */
 export function resetVideoCanvasJobsForTest(): void {
-  for (const job of renders.values()) {
-    job.cancelled = true;
-    if (job.timer) clearTimeout(job.timer);
-    job.controller?.abort();
-  }
-  renders.clear();
-  for (const job of redos.values()) job.controller.abort();
-  redos.clear();
+  abortAllJobs();
+  unwinding.clear();
   startingRedos.clear();
   jobListener = null;
 }

@@ -9,6 +9,106 @@ import { bayerDng } from '../../eval/model-eval/regression/raw-fixture';
 const modulePath = path.resolve(__dirname, '../../src/main/features/image_studio.ts');
 const scores = { intent_alignment: 90, composition: 90, craft: 90, text_legibility: 90, defect_freedom: 90, specificity: 90 };
 
+test('reproduces at source size and preserves every pixel outside the approved title region', async ({ sdkOrkas: orkas }) => {
+  const canvas = { width: 1200, height: 1500 };
+  const title = { left: 120, top: 500, width: 940, height: 240 };
+  const rect = `<rect x="${title.left}" y="${title.top}" width="${title.width}" height="${title.height}" fill="white"/>`;
+  const svg = (body: string) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${canvas.width}" height="${canvas.height}">${body}</svg>`);
+  const renderTitle = (copy: string) => sharp(svg(`<rect width="100%" height="100%" fill="#f2efe6"/><circle cx="800" cy="1100" r="180" fill="#ef6a4c"/><text x="140" y="650" font-family="sans-serif" font-size="104" fill="#18233b">${copy}</text>`)).png().toBuffer();
+  const original = await renderTitle('Original title');
+  const replacement = await renderTitle('New title');
+  const project = path.dirname(orkas.createWorkspaceFile('source-size-reproduction/image-manifest.json', JSON.stringify({
+    schema_version: 1, route: 'compose', canvas, raster_source: 'candidate.png',
+    brief: { purpose: 'Revise title', audience: 'Original readers', required_copy: ['New title'], must_include: [], must_avoid: [] },
+    art_direction: { subject_world: 'Editorial poster', one_job: 'Replace its title', visual_tradition: 'Poster design',
+      composition: 'Preserve original layout', signature_device: 'Orange circle', typography: 'Sans serif', color_light_material: 'Cream paper' },
+    reference_intent: { mode: 'reproduce', basis: 'user', instructions: ['Replace title at its original position and size'], minimum_score: 85 },
+    references: [{ id: 'layout', path: 'original.png', role: 'composition', required: true, strength: 1,
+      preserve: ['Layout, color, title position and size'], may_change: ['Title copy'], region_ids: [] }],
+    generation_budget: { max_calls: 0 },
+  })));
+  writeFileSync(path.join(project, 'original.png'), original);
+  writeFileSync(path.join(project, 'replacement.png'), replacement);
+  await sharp(svg(`<rect width="100%" height="100%" fill="black"/>${rect}`)).png().toFile(path.join(project, 'mask.png'));
+  orkas.createWorkspaceFile('source-size-reproduction/request.json', JSON.stringify({
+    op: 'masked_composite', input_path: 'original.png', background_path: 'replacement.png', mask_path: 'mask.png', output_path: 'candidate.png',
+  }));
+  const outputAbsPath = path.join(project, 'final.png');
+  const result = await orkas.electronApp!.evaluate(async (_, args) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const studio = require(args.modulePath);
+    const path = require('node:path');
+    const composite = await require(args.assetScript)({ args: ['--project', args.project, '--request', 'request.json'] });
+    const stateAbsPath = path.join(args.project, 'native-state.json');
+    const inspected = await studio.recordRasterEvidence({ projectDirAbs: args.project, stateAbsPath });
+    if (!inspected.ok) return { blockers: inspected.blockers.map((issue: any) => issue.code) };
+    await studio.submitImageStudioDesignReview({ stateAbsPath, evidenceAbsPath: inspected.evidence_path,
+      verdict: 'passed', scope: 'Controlled native review of the masked composition', findings: [],
+      qualityScores: { ...args.scores, reference_fidelity: 85 } });
+    await studio.exportImageStudioProject({ stateAbsPath, outputAbsPath: args.outputAbsPath, format: 'png' });
+    return { protectedPixels: composite.protected_pixels, generationCalls: composite.model_calls };
+  }, { modulePath, project, outputAbsPath, scores,
+    assetScript: path.resolve(__dirname, '../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js') });
+  expect(result).toEqual({ protectedPixels: canvas.width * canvas.height - title.width * title.height, generationCalls: 0 });
+  const decode = (input: string | Buffer) => sharp(input).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const [before, patch, after] = await Promise.all([decode(original), decode(replacement), decode(outputAbsPath)]);
+  expect(after.info).toMatchObject({ ...canvas, channels: 4 });
+  const expected = Buffer.from(before.data);
+  for (let y = title.top; y < title.top + title.height; y++) {
+    const offset = (y * canvas.width + title.left) * 4;
+    patch.data.copy(expected, offset, offset, offset + title.width * 4);
+  }
+  expect(expected.equals(before.data)).toBe(false);
+  expect(after.data.equals(expected)).toBe(true);
+  expect(readFileSync(path.join(project, 'original.png'))).toEqual(original);
+});
+
+test('exports the verified pixels when evidence is replaced during validation and rechecks the next request', async ({ sdkOrkas: orkas }) => {
+  for (const format of ['png', 'jpeg'] as const) {
+    const input = createPoster(orkas, `verified-export-${format}`, '');
+    const replacement = await sharp({ create: { width: 1080, height: 1080, channels: 4, background: '#ff00ff' } }).png().toBuffer();
+    const output = path.join(input.projectDirAbs, `final.${format}`);
+    const result = await orkas.electronApp!.evaluate(async ({ nativeImage }, args) => {
+      const studio = (process as any).mainModule.require(args.modulePath);
+      const fs = (process as any).mainModule.require('node:fs');
+      const inspection = await studio.snapshotImageStudioProject(args.input);
+      if (!inspection.ok) throw new Error('Fixture snapshot failed');
+      await studio.submitImageStudioDesignReview({ stateAbsPath: args.input.stateAbsPath, evidenceAbsPath: args.input.outputAbsPath,
+        verdict: 'passed', scope: 'Controlled evidence replacement; no model visual judgment', findings: [], qualityScores: args.scores });
+      const reviewed = fs.readFileSync(args.input.outputAbsPath).toString('base64');
+      const create = nativeImage.createFromPath;
+      let injected = false;
+      nativeImage.createFromPath = file => {
+        const image = create(file);
+        if (file === args.input.outputAbsPath && !injected) {
+          const bitmap = image.toBitmap.bind(image);
+          // Replace the file just after the validator obtains its pixel bytes.
+          // The oracle below checks the delivered pixels, not a private call count.
+          image.toBitmap = () => {
+            const pixels = bitmap();
+            if (!injected) { injected = true; fs.writeFileSync(file, Buffer.from(args.replacement, 'base64')); }
+            return pixels;
+          };
+        }
+        return image;
+      };
+      try { await studio.exportImageStudioProject({ stateAbsPath: args.input.stateAbsPath, outputAbsPath: args.output, format: args.format }); }
+      finally { nativeImage.createFromPath = create; }
+      let nextRejected = false;
+      const next = args.output + '.next';
+      try { await studio.exportImageStudioProject({ stateAbsPath: args.input.stateAbsPath, outputAbsPath: next, format: args.format }); }
+      catch (error) { nextRejected = String(error).includes('E_IMAGE_REVIEW_EVIDENCE_CHANGED'); }
+      return { reviewed, injected, nextRejected, nextAbsent: !fs.existsSync(next) };
+    }, { modulePath, input, output, format, scores, replacement: replacement.toString('base64') });
+    expect(result).toMatchObject({ injected: true, nextRejected: true, nextAbsent: true });
+    const expected = await sharp(Buffer.from(result.reviewed, 'base64')).removeAlpha().raw().toBuffer();
+    const actual = await sharp(output).removeAlpha().raw().toBuffer();
+    expect(actual.length).toBe(expected.length);
+    if (format === 'png') expect(actual.equals(expected)).toBe(true);
+    else expect(actual.reduce((sum, value, index) => sum + Math.abs(value - expected[index]), 0) / actual.length).toBeLessThan(4);
+  }
+});
+
 test('runs bundled RAW development through the real Electron Skill environment and resumes the batch', async ({ sdkOrkas: orkas }) => {
   const project = path.dirname(orkas.createWorkspaceFile('raw-photos/request.json', JSON.stringify({ op: 'batch', raw: { exposure_ev: 1, white_balance: 'camera' },
     items: [{ input_path: 'original.dng', output_path: 'out/photo.png' }] })));
@@ -132,7 +232,7 @@ for (const route of ['compose', 'edit']) test(`exports documented layered ${rout
     await studio.exportImageStudioProject({ stateAbsPath, outputAbsPath, format: 'png' });
     const psd = await invoke(args.requests[2]);
     await studio.exportImageStudioProject({ stateAbsPath, format: 'psd',
-      inputAbsPath: path.join(args.project, 'out/candidate.psd'), outputAbsPath: path.join(args.project, 'out/design.psd') });
+      inputAbsPath: psd.final_export.input_path, outputAbsPath: path.join(args.project, 'out/design.psd') });
     return { ok: true, rejectedBeforeReview, verified: psd.structure_verified, externalEditorVerified: psd.external_editor_verified };
   }, { modulePath, helper: path.join(skills, 'image-compose/scripts/layered_document.js'), project, route, requests, scores });
   expect(result).toEqual({ ok: true, rejectedBeforeReview: true, verified: true, externalEditorVerified: false });
@@ -292,6 +392,28 @@ test('recovers fragmented poster copy and exports it without accepting missing w
   expect(result).toEqual({ initialBlockers: ['E_REQUIRED_COPY_MISSING'], createdInvalidEvidence: false,
     missingCopy: ['E_REQUIRED_COPY_MISSING'], preserved: true });
   expect(await sharp(output).metadata()).toMatchObject({ width: 1080, height: 1080 });
+});
+
+test('uses the first visible occurrence of repeated required copy of equal length', async ({ sdkOrkas: orkas }) => {
+  const wrapped = '<p style="font:24px monospace;width:3.2ch;overflow-wrap:anywhere">A1B2</p>';
+  const unwrapped = '<p style="font:24px monospace">A1B2</p>';
+  const hidden = wrapped.replace('font:', 'display:none;font:');
+  const input = createPoster(orkas, 'repeated-required-copy', hidden + wrapped + unwrapped);
+  const manifestPath = path.join(input.projectDirAbs, 'image-manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  manifest.brief.required_copy.push('A1B2');
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+
+  const capture = () => orkas.electronApp!.evaluate(async (_, args) => {
+    const studio = (process as any).mainModule.require(args.modulePath);
+    const result = await studio.snapshotImageStudioProject(args.input);
+    return { ok: result.ok, blockers: result.blockers.map((issue: any) => issue.code) };
+  }, { input, modulePath });
+
+  expect(await capture()).toEqual({ ok: false, blockers: ['E_REQUIRED_COPY_ORPHAN_LINE'] });
+  const entry = path.join(input.projectDirAbs, 'index.html');
+  writeFileSync(entry, readFileSync(entry, 'utf8').replace(wrapped + unwrapped, unwrapped + wrapped));
+  expect(await capture()).toEqual({ ok: true, blockers: [] });
 });
 
 test('exports all poster corners after the host initially constrains the capture window', async ({ sdkOrkas: orkas }) => {

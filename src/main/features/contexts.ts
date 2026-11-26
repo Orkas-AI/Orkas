@@ -26,6 +26,7 @@ import { readTextPreview } from '../util/text-preview';
 import { isPathAllowed, resolveSandboxRoot } from '../util/path-sandbox';
 import { writeBytesAtomicSync, writeTextAtomicSync } from '../storage';
 import { fileFailureKind } from '../util/app-error';
+import type { BeforeLocalEntryDelete } from '../util/file-import';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import { Semaphore } from 'async-mutex';
@@ -691,9 +692,11 @@ export async function importContextFileFromPath(
 }
 
 /** User-facing delete — files or dirs (recursive), refuses to touch the root index. */
+export function deleteContextTarget(relpath: string, userId?: string): Result;
+export function deleteContextTarget(relpath: string, userId: string, beforeDelete: BeforeLocalEntryDelete): Result | Promise<Result>;
 export function deleteContextTarget(
-  relpath: string, userId: string = getActiveUserId(), beforeDelete?: () => boolean,
-): Result {
+  relpath: string, userId: string = getActiveUserId(), beforeDelete?: BeforeLocalEntryDelete,
+): Result | Promise<Result> {
   let p: string;
   try { p = resolvePath(relpath, { mustExist: true, userId }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -702,18 +705,24 @@ export function deleteContextTarget(
     return { ok: false, error: t('errors.cant_delete_index') };
   }
   const droppedRels = _collectRelsUnder(p, relpath);
-  try {
-    const st = fs.statSync(p);
-    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
-    if (st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
-    else fs.unlinkSync(p);
-  } catch (err) { return { ok: false, error: (err as Error).message }; }
-  invalidateIndex(userId);
-  for (const r of droppedRels) {
-    search.dropContext(userId, r);
-    enqueueCommittedContextSource(userId, r, 'delete');
-  }
-  return { ok: true };
+  const remove = (confirm?: () => boolean): Result => {
+    try {
+      const st = fs.statSync(p);
+      if (confirm && !confirm()) return { ok: false, error: 'source_changed' };
+      if (st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
+      else fs.unlinkSync(p);
+    } catch (err) { return { ok: false, error: (err as Error).message }; }
+    invalidateIndex(userId);
+    for (const r of droppedRels) {
+      search.dropContext(userId, r);
+      enqueueCommittedContextSource(userId, r, 'delete');
+    }
+    return { ok: true };
+  };
+  const check = beforeDelete?.();
+  if (check === false) return { ok: false, error: 'source_changed' };
+  if (check && check !== true) return check.then(remove);
+  return remove();
 }
 
 /** Walk a path that's about to be deleted; collect every KB-supported doc-id we hold. */

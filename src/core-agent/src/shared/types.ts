@@ -89,9 +89,16 @@ export type MessageContent = (
 
 export type MessageRole = "user" | "assistant" | "system" | "developer";
 
+/** In-memory marker on the last completed-history row of a model request. */
+export const STABLE_CACHE_HISTORY_END = Symbol("stableCacheHistoryEnd");
+
 export type Message = {
   role: MessageRole;
   content: MessageContent[];
+  [STABLE_CACHE_HISTORY_END]?: true;
+  /** Request projection only. Announce currently active definitions after
+   * this accepted user update or checkpoint, without persisting a grant. */
+  toolsAddedAfter?: readonly string[];
   /**
    * Orkas-owned UI turn identity. Assigned by Session, persisted for healing /
    * restart, and stripped from provider-facing projections. Models never
@@ -145,6 +152,7 @@ export type ServerModelFallbackReason =
 
 /** Streaming event types. */
 export type StreamEvent =
+  | Extract<import("../agent/types.js").AgentRunEvent, { type: "context_status" | "compaction" }>
   | { type: "text_delta"; text: string }
   /** Structured presentation phase for the immediately preceding text block.
    * Responses-style providers may learn this only at `text_end`; consumers

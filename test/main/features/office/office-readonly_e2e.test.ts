@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const require = createRequire(import.meta.url);
+const OFFICE_FIXTURE_TIMEOUT_MS = 150_000;
 type Row = {
   id: string; error?: string;
   logs: Array<{ scope: string; level: string; args: unknown[] }>;
@@ -41,6 +42,10 @@ const SCENARIOS = [
   ['ppt-native-recovery', 'rejects an unsupported native graph atomically and corrects the same creation with custom dimensions'],
   ['ppt-unit-contract', 'rejects fractional unitless coordinates before native dispatch and preserves explicit and raw EMU lengths'],
   ['ppt-native-append', 'preserves native placeholders and the source while appending complete pages atomically after a rollback'],
+  ['create-docx-heading-outline', 'creates editable Word headings with their navigation levels'],
+  ['read-tables', 'marks omitted Word table text as partial and provides a working native read path'],
+  ['ppt-image-format-preflight', 'checks a mislabeled image without reserving output and embeds the corrected image at the same path'],
+  ['ppt-layered-contrast', 'recognizes an opaque backing panel and keeps genuine low contrast and uncertain layers distinct without editing the deck'],
   ] as const;
 
 // OfficeCLI is bundled for desktop macOS/Windows, not Linux hosts.
@@ -48,9 +53,14 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform)).each([
   { cohort: 'review', cases: SCENARIOS.slice(0, 5) },
   { cohort: 'edit', cases: SCENARIOS.slice(5, 10) },
   { cohort: 'notes', cases: SCENARIOS.slice(10, 15) },
-  { cohort: 'creation', cases: SCENARIOS.slice(15, 24) },
-  { cohort: 'presentation', cases: SCENARIOS.slice(24) },
-])('real Office review lifecycle ($cohort)', ({ cases }) => {
+  { cohort: 'creation-recovery', cases: SCENARIOS.slice(15, 18) },
+  { cohort: 'creation-publication', cases: SCENARIOS.slice(18, 21) },
+  { cohort: 'creation-native-pptx', cases: SCENARIOS.slice(21, 24) },
+  { cohort: 'presentation', cases: SCENARIOS.slice(24, 25) },
+  { cohort: 'docx-headings', cases: SCENARIOS.slice(25, 26) },
+  { cohort: 'docx-tables', cases: SCENARIOS.slice(26, 27) },
+  { cohort: 'ppt-image-preflight', cases: SCENARIOS.slice(27) },
+])('real Office review lifecycle ($cohort)', ({ cohort, cases }) => {
   let root: string;
   let rows: Row[];
 
@@ -60,18 +70,24 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform)).each([
     fs.mkdirSync(env.ORKAS_WORKSPACE_ROOT);
     delete env.ELECTRON_RUN_AS_NODE;
     const output = path.join(root, 'results.json');
-    const logs = await promisify(execFile)(require('electron'), [
+    const run = promisify(execFile)(require('electron'), [
       path.resolve('test/fixtures/office/readonly-review.cjs'), process.cwd(), output,
       JSON.stringify(cases.map(([id]) => id)),
-    ], { env, timeout: 150_000, maxBuffer: 256 * 1024 });
+    ], { env, timeout: OFFICE_FIXTURE_TIMEOUT_MS, maxBuffer: 256 * 1024 });
+    const logs = await run;
+    // Electron can exit with code 0 after execFile sends its timeout signal.
+    expect(run.child.killed, `Office fixture ${cohort} exceeded its ${OFFICE_FIXTURE_TIMEOUT_MS} ms deadline`).toBe(false);
     // Even an otherwise empty Electron app emits one console CRLF on Windows.
     expect(process.platform === 'win32' ? ['', '\r\n'] : ['']).toContain(logs.stdout);
     expect(logs.stderr).toBe('');
+    expect(fs.existsSync(output), `Office fixture ${cohort} exited without a results receipt`).toBe(true);
     rows = JSON.parse(fs.readFileSync(output, 'utf8'));
     expect(rows.map(row => row.id)).toEqual(cases.map(([id]) => id));
-  }, 160_000);
+  }, OFFICE_FIXTURE_TIMEOUT_MS + 10_000);
 
-  afterAll(() => { if (root) fs.rmSync(root, { recursive: true, force: true }); });
+  afterAll(async () => {
+    if (root) await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
 
   it.each(cases)('%s: %s', (id) => {
     const row = rows.find(item => item.id === id)!;
@@ -104,6 +120,10 @@ describe.skipIf(!['darwin', 'win32'].includes(process.platform)).each([
         : id === 'read-notes-end' ? ['/footnotes'] : id === 'read-notes-none' ? ['/footnotes', '/endnotes'] : [];
       expect(failures.map(({ verb, target, code }) => ({ verb, target, code }))).toEqual(
         absent.map(target => ({ verb: 'get', target, code: 1 })),
+      );
+    } else if (id === 'read-tables') {
+      expect(failures.map(({ verb, target, code }) => ({ verb, target, code }))).toEqual(
+        ['/footnotes', '/endnotes'].map(target => ({ verb: 'get', target, code: 1 })),
       );
     } else expect(failures).toEqual([]);
   });

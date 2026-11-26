@@ -704,7 +704,7 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
     name: 'chat_history',
     executionMode: 'parallel',
     description: historyContract.description,
-    compatibilityInputFields: ['cid', ...historyContract.rejectedFields],
+    compatibilityInputFields: ['cid', ...historyContract.rejectedFields, ...historyContract.legacyReadFields],
     inputSchema: historyContract.inputSchema(z, scopeEnum),
     async execute(input, ctx) {
       const projected = historyContract.project(z, input, scopeEnum);

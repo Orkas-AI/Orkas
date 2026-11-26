@@ -34,6 +34,31 @@ describe("PersistentSession", () => {
     try { fs.unlinkSync(`${file}.context.json.tmp`); } catch { /* ignore */ }
   });
 
+  it("rebuilds archived tool announcements after restart and drops them at turn completion", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "Inspect the release notes" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "load", name: "tool_load", input: {} }]);
+    session.addToolResult("load", "Tool ready", undefined, false, ["web_search"]);
+    const steer = session.addMessage("user", [{ type: "text", text: "Also use the selected connector" }]);
+    session.recordSteerToolAdditions(steer, ["call_connector_tool"]);
+    session.addAssistantMessage([{ type: "tool_use", id: "search", name: "web_search", input: {} }]);
+    session.addToolResult("search", "The release is published");
+    session.applyActiveCheckpointSummary("The query is ready.", 2);
+
+    const projected = session.getMessagesForModel();
+    expect(projected.filter((message) => message.toolsAddedAfter).map((message) => message.toolsAddedAfter))
+      .toEqual([["web_search"], ["call_connector_tool"]]);
+    expect(fs.readFileSync(file, "utf8")).not.toContain("toolsAddedAfter");
+    expect(fs.readFileSync(file, "utf8")).not.toContain("call_connector_tool");
+
+    const reopened = new PersistentSession({ sessionFile: file });
+    expect(reopened.getMessagesForModel().filter((message) => message.toolsAddedAfter).map((message) => message.toolsAddedAfter))
+      .toEqual([["web_search"]]);
+    reopened.completeActiveTurn();
+    reopened.beginUserTurn([{ type: "text", text: "Start a separate task" }]);
+    expect(reopened.getMessagesForModel().some((message) => message.toolsAddedAfter)).toBe(false);
+  });
+
   it("restores authoring images after checkpoint/restart without restoring them in the next turn", () => {
     const session = new PersistentSession({ sessionFile: file });
     session.beginUserTurn([{ type: "text", text: "Create using the reference" }]);
@@ -2051,6 +2076,20 @@ describe("context save integrity and efficiency", () => {
     return new PersistentSession({ sessionFile: file });
   }
 
+  it("keeps the active checkpoint retry reservation on reopen and resets it for a new user turn", async () => {
+    const session = started();
+    expect(session.claimActiveCheckpointLengthRetry()).toBe(true);
+    await session.flushPending();
+    const restored = assertSaved(session);
+    expect(restored.claimActiveCheckpointLengthRetry()).toBe(false);
+    expect(restored.getMessages()).toEqual(session.getMessages());
+    restored.addAssistantMessage([{ type: "text", text: "finished" }]);
+    restored.completeActiveTurn();
+    restored.beginUserTurn([{ type: "text", text: "A new request" }]);
+    expect(restored.claimActiveCheckpointLengthRetry()).toBe(true);
+    expect(restored.claimActiveCheckpointLengthRetry()).toBe(false);
+  });
+
   it("saves every ordinary message for immediate reopen without re-encoding or overwriting unchanged context", () => {
     const session = started(), original = fs.readFileSync(sidecar);
     const encode = vi.spyOn(session, "getSerializedContextState"), write = vi.spyOn(fs, "writeFileSync");
@@ -2303,10 +2342,22 @@ describe("context save integrity and efficiency", () => {
     expect(assertSaved(session).getMessages()).toEqual(session.getMessages());
   });
 
-  it("falls back to full saves for oversized snapshots instead of retaining unbounded cache entries", () => {
+  it("persists oversized snapshots without scanning them a second time for cache admission", () => {
     const session = started();
-    const resource = "/" + "x".repeat(4 * 1024 * 1024);
-    session.addHistoryResource({ kind: "attachment", path: resource });
+    const resource = "/" + "界".repeat(4 * 1024 * 1024);
+    const byteLength = Buffer.byteLength;
+    let scans = 0;
+    const scan = vi.spyOn(Buffer, "byteLength").mockImplementation((value, encoding) => {
+      if (typeof value === "string" && value.startsWith('{"version":1') && value.length > resource.length) scans++;
+      return byteLength(value, encoding);
+    });
+    try {
+      session.addHistoryResource({ kind: "attachment", path: resource });
+    } finally {
+      scan.mockRestore();
+    }
+    expect(scans).toBe(0);
+    expect(fs.readFileSync(sidecar, "utf8")).toBe(JSON.stringify(session.getSerializedContextState()) + "\n");
     const encode = vi.spyOn(session, "getSerializedContextState");
     session.addAssistantMessage([{ type: "text", text: "after large state" }]);
     expect(encode).toHaveBeenCalled();

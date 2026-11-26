@@ -86,7 +86,7 @@ it.runIf(process.env.ORKAS_REAL_WHISPER_TEST === '1')('preserves native VideoStu
   const { transcribeSpeech } = await import('../../../src/main/features/video_studio');
   const transcriptPath = path.join(root, 'video-transcript.json');
   const source = fs.readFileSync(speechFixtureFile);
-  const result = await transcribeSpeech({ inputAbsPath: speechFixtureFile, transcriptAbsPath: transcriptPath, language: 'en', timestamps: 'segment', allowModelDownload: false });
+  const result = await transcribeSpeech({ inputAbsPath: speechFixtureFile, transcriptAbsPath: transcriptPath, language: 'en', timestamps: 'segment' });
   // JFK's 220–220 ms first word now fits before the next word at 330 ms.
   // Segment requests also validate that word view before publishing their JSON.
   expect(result).toMatchObject({ ok: true, transcript_path: transcriptPath });

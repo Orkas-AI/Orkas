@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../src/main/i18n', () => ({
@@ -9,7 +10,7 @@ vi.mock('../../../src/main/i18n', () => ({
 }));
 
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ warn: vi.fn() }),
+  createLogger: () => ({ info: vi.fn(), warn: vi.fn() }),
 }));
 
 vi.mock('../../../src/main/features/group_chat/bus', () => ({
@@ -17,12 +18,15 @@ vi.mock('../../../src/main/features/group_chat/bus', () => ({
 }));
 
 import {
+  createTaskNotificationForeground,
   startTaskNotifications,
   type TaskNotificationRuntime,
 } from '../../../src/main/features/task_notifications';
 import type { TaskTerminalEvent, TaskTerminalListener } from '../../../src/main/features/group_chat/bus';
+import * as bashPermissions from '../../../src/main/model/core-agent/bash-permissions';
 import {
   _resetTaskInterventionsForTest,
+  captureDeliveredTaskIntervention,
   emitTaskIntervention,
   type TaskInterventionListener,
 } from '../../../src/main/util/task-intervention-events';
@@ -54,6 +58,8 @@ describe('task completion notifications', () => {
   let resolveLanguageForUser: ReturnType<typeof vi.fn>;
   let stopFocusListener: ReturnType<typeof vi.fn>;
   let focusListener: (() => void) | null;
+  let backgroundListener: (() => void) | null;
+  let resolvePermission: (() => void) | null;
   let stopTaskNotifications: () => void;
   let unsubscribe: ReturnType<typeof vi.fn>;
   let unsubscribeInterventions: ReturnType<typeof vi.fn>;
@@ -73,6 +79,8 @@ describe('task completion notifications', () => {
     focused = false;
     supported = true;
     focusListener = null;
+    backgroundListener = null;
+    resolvePermission = null;
     closeNotification = vi.fn();
     showNotification = vi.fn();
     openConversation = vi.fn();
@@ -91,13 +99,21 @@ describe('task completion notifications', () => {
     runtime = {
       getActiveUserId: () => activeUserId,
       isEnabled: () => enabled,
-      hasFocusedWindow: () => focused,
+      isForeground: () => focused,
       isSupported: () => supported,
       resolveLanguageForUser,
       setBadgeCount,
-      onDidFocus: (next) => {
+      onDidEnterForeground: (next) => {
         focusListener = next;
         return stopFocusListener;
+      },
+      onDidEnterBackground: (next) => {
+        backgroundListener = next;
+        return () => { backgroundListener = null; };
+      },
+      watchBashPermission: (_requestId, _uid, _cid, resolved) => {
+        resolvePermission = resolved;
+        return () => { resolvePermission = null; };
       },
       createNotification,
       openConversation,
@@ -243,6 +259,92 @@ describe('task completion notifications', () => {
       expect(showNotification).toHaveBeenCalledOnce();
     } finally {
       stopDefaultSubscription();
+      _resetTaskInterventionsForTest();
+    }
+  });
+
+  it.each([false, true])('releases only the resolved Bash badge after native dismissal (focus reset=%s)', reset => {
+    interventionListener({
+      attention_id: 'sensitive_operation:dismissed', bash_request_id: 'dismissed',
+      user_id: 'u1', conversation_id: 'c1', kind: 'sensitive_operation',
+    });
+    closeListener!('dismissed');
+    if (reset) focusListener!();
+    listener({ ...terminal('completed'), conversation_id: 'other' });
+    expect(setBadgeCount).toHaveBeenLastCalledWith(reset ? 1 : 2);
+    resolvePermission!();
+    expect(setBadgeCount).toHaveBeenLastCalledWith(1);
+  });
+
+  it('reminds once when a foreground Bash approval is still pending on leaving Orkas', () => {
+    focused = true;
+    const delivered = {
+      attention_id: 'sensitive_operation:request-1', bash_request_id: 'request-1',
+      user_id: 'u1', conversation_id: 'c1', kind: 'sensitive_operation' as const,
+    };
+    interventionListener(delivered);
+    expect(showNotification).not.toHaveBeenCalled();
+
+    focused = false;
+    backgroundListener?.();
+    backgroundListener?.();
+    expect(showNotification).toHaveBeenCalledOnce();
+    clickListener!();
+    expect(openConversation).toHaveBeenCalledWith('c1', 'waiting_input', 'u1');
+
+    focused = true;
+    focusListener?.();
+    focused = false;
+    interventionListener(delivered);
+    backgroundListener?.();
+    expect(showNotification).toHaveBeenCalledOnce();
+  });
+
+  it.each(['answered in the foreground', 'account switched'] as const)('skips a deferred approval after it was %s', reason => {
+    focused = true;
+    interventionListener({
+      attention_id: 'sensitive_operation:request-2', bash_request_id: 'request-2',
+      user_id: 'u1', conversation_id: 'c1', kind: 'sensitive_operation',
+    });
+    if (reason === 'answered in the foreground') resolvePermission?.();
+    else activeUserId = 'u2';
+    focused = false;
+    backgroundListener?.();
+    expect(showNotification).not.toHaveBeenCalled();
+    expect(openConversation).not.toHaveBeenCalled();
+  });
+
+  it.each(['responded', 'task cancelled', 'account cancelled'] as const)('withdraws a background prompt that was %s at the Bash gate', async reason => {
+    stopTaskNotifications();
+    runtime.watchBashPermission = bashPermissions.watchBashPermission;
+    _resetTaskInterventionsForTest();
+    stopTaskNotifications = startTaskNotifications(runtime, () => unsubscribe);
+    let requestId = '';
+    bashPermissions._setBroadcastForTest((channel, payload) => {
+      if (channel === 'bash:permission') {
+        requestId = (payload as { request_id: string }).request_id;
+        captureDeliveredTaskIntervention(channel, payload, 'u1');
+      }
+    });
+    try {
+      const decision = bashPermissions.requestBashDecision({
+        uid: 'u1', cid: 'c1', agentId: 'agent-1', agentName: 'Reviewer',
+        command: 'scoped approval fixture', reasons: ['sensitive_path'],
+      });
+      expect(showNotification).toHaveBeenCalledOnce();
+      const staleClick = clickListener;
+      if (reason === 'responded') bashPermissions.respond(requestId, 'allow_once');
+      else if (reason === 'task cancelled') bashPermissions.cancelForCid('c1');
+      else bashPermissions.cancelForUid('u1');
+
+      expect(await decision).toBe(reason === 'responded' ? 'allow_once' : 'deny');
+      expect(closeNotification).toHaveBeenCalledOnce();
+      expect(setBadgeCount).toHaveBeenLastCalledWith(0);
+      staleClick?.();
+      expect(openConversation).not.toHaveBeenCalled();
+    } finally {
+      bashPermissions._resetForTest();
+      bashPermissions._setBroadcastForTest(null);
       _resetTaskInterventionsForTest();
     }
   });
@@ -430,5 +532,120 @@ describe('task completion notifications', () => {
     expect(stopFocusListener).toHaveBeenCalledOnce();
     expect(setBadgeCount).toHaveBeenLastCalledWith(0);
     expect(closeNotification).toHaveBeenCalledOnce();
+  });
+});
+
+describe('task notification foreground on the desktop', () => {
+  function desktop(platform: NodeJS.Platform) {
+    const app = Object.assign(new EventEmitter(), { isActive: vi.fn(() => true) });
+    const state = { focused: false, visible: true, minimized: false, destroyed: false };
+    const window = {
+      isFocused: () => state.focused,
+      isVisible: () => state.visible,
+      isMinimized: () => state.minimized,
+      isDestroyed: () => state.destroyed,
+    };
+    const windows = [window];
+    return { app, state, windows, ...createTaskNotificationForeground(app, () => windows, platform) };
+  }
+
+  it('treats a visible macOS app with a native sheet as foreground even without window focus', () => {
+    const { app, state, isForeground } = desktop('darwin');
+    expect(isForeground()).toBe(true);
+
+    app.isActive.mockReturnValue(false);
+    state.focused = true;
+    expect(isForeground()).toBe(false);
+  });
+
+  it('allows macOS background notifications when the active app has no usable window', () => {
+    const { state, windows, isForeground } = desktop('darwin');
+    state.visible = false;
+    expect(isForeground()).toBe(false);
+
+    state.visible = true;
+    state.minimized = true;
+    expect(isForeground()).toBe(false);
+
+    state.minimized = false;
+    state.destroyed = true;
+    expect(isForeground()).toBe(false);
+
+    windows.length = 0;
+    expect(isForeground()).toBe(false);
+  });
+
+  it('acknowledges macOS foreground return without a window focus event', () => {
+    const { app, onDidEnterForeground } = desktop('darwin');
+    const acknowledge = vi.fn();
+    const unsubscribe = onDidEnterForeground(acknowledge);
+
+    app.emit('did-become-active');
+    expect(acknowledge).toHaveBeenCalledOnce();
+
+    unsubscribe();
+    app.emit('did-become-active');
+    app.emit('browser-window-focus');
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the macOS badge until a hidden window is restored or the app becomes active', () => {
+    const { app, state, onDidEnterForeground } = desktop('darwin');
+    const acknowledge = vi.fn();
+    const unsubscribe = onDidEnterForeground(acknowledge);
+
+    state.visible = false;
+    app.emit('did-become-active');
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    state.visible = true;
+    app.isActive.mockReturnValue(false);
+    app.emit('browser-window-focus');
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    app.isActive.mockReturnValue(true);
+    state.focused = true;
+    app.emit('browser-window-focus');
+    expect(acknowledge).toHaveBeenCalledOnce();
+    unsubscribe();
+  });
+
+  it.each(['darwin', 'win32'] as const)('rechecks desktop foreground after a window switch on %s', async platform => {
+    const { app, state, onDidEnterBackground } = desktop(platform);
+    const background = vi.fn();
+    const unsubscribe = onDidEnterBackground(background);
+    state.focused = false;
+    app.emit('browser-window-blur');
+    state.focused = true;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(background).not.toHaveBeenCalled();
+
+    state.focused = false;
+    app.isActive.mockReturnValue(false);
+    app.emit(platform === 'darwin' ? 'did-resign-active' : 'browser-window-blur');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(background).toHaveBeenCalledOnce();
+
+    app.emit('browser-window-blur');
+    unsubscribe();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(background).toHaveBeenCalledOnce();
+  });
+
+  it.each(['win32', 'linux'] as const)('uses window focus for notification delivery and cleanup on %s', platform => {
+    const { app, state, isForeground, onDidEnterForeground } = desktop(platform);
+    const acknowledge = vi.fn();
+    const unsubscribe = onDidEnterForeground(acknowledge);
+
+    expect(isForeground()).toBe(false);
+    app.emit('did-become-active');
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    state.focused = true;
+    app.emit('browser-window-focus');
+    expect(isForeground()).toBe(true);
+    expect(acknowledge).toHaveBeenCalledOnce();
+    expect(app.isActive).not.toHaveBeenCalled();
+    unsubscribe();
   });
 });

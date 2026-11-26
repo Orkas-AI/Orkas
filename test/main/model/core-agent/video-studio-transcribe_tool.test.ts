@@ -1,7 +1,9 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import sharp from 'sharp';
 
 vi.mock('electron', () => ({}));
 
@@ -110,7 +112,7 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe tr
     const output = path.join(transcriptsDir(), 'old.json'); fs.writeFileSync(output, '{"text":"Prior"}');
     writeExecutable(path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
       '#!/usr/bin/env node', "const fs=require('node:fs'),a=process.argv.slice(2);",
-      "fs.writeFileSync(a[a.indexOf('-of')+1]+'.json',JSON.stringify({transcription:[{text:'Keep this text.',offsets:{from:0,to:6000}}]}));",
+      "fs.writeFileSync(a[a.indexOf('-of')+1]+'.json',JSON.stringify({transcription:[{text:'Keep this text.',offsets:{from:3000,to:1000}}]}));",
     ]);
     const written: string[] = [];
     const t = await tool({ onFileWritten: (file: string) => { written.push(file); } });
@@ -169,6 +171,31 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe tr
       expect(fs.readdirSync(outside)).toEqual([]);
     } finally {
       fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // 2026-11-23: a file the user named elsewhere on the computer follows the access setting the
+  // file tools follow, and its transcript is still the project's.
+  it('transcribes a file elsewhere on the computer when the access setting allows it', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-transcribe-elsewhere-file-'));
+    const source = path.join(elsewhere, 'talk.mp4');
+    fs.writeFileSync(source, 'fake media');
+    const t = await tool();
+    const ctx = { workingDir: workspace, state: {} } as any;
+    try {
+      perm.setLocalExecMode('workspace_approval');
+      const refused: any = await t.execute({ op: 'speech.transcribe', input_path: source }, ctx);
+      expect(refused.isError).toBe(true);
+      expect(String(refused.content)).toMatch(/^E_PATH_OUT_OF_SCOPE: .* Ask the user to attach it, or to allow files outside the workspace in Settings\.$/);
+      expect(fs.existsSync(transcriptsDir())).toBe(false);
+      perm.setLocalExecMode('all_files_approval');
+      const done = body(await t.execute({ op: 'speech.transcribe', input_path: source }, ctx));
+      expect(done).toMatchObject({ ok: true, op: 'speech.transcribe' });
+      expect(path.dirname(done.transcript_path)).toBe(transcriptsDir());
+    } finally {
+      perm.setLocalExecMode('all_files_approval');
+      fs.rmSync(elsewhere, { recursive: true, force: true });
     }
   });
 
@@ -244,5 +271,79 @@ describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe ph
     expect(JSON.parse(fs.readFileSync(argsLog, 'utf8'))).toContain('-ojf');
     expect(reply.summary).toMatchObject({ timestamp_detail: 'segment', words: [] });
     expect(reply.phrases.text).toBe('[0.00–0.50] Grow\n  — 0.60s —\n[1.10–2.00] without hiring.');
+  });
+});
+
+// 2026-11-17 benchmark: a drama recap told the next episode's preview ("录音被删了") as
+// something that had happened, and kept the preview's picture. The 下集预告 card was only in
+// the picture; the Agent wrote its scene list from the transcript and never looked.
+describe.skipIf(process.platform === 'win32')('video_studio speech.transcribe frames under each phrase', () => {
+  const realBin = (name: string) => path.resolve('resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`, name);
+  const fakeWhisper = (segments: Array<[number, number, string]>) => writeExecutable(
+    path.join(root, 'runtime', 'whisper', 'current', 'bin', 'whisper-cli'), [
+      '#!/usr/bin/env node', "const a = process.argv.slice(2);",
+      `require('node:fs').writeFileSync(a[a.indexOf('-of') + 1] + '.json', JSON.stringify({ result: { language: 'en' }, transcription: ${JSON.stringify(
+        segments.map(([from, to, text]) => ({ offsets: { from, to }, text })))} }));`,
+    ]);
+
+  it.skipIf(!fs.existsSync(realBin('ffmpeg')))('attaches the picture in the middle of each phrase, labelled with its start', async () => {
+    process.env.ORKAS_BUNDLED_FFMPEG = realBin('ffmpeg');
+    process.env.ORKAS_BUNDLED_FFPROBE = realBin('ffprobe');
+    const source = path.join(workspace, 'project', 'raw', 'episode.mp4');
+    const made = spawnSync(realBin('ffmpeg'), ['-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'color=red:s=1080x1920:r=25:d=2', '-f', 'lavfi', '-i', 'color=blue:s=1080x1920:r=25:d=2',
+      '-f', 'lavfi', '-i', "sine=frequency=300:sample_rate=48000:duration=4,volume=enable='between(t,1.6,2.4)':volume=0",
+      '-filter_complex', '[0:v][1:v]concat=n=2:v=1[v]', '-map', '[v]', '-map', '2:a',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', source], { encoding: 'utf8' });
+    expect(made.status, made.stderr).toBe(0);
+    fakeWhisper([[200, 1600, ' The contract was changed.'], [2400, 3800, ' The recording was deleted.']]);
+
+    const result: any = await (await tool()).execute({ op: 'speech.transcribe', input_path: source }, { workingDir: workspace, state: {} } as any);
+    const data = body(result);
+    expect(data).toMatchObject({ ok: true, visual_evidence: { attached: true, role: 'phrase_frames' }, phrase_frames: { frames: 2, phrases: 2 } });
+    expect(data.phrase_frames.note).toContain('start time');
+    expect(data).not.toHaveProperty('phrase_lines');
+    // A large result is stored and shown by its start: the note on the attached picture comes first.
+    const content = String(result.content);
+    expect(content.indexOf('"phrase_frames"')).toBeLessThan(content.indexOf('"phrases"'));
+    expect(content.indexOf('"phrase_frames"')).toBeLessThan(content.indexOf('"summary"'));
+    expect(result.images).toHaveLength(1);
+    expect(result.imageRetention).toBe('active_turn');
+    // One row of two 270x480 cells: the first phrase is over red, the second over blue.
+    const sheet = Buffer.from(result.images[0].data, 'base64');
+    const { width = 0 } = await sharp(sheet).metadata();
+    const scale = width / (2 * 270 + 3 * 16);
+    const colour = async (left: number) => {
+      const crop = await sharp(sheet).extract({ left: Math.round(left * scale), top: Math.round(216 * scale), width: Math.round(40 * scale), height: Math.round(40 * scale) }).png().toBuffer();
+      const { channels } = await sharp(crop).stats();
+      return channels[0].mean > channels[2].mean ? 'red' : 'blue';
+    };
+    expect(await colour(16 + 100)).toBe('red');
+    expect(await colour(16 + 270 + 16 + 100)).toBe('blue');
+  }, 60_000);
+
+  it('attaches no frames to a recording with no picture', async () => {
+    const source = path.join(workspace, 'project', 'raw', 'voice.m4a');
+    fs.writeFileSync(source, 'fake audio');
+    const result: any = await (await tool()).execute({ op: 'speech.transcribe', input_path: source }, { workingDir: workspace, state: {} } as any);
+    expect(body(result)).toMatchObject({ ok: true });
+    expect(body(result)).not.toHaveProperty('phrase_frames');
+    expect(body(result)).not.toHaveProperty('visual_evidence');
+    expect(result.images).toBeUndefined();
+  });
+
+  it('still returns the transcript when the frames cannot be made', async () => {
+    // The picture is reported, but the fake ffmpeg writes no real image.
+    writeExecutable(path.join(root, 'bin', 'ffprobe'), [
+      '#!/usr/bin/env node',
+      'process.stdout.write(JSON.stringify({ format: { duration: "5" }, streams: [{ codec_type: "video", width: 1080, height: 1920, avg_frame_rate: "25/1" }, { codec_type: "audio", codec_name: "aac" }] }));',
+    ]);
+    const source = path.join(workspace, 'project', 'raw', 'clip.mp4');
+    fs.writeFileSync(source, 'fake media');
+    const result: any = await (await tool()).execute({ op: 'speech.transcribe', input_path: source }, { workingDir: workspace, state: {} } as any);
+    expect(result.isError).not.toBe(true);
+    expect(body(result)).toMatchObject({ ok: true, op: 'speech.transcribe' });
+    expect(body(result)).not.toHaveProperty('phrase_frames');
+    expect(result.images).toBeUndefined();
   });
 });

@@ -242,9 +242,9 @@ test.describe('long-task context continuity', () => {
 
     const requestCountAtStop = modelOrkas.modelRequests.length;
     await page.locator('#chat-send-btn').click();
-    await expect(page.locator(
-      '#chat-history .chat-message.assistant [data-role="final"]',
-    )).toHaveText('Interrupted', {
+    const stoppedTurn = page.locator('#chat-history .chat-message.assistant');
+    await expect(stoppedTurn).toHaveAttribute('data-interrupted', '1');
+    await expect(stoppedTurn.locator('[data-role="final"]')).toHaveText('Run aborted', {
       timeout: 10_000,
     });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);

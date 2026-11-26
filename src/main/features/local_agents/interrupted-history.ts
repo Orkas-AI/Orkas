@@ -11,6 +11,7 @@ import type { GroupMessage } from '../group_chat/visibility';
 import type { HistoryProcessPart } from '../conversation-process-cache';
 import { processTextChunks } from '../conversation-process-cache';
 import { CodexFileCitationStreamFilter } from './public-output';
+import { isExpandedLocalCli } from './expanded-cli-types';
 
 type Item = NonNullable<GroupMessage['process']>[number];
 type Candidate = { record: GroupMessage; actorId: string; actorResolved: boolean;
@@ -74,7 +75,8 @@ async function archiveRuns(userId: string, cid: string, actors: Set<string>): Pr
       if ((await handle.stat()).size > 4 * 1024 * 1024) continue;
       const meta = JSON.parse(await handle.readFile('utf8'));
       if (meta.cid !== cid || !actors.has(meta.agentId)
-          || !['codex', 'claude', 'opencode', 'openclaw', 'hermes'].includes(meta.cli)) continue;
+          || (!['codex', 'claude', 'opencode', 'openclaw', 'hermes'].includes(meta.cli)
+            && !isExpandedLocalCli(meta.cli))) continue;
       runs.push({ directory, cid: meta.cid, agentId: meta.agentId, cli: meta.cli,
         startedAt: meta.startedAt, endedAt: meta.endedAt, durationMs: meta.durationMs,
         currentMessageId: meta.currentMessageId });
@@ -167,7 +169,9 @@ async function recoverRun(run: Run, store: (items: Item[]) => HistoryProcessPart
     }
     flushText();
     if (event.heartbeat === true || event.type === 'idle') continue;
-    if (event.type === 'thinking') {
+    if (event.type === 'commentary-finalized' && typeof event.text === 'string') {
+      addText(event.text);
+    } else if (event.type === 'thinking') {
       // Old diagnostic archives may predate runner-side raw-thought removal.
       // A summary already passed the public runner boundary; never copy text.
       batch.push({ type: 'event', event: { stream: 'cli', data: {

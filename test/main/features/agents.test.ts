@@ -157,13 +157,13 @@ describe('agents › diagnostic privacy', () => {
   });
 });
 
-async function failNextBlockingAgentChat(text: string, error: string): Promise<void> {
+async function failNextBlockingAgentChat(text: string, error: string, aborted = false): Promise<void> {
   const client = await import('../../../src/main/model/client');
   vi.mocked(client.chatWithModel).mockResolvedValueOnce({
     ok: false,
     text,
     error,
-    aborted: false,
+    aborted,
   });
 }
 
@@ -2528,11 +2528,12 @@ describe('agents › custom agent memory', () => {
 
 describe('agents › blocking edit-chat failure recovery', () => {
   it.each([
-    ['积分不足', '已完成的智能体说明。'],
-    ['fetch failed', '已生成的配置预览。'],
-  ])('persists partial model text before %s', async (error, partial) => {
+    ['积分不足', '已完成的智能体说明。', false, true],
+    ['fetch failed', '已生成的配置预览。', false, true],
+    ['user stopped the edit', 'A partial edit.', true, false],
+  ])('persists partial model text before %s', async (error, partial, aborted, failed) => {
     writeCustomAgent('abc', { name: 'Agent A', workflow: 'Do the work.' });
-    await failNextBlockingAgentChat(partial, error);
+    await failNextBlockingAgentChat(partial, error, aborted);
     const a = await loadAgents();
 
     const result = await a.sendToAgentEditChat('u1', 'abc', '更新智能体');
@@ -2544,7 +2545,34 @@ describe('agents › blocking edit-chat failure recovery', () => {
     const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     expect(rows.at(-1)?.content).toContain(partial);
     expect(rows.at(-1)?.content).toContain(error);
+    expect(rows.at(-1)?.failed).toBe(failed);
   });
+});
+
+it('restores legacy Agent edit failures from the last runtime receipt without rewriting history', async () => {
+  const agents = await loadAgents();
+  const receipt = (data: object) => ({
+    type: 'event', event: { stream: 'runtime', data: { phase: 'end', ...data } },
+  });
+  const error = receipt({ status: 'error', errored: true, aborted: false });
+  const completed = receipt({ status: 'success', errored: false, aborted: false });
+  const aborted = receipt({ status: 'error', errored: false, aborted: true });
+  const rows = [
+    { role: 'assistant', content: 'Interrupted edit', process: [error] },
+    { role: 'assistant', content: 'Edited successfully', process: [error, completed] },
+    { role: 'assistant', content: 'User stopped the edit', process: [aborted] },
+    { role: 'assistant', content: 'Model response failed: hypothetical example' },
+  ];
+  const source = rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+  const directory = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc');
+  fs.mkdirSync(directory, { recursive: true });
+  const chatPath = path.join(directory, 'chat.jsonl');
+  fs.writeFileSync(chatPath, source);
+
+  expect(await agents.getAgentChatMessages(TEST_UID, 'abc')).toEqual([
+    { ...rows[0], failed: true }, ...rows.slice(1),
+  ]);
+  expect(fs.readFileSync(chatPath, 'utf8')).toBe(source);
 });
 
 describe('agents › streamSendToAgentEditChat synthesized progress', () => {
@@ -2790,6 +2818,19 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
       errored: false,
     });
     expect(runtime?.event?.data?.duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('keeps a stream reported as aborted out of Agent edit failure history', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    streamImpl.current = async function* () {
+      yield { type: 'error', text: 'aborted', aborted: true };
+    };
+    const agents = await loadAgents();
+    for await (const _event of agents.streamSendToAgentEditChat(TEST_UID, 'abc', 'Edit the workflow')) {
+      // Drain the persisted result.
+    }
+    const history = await agents.getAgentChatMessages(TEST_UID, 'abc');
+    expect(history.at(-1)).toMatchObject({ role: 'assistant', failed: false });
   });
 
   it('keeps non-CLI commentary in the process rail and final-answer deltas in the reply', async () => {

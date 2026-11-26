@@ -70,6 +70,14 @@ async function runtimeTrace(skillIds: string[]): Promise<ImageStudioSkillTraceEv
       expect(result.content).toMatch(/explicit match\/recreate\/restore request takes precedence[\s\S]*reproduce[\s\S]*limited edit[\s\S]*may_change/i);
       expect(result.content).toMatch(/Otherwise, a requested source edit implies edit/i);
       expect(result.content).not.toMatch(/combine editing with strong preservation, keep mode edit/i);
+      expect(result.content).toMatch(/localized copy revision[\s\S]*visible geometry[\s\S]*load .image-compose./i);
+      expect(result.content).toMatch(/clarify only if[\s\S]*explicitly required[\s\S]*change area cannot be isolated/i);
+      const handoff = result.content.split('## Progressive-disclosure handoff')[1] || '';
+      expect(handoff).toMatch(/Return[^\n]*`route`[^\n]*`reference_intent`/i);
+      expect(handoff).toMatch(/source_dimensions[^\n]*preview_dimensions/i);
+      const routing = result.content.split('## Route selection')[1]?.split('## Lock output')[0] || '';
+      expect(routing).toMatch(/Choose `EDIT` for `edit` intent/i);
+      expect(routing).toMatch(/`reproduce`[^\n]*deterministic[^\n]*`COMPOSE`/i);
     }
     if (skillId === 'image-craft') {
       expect(result.content).not.toContain('Never request a protected artist imitation');
@@ -79,6 +87,12 @@ async function runtimeTrace(skillIds: string[]): Promise<ImageStudioSkillTraceEv
       expect(result.content).toContain('generate_image.reference_bindings');
     }
     if (skillId === 'image-compose') {
+      expect(result.content).toMatch(/unchanged source[^\n]*`masked_composite`[^\n]*final raster/i);
+      expect(result.content).toMatch(/supplied raster[^\n]*text box[^\n]*wrap the replacement naturally within the original title area[^\n]*masked_composite/i);
+      const bootstrap = result.content.split('## Safe project bootstrap')[1]?.split('## Authoring contract')[0] || '';
+      expect(bootstrap).toMatch(/HTML final source[^\n]*entry file/i);
+      expect(result.content).toMatch(/masked_composite[^\n]*raster_source[^\n]*project\.inspect/i);
+      expect(result.content).toMatch(/on every route[^\n]*`reference_intent`[^\n]*`required:true` for reproduction/i);
       const reviewStep = result.content.split('## Native workflow')[1]?.split('\n').find(line => /\b4\./.test(line)) || '';
       expect(reviewStep).toMatch(/non-generation[\s\S]*current visual evidence[\s\S]*read `image-design-review`[\s\S]*already loaded[\s\S]*project\.submit_design_review/i);
     }

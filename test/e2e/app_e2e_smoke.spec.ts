@@ -161,11 +161,12 @@ test.describe('desktop shell', () => {
     const appPage = orkas.page;
     if (!appPage) throw new Error('Orkas renderer is unavailable');
     await orkas.invoke('projects.create', { name: 'E2E Visual Project' });
-    await orkas.invoke('agents.create', {
+    const { agent } = await orkas.invoke<{ agent: { agent_id: string; name: string } }>('agents.create', {
       name: 'E2EVisualAgent',
       description: 'Agent detail used to verify navigation.',
       category: 'general',
     });
+    expect(agent?.name).toBe('E2EVisualAgent');
     await appPage.evaluate(async () => (window as any).loadProjects(true));
     await appPage.locator('.project-row', {
       has: appPage.locator('.project-name', { hasText: 'E2E Visual Project' }),
@@ -173,7 +174,9 @@ test.describe('desktop shell', () => {
     await expect(appPage.locator('#project-detail-title')).toHaveText('E2E Visual Project');
 
     await openSidebarEntry(appPage, '#agents-btn');
-    const agentCard = appPage.locator('.agent-card', { hasText: 'E2EVisualAgent' });
+    // The IPC fixture bypasses the renderer's create flow and its catalog refresh.
+    await appPage.evaluate(async () => (window as any).loadAgents(true));
+    const agentCard = appPage.locator(`.agent-card[data-id="${agent.agent_id}"]`);
     await expect(agentCard).toBeVisible();
     await agentCard.click();
     await expect(appPage.locator('#agents-detail-name')).toHaveText('E2EVisualAgent');

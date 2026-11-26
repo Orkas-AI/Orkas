@@ -56,11 +56,11 @@ async function _selectTaskOwner(uid: string, pid: string, task: ProjectTask, cid
       if (getActiveUserId() !== uid) return false;
       return (await groupChat.setFloor(uid, cid, 'commander')).ok;
     }
-    const bindings = pid ? await projects.getBindings(uid, pid) : null;
+    const available = pid ? new Set(await projects.availableProjectAgentIds(uid, pid)) : null;
     const summaries = await agents.listAgentSummaries();
     const candidates = summaries.filter((a) => (
       a.enabled !== false
-      && (!bindings || bindings.agents.includes(a.agent_id))
+      && (!available || available.has(a.agent_id))
       && (task.owner_agent_id ? a.agent_id === task.owner_agent_id : !!pid && a.name === ownerName)
     ));
     // Legacy project tasks may have only a display name. Resolve it only when
@@ -253,6 +253,10 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
       title_text: task.content,
       model_text: _advanceSeedText(task, pid) + '\n\n' + buildHostTurnLanguageDirective(resolveLanguageForUser(uid)),
       ...(attachments.length ? { attachments } : {}),
+      // Its reply may have no reader: the turn neither reports the project's
+      // news nor counts as the user having seen it. Attribution is unchanged.
+      host_todo_run: true,
+      ...(!task.origin_cid ? { confirm_todo_admission: true } : {}),
     });
     if (!res.ok) {
       log.warn('advance send failed', { uid: maskId(uid), pid: maskId(pid), cid: maskId(cid), error: logErrorSummary(res.error || 'unknown') });
@@ -260,7 +264,7 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
       await rollback();
       return { ok: false };
     }
-    await _associateTaskConversation(uid, pid, task.id, cid, res.msg?.id);
+    if (!res.todo_admission_unverified) await _associateTaskConversation(uid, pid, task.id, cid, res.msg?.id);
     log.info('advanced', { uid: maskId(uid), pid: maskId(pid), cid: maskId(cid), task: maskId(task.id) });
     return { ok: true, cid, conversation };
   } catch (err) {
@@ -398,6 +402,8 @@ export async function runTaskNow(
       title_text: task.content,
       model_text: _runSeedText(task, pid) + '\n\n' + buildHostTurnLanguageDirective(resolveLanguageForUser(uid)),
       ...(attachments.length ? { attachments } : {}),
+      host_todo_run: true,
+      ...(!task.origin_cid ? { confirm_todo_admission: true } : {}),
     });
     if (!res.ok) {
       log.warn('runTaskNow send failed', { uid: maskId(uid), pid: maskId(pid), cid: maskId(cid), error: logErrorSummary(res.error || 'unknown') });
@@ -405,7 +411,7 @@ export async function runTaskNow(
       await rollback();
       return { ok: false, error: res.error || 'send_failed' };
     }
-    await _associateTaskConversation(uid, pid, tid, cid, res.msg?.id);
+    if (!res.todo_admission_unverified) await _associateTaskConversation(uid, pid, tid, cid, res.msg?.id);
   } catch (err) {
     log.error('runTaskNow send threw', { uid: maskId(uid), pid: maskId(pid), cid: maskId(cid), error: logErrorSummary(err) });
     await _restoreUnsentStatus(uid, pid, tid, task.status);

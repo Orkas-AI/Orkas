@@ -106,7 +106,10 @@ describe('the VideoStudio package', () => {
     const guide = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8');
     const route = guide.split('## The two tools')[1].split('## 1. Brief')[0];
     expect(route).toMatch(/designed text.*page/i);
-    expect(route).toMatch(/plain subtitles.*`burnsubs`.*`stage-edit`/i);
+    expect(route).toMatch(/read.*@skill\/stage-edit.*subtitles on existing footage.*`burnsubs`/i);
+    const edit = fs.readFileSync(path.join(packageDir, 'skills/stage-edit/SKILL.md'), 'utf8');
+    expect(edit).toMatch(/UTF-8 subtitle file.*`write_file`/i);
+    expect(edit).toMatch(/escape notation.*requested as literal text/i);
     // The implementation and font caveat stay in the editing Skill, rather
     // than becoming another resident command manual.
     expect(agent.workflow).not.toContain('burnsubs');
@@ -157,7 +160,7 @@ describe('the VideoStudio package', () => {
     expect(marketing).toMatch(/need a source the user or the page gave/);
   });
 
-  it('keeps a short ad from going silent or ending as slides, and says what a check flagged', () => {
+  it('keeps a short ad from going silent or ending as slides, and discloses findings that affect use', () => {
     // 2026-11-12 live brand ad: two clips, then three flat text cards still for ~3.5 s each,
     // no music and no voice; the checks flagged both and the reply mentioned neither.
     const guide = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8');
@@ -176,12 +179,38 @@ describe('the VideoStudio package', () => {
     expect(marketing).toMatch(/few shots can be generated, carry them through to the end/);
     expect(marketing).toMatch(/plain text cards over a flat background reads as slides/);
 
-    // The reply names what the real checks flagged and was kept.
+    // Routine findings guide the agent, and users hear about findings that affect delivery.
     const delivery = guide.split('## 5. Deliver')[1].split('## When to stop and ask')[0];
-    expect(delivery).toMatch(/a check flagged that you kept rather than fixed/);
+    expect(delivery).toMatch(/Report routine results only when asked/);
+    expect(delivery).toMatch(/distinguishing the page preview from the delivered file/);
+    expect(delivery).toMatch(/remaining finding that affects use or needs a user decision/);
     const checks = ['video_timeline_render.ts', 'video_timeline_ship.ts']
       .map((name) => fs.readFileSync(path.join(pcRoot, 'src/main/features', name), 'utf8')).join('\n');
     for (const code of ['SCENE_MOSTLY_EMPTY', 'DELIVERY_MOSTLY_STATIC']) expect(checks).toContain(`'${code}'`);
+  });
+
+  it('guides finalized narration into the speech batch while preserving timing dependencies', () => {
+    const audio = fs.readFileSync(path.join(packageDir, 'skills/video-studio/references/audio.md'), 'utf8');
+    const narration = (audio.split('## Narration')[1]?.split('## Captions')[0] ?? '').replace(/\s+/g, ' ');
+    expect(narration).toMatch(/voice one planned line.*keep that take.*then call `preflight`.*same voice settings.*remaining `lines`/i);
+    expect(narration).toMatch(/finalized.*independent.*two.*consecutive.*`generate_speech` calls.*same tool batch/i);
+    expect(narration).toMatch(/separate output paths/i);
+    expect(narration).toMatch(/wait.*measured duration.*before.*rewrit|wait.*measured duration.*before.*revoic/i);
+  });
+
+  it('checks new fixed-picture narration against locked windows while reusing existing audio', () => {
+    const editing = fs.readFileSync(path.join(packageDir, 'skills/stage-edit/references/transcript-and-screen-grounded-editing.md'), 'utf8');
+    const narration = editing.split('## Ground narration on on-screen text')[1]?.replace(/\s+/g, ' ') ?? '';
+    expect(narration).toMatch(/multiple lines.*keep the first planned take.*`preflight`.*same voice settings/i);
+    expect(narration).toMatch(/remaining lines that still need synthesis.*at most 50/i);
+    expect(narration).toMatch(/ordered, non-overlapping windows within the measured picture duration/i);
+    expect(narration).toMatch(/keep.*picture.*start.*end.*shorten.*when editing is allowed/i);
+    expect(narration).toMatch(/verbatim.*estimated or measured.*ask/i);
+    expect(narration).toMatch(/reuse any existing takes that fit.*verify the actual audio.*mix/i);
+    const localization = editing.split('## Ground narration on on-screen text')[0]?.replace(/\s+/g, ' ') ?? '';
+    expect(localization).toMatch(/`--fit-dub` on the existing sound first/i);
+    expect(localization).toMatch(/at most once within existing spending authority/i);
+    expect(localization).toMatch(/multiple new lines.*fixed-picture synthesis/i);
   });
 
   it('keeps configured-service preflight and bounded external spending separate from private credits', () => {
@@ -231,6 +260,8 @@ describe('the VideoStudio package', () => {
     // The delivery checks the beat itself when told the video is cut to it (2026-11-13: the
     // runs that skipped their own check, or ran it and shipped anyway, all drifted off it).
     expect(music).toMatch(/Deliver with `video\.ship` and `"cut_to_beat": true`/);
+    expect(music).toMatch(/Keep that beat timing when reviewing a duration warning/);
+    expect(music).toMatch(/With an older tool that blocks on `expect_duration_sec`, use the music stretch's length/);
     const ship = fs.readFileSync(path.join(pcRoot, 'src/main/model/core-agent/video-timeline-tool.ts'), 'utf8');
     expect(ship).toMatch(/cut_to_beat: \{ type: 'boolean'/);
     const analyze = fs.readFileSync(path.join(packageDir, 'skills/stage-edit/scripts/analyze_media.js'), 'utf8');
@@ -275,7 +306,8 @@ describe('the VideoStudio package', () => {
     expect(explainer).toMatch(/State only what a source says/);
     expect(explainer).toMatch(/A claim you cannot source stays off screen/);
     expect(explainer).toMatch(/compute bar heights, positions and labels from it/);
-    expect(explainer).toMatch(/Blur tokens, keys, emails/);
+    // Owner decision 27.55: private details stay as recorded; the reply says where they show.
+    expect(explainer).toMatch(/stay as recorded: the user hides them/);
     // The guidance sends the Agent to the web tools; a named Agent may load that group
     // on demand even though its persisted tool list does not name it.
     expect(explainer).toContain('`web_search`');
@@ -295,6 +327,10 @@ describe('the VideoStudio package', () => {
     expect(commentary).toMatch(/Facts come only from the episodes supplied/);
     expect(commentary).toMatch(/over about 2 minutes shows the narration for review before it is voiced/);
     expect(commentary).toMatch(/never let the picture run on into the next scene/);
+    expect(commentary).toMatch(/before adding narration[^.]*`render\/pre-narration\.mp4`/);
+    const editGuide = fs.readFileSync(path.join(packageDir, 'skills/stage-edit/SKILL.md'), 'utf8').replace(/\s+/g, ' ');
+    expect(editGuide).toMatch(/narration-only recap revision[^.]*pre-narration cut[^.]*original dialogue/i);
+    expect(editGuide).toMatch(/reuse unchanged voice files at their existing offsets[^.]*replace only the changed/i);
     // Every flag the assembly names is one the shipped scripts parse.
     const edit = fs.readFileSync(path.join(packageDir, 'skills/stage-edit/scripts/edit_video.js'), 'utf8');
     for (const flag of ['--audio-segments', '--on-existing-audio', '--duck']) {
@@ -479,6 +515,80 @@ describe('the VideoStudio package', () => {
     expect(guide).toContain('advisory');
     expect(guide).not.toContain('If it says `needs_work`, fix that too before rendering');
   });
+
+  // Live runs on 2026-11-17–19 sent videos cut with ffmpeg to video.check or video.sheet 20 times:
+  // the workflow said to fix what both show before every delivery.
+  it('sends a video made with ffmpeg alone to delivery, and keeps the page checks for a page timeline', () => {
+    const workflow = String(agent.workflow).split('### 5. Check and deliver')[1]?.split('### 6.')[0] ?? '';
+    expect(workflow).toContain('For a page timeline, follow the `video-studio` review, then render. A video made only with `edit_video` or ffmpeg has no timeline to check: deliver it with `video.ship`.');
+    const guide = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8');
+    const route = guide.split('## The two tools')[1]?.split('## 1. Brief')[0] ?? '';
+    const direct = route.split(/^- \*\*Page render\*\*/m)[0];
+    expect(direct).toMatch(/\bffmpeg\b[^\n]*`video\.ship`/i);
+    expect(direct).not.toContain('`video.check`');
+    const check = guide.split('## 4. Check')[1]?.split('## 5. Deliver')[0] ?? '';
+    expect(check).toMatch(/page timeline.*mixed edit/i);
+    expect(check).toContain('Run `video.check`');
+    const editing = fs.readFileSync(path.join(packageDir, 'skills/stage-edit/SKILL.md'), 'utf8');
+    expect(editing).toMatch(/separate positions[^.]*`\.ass`[^.]*`burnsubs`/i);
+  });
+
+  it('keeps dependent stills and shots behind their reference images', () => {
+    const guide = fs.readFileSync(path.join(packageDir, 'skills/video-studio/references/generation.md'), 'utf8');
+    const calling = guide.split('## Calling')[1]?.split('## Writing the prompt')[0] ?? '';
+    expect(calling).toMatch(/external calls are authorized.*independent stills.*distinct output paths.*references ready/);
+    expect(calling).toMatch(/Check each still before submitting any image or shot that uses it as a reference/);
+  });
+
+  it('plans the available footage per shot and keeps fallback material tied to the request', () => {
+    const skill = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8');
+    const material = skill.split('## 2. Material')[1]?.split('## Material fallback')[0] ?? '';
+    expect(material).toMatch(/For each product shot, decide whether the available footage shows the required scene or action/);
+    expect(material).toMatch(/Reuse suitable real footage/);
+    const fallback = skill.split('## Material fallback')[1]?.split('## 3. Make')[0] ?? '';
+    expect(fallback).toMatch(/including free stock, only when it satisfies the requested shots or the user has accepted a specific alternative/);
+    expect(fallback).toMatch(/Static-image zooms cannot silently replace required product motion/);
+  });
+
+  // 2026-11-18: an eight-minute edit was made whole without a check, rejected, and its rework ran out
+  // of credits; the opening "work straight through" sentence outweighed the 2-minute exception later on.
+  it('ships a representative part first for a video over about 2 minutes, made or edited, and keeps short ones straight through', () => {
+    const skill = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8');
+    const finished = skill.split('## Finished video')[1]?.split('## The two tools')[0] ?? '';
+    expect(finished).toContain('Do not present a plan, a preview or a draft for approval on the way: the user reacts to the finished video, and changing a short one is cheap. A finished video over about 2 minutes is the exception, whether you make it or edit the user\'s footage: first finish one representative part of 30 to 60 seconds with everything the whole will have (look, captions, music, inserted pictures, pace), ship it, say in one line how the rest follows, and make the whole once the user agrees. If it must follow a script you write word for word, show that script first instead. A script the user gave is theirs: make it as written, without showing it back.');
+    const stop = skill.split('## When to stop and ask')[1]?.split('## Changing a video')[0] ?? '';
+    expect(stop).toContain('- A finished video would run over about 2 minutes: ship its representative part first, or the script you wrote for it when it must follow that script word for word (Finished video above). Never stop to show the user a script they gave.');
+    // 2026-11-24: a talk to camera with a few misheard words stopped three turns asking for the script.
+    expect(stop).toContain('- You need something only the user has. The words spoken in a recording are not that: caption them from the transcript, which is not inventing them, and name in your reply any you were unsure of.');
+    expect(fs.readFileSync(path.join(packageDir, 'skills/stage-edit/references/transcript-and-screen-grounded-editing.md'), 'utf8').replace(/\s+/g, ' '))
+      .toContain('With neither, correct what the sentence around a word makes plain (坑 heard as 康) and keep the rest as heard; do not stop to ask the user for a script.');
+    expect(stop).not.toContain('Rework would be expensive');
+    const workflow = JSON.parse(fs.readFileSync(path.join(packageDir, 'agent.json'), 'utf8')).workflow;
+    expect(workflow).toContain('A finished video over about 2 minutes first ships a representative 30 to 60 second part for the user to approve, as `video-studio` describes, or the script you wrote for it when it must follow that script word for word; a script the user gave is made as written, not shown back.');
+  });
+
+  // 2026-11-17: a request to cut the user's uploaded footage arrived with a task brief whose
+  // sources list was empty. VideoStudio wrote the script, recorded narration and tested the edit on
+  // synthetic footage for 40 tool calls before saying the footage never arrived.
+  it('asks for the user\'s footage before any other work when none arrived', () => {
+    const material = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8').split('## 2. Material')[1]?.split('## Material fallback')[0] ?? '';
+    expect(material).toContain("When the request works on the user's own footage, such as a video they say they uploaded to cut, adapt or subtitle, and no video came with it (a task brief whose `sources` list is empty brings none), ask for it before doing anything else: say in one sentence that the footage did not arrive and ask them to add it again. Do not write the script, record narration or test the edit on stand-in footage while you wait.");
+  });
+
+  // Owner decision (27.55, 2026-11-14): private details in a recording are the user's to hide.
+  // The explainer guide still said to blur them; on 2026-11-20 three of four tutorials blurred
+  // the wrong place or nothing, and the reply said the notification was hidden.
+  it('leaves private details in a recording to the user, and names in the reply only what the delivered frames show', () => {
+    const explainer = fs.readFileSync(path.join(packageDir, 'skills/video-craft/references/explainer.md'), 'utf8').replace(/\s+/g, ' ');
+    expect(explainer).toContain('Private details in a recording, such as a phone number or a name in a notification, stay as recorded: the user hides them. Say in your reply where they show, by time, and do not blur or cut them yourself.');
+    for (const { file, text } of modelText.filter((item) => item.file.endsWith('.md'))) expect(text, file).not.toMatch(/boxblur|Blur tokens/);
+    const deliver = fs.readFileSync(path.join(packageDir, 'skills/video-studio/SKILL.md'), 'utf8').split('## 5. Deliver')[1]?.split('## When to stop')[0] ?? '';
+    expect(deliver).toContain('Compare those frames with the current request before replying. Name in the reply only changes the delivered frames show; a change you cannot see there did not reach the video.');
+    expect(deliver).toMatch(/pass the user's requested length if known for either path/);
+    expect(deliver).toMatch(/decide whether to keep or recut an off-target version/);
+    expect(deliver).toContain('- the video link, as `reply_link` from delivery;');
+  });
+
   it('passes the quality validator with no extreme red flags', () => {
     const report = validateAgentSpec({ agentJson: agent });
     expect(report.violations.filter((violation) => violation.level === 'EXTREME')).toEqual([]);
@@ -515,6 +625,21 @@ describe('the VideoStudio package', () => {
     for (const api of ['timeline', 'totalTime', 'totalDuration', 'timeScale']) expect(vendor).toContain(api);
     const timeline = fs.readFileSync(path.join(packageDir, 'skills', 'video-studio', 'references', 'timeline.md'), 'utf8');
     expect(timeline).toContain('assets/vendor/gsap.min.js');
+  });
+
+  it('ships the screen demo helper with every step its reference shows', () => {
+    const helper = fs.readFileSync(path.join(packageDir, 'skills', 'video-studio', 'assets', 'vendor', 'screen-demo.js'), 'utf8');
+    const timeline = fs.readFileSync(path.join(packageDir, 'skills', 'video-studio', 'references', 'timeline.md'), 'utf8');
+    expect(timeline).toContain('./assets/vendor/screen-demo.js');
+    const start = timeline.indexOf("ScreenDemo('[data-scene-id");
+    const example = timeline.slice(start, timeline.indexOf('```', start));
+    const steps = [...example.matchAll(/^\s*\.([a-z]+)\(/gm)].map((match) => match[1]);
+    expect(steps.length).toBeGreaterThan(3);
+    for (const step of steps) expect(helper).toContain(`Demo.prototype.${step} = function`);
+    // A page renders offline and frame by frame: no network, no clock.
+    expect(helper).not.toMatch(/\bfetch\(|XMLHttpRequest|https?:\/\/(?!www\.w3\.org)|setTimeout|setInterval|Date\.now|requestAnimationFrame/);
+    const productSource = fs.readFileSync(path.join(packageDir, 'skills', 'video-craft', 'references', 'product-source.md'), 'utf8');
+    expect(productSource).toContain('`screen-demo.js`');
   });
 
   it('names only operations the tool has', () => {

@@ -45,6 +45,7 @@ type FetchLike = typeof globalThis.fetch;
 export interface BinaryFetchResult {
   status: number;
   body: Buffer;
+  redirectLocation?: string;
 }
 
 export interface BinaryFetchOptions {
@@ -67,6 +68,8 @@ export interface BinaryDownloadOptions extends BinaryFetchOptions {
   retries?: number;
   delaysMs?: number[];
   validate?: (body: Buffer) => void;
+  /** Validate each redirect target before a new request is sent. */
+  validateRedirectUrl?: (url: URL) => boolean;
 }
 
 class BinaryFetchSizeError extends Error {
@@ -75,6 +78,11 @@ class BinaryFetchSizeError extends Error {
     this.name = 'BinaryFetchSizeError';
   }
 }
+
+class BinaryDownloadRedirectError extends Error {}
+
+const BINARY_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_BINARY_REDIRECTS = 20;
 
 class BinaryDownloadHttpError extends Error {
   readonly status: number;
@@ -492,6 +500,13 @@ async function electronSystemBinaryFetch(
       finish(new Error('operation aborted'));
     };
 
+    if (options.redirect === 'manual') {
+      request.on('redirect', (status, _method, redirectLocation) => {
+        finish(undefined, { status, body: Buffer.alloc(0), redirectLocation });
+        request.abort();
+      });
+    }
+
     request.on('response', (response) => {
       const chunks: Buffer[] = [];
       let total = 0;
@@ -548,6 +563,15 @@ async function readBinaryFetchBody(response: Response, maxBytes?: number): Promi
   }
 }
 
+async function readBinaryResponse(response: Response, options: BinaryFetchOptions): Promise<BinaryFetchResult> {
+  if (options.redirect === 'manual' && BINARY_REDIRECT_STATUSES.has(response.status)) {
+    const redirectLocation = response.headers.get('location') ?? undefined;
+    await response.body?.cancel();
+    return { status: response.status, body: Buffer.alloc(0), redirectLocation };
+  }
+  return { status: response.status, body: await readBinaryFetchBody(response, options.maxBytes) };
+}
+
 function createFetchBinary(fetchImpl: FetchLike): BinaryFetchLike {
   return async (url, options = {}) => {
     const target = inputUrl(url);
@@ -563,10 +587,7 @@ function createFetchBinary(fetchImpl: FetchLike): BinaryFetchLike {
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.redirect ? { redirect: options.redirect } : {}),
     });
-    return {
-      status: response.status,
-      body: await readBinaryFetchBody(response, options.maxBytes),
-    };
+    return await readBinaryResponse(response, options);
   };
 }
 
@@ -661,10 +682,7 @@ async function directBinaryFetchWithAddressPolicy(
       ...(options.redirect ? { redirect: options.redirect } : {}),
       dispatcher,
     });
-    return {
-      status: response.status,
-      body: await readBinaryFetchBody(response as unknown as Response, options.maxBytes),
-    };
+    return await readBinaryResponse(response as unknown as Response, options);
   } finally {
     await dispatcher.close();
   }
@@ -913,6 +931,35 @@ async function fetchBinaryWithProxyPolicy(
   return await (_binaryFetchDelegate as BinaryFetchLike)(url, options);
 }
 
+async function fetchCheckedBinaryRedirects(
+  url: string,
+  options: BinaryDownloadOptions,
+  validate: (url: URL) => boolean,
+): Promise<BinaryFetchResult> {
+  let target = url;
+  let headers = options.headers;
+  for (let count = 0; ; count += 1) {
+    const result = await fetchBinaryWithProxyPolicy(target, { ...options, headers, redirect: 'manual' });
+    if (!result.redirectLocation || !BINARY_REDIRECT_STATUSES.has(result.status)) return result;
+    let next: URL;
+    try {
+      next = new URL(result.redirectLocation, target);
+      if (!validate(next)) throw new Error();
+    } catch {
+      throw new BinaryDownloadRedirectError(`${options.label} redirected to a disallowed URL`);
+    }
+    if (count >= MAX_BINARY_REDIRECTS) {
+      throw new BinaryDownloadRedirectError(`${options.label} exceeded its redirect limit`);
+    }
+    if (headers && next.origin !== new URL(target).origin) {
+      headers = Object.fromEntries(Object.entries(headers).filter(([name]) => (
+        !/^(authorization|proxy-authorization|cookie|cookie2)$/i.test(name)
+      )));
+    }
+    target = next.href;
+  }
+}
+
 /**
  * Retry an idempotent binary GET without replaying the operation that produced
  * it. Callers provide byte validation so a transient CDN HTML/XML body with a
@@ -923,7 +970,11 @@ export async function downloadBinaryWithProxyPolicy(
   options: BinaryDownloadOptions,
 ): Promise<BinaryFetchResult> {
   return await retryAsync(options.label, async () => {
-    const result = await fetchBinaryWithProxyPolicy(url, options);
+    const validateRedirectUrl = options.validateRedirectUrl;
+    const download = () => validateRedirectUrl
+      ? fetchCheckedBinaryRedirects(url, options, validateRedirectUrl)
+      : fetchBinaryWithProxyPolicy(url, options);
+    const result = await download();
     if (result.status < 200 || result.status >= 300) {
       throw new BinaryDownloadHttpError(result.status, options.label);
     }
@@ -935,7 +986,7 @@ export async function downloadBinaryWithProxyPolicy(
     signal: options.signal,
     isRetriable: (err) => {
       if (options.signal?.aborted) return false;
-      if (err instanceof BinaryFetchSizeError) return false;
+      if (err instanceof BinaryFetchSizeError || err instanceof BinaryDownloadRedirectError) return false;
       if (err instanceof BinaryDownloadHttpError) return isRetriableBinaryDownloadStatus(err.status);
       return true;
     },

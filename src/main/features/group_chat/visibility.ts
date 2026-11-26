@@ -113,6 +113,12 @@ export interface GroupMessage {
   system_kind?: 'reply_interrupted';
   /** Markdown text body. */
   text: string;
+  /** The original turn's directory was checked for relative media at send.
+   * History may refresh canonical URLs but must not rebind any unresolved
+   * relative media to a different directory. */
+  relative_media_resolved_at_send?: true;
+  /** User opt-in to a verified ImageStudio PNG on this request and its retries. */
+  image_studio_native_png?: true;
   /** User bubble projection preserving authored Commander mentions. Routing
    * and model history continue to use text/model_text; legacy rows omit it. */
   display_text?: string;
@@ -189,6 +195,7 @@ export interface GroupMessage {
    * dialogue projection; manual retry can restore it without parsing prose.
    * Optional for compatibility with records predating goal continuity. */
   orchestration_goal?: string;
+  orchestration_request_history?: import('./state').OrchestrationRequestEntry[];
   /** Host-owned recovery marker for a synchronous `dispatch_to` source (and
    * user retries derived from it). If that Agent bubble is retried after the
    * original Commander call stack was lost, the completed retry must wake a

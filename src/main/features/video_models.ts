@@ -26,13 +26,15 @@ const ratios = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9', 'adaptive'];
 const seedance = { minDuration: 4, maxDuration: 15, resolutions: ['480p', '720p', '1080p'], ratios, images: 9, videos: 3, silent: true, frames: 'first_last' as const };
 const h3 = { minDuration: 4, maxDuration: 15, resolutions: ['480p', '768p'], ratios, images: 9, videos: 3, silent: false, frames: 'first_last' as const, framesFixRatio: true };
 const kling = { minDuration: 3, maxDuration: 30, resolutions: ['720p', '1080p'], ratios: ['16:9', '9:16', '1:1', '21:9', 'adaptive'], images: 10, videos: 5, silent: false, frames: 'first_last' as const, framesWithReferences: true };
+/** The only lengths Veo 3.1 makes, in seconds. */
+export const VEO_DURATIONS: readonly number[] = [4, 6, 8];
 const veo = { minDuration: 4, maxDuration: 8, resolutions: ['720p', '1080p'], ratios: ['16:9', '9:16'], images: 1, videos: 0, silent: true, frames: 'first_last' as const };
 const wan = { minDuration: 2, maxDuration: 30, resolutions: ['480p', '720p', '1080p'], ratios, images: 10, videos: 5, silent: true, autoDuration: true, frames: 'first_last' as const };
 
 export const VIDEO_MODEL_SPECS: Readonly<Record<string, readonly VideoModelSpec[]>> = {
   doubao: [
-    { ...seedance, id: 'doubao-seedance-2-5-260628', name: 'Doubao Seedance 2.5', maxDuration: 30, images: 30, videos: 10, autoDuration: true, framesFixRatio: true },
-    { ...seedance, id: 'doubao-seedance-2-5-flash', name: 'Doubao Seedance 2.5 Flash', maxDuration: 30, resolutions: ['480p', '720p'], images: 10, videos: 5, autoDuration: true, framesFixRatio: true },
+    { ...seedance, id: 'doubao-seedance-2-5-260628', name: 'Seedance 2.5', maxDuration: 30, images: 30, videos: 10, autoDuration: true, framesFixRatio: true },
+    { ...seedance, id: 'doubao-seedance-2-5-flash', name: 'Seedance 2.5 Flash', maxDuration: 30, resolutions: ['480p', '720p'], images: 10, videos: 5, autoDuration: true, framesFixRatio: true },
     { ...seedance, id: 'doubao-seedance-2-0-260128', name: 'Doubao Seedance 2.0' },
     { ...seedance, id: 'doubao-seedance-2-0-fast-260128', name: 'Doubao Seedance 2.0 Fast', resolutions: ['480p', '720p'] },
     { ...seedance, id: 'doubao-seedance-2-0-mini', name: 'Doubao Seedance 2.0 Mini', resolutions: ['480p', '720p'] },
@@ -51,7 +53,7 @@ export const VIDEO_MODEL_SPECS: Readonly<Record<string, readonly VideoModelSpec[
     { ...kling, id: 'kling-v4-0-flash', name: 'Kling 4.0 Flash', maxDuration: 20, resolutions: ['720p'], frames: 'first' },
   ],
   // Omni has no frame setting: it reads image roles from the prompt.
-  google: [{ id: 'gemini-omni-1.1-flash', name: 'Google Gemini Omni 1.1 Flash', minDuration: 3, maxDuration: 10, resolutions: ['360p', '720p', '1080p', '4k'], ratios: ['16:9', '9:16'], images: 9, videos: 1, silent: false, frames: 'none' }],
+  google: [{ id: 'gemini-omni-1.1-flash', name: 'Gemini Omni 1.1 Flash', minDuration: 3, maxDuration: 10, resolutions: ['360p', '720p', '1080p', '4k'], ratios: ['16:9', '9:16'], images: 9, videos: 1, silent: false, frames: 'none' }],
   'google-cloud': [
     { ...veo, id: 'veo-3.1-generate-001', name: 'Google Cloud Veo 3.1', resolutions: ['720p', '1080p', '4k'] },
     { ...veo, id: 'veo-3.1-fast-generate-001', name: 'Google Cloud Veo 3.1 Fast' },
@@ -59,8 +61,8 @@ export const VIDEO_MODEL_SPECS: Readonly<Record<string, readonly VideoModelSpec[
   ],
   runway: [{ id: 'gen4.5', name: 'Runway Gen-4.5', minDuration: 2, maxDuration: 10, resolutions: ['720p'], ratios: ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'], images: 1, videos: 0, silent: true, frames: 'first' }],
   aliyun: [
-    { ...wan, id: 'wan3.0-video', name: 'Alibaba Cloud Wan 3.0' },
-    { ...wan, id: 'wan3.0-video-prime', name: 'Alibaba Cloud Wan 3.0 Prime' },
+    { ...wan, id: 'wan3.0-video', name: 'Wan 3.0' },
+    { ...wan, id: 'wan3.0-video-prime', name: 'Wan 3.0 Prime' },
   ],
 };
 

@@ -198,6 +198,20 @@ test.describe('settings modules and model guard', () => {
     await expect(appPage.locator('#settings-add-modal')).not.toHaveClass(/\bopen\b/);
   });
 
+  test('lists Codex models newest first when adding an account', async ({ appPage }, testInfo) => {
+    await openSettingsTab(appPage, 'credentials');
+    await openAddModelDialog(appPage);
+    await appPage.locator('#settings-picker-provider .ai-select-trigger').click();
+    const popover = appPage.locator('.ai-select-popover:visible');
+    await popover.getByText('OpenAI Codex', { exact: true }).click();
+    await appPage.locator('#settings-picker-model .ai-select-trigger').click();
+    await expect(popover.locator('.ai-select-item-label')).toHaveText([
+      'GPT-6.2 Astra', 'GPT-6.2 Sol', 'GPT-6.1 Sol', 'GPT-6.1 Terra',
+      'GPT-6 Astra', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna',
+    ]);
+    await testInfo.attach('settings-model-order', { body: await popover.screenshot(), contentType: 'image/png' });
+  });
+
   test('persists a masked model credential entry and removes it from the UI', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     await openSettingsTab(orkas.page, 'credentials');

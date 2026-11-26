@@ -1,17 +1,46 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
+import type { EmbedChannel } from '../../src/main/features/kb_embed';
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
 
 
+async function installProjectLibraryEmbeddingFixture(orkas: OrkasTestApp): Promise<void> {
+  if (!orkas.electronApp) throw new Error('Orkas Electron app is unavailable');
+  await orkas.electronApp.evaluate((_electron, main) => {
+    const req = (process as any).mainModule.require.bind((process as any).mainModule);
+    const { VS_DIM } = req(`${main}/features/vec_store.ts`) as typeof import('../../src/main/features/vec_store');
+    const { _setEmbedChannelFactoryForTest } = req(`${main}/features/kb_embed.ts`) as typeof import('../../src/main/features/kb_embed');
+    // Provide deterministic worker replies while the real indexer extracts and persists each chunk.
+    _setEmbedChannelFactoryForTest((): EmbedChannel => {
+      let receive: (reply: unknown) => void;
+      return {
+        onMessage(callback) { receive = callback; },
+        onExit() {},
+        kill() {},
+        postMessage(message) {
+          const { id, type, texts } = message as { id: number; type: string; texts: string[] };
+          if (type !== 'embed' || !texts.length) throw new Error('Expected a non-empty embedding request');
+          const vectors = texts.map(() => [1, ...Array(VS_DIM - 1).fill(0)]);
+          queueMicrotask(() => receive({ id, ok: true, vectors }));
+        },
+      };
+    });
+  }, path.resolve(__dirname, '../../src/main'));
+}
+
+async function getProjectFileIndex(orkas: OrkasTestApp, projectId: string, fileName: string) {
+  const status = await orkas.invoke<{
+    files: Array<{ path: string; status: string; chunks: number; error?: string }>;
+  }>('projects.files.status', { projectId, skipReconcile: true });
+  return status.files.find((item) => item.path === fileName);
+}
+
 async function expectProjectFileReady(orkas: OrkasTestApp, projectId: string, fileName: string): Promise<void> {
   await expect.poll(async () => {
-    const status = await orkas.invoke<{
-      files: Array<{ path: string; status: string; error?: unknown }>;
-    }>('projects.files.status', { projectId, skipReconcile: true });
-    const file = status.files.find((item) => item.path === fileName);
-    return { status: file?.status, error: file?.error || null };
-  }, { timeout: 40_000 }).toEqual({ status: 'ready', error: null });
+    const file = await getProjectFileIndex(orkas, projectId, fileName);
+    return { status: file?.status, chunks: file?.chunks, error: file?.error ?? null };
+  }, { timeout: 40_000 }).toEqual({ status: 'ready', chunks: 1, error: null });
 }
 
 /** The unprojected `cloud/chats` dir of whichever account the run activated. */
@@ -64,6 +93,65 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
+  // Product decision 2026-11-23: built-in Agents work in every project. A new
+  // project that added none says so in its Agents tab and lists no Agents; the
+  // Add picker shows built-ins (VideoStudio here) greyed as already available,
+  // after the addable ones and without an Add control.
+  test('shows built-in Agents as already available in a project that added none', async ({ orkas }, testInfo) => {
+    await createProject(orkas, 'E2E Built-in Agents');
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const resources = page.locator('.project-side-resources');
+    const note = page.locator('#project-agents-builtin-note');
+    await expect(note).toBeVisible();
+    await expect(note).toHaveText(/Built-in agents.*ready.*Add others/i);
+    await expect(page.locator('#project-agents-list')).toBeHidden();
+    for (const [locale, width, height, singleLine] of [
+      ['zh', 1280, 800, true], ['de', 1000, 600, false], ['ar', 1000, 600, false], ['en', 1000, 600, true],
+    ] as const) {
+      await page.setViewportSize({ width, height });
+      await page.evaluate((lang) => (window as any).setLang(lang), locale);
+      await expect(note).not.toHaveText('');
+      await resources.screenshot({ path: testInfo.outputPath(`project-agents-builtin-note-${locale}.png`) });
+      if (!singleLine) continue;
+      const fitsOnOneLine = await note.evaluate((element) => {
+        const style = getComputedStyle(element);
+        const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+        return element.scrollHeight - padding <= parseFloat(style.lineHeight) + 1;
+      });
+      expect(fitsOnOneLine, `The empty Agents hint fits the ${locale} resource rail`).toBe(true);
+    }
+
+    const agentsTab = resources.getByRole('tab', { name: 'Agents' });
+    const libraryTab = resources.getByRole('tab', { name: 'Library' });
+    await agentsTab.press('ArrowRight');
+    await expect(libraryTab).toBeFocused();
+    await expect(resources.locator('#project-library-root-menu-btn')).toBeVisible();
+    await resources.screenshot({ path: testInfo.outputPath('project-resources-library-en.png') });
+    await libraryTab.press('ArrowLeft');
+    await expect(agentsTab).toBeFocused();
+
+    await page.locator('#project-add-agent-btn').click();
+    const picker = page.locator('.project-binding-picker-modal');
+    await expect(picker).toBeVisible();
+    const videoStudio = picker.locator('.project-binding-picker-item[data-id="79df9cc89f5f"]');
+    await expect(videoStudio).toHaveClass(/is-disabled/);
+    await expect(videoStudio).toHaveAttribute('aria-disabled', 'true');
+    await expect(videoStudio.locator('.project-binding-available')).toHaveText('Available');
+    await expect(videoStudio.locator('[data-action="pick"]')).toHaveCount(0);
+    const rows = picker.locator('.project-binding-picker-item');
+    const flags = await rows.evaluateAll((items) => items.map((item) => item.classList.contains('is-disabled')));
+    // Addable rows (if any) precede every greyed built-in row.
+    expect(flags.indexOf(true)).toBeGreaterThanOrEqual(0);
+    expect(flags.slice(flags.indexOf(true)).every(Boolean)).toBe(true);
+    await videoStudio.scrollIntoViewIfNeeded();
+    await picker.screenshot({ path: testInfo.outputPath('project-agent-picker-builtin-en.png') });
+    const listed = await orkas.invoke<{ projects: Array<{ name: string; project_id: string }> }>('projects.list');
+    const projectId = listed.projects.find((project) => project.name === 'E2E Built-in Agents')?.project_id;
+    const bindings = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.list', { projectId });
+    expect(bindings.bindings.agents).toEqual([]);
+  });
+
   test('memory deletion confirmation never retargets the newly opened project', async ({ orkas }) => {
     await createProject(orkas, 'E2E Memory Delete A');
     await createProject(orkas, 'E2E Memory Delete B');
@@ -587,6 +675,7 @@ test.describe('projects', () => {
   test('uploads, previews, persists, and deletes a project Library file', async ({ orkas }) => {
     const projectName = 'E2E Project Library';
     const fileName = 'E2E project source.md';
+    await installProjectLibraryEmbeddingFixture(orkas);
     const source = orkas.createFixtureFile(fileName, '# Project Library\n\nUnique project-only preview body.\n');
     await createProject(orkas, projectName);
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
@@ -613,6 +702,7 @@ test.describe('projects', () => {
     const projectId = projects.projects.find((project) => project.name === projectName)!.project_id;
     await expectProjectFileReady(orkas, projectId, fileName);
     page = await orkas.relaunch();
+    await expectProjectFileReady(orkas, projectId, fileName);
     await page.locator('.project-row', {
       has: page.locator('.project-name', { hasText: projectName }),
     }).click();
@@ -626,6 +716,7 @@ test.describe('projects', () => {
     await page.locator('.ui-dialog-overlay:visible [data-act="ok"]').click();
     await expect(row).toHaveCount(0);
     await expect(page.locator('#project-detail-files-count')).toBeEmpty();
+    await expect.poll(() => getProjectFileIndex(orkas, projectId, fileName)).toBeUndefined();
   });
 
   test('adds an attachment from the project composer and adopts it into the new conversation', async ({
@@ -695,6 +786,7 @@ test.describe('projects', () => {
     modelOrkas,
   }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+    await installProjectLibraryEmbeddingFixture(modelOrkas);
     const page = modelOrkas.page;
     const fileName = 'produced-project-library-e2e.png';
     const projectName = 'E2E Produced Project Library';
@@ -973,7 +1065,7 @@ test.describe('projects', () => {
     expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeRelaunch);
   });
 
-  test('binds a project agent, selects it as recipient, and removes it', async ({ orkas }) => {
+  test('binds a project agent, selects it as recipient, and removes it', async ({ orkas }, testInfo) => {
     const createdAgent = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
       name: 'E2EProjectAgent',
       description: 'A project-scoped test agent.',
@@ -1010,6 +1102,7 @@ test.describe('projects', () => {
 
     const bound = page.locator(`.project-agent-row[data-project-agent-id="${createdAgent.agent.agent_id}"]`);
     await expect(bound).toContainText('E2EProjectAgent');
+    await page.locator('.project-side-resources').screenshot({ path: testInfo.outputPath('project-resources-with-agent-en.png') });
     const projects = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
     const projectId = projects.projects.find((item) => item.name === 'E2E Agent Binding Project')?.project_id;
     const bindings = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.list', { projectId });
@@ -1202,6 +1295,7 @@ test.describe('projects', () => {
 
   test('cancels deletion, then deletes and restores a project from the recycle bin', async ({ orkas }) => {
     const projectName = 'E2E Recyclable Project';
+    await installProjectLibraryEmbeddingFixture(orkas);
     await createProject(orkas, projectName);
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
@@ -1217,12 +1311,7 @@ test.describe('projects', () => {
       name: sourceName,
       data: Buffer.from('Project deletion must remove derived vectors.').toString('base64'),
     });
-    await expect.poll(async () => {
-      const status = await orkas.invoke<{
-        files: Array<{ path: string; status: string }>;
-      }>('projects.files.status', { projectId });
-      return status.files.find((file) => file.path === sourceName)?.status;
-    }).toBe('ready');
+    await expectProjectFileReady(orkas, projectId!, sourceName);
     const localProjectDir = path.join(
       orkas.workspaceRoot,
       'account-e2e',

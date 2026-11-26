@@ -493,21 +493,20 @@ export interface CatalogEntry extends LocalizedCatalogCopy<'description'> {
    *  Microsoft 365 mail toolkit). Commander's connector search matches them like display names;
    *  they are never displayed. List only names of this service, not category words. */
   search_aliases?: string[];
-  /** Inline SVG markup for the brand logo. Required on every shipped catalog entry — the
-   *  renderer draws this on a white rounded square. Keep the inner SVG `width` / `height`
-   *  either absent or `100%` so CSS-set 40×40 card box governs the rendered size.
-   *
-   *  Optional only so `_entryFromInstance` (orphan-instance fallback when the catalog entry
-   *  was removed but the install still exists) can omit it; the orphan path renders the
-   *  display_name initials on a neutral gray placeholder. */
+  /** Inline SVG brand markup. Shipped entries supply an SVG or a bundled raster mark.
+   *  When neither is available for an orphaned instance, the card shows its initials. */
   icon_svg?: string;
-  /** Public source asset used to derive `icon_svg`. */
+  /** Renderer-owned raster asset identifier. Never a URL or a user-controlled path. */
+  icon_asset?: 'openseo';
+  /** Public source for the brand artwork. */
   icon_source_url?: string;
   /** SHA-256 of the fetched source asset so artwork drift is explicit and reviewable. */
   icon_source_sha256?: string;
   category: CatalogCategory;
   description_zh: string;
   description_en: string;
+  /** Explicit capability boundary for setup results; excluded from catalog search matching. */
+  setup_scope_note?: string;
   /** Sole display switch for the shared credit tag. Runtime metering fields do not affect it. */
   requires_credits?: boolean;
   /** Which OAuth pathway this provider needs — see the `// ── OAuth ──` section above. */

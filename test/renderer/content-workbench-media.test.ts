@@ -21,6 +21,19 @@ it('keeps a failed generation explanation through save/reopen and clears it on a
  expect(m.failureText({status:'failed',text:''})).toBe('');expect(m.failureText(undefined)).toBe('');
 });
 
+it('preserves the saved reply and isolates the host error pill from trailing markup',()=>{
+ const reply='请补传 <素材 A & B>。';
+ const error='<span style="color:var(--danger)">The model is unavailable &amp; should be retried.</span>';
+ const detail=' <span class="test-detail">extra detail</span>';
+ const job={status:'failed',errorCode:'E_INTERACTION_REQUIRED',text:reply};
+ expect(m.failureContent(job)).toEqual({reply,notice:''});
+ expect(m.failureContent({...job,text:reply+'\n\n'+error+detail})).toEqual({reply,notice:'The model is unavailable &amp; should be retried.'});
+ expect(m.failureContent({...job,text:error+detail})).toEqual({reply:'',notice:'The model is unavailable &amp; should be retried.'});
+ expect(m.failureContent({...job,text:error+detail.slice(0,-7)})).toEqual({reply:'',notice:'The model is unavailable &amp; should be retried.'});
+ expect(m.failureContent({...job,text:'',status:'failed'})).toEqual({reply:'',notice:''});
+ expect(m.failureContent({...job,status:'completed'})).toEqual({reply:'',notice:''});
+});
+
 it.each(['image','video','audio'])('selects the first usable configured %s service once and preserves explicit choices',kind=>{
  const work=m.draft(kind,'zh'),first={id:'a'.repeat(32),provider:kind==='image'?'openai':kind==='video'?'doubao':'elevenlabs',model:'user-model',label:'My studio',name:'Configured model',managed:false,available:true},second={...first,id:'b'.repeat(32)};
  expect(m.selectFirstService(work,[], 'zh')).toBe(false);expect(work.settings).not.toHaveProperty('serviceId');
@@ -30,6 +43,7 @@ it.each(['image','video','audio'])('selects the first usable configured %s servi
  expect(m.selectFirstService(work,[second],'zh')).toBe(false);expect(work.settings.serviceId).toBe(first.id);
 });
 it('preserves configured service labels without hosted product aliases',()=>{
+ expect(m.serviceLabel({label:'My studio',name:'Seedance 2.0'},'en','video')).toBe('Seedance 2.0');
  expect(m.serviceLabel({managed:false,label:'My studio',name:'GPT Image 2'},'en')).toBe('My studio · GPT Image 2');
  expect(m.serviceLabel({managed:false,name:'Configured speech'},'zh')).toBe('Configured speech');
 });

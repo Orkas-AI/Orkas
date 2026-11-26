@@ -44,7 +44,7 @@ import {
   reapCliAfterProtocolTerminal,
 } from './base.js';
 
-import { prepareOpenclawBridge } from './openclaw-bridge.js';
+import { OpenClawSetupError, prepareOpenclawBridge } from './openclaw-bridge.js';
 
 const log = createLogger('local-agents:openclaw');
 
@@ -52,8 +52,22 @@ export const openclawBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const sessionId = opts.resumeSessionId || crypto.randomUUID();
     const args = buildOpenclawArgs(opts, sessionId);
-    const bridgeConfig = await prepareOpenclawBridge(opts);
+    let bridgeConfig: Awaited<ReturnType<typeof prepareOpenclawBridge>>;
     try {
+      bridgeConfig = await prepareOpenclawBridge(opts);
+    } catch (error) {
+      if (opts.signal.aborted) opts.onEvent({ type: 'done', status: 'cancelled' });
+      else if (error instanceof OpenClawSetupError) {
+        opts.onEvent({ type: 'done', status: error.status, error: error.message,
+          cliError: 'tool_setup_failed', exitCode: error.exitCode });
+      } else throw error;
+      return;
+    }
+    try {
+      if (opts.signal.aborted) {
+        opts.onEvent({ type: 'done', status: 'cancelled' });
+        return;
+      }
       const child = spawnCli(opts.binPath, args, opts.cwd, bridgeConfig.env);
       const detachAbort = bindAbort(child, opts.signal);
       const tail = new StderrTail();

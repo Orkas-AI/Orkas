@@ -38,6 +38,10 @@ describe('group-chat response language', () => {
     expect(prompt).toContain('a current explicit request about reply language');
     expect(prompt).toContain("the clear language of the user's latest substantive prose");
     expect(prompt).toContain('Write all human-readable prose in the chosen language');
+    expect(prompt).toContain('Examples show shape only, not output language.');
+    // Execution Agents never author Agent/Skill descriptions; those field rules
+    // stay with Commander and the editors (prompts/contract.test.ts).
+    expect(prompt).not.toMatch(/description_zh|description_en|owning creator Skill/);
     expect(prompt.lastIndexOf('## User language'))
       .toBeGreaterThan(prompt.lastIndexOf('## Runtime injection'));
     expect(prompt.lastIndexOf('## User language'))

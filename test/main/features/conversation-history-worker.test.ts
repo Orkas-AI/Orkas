@@ -6,15 +6,18 @@ import { createHash } from 'node:crypto';
 import { checkLatencyBudget } from '../../helpers/latency-budget';
 import { measureWorkload } from '../../helpers/workload-metrics.cjs';
 
-const bootstrap = vi.hoisted(() => ({ gate: undefined as SharedArrayBuffer | undefined, partial: false }));
+const bootstrap = vi.hoisted(() => ({ gate: undefined as SharedArrayBuffer | undefined, partial: false, heapMiB: undefined as number | undefined }));
 vi.mock('node:worker_threads', async importOriginal => {
   const actual = await importOriginal<typeof import('node:worker_threads')>();
   return { ...actual, Worker: class extends actual.Worker {
     constructor(file: string | URL, options: import('node:worker_threads').WorkerOptions = {}) {
       const gate = bootstrap.gate;
       const partial = bootstrap.partial;
+      const heapMiB = bootstrap.heapMiB;
       bootstrap.gate = undefined;
       bootstrap.partial = false;
+      bootstrap.heapMiB = undefined;
+      if (heapMiB) options = { ...options, resourceLimits: { maxOldGenerationSizeMb: heapMiB } };
       super(file, gate ? { ...options, workerData: { historyPublishGate: gate, historyPartialCache: partial },
         execArgv: ['--require', path.resolve('test/helpers/history-cache-publish-gate.cjs')] } : options);
     }
@@ -32,6 +35,7 @@ beforeEach(() => {
 afterEach(async () => {
   bootstrap.gate = undefined;
   bootstrap.partial = false;
+  bootstrap.heapMiB = undefined;
   await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
   vi.restoreAllMocks();
   if (previous === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
@@ -52,6 +56,45 @@ function historySource(name: string, output = '') {
   fs.writeFileSync(file, JSON.stringify(row(name, output)) + '\n');
   return file;
 }
+
+it('returns only file references from the newest visible rows, even with large execution histories', async () => {
+  const { historyRequest } = await import('../../../src/main/features/conversation-history-client');
+  const file = path.join(root, 'produced.jsonl');
+  const reports = [path.join(root, 'older.txt'), path.join(root, 'latest.txt')];
+  const records = [
+    JSON.stringify({ ...row('older'), produced: [reports[0]] }),
+    JSON.stringify({ ...row('latest', 'x'.repeat(1024 * 1024)), produced: [reports[1]] }),
+    JSON.stringify({ ...row('deleted'), deleted_at: 'now', produced: ['deleted.txt'] }),
+    '{"produced":["malformed.txt"],"process":[}',
+  ];
+  fs.writeFileSync(file, records.join('\n'));
+  const result = await historyRequest({ kind: 'produced-paths', userId: 'user', sourceFile: file, limit: 1 });
+  expect(result).toEqual([{ stored: [reports[1]], cited: [] }]);
+  expect(fs.readFileSync(file, 'utf8')).toBe(records.join('\n'));
+});
+
+it('lists file references from a large execution record within a smaller Worker heap', async () => {
+  const { historyRequest } = await import('../../../src/main/features/conversation-history-client');
+  const file = path.join(root, 'produced-heavy.jsonl');
+  const earlier = { from: 'user', produced: ['earlier.txt'], text: ':codex-file-citation{path="ignored.txt" purpose="output"}' };
+  const event = JSON.stringify({ text: '中\\"[]{}'.repeat(2000), produced: ['nested.txt'], level: -2.3e-12 });
+  const chunk = `${event},`.repeat(40);
+  const largeRow = '{"produced":["superseded.txt"],"process":[';
+  const suffix = '{"text":"\\u0041"}],"pr\\u006fduced":["实际.txt",null],"text":":codex-file-citation{path=\\"reply.txt\\" purpose=\\"output\\"}"}';
+  const brokenRow = '{"produced":["broken.txt"],"process":[';
+  fs.writeFileSync(file, `${JSON.stringify(earlier)}\r\n${largeRow}`);
+  for (let part = 0; part < 100; part++) fs.appendFileSync(file, chunk);
+  fs.appendFileSync(file, `${suffix}\r\n${brokenRow}${chunk}{"value":01}]}\n`);
+  const size = fs.statSync(file).size;
+  expect(size).toBeGreaterThan(48 * 1024 * 1024);
+  bootstrap.heapMiB = 48;
+
+  await expect(historyRequest({ kind: 'produced-paths', userId: 'user', sourceFile: file, limit: 2 })).resolves.toEqual([
+    { stored: ['earlier.txt'], cited: [] },
+    { stored: ['实际.txt'], cited: ['reply.txt'] },
+  ]);
+  expect(fs.statSync(file).size).toBe(size);
+}, 20_000);
 
 it('lets other conversations finish while one source waits, with only two active history owners', async () => {
   const client = await import('../../../src/main/features/conversation-history-client');

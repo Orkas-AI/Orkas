@@ -87,4 +87,8 @@ Use one series. Labels and values must have equal lengths and values must total 
 }
 ```
 
-After rendering, place the SVG in `index.html` through a local `<img>` or inline it when custom annotations are needed. Map the containing element to the matching `visual_plan` region and follow the [native workflow](../SKILL.md#native-workflow).
+## Place and deliver
+
+If the SVG contains any `brief.required_copy`, paste the generated `<svg>…</svg>` markup into `index.html` so the native snapshot can check the visible text in the page DOM. Use a local `<img>` for supporting SVGs when the page already contains all required copy as visible text.
+
+Remove the default page margin and size the SVG to fit its `visual_plan` region within the manifest's fixed canvas. Follow the [native workflow](../SKILL.md#native-workflow) to snapshot the HTML, review that snapshot, and export in a supported format such as PNG. Keep the generated `.svg` as an editable source file when requested.

@@ -38,6 +38,42 @@ beforeEach(async () => {
 afterEach(async () => { process.env = priorEnv; await fs.rm(root, { recursive: true, force: true }); });
 
 describe('VoiceStudio audio project journeys', () => {
+  it.each([['--help'], ['status', '--help']].map(args => ({ args })))('offers read-only invocation help without a project or codec: $args', async ({ args }) => {
+    delete process.env.ORKAS_BUNDLED_FFMPEG; delete process.env.ORKAS_BUNDLED_FFPROBE;
+    const result = await audio.default({ args });
+    expect(result).toMatchObject({ ok: true, operations: expect.arrayContaining(['preflight', 'probe', 'status', 'render', 'convert']) });
+    expect(result.usage).toContain('audio --');
+    expect(result.request).toContain('project');
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+  it.each([
+    [], ['render'], ['render', 'missing.json', 'extra'], ['preflight', 'unused.json'],
+    ['status', '--help', 'extra'],
+  ].map(args => ({ args })))('rejects malformed argument counts before reading files or changing project state: $args', async ({ args }) => {
+    await save(speechPlan()); const before = await fs.readFile(project);
+    const result = await audio.default({ args });
+    expect(result).toMatchObject({ ok: false, code: 'E_USAGE', message: expect.stringContaining('audio --') });
+    expect(await fs.readFile(project)).toEqual(before);
+    expect(await fs.readdir(root)).toEqual(['voice-project.json']);
+  });
+  it('rejects unknown or reversed operations before request I/O, including direct module callers', async () => {
+    for (const args of [['missing.json'], ['missing.json', 'render'], ['bogus', 'missing.json']]) {
+      expect(await audio.default({ args })).toMatchObject({ ok: false, code: 'E_OPERATION', message: expect.stringContaining('audio --') });
+    }
+    await expect(audio.execute('bogus', {})).rejects.toMatchObject({ code: 'E_OPERATION' });
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+  it('distinguishes a missing or malformed request from a project problem and permits a corrected invocation', async () => {
+    await save({ schema_version: 1, roles: {}, segments: [] }); const before = await fs.readFile(project);
+    const requestFile = path.join(root, 'request.json');
+    expect(await audio.default({ args: ['status', requestFile] })).toMatchObject({ ok: false, code: 'E_REQUEST', message: expect.stringContaining('request JSON') });
+    await fs.writeFile(requestFile, '{');
+    expect(await audio.default({ args: ['status', requestFile] })).toMatchObject({ ok: false, code: 'E_REQUEST', message: expect.stringContaining('valid JSON') });
+    await fs.writeFile(requestFile, JSON.stringify({ project }));
+    expect(await audio.default({ args: ['status', requestFile] })).toEqual({ ok: true, segments: [] });
+    expect(await fs.readFile(project)).toEqual(before);
+    expect((await fs.readdir(root)).sort()).toEqual(['request.json', 'voice-project.json']);
+  });
   it.each([null, [], {}, { schema_version: 1, segments: [] }, { project: 42 }, { project: '' }].map(request => ({ request })))('reports an invalid request as an input problem without touching the saved project: $request', async ({ request }) => {
     await save({ schema_version: 1, roles: {}, segments: [] });
     const before = await fs.readFile(project);
@@ -198,6 +234,7 @@ describe('VoiceStudio audio project journeys', () => {
     await fs.writeFile(path.join(root, 'silence.wav'), source);
     await save({ schema_version: 1, segments: [] });
     const result = await call('transcribe', { input_path: 'silence.wav', language: 'en' });
+    expect(result.absolute_files).toEqual(result.files.map((file: string) => path.join(root, file)));
     const textFile = result.files.find((f: string) => f.endsWith('.txt'));
     const dir = path.dirname(path.join(root, textFile));
     const declaration = JSON.parse(await fs.readFile(path.join(dir, '.orkas-output-types.json'), 'utf8'));
@@ -228,6 +265,134 @@ describe('VoiceStudio audio project journeys', () => {
       expect((await fs.readdir(dir)).sort()).toEqual(['.orkas-output-types.json', 'transcript.json', 'transcript.srt', 'transcript.txt']);
     }
   }, 60000);
+});
+
+describe('VoiceStudio explicit recording recovery', () => {
+  async function interrupted() {
+    const plan = speechPlan(); plan.segments = plan.segments.slice(0, 1);
+    await save(plan);
+    const attempt = await call('begin', { segment_id: 'first' });
+    await fs.writeFile(attempt.request.output_path, tone(.6));
+    return { plan, attempt };
+  }
+  it('prepares a reusable request without copying the key, changing state or repeating synthesis', async () => {
+    const { plan, attempt } = await interrupted();
+    const before = await fs.readFile(path.join(root, '.voice-state.json'));
+    const prepared = await call('prepare-record', { segment_id: 'first' });
+    expect(prepared).toMatchObject({ ok: true, operation: 'record', request_file: expect.any(String) });
+    expect(JSON.parse(await fs.readFile(prepared.request_file, 'utf8'))).toEqual({
+      project, segment_id: 'first', key: attempt.key, output_path: path.basename(attempt.request.output_path),
+    });
+    expect(await fs.readFile(path.join(root, '.voice-state.json'))).toEqual(before);
+    expect(await fs.readFile(project, 'utf8')).toBe(JSON.stringify(plan));
+    expect(await fs.readFile(attempt.request.output_path)).toEqual(tone(.6));
+    const files = (await fs.readdir(root)).sort();
+    expect(await call('prepare-record', { segment_id: 'first' })).toEqual(prepared);
+    expect((await fs.readdir(root)).sort()).toEqual(files);
+    delete process.env.ORKAS_BUNDLED_FFMPEG;
+    // Local edit settings may change without changing the speech identity.
+    (plan.segments[0] as any).gap_after_sec = .2; await save(plan);
+    expect(await audio.default({ args: ['record', prepared.request_file] })).toMatchObject({ ok: true, key: attempt.key });
+    expect((await call('status')).segments[0].status).toBe('ready');
+    await expect(call('begin', { segment_id: 'first' })).rejects.toMatchObject({ code: 'E_ATTEMPT_EXISTS' });
+  });
+  it.each(['text', 'take', 'voice_ref'])('rejects a prepared request after changing %s, preserving both attempts', async field => {
+    const { plan, attempt } = await interrupted();
+    const prepared = await call('prepare-record', { segment_id: 'first' });
+    if (field === 'voice_ref') plan.roles.narrator.voice_ref = 'changed';
+    else (plan.segments[0] as any)[field] = field === 'take' ? 1 : 'Changed words.';
+    await save(plan);
+    const next = await call('begin', { segment_id: 'first' });
+    await fs.writeFile(next.request.output_path, tone(.4, 660));
+    const before = await fs.readFile(path.join(root, '.voice-state.json'));
+    expect(await audio.default({ args: ['record', prepared.request_file] })).toMatchObject({ ok: false, code: 'E_STALE' });
+    expect(await fs.readFile(path.join(root, '.voice-state.json'))).toEqual(before);
+    expect(await fs.readFile(attempt.request.output_path)).toEqual(tone(.6));
+    expect(await fs.readFile(next.request.output_path)).toEqual(tone(.4, 660));
+    const current = await call('prepare-record', { segment_id: 'first' });
+    expect(current.request_file).not.toBe(prepared.request_file);
+    expect(await audio.default({ args: ['record', current.request_file] })).toMatchObject({ ok: true, key: next.key });
+  });
+  it('uses an explicitly supplied renamed receipt while retaining the original destination', async () => {
+    const { attempt } = await interrupted();
+    const renamed = path.join(root, 'renamed.wav'); await fs.rename(attempt.request.output_path, renamed);
+    const prepared = await call('prepare-record', { segment_id: 'first', output_path: renamed });
+    expect(JSON.parse(await fs.readFile(prepared.request_file, 'utf8')).output_path).toBe('renamed.wav');
+    expect((await call('status')).segments[0].status).toBe('uncertain');
+    expect(await audio.default({ args: ['record', prepared.request_file] })).toMatchObject({ ok: true, key: attempt.key });
+    expect((await call('status')).segments[0]).toMatchObject({ status: 'ready', path: 'renamed.wav' });
+  });
+  it('never overwrites an altered prepared request or falsely repairs completed audio', async () => {
+    const { attempt } = await interrupted();
+    const prepared = await call('prepare-record', { segment_id: 'first' });
+    const before = await fs.readFile(path.join(root, '.voice-state.json'));
+    const changed = JSON.stringify({ project, segment_id: 'first', key: 'wrong' });
+    await fs.writeFile(prepared.request_file, changed);
+    await expect(call('prepare-record', { segment_id: 'first' })).rejects.toMatchObject({ code: 'E_REQUEST_CONFLICT' });
+    expect(await fs.readFile(prepared.request_file, 'utf8')).toBe(changed);
+    expect(await fs.readFile(path.join(root, '.voice-state.json'))).toEqual(before);
+    await call('record', { segment_id: 'first', key: attempt.key });
+    await fs.writeFile(attempt.request.output_path, tone(.2));
+    await expect(call('prepare-record', { segment_id: 'first' })).rejects.toMatchObject({ code: 'E_ATTEMPT_STATE' });
+    expect((await call('status')).segments[0].status).toBe('stale');
+  });
+  it('rejects absent attempts, missing files, cancellation and busy projects without preparing or promoting audio', async () => {
+    await save(speechPlan());
+    await expect(call('prepare-record', { segment_id: 'first' })).rejects.toMatchObject({ code: 'E_ATTEMPT_STATE' });
+    const attempt = await call('begin', { segment_id: 'first' });
+    const before = await fs.readFile(path.join(root, '.voice-state.json'));
+    await expect(call('prepare-record', { segment_id: 'first' })).rejects.toMatchObject({ code: 'E_SOURCE_NOT_FOUND' });
+    await fs.writeFile(attempt.request.output_path, tone(.6));
+    const controller = new AbortController(); controller.abort();
+    await expect(audio.execute('prepare-record', { project, segment_id: 'first' }, controller.signal)).rejects.toMatchObject({ code: 'E_CANCELLED' });
+    await fs.writeFile(path.join(root, '.voice-lock'), 'busy');
+    await expect(call('prepare-record', { segment_id: 'first' })).rejects.toMatchObject({ code: 'E_BUSY' });
+    expect(await fs.readFile(path.join(root, '.voice-lock'), 'utf8')).toBe('busy');
+    await fs.rm(path.join(root, '.voice-lock'));
+    expect((await fs.readdir(root)).filter(f => f.startsWith('record-'))).toEqual([]);
+    expect(await fs.readFile(path.join(root, '.voice-state.json'))).toEqual(before);
+  });
+  it('rejects escaped and non-file recovery receipts without changing state or external files', async () => {
+    await interrupted();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'voice-prepare-outside-'));
+    try {
+      const source = path.join(outside, 'voice.wav'); await fs.writeFile(source, tone(.3));
+      await fs.symlink(outside, path.join(root, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+      await fs.mkdir(path.join(root, 'directory'));
+      const before = await fs.readFile(path.join(root, '.voice-state.json'));
+      for (const output_path of [source, 'escape/voice.wav', 'directory']) {
+        await expect(call('prepare-record', { segment_id: 'first', output_path })).rejects.toMatchObject({ code: 'E_PATH' });
+      }
+      expect(await fs.readFile(source)).toEqual(tone(.3));
+      expect(await fs.readFile(path.join(root, '.voice-state.json'))).toEqual(before);
+      expect((await fs.readdir(root)).filter(f => f.startsWith('record-') || f === '.voice-lock')).toEqual([]);
+    } finally { await fs.rm(outside, { recursive: true, force: true }); }
+  });
+});
+
+describe('VoiceStudio source request diagnostics', () => {
+  it.each(['probe', 'transcribe', 'convert', 'extract'])('identifies a missing input_path for %s and accepts either corrected path representation', async op => {
+    await save({ schema_version: 1, roles: {}, segments: [] });
+    const before = await fs.readFile(project);
+    const requestFile = path.join(root, 'request.json');
+    const fields = { project, input_path: 'missing.wav', format: 'wav' };
+    await fs.writeFile(requestFile, JSON.stringify(fields));
+    expect(await audio.default({ args: [op, requestFile] })).toMatchObject({
+      ok: false, code: 'E_SOURCE_NOT_FOUND', message: expect.stringContaining('input_path'),
+    });
+    const failed = await audio.default({ args: [op, requestFile] });
+    expect(failed.message).not.toContain(root);
+    expect((await fs.readdir(root)).sort()).toEqual(['request.json', 'voice-project.json']);
+    const source = path.join(root, 'source.wav'); await fs.writeFile(source, tone(.6));
+    // Transcription's native ASR execution is already covered separately;
+    // probe verifies the common resolver without introducing a model here.
+    for (const input_path of ['source.wav', source]) {
+      const result = await call(op === 'transcribe' ? 'probe' : op, { input_path, format: 'wav' });
+      expect(result).toMatchObject({ ok: true, duration_sec: .6 });
+    }
+    expect(await fs.readFile(project)).toEqual(before);
+    expect(await fs.readFile(source)).toEqual(tone(.6));
+  });
 });
 
 describe('VoiceStudio revision and caption scenarios', () => {

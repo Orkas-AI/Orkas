@@ -34,7 +34,7 @@ function readInput(filename) {
     if (length > MAX_BYTES) throw new Error();
     return JSON.parse(buffer.subarray(0, length).toString('utf8'));
   } catch {
-    throw new Error('Input must be a readable JSON file no larger than 1 MiB.');
+    throw new Error('Input must be the path of a JSON file no larger than 1 MiB. Write the JSON to a file in the production (for example lamp-ad/timing.json), pass that path, and run it again.');
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }

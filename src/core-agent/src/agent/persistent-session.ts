@@ -666,6 +666,12 @@ export class PersistentSession extends Session {
     this.requestContextWrite();
   }
 
+  override claimActiveCheckpointLengthRetry(): boolean {
+    const claimed = super.claimActiveCheckpointLengthRetry();
+    if (claimed) this.requestContextWrite();
+    return claimed;
+  }
+
   override applyActiveCheckpointSummary(
     summary: string,
     checkpointThroughMessageIndex: number,
@@ -848,7 +854,10 @@ export class PersistentSession extends Session {
     const body = JSON.stringify(state) + "\n";
     let bytes: Buffer | undefined;
     try {
-      if (Buffer.byteLength(body) <= CONTEXT_CACHE_ITEM_BYTES) bytes = Buffer.from(body, "utf-8");
+      // A UTF-8 encoding cannot be shorter than the UTF-16 code unit count.
+      if (body.length <= CONTEXT_CACHE_ITEM_BYTES && Buffer.byteLength(body) <= CONTEXT_CACHE_ITEM_BYTES) {
+        bytes = Buffer.from(body, "utf-8");
+      }
     } catch {
       // Optional pre-encoding failure retains the original string save path.
     }

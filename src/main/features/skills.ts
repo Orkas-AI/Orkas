@@ -56,7 +56,7 @@ const log = createLogger('skills');
 import { prompts } from '../prompts/loader';
 import { buildRuntimeDatetimeBlock } from '../prompts/runtime_context';
 import {
-  nowIso, readJson, writeJson, writeJsonSync, writeTextAtomicSync,
+  nowIso, readJson, readJsonSync, writeJson, writeJsonSync, writeTextAtomicSync,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
@@ -295,7 +295,16 @@ export interface SkillFrontmatter {
   [key: string]: string | string[] | undefined;
 }
 
-export interface SkillChatMeta { session_id?: string; [k: string]: unknown }
+interface SkillImportMetadata {
+  id: string;
+  targets: Record<string, string>;
+}
+
+export interface SkillChatMeta {
+  session_id?: string;
+  import_metadata?: SkillImportMetadata;
+  [k: string]: unknown;
+}
 
 export interface SkillOrkasMeta {
   category?: string;
@@ -1596,6 +1605,7 @@ export interface ImportResult {
   skill?: CustomSkill;
   skills?: CustomSkill[];
   seedModelText?: string;
+  importMetadataId?: string;
   // Deprecated compatibility alias. Import flows should treat this as model
   // text, not as visible UI copy.
   seedMessage?: string | false;
@@ -1797,15 +1807,17 @@ function _sourceSkillMetadataSeed(createdSkills: CustomSkill[]): string {
   return t('skills.import.seed_existing_meta', { skills: ids });
 }
 
-async function _markSourceSkillMetadataSession(firstSkillId: string, targetSkillIds: string[]): Promise<void> {
-  if (!firstSkillId || targetSkillIds.length === 0) return;
-  const uid = getActiveUserId();
-  const current = await loadSkillChatMeta(uid, firstSkillId);
-  await saveSkillChatMeta(uid, firstSkillId, {
-    ...current,
-    import_meta_targets: targetSkillIds,
-    import_meta_created_at: nowIso(),
-  });
+function _sourceSkillMetadataVersion(dir: string): string | undefined {
+  try {
+    const root = fs.lstatSync(dir, { bigint: true });
+    const entry = fs.lstatSync(path.join(dir, 'SKILL.md'), { bigint: true });
+    const sidecar = fs.lstatSync(skillMetaFile(dir), { bigint: true });
+    if (!root.isDirectory() || !entry.isFile() || !sidecar.isFile()) return;
+    return [root.dev, root.ino, root.birthtimeNs,
+      entry.ino, entry.ctimeNs, entry.size, sidecar.ino, sidecar.ctimeNs, sidecar.size].join(':');
+  } catch {
+    return undefined;
+  }
 }
 
 function _hasNonOverrideableAuthoringViolation(report: QualityReport): boolean {
@@ -1825,8 +1837,11 @@ async function _installSourceSkillRoots(
     rejectExisting?: boolean;
     requireSkillMd?: boolean;
     beforeCopy?: () => void;
+    seedMetadataChat?: boolean;
   } = {},
 ): Promise<ImportResult> {
+  const uid = getActiveUserId();
+  const metadataTargets: Record<string, string> = Object.create(null);
   const reserved = new Set<string>();
   const createdIds: string[] = [];
   const createdSkills: CustomSkill[] = [];
@@ -1927,8 +1942,10 @@ async function _installSourceSkillRoots(
       created = _createCustomSkillSync(effectiveName, effectiveDesc);
       if (!created) throw new Error(t('skills.errors.create_failed'));
       fs.cpSync(staged, customSkillDir(created.id), { recursive: true });
+      const version = opts.seedMetadataChat ? _sourceSkillMetadataVersion(customSkillDir(created.id, uid)) : undefined;
       const fresh = await getCustomSkill(created.id);
       if (!fresh) throw new Error(t('skills.errors.create_failed'));
+      if (opts.seedMetadataChat) metadataTargets[created.id] = version || '';
       createdIds.push(created.id);
       createdSkills.push(fresh);
     } catch (err) {
@@ -1965,7 +1982,19 @@ async function _installSourceSkillRoots(
 
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
-  await _markSourceSkillMetadataSession(createdSkills[0]?.id || '', createdSkills.map((skill) => skill.id));
+  const firstId = createdSkills[0].id;
+  let importMetadataId: string | undefined;
+  if (opts.seedMetadataChat && getActiveUserId() === uid && metadataTargets[firstId]) {
+    try {
+      const file = skillChatMetaPath(uid, firstId);
+      const current = readJsonSync<SkillChatMeta>(file);
+      const id = crypto.randomUUID();
+      writeJsonSync(file, { ...current, import_metadata: { id, targets: metadataTargets } });
+      importMetadataId = id;
+    } catch (error) {
+      log.warn('Could not save Skill import metadata operation', logErrorSummary(error));
+    }
+  }
 
   log.info('created-from-dir direct skill install', {
     skill_count: createdSkills.length,
@@ -1980,7 +2009,8 @@ async function _installSourceSkillRoots(
     skill: createdSkills[0],
     skills: createdSkills,
     seedModelText,
-    seedMessage: seedModelText,
+    seedMessage: opts.seedMetadataChat && !importMetadataId ? false : seedModelText,
+    ...(importMetadataId ? { importMetadataId } : {}),
     ...(failures.length ? { failures } : {}),
   };
 }
@@ -2077,19 +2107,84 @@ export async function createFromUrl(
   };
 }
 
-/** Delete a URL-import placeholder skill iff it was never authored — i.e. it
- *  still holds only the boilerplate SKILL.md (empty body, plus the metadata
- *  sidecar that `createCustomSkill` writes). Called when the user leaves an import edit chat
- *  that produced no custom skill (the source was installed as an external
- *  package, the install failed/was not installable, or the import was
- *  abandoned) so an empty draft does not linger in the skill list. The
- *  pristine check makes this safe to call on any id: an authored skill (real
- *  body or extra files) is never deleted. Returns true when a draft was removed. */
-export async function discardImportDraftIfPristine(skillId: string): Promise<boolean> {
-  if (!_isPristineImportDraftSkillSync(skillId)) return false;
-  const ok = await deleteCustomSkill(skillId);
-  if (ok) log.info(`discarded pristine import draft id=${skillId}`);
-  return ok;
+interface ImportDraftActivity {
+  chats: Set<Promise<void>>;
+  revision: number;
+  cleanup?: Promise<boolean>;
+}
+
+const importDraftActivity = new Map<string, ImportDraftActivity>();
+
+function getImportDraftActivity(key: string): ImportDraftActivity {
+  let activity = importDraftActivity.get(key);
+  if (!activity) {
+    activity = { chats: new Set(), revision: 0 };
+    importDraftActivity.set(key, activity);
+  }
+  return activity;
+}
+
+/** Wait for both Skill edit-chat entry points, including abort settlement. */
+function trackSkillEditChat(userId: string, skillId: string): () => void {
+  const key = `${userId}\0${skillId}`;
+  const activity = getImportDraftActivity(key);
+  activity.revision += 1;
+  let release!: () => void;
+  const settled = new Promise<void>((resolve) => { release = resolve; });
+  activity.chats.add(settled);
+  return () => {
+    release();
+    activity.chats.delete(settled);
+    if (!activity.chats.size && !activity.cleanup) importDraftActivity.delete(key);
+  };
+}
+
+function readImportDraftIdentity(dir: string): { source: 'url' | 'dir'; createdAt: string } | undefined {
+  const marker = readSkillOrkasMetaSync(dir)._import;
+  if (!marker || typeof marker !== 'object') return;
+  const { draft, source, created_at } = marker as Record<string, unknown>;
+  if (draft === true && (source === 'url' || source === 'dir') && typeof created_at === 'string' && created_at) {
+    return { source, createdAt: created_at };
+  }
+}
+
+/** Move only a system-created, unedited import placeholder to the recycle bin. */
+export async function discardImportDraftIfPristine(skillId: string, userId = getActiveUserId()): Promise<boolean> {
+  if (userId !== getActiveUserId()) return false;
+  const dir = customSkillDir(skillId, userId);
+  const draft = readImportDraftIdentity(dir);
+  if (!draft) return false;
+  const key = `${userId}\0${skillId}`;
+  const activity = getImportDraftActivity(key);
+  if (activity.cleanup) return activity.cleanup;
+
+  const isSameEmptyDraft = () => {
+    if (userId !== getActiveUserId()) return false;
+    const current = readImportDraftIdentity(dir);
+    return current?.createdAt === draft.createdAt && current.source === draft.source
+      && _isPristineImportDraftSkillSync(skillId);
+  };
+
+  activity.cleanup = (async () => {
+    await Promise.all(activity.chats);
+    if (activity.chats.size || !isSameEmptyDraft()) return false;
+    const revision = activity.revision;
+    const { createAppRecycleBatchForSkill, deleteRecycleBatch } = await import('./recycle_bin');
+    const batch = await createAppRecycleBatchForSkill(userId, skillId);
+    if (!batch?.items.length) return false;
+    if (activity.revision !== revision || !isSameEmptyDraft()) {
+      await deleteRecycleBatch(userId, batch.id);
+      return false;
+    }
+    return deleteCustomSkill(skillId);
+  })();
+
+  try {
+    return await activity.cleanup;
+  } finally {
+    activity.cleanup = undefined;
+    if (!activity.chats.size) importDraftActivity.delete(key);
+  }
 }
 
 function _isPristineImportDraftSkillSync(skillId: string): boolean {
@@ -2166,6 +2261,7 @@ export async function createFromDir(
         continueOnError: opts.continueOnError,
         rejectExisting: opts.rejectExisting,
         requireSkillMd: opts.requireSkillMd,
+        seedMetadataChat: true,
       },
     );
   }
@@ -2636,7 +2732,7 @@ interface SkillMetadataApplyResult {
 export async function applySkillMetadataForEdit(
   skillId: string,
   updates: SkillMetadataUpdate,
-  opts: { replaceSidecar?: boolean; isCancelled?: () => boolean } = {},
+  opts: { isCancelled?: () => boolean } = {},
 ): Promise<SkillMetadataApplyResult> {
   const uid = getActiveUserId();
   const skill = await getSkillForEdit(skillId);
@@ -2679,9 +2775,7 @@ export async function applySkillMetadataForEdit(
   if (writesMarkdown && skill.source !== 'custom') return { ok: false, skillId, written: false };
   const wrote = writesMarkdown || _hasSkillSidecarPatch(sidecarPatch) || !!localized;
   const currentSidecar = readSkillOrkasMetaSync(skill.dir);
-  const proposedSidecar = opts.replaceSidecar && _hasSkillSidecarPatch(sidecarPatch)
-    ? _stripSkillSidecarDescriptions(_skillSidecarReplacementFromMetadataUpdate(updates, currentSidecar))
-    : mergeSkillOrkasMeta(currentSidecar, sidecarPatch);
+  const proposedSidecar = mergeSkillOrkasMeta(currentSidecar, sidecarPatch);
   if (localized) {
     if (localized.zh && localized.en) proposedSidecar.descriptions = { zh: localized.zh, en: localized.en };
     else delete proposedSidecar.descriptions;
@@ -2759,18 +2853,16 @@ async function saveSkillChatMeta(userId: string, skillId: string, meta: SkillCha
   await writeJson(skillChatMetaPath(userId, skillId), meta);
 }
 
-function _skillChatImportMetaTargets(meta: SkillChatMeta): Set<string> {
-  const raw = Array.isArray(meta.import_meta_targets) ? meta.import_meta_targets : [];
-  return new Set(raw.map((id) => String(id || '').trim()).filter(Boolean));
+function _rememberSkillChatSession(userId: string, skillId: string, sessionId: string): void {
+  const file = skillChatMetaPath(userId, skillId);
+  const current = readJsonSync<SkillChatMeta>(file);
+  if (current?.session_id !== sessionId) writeJsonSync(file, { ...current, session_id: sessionId });
 }
 
-async function _clearSkillChatImportMetaTargets(userId: string, skillId: string, sessionId: string): Promise<void> {
-  const current = await loadSkillChatMeta(userId, skillId);
-  if (!current.import_meta_targets && !current.import_meta_created_at) return;
-  const next: SkillChatMeta = { ...current, session_id: sessionId };
-  delete next.import_meta_targets;
-  delete next.import_meta_created_at;
-  await saveSkillChatMeta(userId, skillId, next);
+function _isSkillImportMetadataRequest(meta: SkillChatMeta, skillId: string, requestId: unknown): boolean {
+  const operation = meta?.import_metadata;
+  return typeof requestId === 'string' && !!requestId && operation?.id === requestId
+    && !!operation.targets && Object.prototype.hasOwnProperty.call(operation.targets, skillId);
 }
 
 export async function getSkillChatMessages(userId: string, skillId: string, limit = 500): Promise<any[]> {
@@ -3060,11 +3152,9 @@ export function extractSkillFileBlocks(text: string): { cleanText: string; files
 
 /** Self-closing marker the URL-import edit chat emits AFTER it has already
  *  installed the source as an external package (via `orkas-pkg` over bash).
- *  It is a finalize signal — drop the placeholder skill, switch the view —
- *  not an install instruction; install itself stays on the bash/CLI path. */
+ *  It is a result view signal; install itself stays on the bash/CLI path. */
 // Require an actual self-closing marker (`.../>`) or a paired close tag —
-// a bare `<skill-as-package>` mention in prose must NOT fire, because firing
-// deletes the placeholder skill (a high-cost, irreversible finalize).
+// a bare `<skill-as-package>` mention in prose must not switch the view.
 const SKILL_AS_PACKAGE_RE = /<skill-as-package\b([^>]*?)\/>|<skill-as-package\b([^>]*?)>\s*<\/skill-as-package>/i;
 
 /** Detect + strip the `<skill-as-package name="..."/>` marker. Returns null
@@ -3342,7 +3432,7 @@ export function resolveSkillContainerTarget(
  *  `streamSendToSkillChat`'s file-by-file outcome). */
 export async function applySkillContainerFromCommander(
   container: SkillContainerExtracted,
-  opts: { replaceSidecar?: boolean; isCancelled?: () => boolean } = {},
+  opts: { isCancelled?: () => boolean } = {},
 ): Promise<SkillContainerResult> {
   const hasMetadata = _hasSkillMetadataUpdate(container.metadata);
   if (!container.files.length && !hasMetadata) {
@@ -3495,7 +3585,7 @@ async function _applySkillContainerEdit(
   skillId: string,
   files: SkillFileBlock[],
   metadata?: SkillMetadataUpdate,
-  opts: { replaceSidecar?: boolean; isCancelled?: () => boolean } = {},
+  opts: { isCancelled?: () => boolean } = {},
 ): Promise<SkillContainerResult> {
   const hasMetadata = _hasSkillMetadataUpdate(metadata);
   if (!files.length && !hasMetadata) {
@@ -3552,7 +3642,7 @@ async function _applySkillContainerEdit(
 
   let metadataOk = !hasMetadata;
   if (hasMetadata) {
-    const metaRes = await applySkillMetadataForEdit(resolvedId, metadata || {}, opts);
+    const metaRes = await applySkillMetadataForEdit(resolvedId, metadata || {});
     if (metaRes.ok) {
       metadataOk = true;
       resolvedId = metaRes.skillId;
@@ -3685,6 +3775,20 @@ export async function sendToSkillChat(
   content: string,
   opts: { attachments?: string[]; modelText?: string } = {},
 ): Promise<SkillChatResult> {
+  const settled = trackSkillEditChat(userId, skillId);
+  try {
+    return await _sendToSkillChat(userId, skillId, content, opts);
+  } finally {
+    settled();
+  }
+}
+
+async function _sendToSkillChat(
+  userId: string,
+  skillId: string,
+  content: string,
+  opts: { attachments?: string[]; modelText?: string },
+): Promise<SkillChatResult> {
   const skill = await getSkillForEdit(skillId);
   if (!skill) return { ok: false, error: 'skill not found' };
   if (isMarketplaceSource(skill.source)) {
@@ -3800,12 +3904,79 @@ export async function sendToSkillChat(
   await _appendSkillChatMessage(userId, skillId,
     { time: nowIso(), role: 'assistant', content: assistantText });
 
-  await saveSkillChatMeta(userId, skillId, { session_id: sessionId });
+  _rememberSkillChatSession(userId, skillId, sessionId);
 
   return { ok: true, message: assistantText, written, renamed };
 }
 
 const MAX_SKILL_PROCESS_ITEMS = 300;
+
+interface SkillEditStreamOptions {
+  abortSignal?: AbortSignal;
+  attachments?: string[];
+  modelText?: string;
+  importMetadataId?: unknown;
+}
+
+async function _applyImportedSkillMetadata(
+  userId: string, skillId: string, requestId: unknown, extracted: InlineSkillEditExtraction,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (getActiveUserId() !== userId || signal?.aborted) return [];
+  const file = skillChatMetaPath(userId, skillId);
+  const current = readJsonSync<SkillChatMeta>(file);
+  if (!_isSkillImportMetadataRequest(current, skillId, requestId)) return [];
+  const operation = current.import_metadata!;
+  const proposals = new Map([[skillId, extracted.metadataUpdate]]);
+  for (const container of extracted.externalContainers) {
+    if (container.skillId) proposals.set(container.skillId, container.metadata || {});
+  }
+
+  const permitted: Array<{ id: string; dir: string; version: string; sidecar: SkillOrkasMeta }> = [];
+  for (const [id, version] of Object.entries(operation.targets)) {
+    if (getActiveUserId() !== userId || signal?.aborted) return [];
+    const patch = _importSidecarOnlyMetadata(proposals.get(id));
+    if (!isValidSkillId(id) || !_hasSkillMetadataUpdate(patch)) continue;
+    const dir = customSkillDir(id, userId);
+    if (typeof version !== 'string' || _sourceSkillMetadataVersion(dir) !== version
+      || hasSkillMd(path.join(userMarketplaceSkillsDir(userId), id))) continue;
+    const sidecar = _skillSidecarReplacementFromMetadataUpdate(patch, readSkillOrkasMetaSync(dir));
+    const reports = await validateWithOperatorPolicy(userId, { kind: 'files', files: [
+      { relpath: '_meta.json', content: JSON.stringify(sidecar, null, 2) },
+    ] });
+    if (!reports.some(hasBlockingOperatorPolicy)) permitted.push({ id, dir, version, sidecar });
+  }
+
+  if (getActiveUserId() !== userId || signal?.aborted) return [];
+  const latest = readJsonSync<SkillChatMeta>(file);
+  if (!_isSkillImportMetadataRequest(latest, skillId, requestId)) return [];
+  const { import_metadata: currentOperation, ...remaining } = latest;
+  const updated: string[] = [];
+  let retired = false;
+  // Validate the recorded version again at the synchronous commit boundary.
+  // Once any part is attempted, a later retry cannot replay the batch.
+  for (const { id, dir, version, sidecar } of permitted) {
+    if (currentOperation!.targets[id] !== version || _sourceSkillMetadataVersion(dir) !== version
+      || hasSkillMd(path.join(userMarketplaceSkillsDir(userId), id))) continue;
+    if (!retired) {
+      try {
+        writeJsonSync(file, remaining);
+      } catch (error) {
+        log.warn('Could not settle Skill import metadata operation', logErrorSummary(error));
+        return [];
+      }
+      retired = true;
+    }
+    try {
+      writeSkillOrkasMetaFullSync(dir, sidecar);
+      updated.push(id);
+    } catch (error) {
+      log.warn('Could not update imported Skill metadata', logErrorSummary(error));
+    }
+  }
+  if (updated.length) invalidateSkillCachesForEdit();
+  return updated;
+}
 
 /**
  * Streaming variant of `sendToSkillChat`. Mirrors the event protocol of
@@ -3814,7 +3985,19 @@ const MAX_SKILL_PROCESS_ITEMS = 300;
  */
 export async function* streamSendToSkillChat(
   userId: string, skillId: string, content: string,
-  opts: { abortSignal?: AbortSignal; attachments?: string[]; modelText?: string } = {},
+  opts: SkillEditStreamOptions = {},
+): AsyncGenerator<any, void, unknown> {
+  const settled = trackSkillEditChat(userId, skillId);
+  try {
+    yield* _streamSendToSkillChat(userId, skillId, content, opts);
+  } finally {
+    settled();
+  }
+}
+
+async function* _streamSendToSkillChat(
+  userId: string, skillId: string, content: string,
+  opts: SkillEditStreamOptions,
 ): AsyncGenerator<any, void, unknown> {
   const skill = await getSkillForEdit(skillId);
   if (!skill) {
@@ -3830,7 +4013,14 @@ export async function* streamSendToSkillChat(
 
   const meta = await loadSkillChatMeta(userId, skillId);
   const sessionId = meta.session_id || defaultSkillSessionId(skillId);
-  const importMetaTargets = _skillChatImportMetaTargets(meta);
+  const importMetadataId = opts.importMetadataId;
+  const directImportMetadataOnly = importMetadataId !== undefined;
+  if (directImportMetadataOnly && (skill.source !== 'custom' || getActiveUserId() !== userId
+    || !_isSkillImportMetadataRequest(meta, skillId, importMetadataId))) {
+    yield { type: 'error', text: t('process.skill.final_no_changes') };
+    yield { type: 'done' };
+    return;
+  }
 
   const systemPrompt = await buildSkillEditSystemPrompt(skill);
   const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
@@ -3841,6 +4031,7 @@ export async function* streamSendToSkillChat(
     {
       time: nowIso(), role: 'user', content,
       ...(modelText ? { model_text: modelText } : {}),
+      ...(directImportMetadataOnly ? { import_metadata_id: importMetadataId } : {}),
       ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
     });
 
@@ -3855,11 +4046,6 @@ export async function* streamSendToSkillChat(
   const processItems: any[] = [];
   const written: string[] = [];
   const runStartedAt = Date.now();
-  // Set when the URL-import chat finalized as an external-package install: the
-  // placeholder skill is deleted, so the post-loop persist must be skipped (it
-  // would recreate the just-purged chat dir for a skill that no longer exists).
-  let installedAsPkg = false;
-
   try {
     for await (let event of streamChatWithModel({
       userId, message: attachmentCtx.message, sessionId, systemPrompt,
@@ -3905,24 +4091,35 @@ export async function* streamSendToSkillChat(
       const synthesizedProgress: string[] = [];
       if (etype === 'final') {
         const raw = event.text || '';
-        // External-package import: the LLM already cloned/installed the source
-        // via `orkas-pkg` (bash) this turn and emitted the finalize marker.
-        // Drop the placeholder custom skill opened for this URL and tell the
-        // renderer to switch to the installed package. Install itself never
-        // runs here — only this bookkeeping does.
+        if (directImportMetadataOnly) {
+          if (opts.abortSignal?.aborted) break;
+          const extracted = _extractInlineSkillEditMutations(raw, skillId);
+          const updated = await _applyImportedSkillMetadata(userId, skillId, importMetadataId, extracted, opts.abortSignal);
+          if (opts.abortSignal?.aborted || getActiveUserId() !== userId) break;
+          const targets = Object.keys(meta.import_metadata!.targets);
+          const skipped = targets.filter((id) => !updated.includes(id));
+          const lines = updated.map((name) => t('process.skill.import_updated', { name }));
+          const files = extracted.files.concat(...extracted.externalContainers.map((container) => container.files));
+          const progress = files.map(({ path }) => t('process.skill.file_rejected', { path }));
+          if (extracted.rejectedContainerCount || extracted.externalContainers.some(
+            (container) => !container.skillId || !targets.includes(container.skillId),
+          )) progress.push(t('process.skill.metadata_rejected'));
+          if (skipped.length) lines.push(`${t('process.skill.metadata_rejected')} (${skipped.join(', ')})`);
+          if (updated.length) finalText = skipped.length ? lines.join('\n')
+            : extracted.visibleReply.trim() || t('process.skill.final_updated');
+          else errMsg = t('process.skill.final_no_changes');
+          for (const text of [...progress, ...lines]) {
+            if (processItems.length < MAX_SKILL_PROCESS_ITEMS) processItems.push({ type: 'progress', text });
+            yield { type: 'progress', text };
+          }
+          if (finalText !== null) yield { type: 'final', text: finalText, written };
+          else yield { type: 'error', text: errMsg };
+          continue;
+        }
+        // This marker controls only the package result view. The host
+        // evaluates draft cleanup when the user finishes or leaves the view.
         const pkgMarker = skill.source === 'custom' ? extractSkillAsPackageMarker(raw) : null;
         if (pkgMarker) {
-          let placeholderDeleted = false;
-          try {
-            placeholderDeleted = await deleteCustomSkill(skillId);
-          }
-          catch (e) { log.warn(`drop placeholder skill failed skill=${skillId}: ${(e as Error).message}`); }
-          log.info('url import finalized as external package', {
-            skill_id: skillId,
-            package_name: pkgMarker.name || '',
-            placeholder_deleted: placeholderDeleted,
-          });
-          installedAsPkg = true;
           const inner = { stream: 'skill_as_package', data: { name: pkgMarker.name || '' } };
           processItems.push({ type: 'event', event: inner });
           yield { type: 'event', event: inner };
@@ -3931,23 +4128,14 @@ export async function* streamSendToSkillChat(
           continue;
         }
         const extracted = _extractInlineSkillEditMutations(raw, skillId);
-        const directImportMetadataOnly = importMetaTargets.size > 0;
-        const fileBlocks = directImportMetadataOnly ? [] : extracted.files;
-        const metadataUpdate = directImportMetadataOnly
-          ? _importSidecarOnlyMetadata(extracted.metadataUpdate)
-          : extracted.metadataUpdate;
+        const fileBlocks = extracted.files;
+        const metadataUpdate = extracted.metadataUpdate;
         const externalContainers = extracted.externalContainers;
         const sawMutationProtocol = fileBlocks.length > 0
-          || extracted.files.length > 0
           || _hasSkillMetadataUpdate(metadataUpdate)
           || externalContainers.length > 0;
         if (extracted.rejectedContainerCount > 0) {
           synthesizedProgress.push(t('process.skill.metadata_rejected'));
-        }
-        if (directImportMetadataOnly && extracted.files.length > 0) {
-          for (const fb of extracted.files) {
-            synthesizedProgress.push(t('process.skill.file_rejected', { path: fb.path }));
-          }
         }
         // Track which skill ids had their SKILL.md (re)written this turn —
         // those are the ones we should auto-rename to match the new
@@ -3973,7 +4161,6 @@ export async function* streamSendToSkillChat(
         if (externalContainers.length) {
           const allowExternalImportDraft = skill.source === 'custom'
             && _isImportDraftForExternalSkillContainersSync(skillId);
-          const allowExternalMetadataTargets = skill.source === 'custom' && directImportMetadataOnly;
           if (allowExternalImportDraft) {
             for (const container of externalContainers) {
               const useCurrentDraft = !usedImportDraftAsSkill
@@ -4012,37 +4199,6 @@ export async function* streamSendToSkillChat(
                 synthesizedProgress.push(t('process.skill.metadata_rejected'));
               }
             }
-          } else if (allowExternalMetadataTargets) {
-            for (const container of externalContainers) {
-              for (const fb of container.files) {
-                synthesizedProgress.push(t('process.skill.file_rejected', { path: fb.path }));
-              }
-              const metadataOnly = _importSidecarOnlyMetadata(container.metadata);
-              if (!container.skillId || !importMetaTargets.has(container.skillId) || !_hasSkillMetadataUpdate(metadataOnly)) {
-                log.warn(`rejected inline import metadata container skill=${skillId}`);
-                synthesizedProgress.push(t('process.skill.metadata_rejected'));
-                continue;
-              }
-              const res = await _applySkillContainerEdit(
-                container.skillId,
-                [],
-                metadataOnly,
-                { replaceSidecar: true, isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId },
-              );
-              if (res.ok && res.skillId) {
-                createdSkills.push({
-                  skill_id: res.skillId,
-                  name: res.name || res.skillId,
-                  kind: res.kind,
-                });
-                processedExternalContainers = true;
-                clearSkillImportDraftMarkerSync(res.skillId);
-                synthesizedProgress.push(t('process.skill.import_updated', { name: res.name || res.skillId }));
-              } else {
-                log.warn(`rejected inline import metadata update skill=${container.skillId}: ${res.error || 'unknown'}`);
-                synthesizedProgress.push(t('process.skill.metadata_rejected'));
-              }
-            }
           } else {
             log.warn(`rejected ${externalContainers.length} cross-skill container(s) in non-import skill chat skill=${skillId}`);
             synthesizedProgress.push(t('process.skill.metadata_rejected'));
@@ -4072,7 +4228,7 @@ export async function* streamSendToSkillChat(
           const metaRes = await applySkillMetadataForEdit(
             currentSkillId,
             metadataUpdate,
-            { replaceSidecar: directImportMetadataOnly, isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId },
+            { isCancelled: () => !!opts.abortSignal?.aborted || getActiveUserId() !== userId },
           );
           if (metaRes.ok) {
             updatedMetadata = true;
@@ -4154,41 +4310,29 @@ export async function* streamSendToSkillChat(
       (text) => _visibleInlineSkillEditText(text, skillId),
     );
     try {
-      if (installedAsPkg) {
-        // Placeholder skill (and its chat dir) was deleted after resolving the
-        // import as a package. Persisting here would recreate an orphan chat;
-        // the live stream already rendered the reply and the renderer switches
-        // to the package result state.
-      } else if (finalText !== null) {
+      if (finalText !== null) {
         await _appendSkillChatMessage(userId, skillId,
           { time: nowIso(), role: 'assistant', content: finalText, ...(saved ? { process: saved } : {}) });
-        await saveSkillChatMeta(userId, skillId, { session_id: sessionId });
+        _rememberSkillChatSession(userId, skillId, sessionId);
       } else if (errMsg) {
         const partial = _visibleInlineSkillEditText(streamingText, skillId).trim();
         const content = partial ? `${partial}\n\n${errMsg}` : errMsg;
         await _appendSkillChatMessage(userId, skillId,
-          { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+          { time: nowIso(), role: 'assistant', content, ...(directImportMetadataOnly ? { failed: true } : {}), ...(saved ? { process: saved } : {}) });
       } else if (waitingForInput && !opts.abortSignal?.aborted) {
         await _appendSkillChatMessage(userId, skillId,
           { time: nowIso(), role: 'assistant', content: '', process: saved });
-        await saveSkillChatMeta(userId, skillId, { session_id: sessionId });
-      } else if (streamingText.trim() || hadProcessItems) {
+        _rememberSkillChatSession(userId, skillId, sessionId);
+      } else if (streamingText.trim() || hadProcessItems || directImportMetadataOnly) {
         const partial = _visibleInlineSkillEditText(streamingText, skillId).trim();
         const content = partial
           ? `${partial}\n\n(reply interrupted)`
           : '(reply interrupted)';
         await _appendSkillChatMessage(userId, skillId,
-          { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
+          { time: nowIso(), role: 'assistant', content, ...(directImportMetadataOnly ? { failed: true } : {}), ...(saved ? { process: saved } : {}) });
       }
     } catch (e) {
       log.warn(`persist skill chat assistant failed skill=${skillId}: ${(e as Error).message}`);
-    }
-    if (importMetaTargets.size > 0 && !installedAsPkg) {
-      try {
-        await _clearSkillChatImportMetaTargets(userId, skillId, sessionId);
-      } catch (e) {
-        log.warn(`clear import metadata targets failed skill=${skillId}: ${(e as Error).message}`);
-      }
     }
   }
 }

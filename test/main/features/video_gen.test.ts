@@ -75,6 +75,26 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe('native Doubao model serialization', () => {
+  it('sends the official Flash ID and native edit mode from the saved model ID', async () => {
+    const posts: any[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') { posts.push(JSON.parse(String(init.body))); return Response.json({ id: 'flash-task' }); }
+      if (url.includes('/contents/generations/tasks/')) return Response.json({ status: 'succeeded', content: { video_url: 'https://media.example/result.mp4' } });
+      return new Response(new Uint8Array(mp4Fixture()));
+    }));
+    const { callDoubaoVideo } = await import('../../../src/main/features/video_gen');
+    const result = await callDoubaoVideo({ model: 'doubao-seedance-2-5-flash', apiKey: 'fixture', prompt: 'Edit the sky',
+      operation: 'edit', duration: -1, ratio: 'adaptive', resolution: '720p', generateAudio: true, watermark: false,
+      referenceImageUrls: [], referenceVideoUrls: ['https://media.example/source.mp4'], pollIntervalMs: 1, timeoutMs: 5000 });
+    expect(result.taskId).toBe('flash-task');
+    expect(result.buffer).toEqual(mp4Fixture());
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ model: 'doubao-seedance-2-5-flash-261115', omni_reference_task_type: 'edit', duration: -1,
+      content: expect.arrayContaining([expect.objectContaining({ type: 'video_url', role: 'reference_video' })]) });
+  });
+});
+
 describe('video_gen › Orkas public API', () => {
   it('creates, downloads, and saves a public API video without sending a model', async () => {
     const fetchStub = vi.fn(async () => new Response(JSON.stringify({
@@ -527,5 +547,40 @@ describe('public video rejection recovery boundaries', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({error: {code}}), {status: 400})));
     expect(await generateVideo({prompt: 'A quiet landscape', outputAbsPath: path.join(tmpDir, 'unknown.mp4')}))
       .toMatchObject({ok: false, errorCode: 'PROVIDER_API_ERROR'});
+  });
+});
+
+// Shared concurrency cases from video_generation_spend, adapted to configured user keys.
+describe('configured videos share four admission slots', () => {
+  it.each([false, true])('bounds a five-shot batch and cancels a waiting shot without sending it (cancel=%s)', async cancel => {
+    let open = 0, peak = 0, creates = 0;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      const id = ++creates;
+      open++; peak = Math.max(peak, open);
+      try { await held; } finally { open--; }
+      return new Response(JSON.stringify({ id: `batch-${id}`, status: 'succeeded', url: 'https://cdn.example.test/video.mp4' }), { status: 202 });
+    }));
+    const run = (name: string, signal?: AbortSignal) => generateVideo({ prompt: name, outputAbsPath: path.join(tmpDir, `${name}.mp4`), ...(signal ? { signal } : {}) });
+    const runs = ['a', 'b', 'c', 'd'].map(name => run(name));
+    let last: Promise<Awaited<ReturnType<typeof generateVideo>>> | undefined;
+    try {
+      await vi.waitFor(() => expect(open).toBe(4));
+      const stop = new AbortController(); last = run('e', stop.signal);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(creates).toBe(4);
+      if (cancel) {
+        stop.abort();
+        expect(await last).toMatchObject({ ok: false, dispatched: false });
+        expect(fs.existsSync(path.join(tmpDir, 'e.mp4'))).toBe(false);
+      }
+    } finally {
+      release();
+      const outcomes = await Promise.all([...runs, ...(last ? [last] : [])]);
+      expect(outcomes.filter(result => result.ok)).toHaveLength(cancel ? 4 : 5);
+    }
+    expect(peak).toBe(4); expect(creates).toBe(cancel ? 4 : 5);
+    expect(fs.readdirSync(tmpDir).sort()).toEqual((cancel ? ['a','b','c','d'] : ['a','b','c','d','e']).map(name => `${name}.mp4`));
   });
 });

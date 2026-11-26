@@ -83,19 +83,23 @@ type ParsedPatchFile =
   | { type: "add"; path: string; content: string }
   | { type: "delete"; path: string }
   | { type: "update"; path: string; moveTo?: string; hunks: ParsedPatchHunk[] };
-type StagedPatchFile = {
-  parsed: ParsedPatchFile;
+type PatchWrite = {
+  operation: ApplyPatchOperation;
   sourceAbs: string;
   destinationAbs: string;
-  before?: string;
   next?: string;
   mode?: number;
-  beforeHash?: string;
-  afterHash?: string;
+  sourceStat?: fs.Stats;
   tempPath?: string;
   backupPath?: string;
   backupMoved?: boolean;
   targetReplaced?: boolean;
+};
+type StagedPatchFile = PatchWrite & {
+  parsed: ParsedPatchFile;
+  before?: string;
+  beforeHash?: string;
+  afterHash?: string;
 };
 
 export const APPLY_PATCH_MAX_CHARS = 1_000_000;
@@ -319,10 +323,12 @@ export function applyPatchHunks(
   hunks: readonly ParsedPatchHunk[],
 ): { content: string } | (ToolResult & { candidateLines?: number[] }) {
   const eol = original.includes("\r\n") ? "\r\n" : "\n";
+  const lineEndings: string[] = original.match(/\r\n|\r|\n/g) ?? [];
   const normalized = original.replace(/\r\n?/g, "\n");
   let trailingNewline = normalized.endsWith("\n");
   const lines = normalized.split("\n");
   if (trailingNewline) lines.pop();
+  else lineEndings.push("");
   let cursor = 0;
   let lineDelta = 0;
 
@@ -382,14 +388,35 @@ export function applyPatchHunks(
       position = positions[0];
     }
 
+    const removedEndings: string[] = [];
+    let oldLine = position;
+    for (const line of hunk.lines) {
+      if (line.kind === "-") removedEndings.push(lineEndings[oldLine]);
+      if (line.kind !== "+") oldLine++;
+    }
+    const nearbyEnding = lineEndings[position] || lineEndings[position - 1] || eol;
+    oldLine = position;
+    let replacedLine = 0;
+    const newEndings: string[] = [];
+    for (const line of hunk.lines) {
+      if (line.kind === "+") {
+        newEndings.push(removedEndings[replacedLine++] || nearbyEnding);
+      } else {
+        if (line.kind === " ") newEndings.push(lineEndings[oldLine]);
+        oldLine++;
+      }
+    }
     lines.splice(position, before.length, ...after);
+    lineEndings.splice(position, before.length, ...newEndings);
     cursor = position + after.length;
     // Candidates after the cursor are in the untouched original tail. Report
     // their original rows, since this transaction has not committed any bytes.
     lineDelta += after.length - before.length;
     if (hunk.endOfFile && hunk.noNewlineAtEnd) trailingNewline = false;
   }
-  return { content: lines.join(eol) + (trailingNewline && lines.length ? eol : "") };
+  return { content: lines.map((line, index) => (
+    line + (index === lines.length - 1 && !trailingNewline ? "" : lineEndings[index] || eol)
+  )).join("") };
 }
 
 function fileHash(content: string): string {
@@ -460,6 +487,115 @@ function callbackError(value: void | ToolResult): ToolResult | null {
   return value && typeof value.content === "string" ? value : null;
 }
 
+type PatchWriteFailure = {
+  code: "E_PATCH_STAGE_FAILED" | "E_PATCH_COMMIT_FAILED";
+  error: unknown;
+};
+
+function checkReplacementTarget(file: PatchWrite): void {
+  const entry = fs.lstatSync(file.sourceAbs);
+  const source = file.sourceStat!;
+  if (!entry.isFile() || entry.nlink > 1) {
+    throw new Error("Safe replacement requires a regular file without multiple links.");
+  }
+  const current = fs.statSync(file.sourceAbs);
+  if (current.dev !== source.dev || current.ino !== source.ino || current.size !== source.size
+      || current.dev !== entry.dev || current.ino !== entry.ino
+      || current.mtimeMs !== source.mtimeMs || current.ctimeMs !== source.ctimeMs) {
+    throw new Error("The source changed before publication. Read the current file and rebuild the edit.");
+  }
+  fs.accessSync(file.sourceAbs, fs.constants.W_OK);
+}
+
+function commitPatchFiles(files: readonly PatchWrite[], transactionId: string): PatchWriteFailure | null {
+  const replacements = files.filter(file => file.operation === "update" && file.sourceAbs === file.destinationAbs);
+  try {
+    for (const file of replacements) checkReplacementTarget(file);
+    for (const file of files) {
+      if (file.operation === "delete") continue;
+      fs.mkdirSync(path.dirname(file.destinationAbs), { recursive: true });
+      file.tempPath = siblingPath(file.destinationAbs, transactionId, "tmp");
+      fs.writeFileSync(file.tempPath, file.next!, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: file.mode === undefined ? undefined : 0o600,
+      });
+      if (process.platform !== "win32" && file.sourceStat) {
+        const staged = fs.statSync(file.tempPath);
+        if (staged.uid !== file.sourceStat.uid || staged.gid !== file.sourceStat.gid) {
+          fs.chownSync(file.tempPath, file.sourceStat.uid, file.sourceStat.gid);
+        }
+      }
+      if (file.mode !== undefined) fs.chmodSync(file.tempPath, file.mode);
+    }
+  } catch (error) {
+    for (const file of files) {
+      if (file.tempPath) {
+        try { fs.unlinkSync(file.tempPath); } catch { /* best effort */ }
+      }
+    }
+    return { code: "E_PATCH_STAGE_FAILED", error };
+  }
+
+  let commitError: unknown;
+  try {
+    for (const file of replacements) checkReplacementTarget(file);
+    if (files.length === 1 && replacements.length === 1) {
+      const file = replacements[0];
+      fs.renameSync(file.tempPath!, file.destinationAbs);
+      return null;
+    }
+    for (const file of files) {
+      if (file.operation !== "add") {
+        file.backupPath = siblingPath(file.sourceAbs, transactionId, "bak");
+        fs.renameSync(file.sourceAbs, file.backupPath);
+        file.backupMoved = true;
+      }
+      if (file.operation !== "delete") {
+        fs.renameSync(file.tempPath!, file.destinationAbs);
+        file.targetReplaced = true;
+      }
+    }
+  } catch (error) {
+    commitError = error;
+  }
+
+  if (commitError) {
+    for (const file of [...files].reverse()) {
+      if (file.targetReplaced && fs.existsSync(file.destinationAbs)) {
+        try { fs.unlinkSync(file.destinationAbs); } catch { /* best effort */ }
+      }
+      if (file.backupMoved && file.backupPath && fs.existsSync(file.backupPath)) {
+        try { fs.renameSync(file.backupPath, file.sourceAbs); } catch { /* best effort */ }
+      }
+      if (file.tempPath && fs.existsSync(file.tempPath)) {
+        try { fs.unlinkSync(file.tempPath); } catch { /* best effort */ }
+      }
+    }
+    return { code: "E_PATCH_COMMIT_FAILED", error: commitError };
+  }
+
+  for (const file of files) {
+    if (file.backupPath) {
+      try { fs.unlinkSync(file.backupPath); } catch { /* best effort */ }
+    }
+  }
+  return null;
+}
+
+/** Publish bytes prepared by the host's legacy text replacement under its existing lock. */
+export function commitExistingTextReplacement(filePath: string, content: string, stat: fs.Stats): void {
+  const failure = commitPatchFiles([{
+    operation: "update",
+    sourceAbs: filePath,
+    destinationAbs: filePath,
+    next: content,
+    mode: stat.mode,
+    sourceStat: stat,
+  }], crypto.randomUUID());
+  if (failure) throw failure.error;
+}
+
 export function createApplyPatchTool(hooks: ApplyPatchToolHooks = {}): AgentTool {
   return defineTool({
     name: "apply_patch",
@@ -481,7 +617,7 @@ NL: /\r\n|\r|\n/`,
       },
     },
     description:
-      "Apply multiple known edits in one transactional patch to one or more existing or new text files. Read existing targets first; validation or conflicts leave every target unchanged. Use a targeted edit tool for one small replacement.",
+      "Apply one or more targeted edits in a single transactional patch. Read existing targets first; validation or conflicts leave every target unchanged.",
     inputSchema: {
       type: "object",
       properties: {
@@ -539,7 +675,7 @@ NL: /\r\n|\r|\n/`,
           const denied = callbackError(await hooks.validatePath?.(check, ctx));
           if (denied) return denied;
         }
-        staged.push({ parsed: operation, sourceAbs, destinationAbs });
+        staged.push({ parsed: operation, operation: operation.type, sourceAbs, destinationAbs });
       }
 
       const transactionId = crypto.randomBytes(10).toString("hex");
@@ -646,6 +782,7 @@ NL: /\r\n|\r|\n/`,
           file.beforeHash = currentHash;
           file.before = current;
           file.mode = stat.mode;
+          file.sourceStat = stat;
           if (operation.type === "delete") continue;
           const applied = applyPatchHunks(current, file.sourceAbs, operation.hunks);
           if ("isError" in applied && applied.isError) {
@@ -675,57 +812,10 @@ NL: /\r\n|\r|\n/`,
           file.afterHash = fileHash(applied.content);
         }
 
-        try {
-          for (const file of staged) {
-            if (file.parsed.type === "delete") continue;
-            fs.mkdirSync(path.dirname(file.destinationAbs), { recursive: true });
-            file.tempPath = siblingPath(file.destinationAbs, transactionId, "tmp");
-            fs.writeFileSync(file.tempPath, file.next!, { encoding: "utf8", flag: "wx" });
-            if (file.mode !== undefined) fs.chmodSync(file.tempPath, file.mode);
-          }
-        } catch (error) {
-          for (const file of staged) {
-            if (file.tempPath) {
-              try { fs.unlinkSync(file.tempPath); } catch { /* best effort */ }
-            }
-          }
+        const failure = commitPatchFiles(staged, transactionId);
+        if (failure) {
           return {
-            content: patchError("E_PATCH_STAGE_FAILED", (error as Error).message),
-            isError: true,
-          };
-        }
-
-        let commitError: unknown;
-        try {
-          for (const file of staged) {
-            if (file.parsed.type !== "add") {
-              file.backupPath = siblingPath(file.sourceAbs, transactionId, "bak");
-              fs.renameSync(file.sourceAbs, file.backupPath);
-              file.backupMoved = true;
-            }
-            if (file.parsed.type !== "delete") {
-              fs.renameSync(file.tempPath!, file.destinationAbs);
-              file.targetReplaced = true;
-            }
-          }
-        } catch (error) {
-          commitError = error;
-        }
-
-        if (commitError) {
-          for (const file of [...staged].reverse()) {
-            if (file.targetReplaced && fs.existsSync(file.destinationAbs)) {
-              try { fs.unlinkSync(file.destinationAbs); } catch { /* best effort */ }
-            }
-            if (file.backupMoved && file.backupPath && fs.existsSync(file.backupPath)) {
-              try { fs.renameSync(file.backupPath, file.sourceAbs); } catch { /* best effort */ }
-            }
-            if (file.tempPath && fs.existsSync(file.tempPath)) {
-              try { fs.unlinkSync(file.tempPath); } catch { /* best effort */ }
-            }
-          }
-          return {
-            content: patchError("E_PATCH_COMMIT_FAILED", (commitError as Error).message),
+            content: patchError(failure.code, (failure.error as Error).message),
             isError: true,
           };
         }
@@ -742,11 +832,6 @@ NL: /\r\n|\r|\n/`,
           ...(file.parsed.type === "add" && file.next !== undefined ? { afterContent: file.next } : {}),
           ...(file.before !== undefined ? { beforeContent: file.before } : {}),
         }));
-        for (const file of staged) {
-          if (file.backupPath) {
-            try { fs.unlinkSync(file.backupPath); } catch { /* best effort */ }
-          }
-        }
         const callbackWarnings: string[] = [];
         for (const file of committed) {
           try {

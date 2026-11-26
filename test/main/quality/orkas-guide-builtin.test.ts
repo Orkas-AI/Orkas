@@ -54,10 +54,14 @@ describe('Orkas Guide builtin contract', () => {
         const overviewRoute = skill.split('\n').find((line) => line.startsWith('|') && line.includes('(references/getting-started.md)'));
         expect(overviewRoute).toMatch(/choose features for ongoing work/i);
         const overview = read(path.join(referenceDir, 'getting-started.md'));
-        for (const feature of ['Task / conversation', 'Project', 'Goals & rules', 'To-do', 'Auto', 'Agent', 'Skill', 'Connector', 'Library', 'Memory', 'App', 'Model', 'Workspace']) {
+        const labels = JSON.parse(read(path.join(pcRoot, 'src/renderer/locales/en.json')));
+        const projectTabs = [labels['project.context.goal_tab'], labels['project.context.instructions_tab']];
+        for (const feature of ['Task / conversation', 'Project', ...projectTabs, 'To-do', 'Auto', 'Agent', 'Skill', 'Connector', 'Library', 'Memory', 'App', 'Model', 'Workspace']) {
             expect(overview.includes(`| **${feature}** |`), feature).toBe(true);
         }
+        expect(overview).toMatch(/\| \*\*Goal\*\* \|[^\n]+\| The tab is off by default\./);
         const projectGuide = read(path.join(referenceDir, 'projects-and-automation.md'));
+        expect(projectGuide).toContain('The **Goal** tab is off by default.');
         expect(projectGuide.includes('does not calculate business-metric progress')).toBe(true);
         expect(projectGuide.includes('Completing to-dos measures work progress')).toBe(true);
         expect(projectGuide.includes('auto-advance is separate from scheduled Automation')).toBe(true);
@@ -290,7 +294,9 @@ describe('Orkas Guide builtin contract', () => {
         expect(fileGuide).toMatch(/attach it in\s+\*\*Commander\*\*/);
         expect(fileGuide).toContain('Library or Project Library does not');
         expect(fileGuide).toContain('Use the **Workspace** chip');
-        expect(fileGuide).toContain('Task files do not sync with their task');
+        expect(fileGuide).toContain('Files and tasks stay on the current device in the open-source edition.');
+        expect(fileGuide).toContain('**2 GiB**');
+        expect(fileGuide).toContain('**200 MiB**');
         expect(fileGuide).not.toContain('ZIP and other archive files are not accepted as task attachments');
         const resourceGuide = read(path.join(referenceDir, 'agents-skills-and-connectors.md'));
         expect(resourceGuide).toContain('**Manual**');
@@ -298,7 +304,7 @@ describe('Orkas Guide builtin contract', () => {
         expect(resourceGuide).toContain('**From folder**');
         expect(resourceGuide).toContain('does not provide a general Agent JSON import screen');
         expect(resourceGuide).toContain('**Connectors > Add MCP server**');
-        expect(resourceGuide).toContain('Claude Code, Codex, or OpenCode');
+        expect(resourceGuide).toContain('Claude Code, Codex, OpenClaw, OpenCode, Hermes, Kimi Code, DeepSeek Harness, TraeCode, ZCode, GitHub Copilot, Cursor, and Antigravity');
         expect(resourceGuide).toContain('For CLIs with selectable permissions, the default is **Use CLI default**');
         expect(resourceGuide).toContain('the CLI action or selected path');
         expect(resourceGuide).toContain('asks for your decision');
@@ -334,7 +340,7 @@ describe('Orkas Guide builtin contract', () => {
     });
     it('makes the Project instructions limit discoverable in the in-app guide', () => {
         const projectGuide = read(path.join(referenceDir, 'projects-and-automation.md'));
-        expect(projectGuide).toMatch(/\*\*Goals & rules\*\*[^.]*\b4000 characters\b/);
+        expect(projectGuide).toMatch(/\*\*Rules\*\*[^.]*\b4000 characters\b/);
     });
     it('gives the user-run Skill disable, delete and Marketplace uninstall path with the shipped labels in the in-app guide', () => {
         // Commander has no Skill removal workflow; without this documented path it

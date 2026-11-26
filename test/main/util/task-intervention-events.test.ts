@@ -45,6 +45,7 @@ describe('delivered task intervention signals', () => {
     expect(listener).toHaveBeenCalledOnce();
     expect(listener).toHaveBeenCalledWith({
       attention_id: `${kind}:${expectedId}`,
+      ...(channel === 'bash:permission' ? { bash_request_id: expectedId } : {}),
       user_id: 'u1',
       conversation_id: payload.cid,
       kind,
@@ -115,6 +116,7 @@ describe('delivered task intervention signals', () => {
     expect(failingListener).toHaveBeenCalledOnce();
     expect(healthyListener).toHaveBeenCalledWith({
       attention_id: 'sensitive_operation:req-resilient',
+      bash_request_id: 'req-resilient',
       user_id: 'u1',
       conversation_id: 'c-resilient',
       kind: 'sensitive_operation',

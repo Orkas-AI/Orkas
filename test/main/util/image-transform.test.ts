@@ -25,6 +25,7 @@ describe('image-transform › toCompressedJpeg', () => {
     const r = await toCompressedJpeg(sourcePng, { maxDim: 800, quality: 60 });
     expect(r.mimeType).toBe('image/jpeg');
     expect(Math.max(r.width, r.height)).toBeLessThanOrEqual(800);
+    expect(r).toMatchObject({ sourceWidth: 2000, sourceHeight: 1500, width: 800, height: 600 });
     // JPEG magic
     expect(r.buf.subarray(0, 3).toString('hex')).toBe('ffd8ff');
     // Sanity: non-zero byte length
@@ -50,8 +51,16 @@ describe('image-transform › toCompressedJpeg', () => {
     const small: any = new Jimp({ width: 100, height: 80, color: 0xFFFFFFFF });
     const smallPng: Buffer = await small.getBuffer('image/png');
     const r = await toCompressedJpeg(smallPng, { maxDim: 1024 });
-    expect(r.width).toBe(100);
-    expect(r.height).toBe(80);
+    expect(r).toMatchObject({ sourceWidth: 100, sourceHeight: 80, width: 100, height: 80 });
+  });
+
+  it('reports source and preview in the displayed orientation of a rotated JPEG', async () => {
+    const { default: sharp } = await import('sharp');
+    const input = await sharp({ create: { width: 600, height: 400, channels: 3, background: '#324c69' } })
+      .jpeg().withMetadata({ orientation: 6 }).toBuffer();
+    const result = await toCompressedJpeg(input, { maxDim: 300 });
+    expect(result).toMatchObject({ sourceWidth: 400, sourceHeight: 600, width: 200, height: 300 });
+    expect(await sharp(result.buf).metadata()).toMatchObject({ width: 200, height: 300 });
   });
 
   it('flattens transparent images onto white before JPEG encoding', async () => {

@@ -1,9 +1,25 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { setTimeout as realDelay } from 'node:timers/promises';
 import { AgentRunner, createConfig, createPiProvider, defineTool, ProviderError, ProviderRegistry, RateLimitError,
   type AgentRunEvent, type CompletionParams, type StreamEvent } from '#core-agent';
 import { createRotatingProvider } from '../../../../src/main/model/core-agent/rotating-provider';
 
-const realSetImmediate = setImmediate;
+const realNow = performance.now.bind(performance);
+const waitForIo = realDelay;
+
+async function driveFixtureTimers<T>(operation: Promise<T>): Promise<T> {
+  let settled = false;
+  const markSettled = () => { settled = true; };
+  void operation.then(markSettled, markSettled);
+  const deadline = realNow() + 5_000;
+  while (!settled && realNow() < deadline) {
+    // A fixed turn count can expire before the OS finishes one asynchronous read.
+    await waitForIo(1);
+    await vi.runAllTimersAsync();
+  }
+  expect(settled, 'provider fixture did not settle').toBe(true);
+  return operation;
+}
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
@@ -64,20 +80,14 @@ function task(failures: unknown[], options: { signal?: AbortSignal; onRetry?: ()
     runner, contexts, events, callTimes,
     counts: () => ({ calls, writes, fallbacks }),
     async run() {
-      let settled = false;
       const draining = (async () => {
         for await (const event of runner.runStream({ message: options.secondEpisode
           ? 'Save two records and report their outcomes.' : 'Save a record and report its outcome.', signal: options.signal })) {
           events.push(event);
           if (event.type === 'retry') options.onRetry?.();
         }
-      })().finally(() => { settled = true; });
-      for (let tick = 0; !settled && tick < 100; tick++) {
-        await new Promise<void>(resolve => realSetImmediate(resolve));
-        await vi.runAllTimersAsync();
-      }
-      expect(settled).toBe(true);
-      await draining;
+      })();
+      await driveFixtureTimers(draining);
       expect(events.filter(event => event.type === 'done')).toHaveLength(1);
       expect(events.at(-1)?.type).toBe('done');
       expect(writes).toBe(options.secondEpisode ? 2 : 1);
@@ -225,13 +235,8 @@ it('keeps the same model after a retry is throttled before producing its first d
   const registry = new ProviderRegistry(); registry.registerFactory('fixture', () => rotating);
   const runner = new AgentRunner({ config: createConfig({ agent: { defaultProvider: 'fixture', defaultModel: 'fixture-model' } }),
     providers: registry, tools: [], evolution: { enabled: false } });
-  let settled = false;
-  const pending = runner.run({ message: 'Continue the task.' }).finally(() => { settled = true; });
-  for (let tick = 0; !settled && tick < 100; tick++) {
-    await new Promise<void>(resolve => realSetImmediate(resolve)); await vi.runAllTimersAsync();
-  }
-  expect(settled).toBe(true);
-  expect((await pending).text).toBe('recovered');
+  const pending = runner.run({ message: 'Continue the task.' });
+  expect((await driveFixtureTimers(pending)).text).toBe('recovered');
   expect(calls).toBe(3); expect(fallbacks).toBe(0);
 });
 
@@ -260,13 +265,8 @@ it('recovers a real SDK stream using the retained SSE retry delay', async () => 
   const runner = new AgentRunner({ config: createConfig({ agent: { defaultProvider: 'custom', defaultModel: 'fixture-model' } }),
     providers: registry, tools: [], evolution: { enabled: false } });
   const events: AgentRunEvent[] = [];
-  let settled = false;
-  const draining = (async () => { for await (const event of runner.runStream({ message: 'Report the result.' })) events.push(event); })()
-    .finally(() => { settled = true; });
-  for (let tick = 0; !settled && tick < 100; tick++) {
-    await new Promise<void>(resolve => realSetImmediate(resolve)); await vi.runAllTimersAsync();
-  }
-  await draining;
+  const draining = (async () => { for await (const event of runner.runStream({ message: 'Report the result.' })) events.push(event); })();
+  await driveFixtureTimers(draining);
   expect(events.at(-1)).toMatchObject({ type: 'done', result: { text: 'recovered' } });
   expect(events.filter(event => event.type === 'retry')).toMatchObject([{ waitMs: 25_000 }]);
   expect(calls).toBe(2);

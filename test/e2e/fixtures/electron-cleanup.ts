@@ -44,6 +44,7 @@ export async function requestElectronQuit(app: ElectronApplication): Promise<voi
       const inspectorDisposed = error instanceof Error && [
         'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.',
         'electronApplication.evaluate: Target page, context or browser has been closed',
+        'electronApplication.evaluate: Resulting promise was garbage collected.',
       ].includes(error.message);
       if (!closed && !inspectorDisposed) throw error;
     }

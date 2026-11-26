@@ -214,6 +214,7 @@ import * as autoTasks from './features/auto_tasks';
 import * as projectDriverRunner from './features/project_driver_runner';
 import * as projectTasks from './features/project_tasks';
 import * as projects from './features/projects';
+import { onProjectGoalChanged } from './features/project_goal';
 import * as conversationFiling from './features/conversation_filing';
 import * as systemSkills from './features/system_skills';
 import * as bundledContentStartup from './features/bundled_content_startup';
@@ -232,6 +233,7 @@ import { startIdleSleepGuard } from './features/idle_sleep_guard';
 import { createDesktopWindowController, getDesktopWindowController, setDesktopWindowController } from './features/desktop_windows';
 import * as taskNotifications from './features/task_notifications';
 import { installWindowCloseConfirmation } from './features/window_close_confirmation';
+import { watchBashPermission } from './model/core-agent/bash-permissions';
 import * as taskUnreadTray from './features/task_unread_tray';
 import * as notificationPermissions from './features/notification_permissions';
 import {
@@ -463,6 +465,10 @@ function registerIpc(
   projectTasks.onTasksChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
     projectId: e.pid,
   }));
+  const stopAutomationRunEnds = autoTasks.subscribeRunEnds(({ userId, cid, taskId }) => {
+    if (users.hasActiveUser() && users.getActiveUserId() === userId) ipc.broadcastToRenderer('conversations:automation_run_ended', { cid, taskId });
+  });
+  app.once('will-quit', stopAutomationRunEnds);
   // A conversation filed under a project by the host has no renderer request to
   // answer, so the sidebar is told directly.
   conversationFiling.onConversationFiled((e) => {
@@ -479,6 +485,10 @@ function registerIpc(
   projects.onProjectInstructionsChanged((event) => {
     if (!users.hasActiveUser() || users.getActiveUserId() !== event.uid) return;
     ipc.broadcastToRenderer('projects:instructions-changed', { projectId: event.projectId });
+  });
+  onProjectGoalChanged((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.uid) return;
+    ipc.broadcastToRenderer('projects:goal-changed', { projectId: event.projectId });
   });
   conversationTaskBoard.onBacklogExecutionChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
     projectId: e.pid,
@@ -1537,6 +1547,10 @@ if (!gotLock) {
       await Promise.all([
         prepareForShutdown(),
         import('./features/local_agents/runner.js').then(runner => runner.stopBackgroundRuns('the app is quitting')),
+        // Canvas renders and takes are not Agent turns, so the bus does not stop them.
+        import('./features/video_canvas_jobs')
+          .then(jobs => jobs.stopVideoCanvasJobsForQuit())
+          .catch(() => createLogger('video-canvas-jobs').warn('stopping canvas jobs failed')),
         import('../core-agent/src/tools/process-session')
           .then(sessions => sessions.stopAllProcessSessions())
           .catch(() => createLogger('process-sessions').warn('stopping retained commands failed')),
@@ -1669,20 +1683,20 @@ if (!gotLock) {
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
     registerIpc(flushForShutdown, () => shutdown.quiescent);
+    // Startup services share the same quit phase. Track their disposers as
+    // each service starts so partially completed startup can also clean up.
+    const startupDisposers: Array<() => void> = [];
+    app.once('will-quit', () => {
+      for (const dispose of startupDisposers) dispose();
+    });
     const stopTaskNotifications = taskNotifications.startTaskNotifications({
+      ...taskNotifications.createTaskNotificationForeground(app, () => BrowserWindow.getAllWindows()),
+      watchBashPermission,
       getActiveUserId: () => users.getActiveUserId(),
       isEnabled: () => appConfig.getTaskNotificationsEnabled(),
-      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
-        !win.isDestroyed() && win.isFocused()
-      )),
       isSupported: () => Notification.isSupported(),
       resolveLanguageForUser: (userId) => appConfig.resolveLanguageForUser(userId),
       setBadgeCount: setTaskNotificationBadgeCount,
-      onDidFocus: (listener) => {
-        const onFocus = () => listener();
-        app.on('browser-window-focus', onFocus);
-        return () => { app.off('browser-window-focus', onFocus); };
-      },
       createNotification: (options) => {
         const notification = new Notification(options);
         notification.on('show', () => {
@@ -1716,12 +1730,12 @@ if (!gotLock) {
       },
       openConversation: openConversationFromTaskNotification,
     });
-    app.once('will-quit', stopTaskNotifications);
+    startupDisposers.push(stopTaskNotifications);
     const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
-    app.once('will-quit', stopTaskTerminalUi);
+    startupDisposers.push(stopTaskTerminalUi);
     // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
     const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
-    app.once('will-quit', idleSleepGuard.stop);
+    startupDisposers.push(idleSleepGuard.stop);
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
       if (keys.includes('connectors.catalog') || keys.includes('connectors.dcr_catalog')) {
@@ -1778,7 +1792,7 @@ if (!gotLock) {
       // write lifecycle reports. Normal source and packaged runs behave alike.
       enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
     });
-    app.once('will-quit', () => {
+    startupDisposers.push(() => {
       openLifecycleTracking?.stop();
       openLifecycleTracking = null;
     });
@@ -1797,7 +1811,7 @@ if (!gotLock) {
         },
         warn: message => log.warn(message),
       });
-      app.once('will-quit', stopTaskUnreadTray);
+      startupDisposers.push(stopTaskUnreadTray);
     }
     // A scheduled fire or driver advance can reach the task browser with every
     // window closed, which is routine on macOS. Hand Web Assist the ability to

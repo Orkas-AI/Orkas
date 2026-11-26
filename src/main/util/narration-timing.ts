@@ -15,14 +15,22 @@ const OTHER_ALPHABET_WORD = /\p{L}[\p{L}\p{M}]*/gu;
 const VIETNAMESE_LETTER = /[ăđơưĂĐƠƯ\u1ea0-\u1ef9]/;
 const VIETNAMESE_MIN_TOKEN_SHARE = 0.25;
 
-// Natural-pace rates measured across managed voices (2026-11-03); Chinese and
-// English keep the rates this estimate has always used.
-const HAN_CHARS_PER_SEC = 4;
+// Natural-pace rates measured across managed voices (2026-11-03; Chinese
+// 2026-11-15). For Chinese, 4 per second ran 22% long on ten voices; 5 fit
+// them but left a measured line heavy with English and digits 11.5% short,
+// so 4.5 keeps both within 10%. English keeps the rate this estimate has
+// always used. Pauses are counted separately below.
+const HAN_CHARS_PER_SEC = 4.5;
 const KANA_HANGUL_CHARS_PER_SEC = 5.2;
 const THAI_CHARS_PER_SEC = 11.4;
 const LATIN_WORDS_PER_SEC = 2.5;
 const VIETNAMESE_WORDS_PER_SEC = 4.9;
 const OTHER_ALPHABET_WORDS_PER_SEC = 2;
+const MAJOR_PAUSE_SEC = 0.28;
+const MINOR_PAUSE_SEC = 0.12;
+const LONG_PAUSE_SEC = 0.18;
+/** Languages written in an alphabet other than Latin, read at the other-alphabet rate. */
+const OTHER_ALPHABET_LANGUAGES = new Set(['ar', 'be', 'bg', 'bn', 'el', 'fa', 'gu', 'he', 'hi', 'hy', 'ka', 'kk', 'km', 'kn', 'lo', 'mk', 'ml', 'mn', 'mr', 'my', 'ne', 'pa', 'ru', 'si', 'sr', 'ta', 'te', 'uk', 'ur']);
 
 /** Pick the right length unit for a narration script: characters for a CJK
  *  (Chinese/Japanese/Korean) or Thai line, whitespace words otherwise. Feeds
@@ -96,7 +104,7 @@ export function estimateNarrationDuration(text: string, speed = 1): NarrationDur
   const speechSec = cjkSec + latinSec + numericSec
     + thaiCharacters / THAI_CHARS_PER_SEC
     + otherWords / OTHER_ALPHABET_WORDS_PER_SEC;
-  const pauseSec = majorPauses * 0.28 + minorPauses * 0.12 + longPauses * 0.18;
+  const pauseSec = majorPauses * MAJOR_PAUSE_SEC + minorPauses * MINOR_PAUSE_SEC + longPauses * LONG_PAUSE_SEC;
   const safeSpeed = Number.isFinite(speed) && speed > 0 ? clamp(speed, 0.5, 2) : 1;
   const unitsPerSec = measured.unit === 'characters'
     ? (thaiCharacters > cjkCharacters ? THAI_CHARS_PER_SEC : cjkCharsPerSec)
@@ -120,4 +128,22 @@ export function estimateNarrationDuration(text: string, speed = 1): NarrationDur
       pauseSec: round2(pauseSec),
     },
   };
+}
+
+/** How fast a language's narration runs at speed 1, from the rates estimateNarrationDuration
+ *  uses, so a line can be written to its scene before synthesis. Live runs on 2026-11-17–19 wrote
+ *  Chinese at about 5 characters a second against the 4.5 the voices read, and generate_speech
+ *  refused 27 lines as too long. */
+export function narrationPaceNote(language: string): string | null {
+  const tag = language.trim();
+  const primary = tag.toLowerCase().split(/[-_]/)[0];
+  if (!primary || !/^[a-z]{2,3}$/.test(primary)) return null;
+  const [perSec, unit] = primary === 'zh' ? [HAN_CHARS_PER_SEC, 'characters']
+    : primary === 'ja' || primary === 'ko' ? [KANA_HANGUL_CHARS_PER_SEC, 'characters']
+    : primary === 'th' ? [THAI_CHARS_PER_SEC, 'characters']
+    : primary === 'vi' ? [VIETNAMESE_WORDS_PER_SEC, 'words']
+    : OTHER_ALPHABET_LANGUAGES.has(primary) ? [OTHER_ALPHABET_WORDS_PER_SEC, 'words']
+    : [LATIN_WORDS_PER_SEC, 'words'];
+  const fiveSecond = Math.floor((5 - MAJOR_PAUSE_SEC - MINOR_PAUSE_SEC) * perSec);
+  return `At speed 1, ${tag} narration runs about ${perSec} ${unit} a second, plus ${MAJOR_PAUSE_SEC} s at each full stop and ${MINOR_PAUSE_SEC} s at each comma, so a 5 s scene holds about ${fiveSecond} ${unit}. Write each line to fit its scene before generate_speech.`;
 }

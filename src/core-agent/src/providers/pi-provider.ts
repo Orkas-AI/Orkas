@@ -40,6 +40,7 @@ import type {
   StopReason,
   Usage,
 } from "../shared/types.js";
+import { STABLE_CACHE_HISTORY_END } from "../shared/types.js";
 import {
   AuthError,
   ProviderError,
@@ -57,6 +58,7 @@ import { prepareChatReasoningReplay } from './chat-reasoning-replay.js';
 import { createResponsesStatusDiagnostics } from './responses-status-diagnostics.js';
 import { createRequestDiagnostics, type ProviderFailureSource } from "./request-diagnostics.js";
 import { createProviderErrorCapture } from "./provider-error-capture.js";
+import { codexSseFetch } from "./codex-sse-fetch.js";
 import { ToolInputDiagnostics } from "./tool-input-diagnostics.js";
 
 import { replayOrigin, projectReplay, compatibleReplay, replayMessageSource, mixedReplayToolIds, projectResponsesItemIds, needsDeepSeekToolReasoning, projectDeepSeekToolReasoning } from "./replay-compatibility.js";
@@ -99,6 +101,79 @@ function withUserPromptCacheKey(payload: unknown, key: string | undefined): unkn
     || typeof (payload as Record<string, unknown>).prompt_cache_key !== 'string'
     || !(payload as Record<string, unknown>).prompt_cache_key) return payload;
   return { ...payload, prompt_cache_key: key };
+}
+
+const NATIVE_CHAT_CACHE_RETENTION_PROVIDERS = new Set(['zai', 'kimi-coding', 'moonshot', 'doubao']);
+const MOONSHOT_HOUR_CACHE_MODELS = new Set(['kimi-k3', 'kimi-k3.1-pro']);
+
+function usesNativeChatCacheRetention(model: Model<Api>): boolean {
+  return model.api === 'openai-completions' && (
+    NATIVE_CHAT_CACHE_RETENTION_PROVIDERS.has(model.provider)
+    || (model.provider === 'openrouter' && model.id.startsWith('openai/gpt-'))
+  );
+}
+
+function normalizeChatCacheRetention(payload: unknown, model: Model<Api>, retention: CompletionParams['cacheRetention']): unknown {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !usesNativeChatCacheRetention(model)) return payload;
+  const request = payload as Record<string, unknown>;
+  // Moonshot's documented option applies to these Open Platform models. Kimi
+  // Code and relays use separate endpoints and do not inherit that option.
+  const useMoonshotHour = retention === 'long' && model.provider === 'moonshot' && MOONSHOT_HOUR_CACHE_MODELS.has(model.id);
+  if (request.prompt_cache_retention !== '24h' && !useMoonshotHour) return payload;
+  // The SDK couples this override to emitting a cache key on Chat routes.
+  // Remove the lifetime after serialization so affinity keeps its original scope.
+  const normalized = { ...request };
+  delete normalized.prompt_cache_retention;
+  if (useMoonshotHour) normalized.prompt_cache_options = { mode: 'implicit', ttl: '1h' };
+  return normalized;
+}
+
+type AnthropicCacheBlock = { type?: string; text?: string; cache_control?: { type: string; ttl?: string } };
+
+function usesClaudeHourCacheBoundary(model: Model<Api>, retention: CompletionParams['cacheRetention']): boolean {
+  if (retention !== 'long' || model.api !== 'anthropic-messages') return false;
+  return model.provider === 'anthropic'
+    || (model.provider === 'openrouter' && model.id.startsWith('anthropic/claude-'))
+    // AiHubMix's Claude Messages route was verified to honor a moved 1h breakpoint.
+    || (model.provider === 'custom' && model.baseUrl === 'https://aihubmix.com' && model.id.startsWith('claude-'));
+}
+
+function restrictAnthropicHourCache(payload: unknown, model: Model<Api>, params: CompletionParams): unknown {
+  if (!usesClaudeHourCacheBoundary(model, params.cacheRetention)) return payload;
+  const wire = payload as { messages?: Array<{ role?: string; content?: AnthropicCacheBlock[] }> } | undefined;
+  if (!Array.isArray(wire?.messages)) return payload;
+
+  // The SDK adds a conversation breakpoint near the tail. Leave its tool and
+  // system breakpoints intact and move only this conversation breakpoint.
+  let hourControl: AnthropicCacheBlock['cache_control'];
+  for (const message of wire.messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.cache_control?.type !== 'ephemeral' || block.cache_control.ttl !== '1h') continue;
+      hourControl = block.cache_control;
+      delete block.cache_control;
+    }
+  }
+  if (!hourControl) return payload;
+
+  // Verify the leading serialized history rather than guessing a wire index.
+  // An unsupported block or serializer drift can only shorten the boundary.
+  const historyEnd = params.messages.findIndex(message => message[STABLE_CACHE_HISTORY_END]);
+  let wireIndex = 0;
+  let stableEnd: AnthropicCacheBlock | undefined;
+  for (let i = 0; i <= historyEnd; i++) {
+    const message = params.messages[i];
+    if ((message.role !== 'user' && message.role !== 'assistant') || message.content.some(block => block.type !== 'text')) break;
+    const text = message.content.flatMap(block => block.type === 'text' && block.text.trim() ? [block.text] : []);
+    if (!text.length) continue;
+    const projected = wire.messages[wireIndex++];
+    const blocks = projected?.content;
+    if (projected?.role !== message.role || !Array.isArray(blocks) || blocks.length !== text.length
+      || !blocks.every((block, index) => block.type === 'text' && block.text === text[index])) break;
+    stableEnd = blocks.at(-1);
+  }
+  if (stableEnd) stableEnd.cache_control = hourControl;
+  return payload;
 }
 
 function codexTurnRouting(
@@ -201,7 +276,7 @@ type RuntimePiContext = PiContext & { hostMessageIndexes: number[]; foreignRespo
  * ordering in `transform-messages`, one image trailer per contiguous tool-result
  * batch in `openai-completions`). Bump only after re-checking those rules against
  * the new release; `providers.test.ts` pins the installed package to this value. */
-export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.5.2";
+export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.6.1";
 
 /** pi-ai's portable history has no developer role. Responses has one, so
  * restore explicitly typed host messages at the native serialization boundary.
@@ -267,6 +342,23 @@ export function restoreHostMessageRoles(payload: unknown, context: RuntimePiCont
   return { ...(payload as Record<string, unknown>), [field]: mapped };
 }
 
+function supportsAnchoredToolAdditions(model?: { api: string; compat?: Model<Api>["compat"] }): boolean {
+  const compat = model?.compat;
+  if (!compat || !("supportsMidConvoSystemMessages" in compat) || !compat.supportsMidConvoSystemMessages) return false;
+  switch (model?.api) {
+    case "anthropic-messages":
+      return "supportsMidConvoToolChanges" in compat && compat.supportsMidConvoToolChanges === true;
+    case "openai-responses":
+    case "openai-codex-responses":
+      return ("supportsAdditionalTools" in compat && compat.supportsAdditionalTools === true)
+        || ("supportsToolSearch" in compat && compat.supportsToolSearch === true);
+    case "openai-completions":
+      return "supportsMidConvoToolAdditions" in compat && compat.supportsMidConvoToolAdditions === true;
+    default:
+      return false;
+  }
+}
+
 /** Convert our internal Message[] to pi-ai Context. */
 function buildPiContext(
   messages: Message[],
@@ -283,9 +375,9 @@ function buildPiContext(
   const toolNameByCallId = new Map<string, string>();
   const replayToolIds = model && origin ? mixedReplayToolIds(messages, model, origin) : new Map<string, string>();
   const foreignResponsesCalls: boolean[] = [];
-  // pi-ai 0.87.1 models deferred tools as transcript system additions. Keep
-  // these definitions out of the initial tool set so the SDK can insert them
-  // at the original tool result during replay.
+  // Keep tool_load definitions out of the initial list for SDK replay at
+  // their original receipt. The new user/checkpoint anchors are opt-in so
+  // compatibility routes keep their existing top-level list and order.
   const lateToolNames = new Set(messages.flatMap((message) => message.content.flatMap((part) =>
     part.type === "tool_result" ? part.addedToolNames ?? [] : [])));
   const piTools: PiTool[] | undefined = tools?.map((t) => ({
@@ -299,8 +391,38 @@ function buildPiContext(
       ? { constrainedSampling: t.constrainedSampling } : {}),
   }));
   const toolsByName = new Map(piTools?.map((tool) => [tool.name, tool]));
+  const anchors = new Map<Message, readonly string[]>();
+  if (piTools?.length && supportsAnchoredToolAdditions(model)) {
+    const anchoredNames = new Set<string>();
+    for (const msg of messages) {
+      if (msg.role !== "user" || !msg.toolsAddedAfter?.length
+        || !msg.content.some((c) => c.type === "text" || c.type === "image")) continue;
+      anchors.set(msg, msg.toolsAddedAfter);
+      for (const name of msg.toolsAddedAfter) anchoredNames.add(name);
+    }
+    // Claude needs at least one initially active tool to use inline additions.
+    if (model?.api !== "anthropic-messages" || piTools.some((tool) =>
+      !lateToolNames.has(tool.name) && !anchoredNames.has(tool.name))) {
+      for (const name of anchoredNames) lateToolNames.add(name);
+    } else {
+      anchors.clear();
+    }
+  }
   const initialTools = piTools?.filter((tool) => !lateToolNames.has(tool.name));
   const declaredToolNames = new Set(initialTools?.map((tool) => tool.name));
+  const appendToolAdditions = (names: readonly string[] | undefined) => {
+    if (!names?.length) return;
+    const additions: PiTool[] = [];
+    for (const name of names) {
+      const tool = toolsByName.get(name);
+      if (!tool || declaredToolNames.has(name)) continue;
+      declaredToolNames.add(name);
+      additions.push(tool);
+    }
+    if (additions.length) {
+      piMessages.push({ role: "system", content: "", toolsAdded: additions, timestamp: Date.now() });
+    }
+  };
 
   for (const msg of messages) {
     if (msg.role === "system") continue;
@@ -332,15 +454,7 @@ function buildPiContext(
           isError: tr.isError ?? false,
           timestamp: Date.now(),
         });
-        const additions = (tr.addedToolNames ?? []).flatMap((name) => {
-          const tool = toolsByName.get(name);
-          if (!tool || declaredToolNames.has(name)) return [];
-          declaredToolNames.add(name);
-          return [tool];
-        });
-        if (additions.length > 0) {
-          piMessages.push({ role: "system", content: "", toolsAdded: additions, timestamp: Date.now() });
-        }
+        appendToolAdditions(tr.addedToolNames);
       }
 
       // Emit user text/image content
@@ -364,6 +478,7 @@ function buildPiContext(
             content: piContent,
             timestamp: Date.now(),
           });
+          appendToolAdditions(anchors.get(msg));
         }
       }
     } else if (msg.role === "assistant") {
@@ -555,13 +670,13 @@ const LEADING_THINK_CLOSE = "</think>";
  * Some provider endpoints serialize private reasoning as a literal leading
  * `<think>...</think>` text block instead of the protocol's structured
  * reasoning field. Hold only the ambiguous prefix while streaming, suppress
- * each block in a consecutive leading sequence, and pass every non-leading
- * lookalike through unchanged.
+ * each block in a consecutive leading sequence, and discard an orphaned
+ * closing line when it precedes an answer. Pass non-leading lookalikes through.
  */
 function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
   let state: "detect" | "suppress" | "pass" = "detect";
   let pending = "";
-  let suppressedLeadingBlock = false;
+  let suppressedLeadingMarkup = false;
   let thinkingActive = false;
   let activityStarted = false;
   let activityChars = 0;
@@ -595,10 +710,21 @@ function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
       while (true) {
         if (state === "detect") {
           const candidate = pending.replace(/^\s+/, "");
-          if (!candidate || LEADING_THINK_OPEN.startsWith(candidate)) return "";
+          if (!candidate || LEADING_THINK_OPEN.startsWith(candidate) ||
+              LEADING_THINK_CLOSE.startsWith(candidate)) return "";
+          if (candidate.startsWith(LEADING_THINK_CLOSE)) {
+            const afterClose = candidate.slice(LEADING_THINK_CLOSE.length);
+            if (!afterClose.trim()) return "";
+            const lineBreak = /^[ \t]*\r?\n/.exec(afterClose);
+            if (lineBreak) {
+              pending = afterClose.slice(lineBreak[0].length);
+              suppressedLeadingMarkup = true;
+              continue;
+            }
+          }
           if (!candidate.startsWith(LEADING_THINK_OPEN)) {
             state = "pass";
-            const visible = suppressedLeadingBlock ? candidate : pending;
+            const visible = suppressedLeadingMarkup ? candidate : pending;
             pending = "";
             return visible;
           }
@@ -627,7 +753,7 @@ function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
           }
           recordThinking(pending.slice(0, closeIndex));
           pending = pending.slice(closeIndex + LEADING_THINK_CLOSE.length);
-          suppressedLeadingBlock = true;
+          suppressedLeadingMarkup = true;
           state = "detect";
           endThinking();
         }
@@ -636,7 +762,7 @@ function createLeadingThinkTextFilter(): LeadingThinkTextFilter {
 
     finish(): string {
       const visible = state === "detect"
-        ? (suppressedLeadingBlock ? pending.replace(/^\s+/, "") : pending)
+        ? (suppressedLeadingMarkup ? pending.replace(/^\s+/, "") : pending)
         : "";
       if (state === "suppress") {
         recordThinking(pending);
@@ -1090,7 +1216,10 @@ export function createPiProvider(config: {
       const cacheKey = sessionId && params.cacheRetention !== 'none' ? userCacheKey : undefined;
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders, userCacheKey);
       const headers = turnRouting?.headers ?? suppliedHeaders;
-      const onPayload = (cacheKey || chatReplay.active || statusDiagnostics || useOfficialReasoningDefaults || useProviderOutputDefault || needsDeepSeekToolReasoning(model) || config.onPayload || context.hostMessageIndexes.length || context.foreignResponsesCalls.some(Boolean))
+      const onPayload = (cacheKey || chatReplay.active || statusDiagnostics || useOfficialReasoningDefaults
+        || useProviderOutputDefault || usesNativeChatCacheRetention(model) || needsDeepSeekToolReasoning(model)
+        || usesClaudeHourCacheBoundary(model, params.cacheRetention)
+        || config.onPayload || context.hostMessageIndexes.length || context.foreignResponsesCalls.some(Boolean))
         ? ((payload: unknown, hookModel: Model<Api>) => requestDiagnostics.observePayload(() => {
             payload = restoreHostMessageRoles(projectResponsesItemIds(chatReplay.restore(payload), context.foreignResponsesCalls), context, hookModel);
             const reasoningNormalized = useOfficialReasoningDefaults
@@ -1108,7 +1237,10 @@ export function createPiProvider(config: {
             // Preserve Host normalization when an observer-only hook returns
             // nothing instead of accidentally restoring the generated cap.
             const observe = (result: unknown) => {
-              const value = withUserPromptCacheKey(projectDeepSeekToolReasoning(result === undefined ? normalized : result, hookModel), cacheKey);
+              const projected = projectDeepSeekToolReasoning(result === undefined ? normalized : result, hookModel);
+              const value = restrictAnthropicHourCache(
+                normalizeChatCacheRetention(withUserPromptCacheKey(projected, cacheKey), hookModel, params.cacheRetention), hookModel, params,
+              );
               requestDiagnostics.observeBudget(value, hookModel.contextWindow);
               statusDiagnostics?.payload(value);
               return value;
@@ -1122,7 +1254,8 @@ export function createPiProvider(config: {
       // pi-ai can flatten HTTP failures into message-only error results.
       // Keep the response status local to this request for host retry policy.
       const errorCapture = createProviderErrorCapture(
-        model.api === 'openai-responses' ? 'openai-responses'
+        model.api === 'openai-codex-responses' ? 'openai-codex-responses'
+          : model.api === 'openai-responses' ? 'openai-responses'
           : model.api === 'openai-completions' ? 'openai-completions' : undefined);
       let responseErrorStatus: number | undefined;
       const onResponse = (response: ProviderHttpResponse) => {
@@ -1131,7 +1264,8 @@ export function createPiProvider(config: {
         requestDiagnostics.onResponse(response);
       };
       const transportFetch = withUserCacheAffinity(
-        errorCapture.wrapFetch(config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch),
+        errorCapture.wrapFetch(codexSseFetch(
+          config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch, model.api)),
         model, cacheKey, Boolean(cacheKey), suppliedHeaders,
       );
       const requestFetch: typeof globalThis.fetch = async (input, init) => {
@@ -1253,7 +1387,8 @@ export function createPiProvider(config: {
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders, userCacheKey);
       const headers = turnRouting?.headers ?? suppliedHeaders;
       const errorCapture = createProviderErrorCapture(
-        model.api === 'openai-responses' ? 'openai-responses'
+        model.api === 'openai-codex-responses' ? 'openai-codex-responses'
+          : model.api === 'openai-responses' ? 'openai-responses'
           : model.api === 'openai-completions' ? 'openai-completions' : undefined);
       let responseErrorStatus: number | undefined;
       const onResponse = (response: ProviderHttpResponse) => {
@@ -1262,7 +1397,8 @@ export function createPiProvider(config: {
         requestDiagnostics.onResponse(response);
       };
       const transportFetch = withUserCacheAffinity(
-        errorCapture.wrapFetch(config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch),
+        errorCapture.wrapFetch(codexSseFetch(
+          config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch, model.api)),
         model, cacheKey, Boolean(cacheKey), suppliedHeaders,
       );
       const requestFetch: typeof globalThis.fetch = async (input, init) => {
@@ -1291,7 +1427,10 @@ export function createPiProvider(config: {
           : normalized;
         // pi-ai treats an undefined hook result as "keep the pre-hook
         // payload". Observer-only hooks must not undo Host normalization.
-        const finalPayload = withUserPromptCacheKey(projectDeepSeekToolReasoning(transformed === undefined ? normalized : transformed, hookModel), cacheKey);
+        const projected = projectDeepSeekToolReasoning(transformed === undefined ? normalized : transformed, hookModel);
+        const finalPayload = restrictAnthropicHourCache(
+          normalizeChatCacheRetention(withUserPromptCacheKey(projected, cacheKey), hookModel, params.cacheRetention), hookModel, params,
+        );
         // Observe that exact final shape so this is an on-wire value, not a
         // model-catalog guess made before context and adapter adjustments.
         effectiveMaxTokens = effectiveMaxTokensFromPayload(finalPayload);
@@ -1500,6 +1639,8 @@ export function createPiProvider(config: {
           transport: CORE_AGENT_TRANSPORT,
           maxRetries: 0,
           maxTokens: 1,
+          ...(model.api === 'openai-codex-responses'
+            ? { fetch: codexSseFetch(globalThis.fetch, model.api) } : {}),
         });
         return result.stopReason !== "error";
       } catch {

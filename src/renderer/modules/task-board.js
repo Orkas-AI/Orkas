@@ -94,8 +94,8 @@ function _taskBoardVisibility(liveRows) {
   return { visible: rows.length >= 2 || hasStandaloneControl };
 }
 
-// Latest-batch display retains failed/stopped outcomes alongside live work;
-// completed and cancelled messages leave the panel. It retracts once only
+// Latest-batch display retains failed/stopped outcomes and successful retries
+// of delegated tasks alongside live work. It retracts once only
 // an ordinary single running/waiting task (or no live work) remains. A batch
 // resets when a task is created while every tracked task is already terminal.
 // Seed/resync unions live disk rows in without wiping batch terminals.
@@ -187,23 +187,41 @@ function _taskBoardBatchAfterCreate(batchIds, tasksById, createdId) {
   return next;
 }
 
-// Keep the batch's failed/stopped outcomes first (in creation order), then
-// the live block in its admission order (running >
+function _taskBoardRetryOriginal(task, tasksById) {
+  const original = tasksById.get(task.retry_of_task_id);
+  return original?.parent_task_id && original.assignee === task.assignee
+    && (original.status === 'failed' || original.status === 'stopped') ? original : null;
+}
+
+// Keep the batch's outcomes first (in creation order), then the live block
+// in its admission order (running >
 // waiting > blocked > queued — that block's order is the reorder contract).
 function _taskBoardDisplayRows(tasks, batchIds) {
-  const live = _taskBoardLiveRows(tasks);
+  const all = (Array.isArray(tasks) ? tasks : []).filter((task) => task?.task_id);
+  const live = _taskBoardLiveRows(all);
   const ids = batchIds instanceof Set ? batchIds : new Set();
-  const terminals = (Array.isArray(tasks) ? tasks : [])
-    .filter((t) => t
-      && t.task_id
-      && !t.absorbed_into_turn_id
-      && _TASK_BOARD_TERMINAL.has(t.status)
-      && t.status !== 'cancelled'
-      && t.status !== 'done'
-      && ids.has(t.task_id))
+  const byId = new Map(all.map((task) => [task.task_id, task]));
+  const terminals = all.filter((task) => ids.has(task.task_id) && !task.absorbed_into_turn_id
+    && task.status !== 'cancelled' && _TASK_BOARD_TERMINAL.has(task.status));
+  const latestRetry = new Map();
+  for (const task of [...terminals, ...live]) {
+    if (!ids.has(task.task_id)) continue;
+    const original = _taskBoardRetryOriginal(task, byId);
+    if (!original) continue;
+    const previous = latestRetry.get(original.task_id);
+    if (!previous || String(task.created_at || '') >= String(previous.created_at || '')) {
+      latestRetry.set(original.task_id, task);
+    }
+  }
+  const outcomes = terminals
+    .filter((task) => {
+      if (latestRetry.has(task.task_id)) return false;
+      const original = _taskBoardRetryOriginal(task, byId);
+      return original ? latestRetry.get(original.task_id) === task : task.status !== 'done';
+    })
     .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
     .slice(-20);
-  return [...terminals, ...live];
+  return [...outcomes, ...live];
 }
 
 // Seed/resync merge rule (pure — renderer tests extract it): a task that is
@@ -391,6 +409,29 @@ function _taskBoardCanSendNow(cid, task) {
   ));
 }
 
+// One shortcut target follows queue scan order, including across Agent groups.
+// Keep the composer available for newlines while editing a queued message.
+function _taskBoardSendNowShortcutTask(cid) {
+  if (!cid || (typeof _queueComposerEditFor === 'function' && _queueComposerEditFor(cid))) return null;
+  if ([..._taskBoardEditing].some((key) => key.startsWith(`${cid}:`))) return null;
+  return _taskBoardLiveRows([..._taskBoardMapFor(cid).values()])
+    .find((task) => _taskBoardCanSendNow(cid, task)) || null;
+}
+
+function _taskBoardSendNowShortcut(cid, event) {
+  if (!cid || typeof currentCid === 'undefined' || cid !== currentCid
+    || event.key !== 'Enter' || !event.shiftKey || event.ctrlKey || event.metaKey || event.altKey
+    || event.isComposing || event.keyCode === 229 || event.defaultPrevented) return false;
+  const task = _taskBoardSendNowShortcutTask(cid);
+  if (!task) return false;
+  // Holding the keys or pressing again during persistence must not send the
+  // next queue item. Reuse the button's endpoint, receipt and error recovery.
+  if (!event.repeat && ![..._taskBoardSendingNow].some((key) => key.startsWith(`${cid}:`))) {
+    void _taskBoardSendNow(cid, task.task_id);
+  }
+  return true;
+}
+
 // One-time header wiring: while the board is visible, its header toggles the
 // row list for the CURRENT conversation. Chevron + counts stay visible.
 function _taskBoardWireHeader(panel) {
@@ -406,6 +447,36 @@ function _taskBoardWireHeader(panel) {
     else _taskBoardCollapsedCids.add(cid);
     _taskBoardRender(cid);
   });
+}
+
+// A native group button handles Space on key-up. Keep the focused button
+// attached throughout a background repaint so that activation is not lost.
+function _taskBoardUpdateList(list, cid, html) {
+  const button = document.activeElement;
+  const group = button?.classList?.contains('chat-queue-agent-toggle') ? button.parentElement : null;
+  if (group && group.parentElement === list && list.dataset.boardCid === cid) {
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    const children = Array.from(template.content.children);
+    const index = children.findIndex(node => node.dataset.assignee === group.dataset.assignee);
+    if (index >= 0) {
+      const next = children[index];
+      const toggle = next.querySelector('.chat-queue-agent-toggle');
+      button.setAttribute('aria-controls', toggle.getAttribute('aria-controls'));
+      button.setAttribute('aria-expanded', toggle.getAttribute('aria-expanded'));
+      if (button.innerHTML !== toggle.innerHTML) button.replaceChildren(...toggle.childNodes);
+      group.querySelector('.chat-queue-agent-items').replaceWith(next.querySelector('.chat-queue-agent-items'));
+      for (const sibling of Array.from(list.children)) {
+        if (sibling !== group) sibling.remove();
+      }
+      group.before(...children.slice(0, index));
+      group.after(...children.slice(index + 1));
+      return button;
+    }
+  }
+  list.dataset.boardCid = cid;
+  list.innerHTML = html;
+  return null;
 }
 
 function _taskBoardRender(cid) {
@@ -429,8 +500,10 @@ function _taskBoardRender(cid) {
     if (_taskBoardDragging.cid === cid && _taskBoardCanDrag(cid, _taskBoardDragging.taskId)) return;
     _taskBoardDragging = null;
   }
-  const all = cid ? [..._taskBoardMapFor(cid).values()] : [];
+  const tasksById = cid ? _taskBoardMapFor(cid) : new Map();
+  const all = [...tasksById.values()];
   const editing = typeof _queueComposerEditFor === 'function' ? _queueComposerEditFor(cid) : null;
+  const shortcutTask = _taskBoardSendNowShortcutTask(cid);
   const rows = _taskBoardLiveRows(all);
   const decision = _taskBoardVisibility(rows);
   const planningEntries = cid ? _taskBoardPlanning.get(cid) : null;
@@ -465,7 +538,7 @@ function _taskBoardRender(cid) {
   const activeToggle = document.activeElement;
   const focusedAssignee = activeToggle?.matches?.('.chat-queue-agent-toggle') && list.contains(activeToggle)
     ? activeToggle.closest('.chat-queue-agent-group')?.dataset.assignee : null;
-  list.innerHTML = groups.map((group, index) => {
+  const html = groups.map((group, index) => {
     const expanded = !_taskBoardCollapsedAgents.get(cid)?.has(group.assignee);
     return `
     <section class="chat-queue-agent-group" data-assignee="${escapeHtml(group.assignee)}">
@@ -483,11 +556,12 @@ function _taskBoardRender(cid) {
         const statusChip = `<span class="chat-queue-skill${isTerminal ? ' chat-queue-dep' : ''}">${escapeHtml(statusText)}</span>`;
         // Dispatch origin remains visible even when parent and child belong to
         // different agent sections.
-        const parent = _taskBoardMapFor(cid).get(task.parent_task_id);
+        const retryOriginal = _taskBoardRetryOriginal(task, tasksById);
+        const parent = tasksById.get(task.parent_task_id || retryOriginal?.parent_task_id);
         const origin = parent
           ? `${_taskBoardAssigneeLabel(cid, parent)}: ${String(parent.instruction || '').replace(/\s+/g, ' ').slice(0, 160)}`
           : '';
-        const dispatchedChip = task.created_by === 'commander'
+        const dispatchedChip = task.created_by === 'commander' || retryOriginal
           ? `<span class="chat-queue-skill chat-queue-dep" title="${escapeHtml(origin)}">${escapeHtml(t('chat.task_dispatched'))}</span>`
           : '';
         const preview = escapeHtml(String(task.instruction || '').replace(/\s+/g, ' ')).slice(0, 160);
@@ -514,8 +588,12 @@ function _taskBoardRender(cid) {
         const sendNowKey = `${cid}:${task.task_id}`;
         const sendingNow = _taskBoardSendingNow.has(sendNowKey);
         const canSendNow = task.task_id !== editing?.taskId && _taskBoardCanSendNow(cid, task);
+        const showShortcut = !sendingNow && shortcutTask?.task_id === task.task_id;
+        const shortcutHint = showShortcut
+          ? `<span class="chat-queue-shortcut" aria-hidden="true">${uiIconHtml('shift')}${uiIconHtml('enter')}</span>`
+          : '';
         const sendNowBtn = (canSendNow || sendingNow)
-          ? `<button class="chat-queue-btn" data-act="task-send-now"${sendingNow ? ' disabled' : ''}>${escapeHtml(t(sendingNow ? 'chat.queue_sending_now' : 'chat.queue_send_now'))}</button>`
+          ? `<button class="chat-queue-btn" data-act="task-send-now"${sendingNow ? ' disabled' : ''}${showShortcut ? ' aria-keyshortcuts="Shift+Enter"' : ''}>${escapeHtml(t(sendingNow ? 'chat.queue_sending_now' : 'chat.queue_send_now'))}${shortcutHint}</button>`
           : '';
         const editBtn = task.status === 'queued' && task.created_by === 'user'
           ? `<button class="chat-queue-btn" data-act="task-edit"${sendingNow || editing || _taskBoardEditing.has(sendNowKey) ? ' disabled' : ''}>${escapeHtml(t('chat.queue_edit'))}</button>`
@@ -544,7 +622,9 @@ function _taskBoardRender(cid) {
       <div class="chat-queue-text"><span class="chat-queue-skill">${escapeHtml(t('chat.task_status_planning'))}</span>${escapeHtml(String(entry.preview || '').replace(/\s+/g, ' ').slice(0, 160))}</div>
     </div>
   `).join('');
+  const retainedToggle = _taskBoardUpdateList(list, cid, html);
   list.querySelectorAll('.chat-queue-agent-toggle').forEach((button) => {
+    if (button === retainedToggle) return;
     button.addEventListener('click', () => {
       const group = button.closest('.chat-queue-agent-group');
       let collapsedAgents = _taskBoardCollapsedAgents.get(cid);
@@ -811,6 +891,7 @@ async function _taskBoardEdit(cid, taskId) {
 }
 
 window.TaskBoard = {
+  sendNowShortcut: _taskBoardSendNowShortcut,
   onEvent: _taskBoardOnEvent,
   sync: _taskBoardSync,
   resync: _taskBoardResync,

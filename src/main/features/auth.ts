@@ -97,6 +97,7 @@ import {
 } from '../model/provider_policy';
 import { isCooledDown, getCooldown, clearCooldown } from '../model/core-agent/profile-cooldown';
 import type { KeyFailureKind } from '../model/core-agent/auth-error';
+import { hasServerProviderModelList } from './client_config';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { logErrorSummary } from '../util/log-redact';
@@ -2615,6 +2616,13 @@ async function measureConnectionFirstResponse(
   }
 }
 
+// Keep existing model-less probes independent of the bundled picker order.
+const BUNDLED_CONNECTION_PROBE_MODELS = new Map([
+  ['google', 'gemini-3.8-flash'],
+  ['openai', 'gpt-6-astra'],
+  ['openai-codex', 'gpt-6-astra'],
+]);
+
 export async function testConnection(
   providerId: string,
   modelId?: string,
@@ -2622,7 +2630,11 @@ export async function testConnection(
 ): Promise<TestConnectionResult> {
   const pid = String(providerId || '').trim();
   if (!pid) return { ok: false, error: 'provider required' };
-  const selectedModel = resolveModelUpgrade(pid, String(modelId || '').trim()).modelId || curatedModelsFor(pid)[0]?.id || '';
+  const upgradedInputModel = modelId ? resolveModelUpgrade(pid, String(modelId).trim()).modelId : '';
+  const bundledProbe = BUNDLED_CONNECTION_PROBE_MODELS.get(pid);
+  const selectedModel = upgradedInputModel || (bundledProbe && !hasServerProviderModelList(pid)
+    ? bundledProbe
+    : curatedModelsFor(pid)[0]?.id) || '';
   if (!isModelProviderAllowed(pid, selectedModel || undefined)) {
     return { ok: false, error: 'DeepSeek is disabled in this build' };
   }

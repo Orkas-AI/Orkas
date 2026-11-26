@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { commandSessionWait, continueCommandSession, inspectCommandRead, resetCommandSessionsForTest, runningCommandSessions, stopCommandSessionsForHostExit } from "./command-sessions.js";
+import { commandSessionWait, continueCommandSession, inspectCommandRead, resetCommandSessionsForTest, runningCommandSessions, stopCommandSessionsForHostExit, withCommandWaitProgress } from "./command-sessions.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,7 +7,7 @@ import path from "node:path";
 import {
   buildSandboxedShellInvocation,
   buildSandboxEnv,
-  decodeProcessOutput,
+  createProcessOutputDecoder,
   defaultShellForPlatform,
   killProcessTree,
 } from "../sandbox/executor.js";
@@ -29,7 +29,7 @@ interface ProcessSession {
   cwd: string;
   child: ChildProcessWithoutNullStreams;
   closed: boolean;
-  env: NodeJS.ProcessEnv;
+  decoders: Record<"stdout" | "stderr", ReturnType<typeof createProcessOutputDecoder>>;
   status: ProcessSessionStatus;
   createdAt: number;
   updatedAt: number;
@@ -102,7 +102,7 @@ function appendOutput(
   const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), "utf8");
   if (stream === "stdout") session.stdoutBytes += buffer.length;
   if (stream === "stderr") session.stderrBytes += buffer.length;
-  const text = decodeProcessOutput(buffer, process.platform, session.env);
+  const text = stream ? session.decoders[stream].write(buffer) : buffer.toString("utf8");
   if (!text) return;
   session.output += text;
   session.outputEnd += text.length;
@@ -142,6 +142,7 @@ function finishSession(
   } = {},
 ): void {
   if (session.status !== "running") return;
+  appendOutput(session, session.decoders.stdout.end() + session.decoders.stderr.end());
   session.status = status;
   session.updatedAt = Date.now();
   if ("exitCode" in patch) session.exitCode = patch.exitCode;
@@ -365,7 +366,7 @@ function startProcessSession(command: string, ctx: ToolContext, maxLifetimeMs: u
     cwd,
     child,
     closed: false,
-    env,
+    decoders: { stdout: createProcessOutputDecoder(process.platform, env), stderr: createProcessOutputDecoder(process.platform, env) },
     status: "running",
     createdAt: now,
     updatedAt: now,
@@ -485,24 +486,32 @@ export const processReadTool: AgentTool = defineTool({
   async execute(input, ctx) {
     const session = ownedSession(ctx, input.session_id);
     if (isToolResult(session)) return session;
-    const waitMs = input.yield_time_ms === undefined ? 0 : commandSessionWait(input.yield_time_ms) ?? 0;
+    const untilExit = input.wait_for === "exit";
+    const waitMs = input.yield_time_ms === undefined ? 0 : commandSessionWait(input.yield_time_ms, input.wait_for) ?? 0;
     const cursor = typeof input.cursor === "number" ? input.cursor : session.outputStart;
-    if (session.status === "running" && session.outputEnd <= cursor && waitMs > 0 && !ctx.signal?.aborted) {
-      await new Promise<void>((resolve) => {
+    if (session.status === "running" && (untilExit || session.outputEnd <= cursor) && waitMs > 0 && !ctx.signal?.aborted) {
+      const pending = () => new Promise<void>((resolve) => {
+        if (ctx.signal?.aborted || session.status !== "running") { resolve(); return; }
         const finish = () => {
           clearTimeout(timer);
           session.child.stdout.off("data", finish);
           session.child.stderr.off("data", finish);
+          session.child.off("error", finish);
           session.child.off("close", finish);
           ctx.signal?.removeEventListener("abort", finish);
           resolve();
         };
         const timer = setTimeout(finish, waitMs);
-        session.child.stdout.once("data", finish);
-        session.child.stderr.once("data", finish);
+        if (!untilExit) {
+          session.child.stdout.once("data", finish);
+          session.child.stderr.once("data", finish);
+        }
+        session.child.once("error", finish);
         session.child.once("close", finish);
         ctx.signal?.addEventListener("abort", finish, { once: true });
       });
+      if (untilExit) await withCommandWaitProgress(ctx, waitMs, pending);
+      else await pending();
     }
     return session.status === "running"
       ? resultJson(readPayload(session, input.cursor, input.max_chars))
@@ -578,7 +587,7 @@ export const processStopTool: AgentTool = defineTool({
 type ProcessSessionAction = "read" | "write" | "stop";
 
 const PROCESS_SESSION_ACTION_FIELDS: Readonly<Record<ProcessSessionAction, ReadonlySet<string>>> = {
-  read: new Set(["action", "session_id", "cursor", "max_chars", "yield_time_ms"]),
+  read: new Set(["action", "session_id", "cursor", "max_chars", "yield_time_ms", "wait_for"]),
   write: new Set(["action", "session_id", "chars", "add_newline"]),
   stop: new Set(["action", "session_id"]),
 };
@@ -598,7 +607,7 @@ function processSessionActionError(
 function inspectProcessRead(input: Record<string, unknown>, ctx: ToolContext, includeManaged = true): ToolReadContinuation | undefined {
   if (!input || input.action !== "read" || processSessionActionError("read", input)
     || typeof input.session_id !== "string" || !input.session_id.trim()
-    || commandSessionWait(input.yield_time_ms) === null
+    || commandSessionWait(input.yield_time_ms, input.wait_for) === null
     || (input.cursor !== undefined && (typeof input.cursor !== "number" || !Number.isFinite(input.cursor)))
     || (input.max_chars !== undefined && (typeof input.max_chars !== "number" || !Number.isFinite(input.max_chars) || input.max_chars < 1))) return undefined;
   const managed = includeManaged ? inspectCommandRead(input, ctx) : undefined;
@@ -609,7 +618,8 @@ function inspectProcessRead(input: Record<string, unknown>, ctx: ToolContext, in
   const waitCursor = typeof input.cursor === "number" ? input.cursor : session.outputStart;
   return {
     version: JSON.stringify([session.id, effectiveCursor, Math.min(session.outputEnd, effectiveCursor + maxChars), session.status]),
-    waiting: !ctx.signal?.aborted && session.status === "running" && session.outputEnd <= waitCursor && (commandSessionWait(input.yield_time_ms) ?? 0) > 0,
+    waiting: !ctx.signal?.aborted && session.status === "running" && (input.wait_for === "exit" || session.outputEnd <= waitCursor)
+      && (commandSessionWait(input.yield_time_ms, input.wait_for) ?? 0) > 0,
   };
 }
 
@@ -632,7 +642,8 @@ export const processSessionTool: AgentTool = defineTool({
         description: "read: session_id/cursor; write: session_id/chars; stop: session_id. Known unused fields are ignored and listed in ignored_fields; session_id always selects the existing session.",
       },
       session_id: { type: "string", description: "Required for read, write, and stop." },
-      yield_time_ms: { type: "integer", minimum: 0, maximum: 30000, default: 10000, description: "Read only. Wait for new output or exit; zero polls immediately." },
+      wait_for: { type: "string", enum: ["output", "exit"], default: "output", description: "Read only. output returns on new output or completion; exit waits for completion despite logs. At the wait deadline, a running session remains usable." },
+      yield_time_ms: { type: "integer", minimum: 0, maximum: 600000, default: 10000, description: "Read only. Maximum 30000 for output, 600000 for exit. Zero polls immediately; does not change the command's total timeout." },
       cursor: { type: "number", description: "Read only. Previous next_cursor." },
       max_chars: { type: "number", description: "Read only. Default 32000; maximum 64000." },
       chars: { type: "string", description: "Write only. Known non-secret characters for stdin." },
@@ -665,8 +676,11 @@ export const processSessionTool: AgentTool = defineTool({
       } catch { /* Preserve non-JSON errors with a text receipt. */ }
       return { ...result, content: `${notice}${result.content}` };
     };
-    if (action === "read" && commandSessionWait(input.yield_time_ms) === null) {
-      return { content: "E_BAD_INPUT: yield_time_ms must be an integer from 0 to 30000", isError: true };
+    if (action === "read" && input.wait_for !== undefined && input.wait_for !== "output" && input.wait_for !== "exit") {
+      return { content: "E_BAD_INPUT: wait_for must be output or exit", isError: true };
+    }
+    if (action === "read" && commandSessionWait(input.yield_time_ms, input.wait_for) === null) {
+      return { content: "E_BAD_INPUT: yield_time_ms must be an integer; maximum 30000 for output or 600000 for exit", isError: true };
     }
     const managed = await continueCommandSession(input, ctx);
     if (managed) return withNotice(managed);

@@ -431,11 +431,8 @@ function maxTokensAdvice(
   return t('errors.model_output_cap_repeated');
 }
 
-/** Failure codes for a request the provider refused as malformed or
- * unsupported. Retrying resumes the identical request, so it is refused again:
- * one sampled conversation ended in 400 fourteen times in a row while the
- * user pressed "Continue" thirteen times. From the second rejection in a
- * row the visible error says that retrying as is will not help. */
+/** Consecutive terminal request rejections in a session. The count describes
+ * recent outcomes only, since the requests can use different input or models. */
 const REQUEST_REJECTION_FAILURE_CODES = new Set(['provider_http_400', 'provider_http_422', 'provider_request']);
 
 function requestRejectionAdvice(
@@ -1255,6 +1252,7 @@ export async function* mapCoreAgentEvents(
         break;
 
       case 'context_status': {
+        if (ev.phase === 'candidate_summary_done') break;
         yield {
           type: 'event',
           event: { stream: 'context', data: { phase: ev.phase, ...(ev.data || {}) } },

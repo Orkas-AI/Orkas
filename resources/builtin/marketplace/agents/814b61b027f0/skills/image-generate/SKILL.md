@@ -7,7 +7,7 @@ description_en: After route lock, handles synthesized or reconstructed pixels fo
 
 # Image Generate
 
-Read this skill only after route lock when the task needs synthesized or content-aware reconstructed pixels: `GENERATE`, semantic `EDIT`, or the raster phase of `HYBRID`. Do not load it for `COMPOSE`, deterministic transforms, or overlays. It governs direct `generate_image` calls and the stable host workflow kernel; engine-specific request formats and reusable graphs remain private skill resources rather than new application tools.
+Read this skill only after route lock when the task needs synthesized or content-aware reconstructed pixels: `GENERATE`, semantic `EDIT`, or the raster phase of `HYBRID`. Do not load it for `COMPOSE`, deterministic transforms, or overlays. It governs `generate_image` calls.
 
 This production skill is the earliest point at which a manifest for a direct `GENERATE` or `EDIT` task may be created. Initialize `image-manifest.json` from the `Canonical image-manifest v1` block in `image-router`; it is the single structural source. Replace the locked route and budget, then add the reference and generation fields below. Do not reconstruct the base schema from memory.
 
@@ -19,7 +19,7 @@ This production skill is the earliest point at which a manifest for a direct `GE
 - Mirror manifest references into `generate_image.reference_bindings` using the exact concatenated reference order. Include role, strength, preserve, may-change, and target region. Send `generation_contract.negative_prompt` separately.
 - Compile `reference_intent.mode` into the request: reproduction asks for the declared protected attributes to match; guide limits influence to declared roles; editing uses the required `edit_source` as the original. User-declared instructions and boundaries have priority over inferred defaults and provider convenience.
 - Keep original/reference paths, the current candidate path, and delivery dimensions distinct, including on follow-up turns. `manifest.canvas` records the agreed delivery size; never replace it with provider dimensions merely to pass inspection.
-- Treat each planned `output_path` as a stable artifact binding. After an intentional deterministic transform, retain the original and provider output, record the new candidate in `raster_source`, and use that exact path for `project.inspect` and export. Otherwise reuse the provider/workflow output path verbatim; never substitute the edit source or guess a downstream path.
+- Treat each planned `output_path` as a stable artifact binding. After an intentional deterministic transform, retain the original and provider output, record the new candidate in `raster_source`, and use that exact path for `project.inspect` and export. Otherwise reuse the provider output path verbatim; never substitute the edit source or guess a downstream path.
 - For edits, send the manifest instructions, protected regions, unchanged attributes, and allowed changes explicitly. Prefer a localized edit over regenerating the full scene, and never reinterpret an edit as a fresh variation.
 - For reproduction, do not silently change subject, crop, layout, identity, typography, palette, or other preserved axes merely because regeneration is easier. Choose the provider/control path that can honor the declared fidelity floor.
 - For hybrid work, generate only the difficult raster layer. Exclude final copy, logos, labels, diagrams, and UI text from the model request.
@@ -45,42 +45,10 @@ summary.
 
 `project.status` may include a next-call quote using provider-default size and manifest reference count. Use it for orientation only; `generation.quote` must carry the exact request immediately before a direct call.
 
-## External workflows
-
-Use an external workflow only when the user or host has already configured ComfyUI, InvokeAI, AUTOMATIC1111, or IOPaint and a reusable project-local request offers a concrete control or model advantage. First call `image_studio workflow.capabilities`; never infer availability from a file or a prior session. Read [external-workflows.md](references/external-workflows.md) for the project-local formats.
-
-- The endpoint and credential are host-managed. Never accept, construct, print, or persist them in agent output or project files.
-- Read the engine-specific reference before drafting its request and preserve
-  exact field names instead of paraphrasing the protocol. For IOPaint edits
-  that protect unaffected pixels, set `request.sd_keep_unmasked_area:true`.
-- Validate the drafted request against the selected engine schema before
-  handing it off. An IOPaint masked edit that protects unaffected pixels is
-  incomplete unless the nested `request` object contains the exact boolean
-  `"sd_keep_unmasked_area": true`; a prompt, `protected_content`, or review
-  instruction saying "preserve unmasked pixels" does not replace this field.
-- `workflow_path` must be a project-local engine request JSON. Prefer a user-exported, reviewed graph; do not invent custom server nodes or install missing nodes/models.
-- Call `workflow.run` with the configured engine, stable `image_request_id`, project-local output, and optional output node/index. It consumes the manifest's durable generation budget, scoped to the current user turn, exactly like `generate_image`.
-- A host-configured workflow does not use in-app billing. Its host/provider may still have separate billing; report that billing as external and not estimated.
-- Treat `pending_uncertain` as a dispatched call in the current turn. Do not retry it or create a replacement request id in that turn; inspect the host queue and report the pending state.
-- Capability evidence proves protocol reachability, not that a particular graph node or model exists. Report the executed engine and returned dispatch evidence without claiming broader native-control support.
-
-An execution handoff must retain concrete, executable fields: the exact
-`workflow.run` operation, engine, project-local `workflow_path`, stable
-`image_request_id`, output path, manifest `max_calls`, and output node/index
-when applicable. The next-evidence chain must name `project.inspect` and
-`project.export` exactly. For a verified `is_generation:true` artifact, never add `project.submit_design_review`; follow the host handoff for any subsequent authored candidate. Natural-language approximations are not an executable handoff.
-
-For missing capabilities:
-
-- Prefer the private `image-compose image_asset` script with host-managed Real-ESRGAN for zero-paid-call upscaling; a reviewed ComfyUI graph is the fallback.
-- Use an IOPaint request or a reviewed ComfyUI graph for mask-preserving inpaint/object removal. Keep unaffected pixels protected.
-- Use SAM/SAM2 or GroundingDINO only through an already installed, user-reviewed host workflow that materializes a mask. These projects are capability sources, not bundled Orkas runtimes.
-- Use AUTOMATIC1111 for existing host installations and `txt2img`/`img2img` compatibility. Never put HTTP credentials or base URLs in its request file.
-
 ## Review loop
 
 On a raster size mismatch, compare the inspected path and decoded dimensions with the current candidate and agreed canvas. Correct a wrong input path; if the candidate itself has the wrong size, use `image-compose` for a deterministic resize compatible with the protected content and aspect ratio, then inspect the new candidate. Do not stretch or destructively crop protected content to satisfy the gate; ask only if meeting the delivery size requires a real framing tradeoff.
 
-After either generation path, call `image_studio` with `project.inspect`, passing the current raster path. It verifies file decoding, canvas and signature, and derives `is_generation` from the exact production record. For `is_generation:true`, it never requests quality scores and returns `project.export`: do not load `image-design-review`. Reference reproduction, semantic edits and set consistency still belong in the provider request and reference bindings before generation. After local authoring, inspect the new candidate and follow its returned next operation; an EDIT or GENERATE route does not exempt a composite from review.
+After generation, call `image_studio` with `project.inspect`, passing the current raster path. It verifies file decoding, canvas and signature, and derives `is_generation` from the exact production record. For `is_generation:true`, it never requests quality scores and returns `project.export`: do not load `image-design-review`. Reference reproduction, semantic edits and set consistency still belong in the provider request and reference bindings before generation. After local authoring, inspect the new candidate and follow its returned next operation; an EDIT or GENERATE route does not exempt a composite from review.
 
 Export the exact validated raster through `image_studio`. Never start another provider call based on an ImageStudio post-generation judgment. Spend a second generation only after an explicit user request or approval, and make it address the user's requested change rather than an internal variation search. A definite pre-dispatch failure is recorded but does not consume a generation call; a dispatched, terminal failure or `pending_uncertain` attempt still counts in the current turn. If the authorized repair budget is exhausted in that turn, use `project.status.current_candidate` and `recovery_context`: keep the best image visible, apply any useful deterministic zero-call repair, report the remaining finding, and end the turn. Never raise manifest `max_calls` or request a quota-increase form to bypass the same-turn limit. A later direct user message starts a fresh turn-scoped allowance automatically; never carry earlier-turn exhaustion forward or request extra authorization solely because that earlier turn used its calls. Ask the user only for a material intent/quality/reference/delivery tradeoff, using normal chat rather than a recovery form.

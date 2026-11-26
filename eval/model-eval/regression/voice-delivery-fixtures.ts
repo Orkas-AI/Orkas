@@ -7,6 +7,7 @@ import {createHash} from 'node:crypto';
 import {VOICE_DELIVERY_CASE_IDS} from '../../benchmark/scenarios/voice-studio.js';
 import type {VoiceEvidence} from './voice-studio-fixtures.js';
 import type { VoiceTrace as ProductionRegressionTrace } from './voice-studio-fixtures.js';
+import {scopedPublishedVoiceFiles} from './voice-output-evidence.js';
 const require=createRequire(import.meta.url);
 export const deliveryCases:readonly string[]=VOICE_DELIVERY_CASE_IDS;
 export function startLocalDeliveryBoundary(){
@@ -67,7 +68,7 @@ function amplitude(b:Buffer,start:number,hz:number){
   const offset=Math.round(start*44100),n=8820;if((offset+n)*4>b.length)return NaN;let a=0,c=0;
   for(let i=0;i<n;i++){const value=b.readFloatLE((offset+i)*4);a+=value*Math.cos(i*2*Math.PI*hz/44100);c+=value*Math.sin(i*2*Math.PI*hz/44100);}return Math.hypot(a,c)/n;
 }
-export function inspectDelivery(id:string,root:string):VoiceEvidence{
+export function inspectDelivery(id:string,root:string,published?:readonly string[]):VoiceEvidence{
   const base=path.join(root,'audio'),inputs=deliveryInputs(id);
   const same=(rel:string)=>{try{return hash(fs.readFileSync(path.join(base,rel)))===hash(inputs[rel]);}catch{return false;}};
   const e:VoiceEvidence={sourcesPreserved:Object.keys(inputs).filter(p=>p.startsWith('sources/')).every(same),previousPreserved:same('export-previous/audio.wav'),
@@ -79,26 +80,44 @@ export function inspectDelivery(id:string,root:string):VoiceEvidence{
     else if(/^voice-project(?:-\d+)?\.json$/.test(item.name))projects.push(file);
     else if(/\.(wav|mp3|flac|m4a|aac|ogg|opus)$/i.test(item.name))files.push(file);
   }}visit(base);e.exportCount=files.length;
-  for(const file of projects)try{const p=JSON.parse(fs.readFileSync(file,'utf8'));e.projectValid||=[1,2,3].includes(p.schema_version)&&Array.isArray(p.segments)
+  const delivered = published === undefined ? undefined : scopedPublishedVoiceFiles(root, published);
+  const audio = delivered?.filter(file => /\.(wav|mp3|flac|m4a|aac|ogg|opus)$/i.test(file)) ?? files;
+  if (delivered) {
+    e.deliveredAudioCount = audio.length;
+    if (id === 'voice-export-spec') projects.push(...delivered.filter(file => /\.json$/i.test(file)));
+  }
+  for(const file of new Set(projects))try{
+    if (fs.statSync(file).size > 4 * 1024 * 1024) continue;
+    const p=JSON.parse(fs.readFileSync(file,'utf8'));e.projectValid||=[1,2,3].includes(p.schema_version)&&Array.isArray(p.segments)
     &&(id!=='voice-export-spec'||p.export?.format==='wav'&&p.export.sample_rate===24000&&p.export.channels===1&&p.export.bit_depth===24);}catch{}
   if(id==='voice-convert-isolated')e.projectValid &&=same('voice-project.json');
-  for(const file of files)try{
+  if (delivered && audio.length !== 1) return e;
+  for(const file of audio)try{
     const m=JSON.parse(run(env().ORKAS_BUNDLED_FFPROBE,['-v','error','-show_streams','-show_format','-of','json',file]).toString());
     const s=m.streams[0],b=decode(file);e.decoded=true;e.duration=b.length/4/44100;
     if(m.streams.length!==1||s.codec_type!=='audio'||Math.abs(e.duration-4)>.005)continue;
+    const bitDepth = Number(s.bits_per_raw_sample) || Number(s.bits_per_sample);
+    e.deliveryMedia = { codec: s.codec_name, sampleRate: Number(s.sample_rate), channels: s.channels,
+      ...(bitDepth > 0 ? { bitDepth } : {}) };
     // The user did not fix the base music gain. Require audible restored music,
     // relative attenuation during speech and unchanged voice level independently.
     if(id==='voice-music-duck')e.contentMatched=amplitude(b,1.8,220)/amplitude(b,3.7,220)<.4&&amplitude(b,3.7,220)>.0005&&amplitude(b,3.7,220)<.13&&Math.abs(amplitude(b,1.8,660)-.15)<.005;
     else if(id==='voice-export-spec')e.contentMatched=s.codec_name==='pcm_s24le'&&s.sample_rate==='24000'&&s.channels===1&&Number(s.bits_per_raw_sample)===24&&amplitude(b,1.5,660)>.002;
-    else e.contentMatched=s.codec_name===(['voice-convert-preserve','voice-convert-isolated'].includes(id)?'flac':'pcm_s16le')&&s.sample_rate==='44100'&&s.channels===1&&b.equals(decode(path.join(base,id==='voice-extract-track'?'sources/second.wav':'sources/recording.wav')));
+    else {
+      e.deliveryMedia.sourceSamplesMatch = b.equals(decode(path.join(base, id === 'voice-extract-track' ? 'sources/second.wav' : 'sources/recording.wav')));
+      const flac = ['voice-convert-preserve', 'voice-convert-isolated'].includes(id);
+      e.contentMatched = s.codec_name === (flac ? 'flac' : 'pcm_s16le') && s.sample_rate === '44100'
+        && s.channels === 1 && e.deliveryMedia.sourceSamplesMatch
+        && (id !== 'voice-convert-isolated' || bitDepth === 16);
+    }
   }catch{}
   return e;
 }
 export function deliveryChecks(_id:string,trace:ProductionRegressionTrace){
   const e=trace.voiceStudio;
-  const check=(name:string,pass:boolean)=>({id:'acceptance:voice-'+name,pass,critical:true,detail:'Independent media codec, waveform, level and saved-project evidence.'});
+  const check=(name:string,pass:boolean)=>({id:'acceptance:voice-'+name,pass,critical:true,detail:`Independent media codec, waveform, level and saved-project evidence: ${JSON.stringify(e ?? null)}.`});
   return [check('preservation',!!e?.sourcesPreserved&&e.previousPreserved&&e.projectValid),
     check('local-only',!trace.toolCalls.some(c=>c.name==='generate_speech')),
     check('observed-execution',trace.toolCalls.some(c=>c.name==='bash'&&c.isError===false)),
-    check('outcome',!!e?.decoded&&e.contentMatched&&e.exportCount===1)];
+    check('outcome',!!e?.decoded&&e.contentMatched&&(e.deliveredAudioCount??e.exportCount)===1)];
 }

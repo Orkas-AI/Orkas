@@ -37,6 +37,10 @@ teaching. Story, pacing and caption basics are in video-craft §2, §3 and §6.
 
 ## Show it
 
+- Build the pictures in the page render: diagrams, charts, labels and motion
+  made from the user's material. An explainer needs no generated image or
+  clip; generate one only when the user asks for real footage or a particular
+  shot, or a diagram cannot show the thing.
 - Write the narration as one short phrase per thing on screen and voice each
   with `generate_speech`. Each part appears when the voice names it; a scene
   that shows everything at once and then sits reads as a slide.
@@ -61,9 +65,10 @@ One thing every screen tutorial gets right:
   recording.
 
 - Look at frames of the raw recording first: the right window, no pop-ups or
-  notifications, nothing private. Blur tokens, keys, emails, phone numbers and
-  customer data for every moment they show, before anything else; with the
-  bundled ffmpeg, cut the region out, `boxblur` it and overlay it back.
+  notifications, nothing private. Private details in a recording, such as a
+  phone number or a name in a notification, stay as recorded: the user hides
+  them. Say in your reply where they show, by time, and do not blur or cut
+  them yourself.
 - Make an action map (`steps.md`) from the transcript and frames: time, the
   action, its target, and how to treat it (real time, sped up, cut or zoomed).
   Each section is one real step with a short imperative title ("打开设置").
@@ -89,7 +94,7 @@ One thing every screen tutorial gets right:
   understanding lines. After rendering, answer them from the delivered video
   alone (its transcript and frames). A question you cannot answer marks the
   scene to fix.
-- Look at `video.sheet` as a stranger would: anything you would have to
+- Look at the preview frames as a stranger would: anything you would have to
   explain is a fix. Then cover the words: the pictures should still carry the
   idea. Check the sheet at phone size.
 - Read the final narration against `facts.md`, line by line.

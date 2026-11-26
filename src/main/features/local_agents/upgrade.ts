@@ -20,7 +20,7 @@ import { redactPaths } from '../../util/redact.js';
 
 const log = createLogger('local-cli-upgrade');
 
-const PACKAGES: Record<LocalCliType, readonly string[]> = {
+const PACKAGES: Partial<Record<LocalCliType, readonly string[]>> = {
   codex: ['@openai/codex'], claude: ['@anthropic-ai/claude-code'],
   opencode: ['opencode-ai', '@opencode/cli'], openclaw: ['openclaw'], hermes: [],
 };
@@ -28,8 +28,14 @@ export type CliUpgradePlan = { method: 'native' | 'npm' | 'brew' | 'unavailable'
 export type CliUpgradeInfo = { type: LocalCliType; version: string | null; can_upgrade: boolean; method: CliUpgradePlan['method'] };
 type CliUpgradeOutcome = CliUpgradeInfo & { ok: boolean; outcome?: 'upgraded' | 'up_to_date'; error_code?: 'failed' | 'timeout' | 'output_limit' | 'verification_failed' | 'changed_installation' | 'unavailable'; error_detail?: string; entry?: LocalCliEntry };
 export type CliUpgradeResult = CliUpgradeOutcome & { operation_id: number; duration_ms: number };
+type CliUpgradePhase = 'checking' | 'upgrading' | 'verifying';
+type CliUpgradeProgress = { phase: CliUpgradePhase; elapsed_ms: number };
+type ProgressListener = (progress: CliUpgradeProgress) => void;
 let operationCounter = 0;
-const inFlight = new Map<LocalCliType, Promise<CliUpgradeResult>>();
+const inFlight = new Map<LocalCliType, {
+  result: Promise<CliUpgradeResult>;
+  subscribe: (listener?: ProgressListener) => void;
+}>();
 type CommandFailureDiagnostic =
   | { phase: 'spawn'; spawn_code: string }
   | { phase: 'exit'; exit_code: number | null; signal: string };
@@ -113,10 +119,10 @@ export async function planCliUpgrade(type: LocalCliType, binPath: string): Promi
   // Homebrew owns its formula even when it wraps a global npm installation.
   const cellar = segments.indexOf('Cellar'); const cask = segments.indexOf('Caskroom');
   const owner = cellar >= 0 ? cellar : cask;
-  const brewNames: Record<LocalCliType, readonly string[]> = {
+  const brewNames: Partial<Record<LocalCliType, readonly string[]>> = {
     codex: ['codex'], claude: ['claude-code'], opencode: ['opencode'], openclaw: ['openclaw'], hermes: [],
   };
-  if (owner >= 0 && brewNames[type].includes(segments[owner + 1])) {
+  if (owner >= 0 && brewNames[type]?.includes(segments[owner + 1])) {
     const brew = path.join(segments.slice(0, owner).join(path.sep), 'bin', 'brew');
     try { await fs.access(brew); return { method: 'brew', command: brew, args: ['upgrade', ...(cask >= 0 ? ['--cask'] : []), segments[owner + 1]] }; }
     catch { return unavailable; }
@@ -128,7 +134,7 @@ export async function planCliUpgrade(type: LocalCliType, binPath: string): Promi
       const manifest = path.join(dir, 'package.json');
       if ((await fs.stat(manifest)).size > 64 * 1024) return unavailable;
       const pkg = JSON.parse(await fs.readFile(manifest, 'utf8'));
-      if (PACKAGES[type].includes(pkg.name)) {
+      if (PACKAGES[type]?.includes(pkg.name)) {
         const parts = dir.split(path.sep); const nm = parts.lastIndexOf('node_modules');
         if (nm >= 0) {
           const parent = parts.slice(0, nm).join(path.sep) || path.parse(dir).root;
@@ -174,11 +180,31 @@ export async function getCliUpgradeInfo(type: LocalCliType): Promise<CliUpgradeI
   const entry = await resolveCli(type, { force: true });
   return info(entry, entry.path ? await planCliUpgrade(type, entry.path) : { method: 'unavailable' });
 }
-export function upgradeLocalCli(type: LocalCliType): Promise<CliUpgradeResult> {
-  const pending = inFlight.get(type); if (pending) return pending;
+export function upgradeLocalCli(type: LocalCliType, onProgress?: ProgressListener): Promise<CliUpgradeResult> {
+  const pending = inFlight.get(type);
+  if (pending) {
+    pending.subscribe(onProgress);
+    return pending.result;
+  }
   const operationId = ++operationCounter;
-  const startedAt = Date.now();
-  const job = (async (): Promise<CliUpgradeOutcome> => {
+  const startedAt = performance.now();
+  const elapsed = () => Math.floor(performance.now() - startedAt);
+  const listeners = new Set<ProgressListener>();
+  let phase: CliUpgradePhase = 'checking';
+  const notify = (listener: ProgressListener) => {
+    try { listener({ phase, elapsed_ms: elapsed() }); }
+    catch { /* Progress delivery cannot change the maintenance outcome. */ }
+  };
+  const subscribe = (listener?: ProgressListener) => {
+    if (!listener || listeners.has(listener)) return;
+    listeners.add(listener);
+    notify(listener);
+  };
+  const advance = (next: CliUpgradePhase) => {
+    phase = next;
+    for (const listener of [...listeners]) notify(listener);
+  };
+  const result = (async (): Promise<CliUpgradeOutcome> => {
     const entry = await resolveCli(type, { force: true });
     const plan = entry.path ? await planCliUpgrade(type, entry.path) : { method: 'unavailable' as const };
     const metadata = info(entry, plan);
@@ -188,6 +214,7 @@ export function upgradeLocalCli(type: LocalCliType): Promise<CliUpgradeResult> {
     if (fresh.path !== entry.path || fresh.fullVersion !== entry.fullVersion || fresh.version !== entry.version) {
       return { ...metadata, ok: false, error_code: 'changed_installation' };
     }
+    advance('upgrading');
     const result = await runUpgradeCommand(plan.command, plan.args, 10 * 60_000, 'failure');
     invalidateCache(type);
     if (!result.ok) {
@@ -201,6 +228,7 @@ export function upgradeLocalCli(type: LocalCliType): Promise<CliUpgradeResult> {
         ...(result.error_detail ? { error_detail: result.error_detail } : {}) };
     }
     // Verify the original entry point, not a newly discovered higher-priority install.
+    advance('verifying');
     const probe = await detectVersionResult(entry.path);
     if (probe.status !== 'success' || checkMinVersion(type, probe.version)
       || (entry.version && !cliVersionAtLeast(probe.version, entry.version))) {
@@ -214,8 +242,10 @@ export function upgradeLocalCli(type: LocalCliType): Promise<CliUpgradeResult> {
     // after all health/identity checks, preserving prerelease distinctions.
     const current = info(after, plan);
     return { ...current, ok: true, outcome: metadata.version === current.version ? 'up_to_date' : 'upgraded', entry: after };
-  })().then(result => ({ ...result, operation_id: operationId, duration_ms: Date.now() - startedAt }));
+  })().then(outcome => ({ ...outcome, operation_id: operationId, duration_ms: elapsed() }));
+  const job = { result, subscribe };
   inFlight.set(type, job);
-  void job.finally(() => { if (inFlight.get(type) === job) inFlight.delete(type); }).catch(() => {});
-  return job;
+  void result.finally(() => { if (inFlight.get(type) === job) inFlight.delete(type); }).catch(() => {});
+  subscribe(onProgress);
+  return result;
 }

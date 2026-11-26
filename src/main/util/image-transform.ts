@@ -19,6 +19,12 @@ export interface ImageTransformResult {
   height: number;
 }
 
+export interface ImagePreviewResult extends ImageTransformResult {
+  /** Source pixel dimensions after applying image orientation, before scaling. */
+  sourceWidth: number;
+  sourceHeight: number;
+}
+
 /** Canonical Library/KB image-indexing transform. Production extraction and
  * its live model regression share this object so fidelity cannot drift. */
 export const LIBRARY_IMAGE_TRANSFORM_OPTIONS: Readonly<Required<ImageTransformOpts>> = Object.freeze({
@@ -81,7 +87,7 @@ function flattenAlphaOnWhite(Jimp: any, img: any): { image: any; flattened: bool
 export async function toCompressedJpeg(
   buf: Buffer,
   opts: ImageTransformOpts = {},
-): Promise<ImageTransformResult> {
+): Promise<ImagePreviewResult> {
   if (!buf || !(buf instanceof Buffer) || buf.length === 0) {
     throw new Error('toCompressedJpeg: empty or invalid buffer');
   }
@@ -90,6 +96,7 @@ export async function toCompressedJpeg(
 
   const Jimp: any = await loadJimp();
   let img: any = await Jimp.read(buf);
+  const { width: sourceWidth, height: sourceHeight } = img.bitmap;
 
   // JPEG has no alpha channel. Encoding a transparent PNG/WebP directly lets
   // the codec replace transparent pixels with black, which can hide the common
@@ -106,6 +113,8 @@ export async function toCompressedJpeg(
   return {
     buf: out,
     mimeType: 'image/jpeg',
+    sourceWidth,
+    sourceHeight,
     width: img.bitmap.width,
     height: img.bitmap.height,
   };

@@ -69,11 +69,13 @@ describe('interrupted video delivery explanation', () => {
     expect(second).toBe('Attachment 2: delivered version v2 is retained.');
   });
 
-  it.each(['legacy', 'wrong-version', 'missing-record', 'broken-record', 'missing-source', 'broken-source'])(
+  // `unwritten-form`: a delivery hash in a form only development builds wrote (review 2026-11-16 S4-8).
+  it.each(['legacy', 'unwritten-form', 'wrong-version', 'missing-record', 'broken-record', 'missing-source', 'broken-source'])(
     'retains only established version information with %s evidence', async mode => {
       const p = await delivered(); p.edit();
       const record = JSON.parse(fs.readFileSync(p.recordPath, 'utf8'));
       if (mode === 'legacy') { delete record.delivered_version_id; fs.writeFileSync(p.recordPath, JSON.stringify(record)); }
+      if (mode === 'unwritten-form') fs.writeFileSync(p.recordPath, JSON.stringify({ ...record, delivered_source_sha256: `facts:${'0'.repeat(64)}` }));
       if (mode === 'wrong-version') fs.writeFileSync(p.recordPath, JSON.stringify({ ...record, delivered_version_id: 'v999' }));
       if (mode === 'missing-record') fs.rmSync(p.recordPath);
       if (mode === 'broken-record') fs.writeFileSync(p.recordPath, '{');

@@ -5,6 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import type { VoiceEvidence } from './voice-studio-fixtures.js';
 import type { VoiceTrace as ProductionRegressionTrace } from './voice-studio-fixtures.js';
+import { scopedPublishedVoiceFiles } from './voice-output-evidence.js';
+import { inspectProjectReplay } from './voice-project-replay.js';
 const require = createRequire(import.meta.url);
 export const processingCases = ['voice-trim-edges', 'voice-compress-pauses', 'voice-denoise', 'voice-preserve-pauses', 'voice-all-silent', 'voice-separate-offline', 'voice-revise-pauses', 'voice-revise-pauses-follow-up'];
 const hash = (b: Buffer | string) => createHash('sha256').update(b).digest('hex');
@@ -22,10 +24,15 @@ export function processingInputs(id: string): Record<string, Buffer | string> {
   }
   return { 'sources/recording.wav': b, 'export-previous/audio.wav': b, 'voice-project.json': JSON.stringify({ schema_version: 1, roles: {}, segments: [{ id: 'recording', path: 'sources/recording.wav' }] }) };
 }
-export function inspectProcessing(id: string, root: string): VoiceEvidence {
+export function inspectProcessing(id: string, root: string, published?: readonly string[]): VoiceEvidence {
   const base = path.join(root, 'audio'), inputs = processingInputs(id);
   const same = (rel: string) => { try { return hash(fs.readFileSync(path.join(base, rel))) === hash(inputs[rel]); } catch { return false; } };
   const e: VoiceEvidence = { sourcesPreserved: same('sources/recording.wav'), previousPreserved: same('export-previous/audio.wav'), projectValid: false, recordingsPreserved: true, recovered: false, exportCount: 0, decoded: false, contentMatched: false, transcriptCount: 0 };
+  if (id === 'voice-all-silent') {
+    // This fixture is PCM16 with a fixed 44-byte header. Its digest must match the actual supplied file.
+    const source = inputs['sources/recording.wav'];
+    e.allSilentSource = e.sourcesPreserved && Buffer.isBuffer(source) && source.subarray(44).every(byte => byte === 0);
+  }
   let plan: any;
   try { plan = JSON.parse(fs.readFileSync(path.join(base, 'voice-project.json'), 'utf8')); e.projectValid = [1, 2, 3].includes(plan.schema_version) && plan.segments?.length === 1; } catch {}
   const files: string[] = [];
@@ -39,6 +46,12 @@ export function inspectProcessing(id: string, root: string): VoiceEvidence {
     }
   }
   visit(base); e.exportCount = files.length;
+  const delivered = published !== undefined && ['voice-preserve-pauses', 'voice-trim-edges', 'voice-all-silent'].includes(id)
+    ? scopedPublishedVoiceFiles(root, published)
+    : undefined;
+  const audio = delivered?.filter(file => /\.wav$/i.test(file)) ?? files;
+  if (delivered) e.deliveredAudioCount = audio.length;
+  if (id === 'voice-all-silent' || (delivered && audio.length !== 1)) return e;
   const durations: number[] = [];
   const expected = id === 'voice-trim-edges' ? 3.5 : id === 'voice-compress-pauses' ? 3.1 : id === 'voice-revise-pauses-follow-up' ? 3.4 : id === 'voice-revise-pauses' ? 3.1 : id === 'voice-denoise' ? 2 : 4.2;
   try {
@@ -50,7 +63,7 @@ export function inspectProcessing(id: string, root: string): VoiceEvidence {
       for (let i = 0; i < n; i++) { const v = b.readFloatLE((off + i) * 4); a += hz ? v * Math.cos(2 * Math.PI * hz * i / 48000) : v * v; if (hz) c += v * Math.sin(2 * Math.PI * hz * i / 48000); }
       return hz ? Math.hypot(a, c) / n : Math.sqrt(a / n);
     }
-    for (const file of files) {
+    for (const file of audio) {
       const b = decode(file), duration = b.length / 4 / 48000; durations.push(duration);
       if (Math.abs(duration - expected) > .03) continue;
       e.duration = duration; e.decoded = true;
@@ -64,10 +77,22 @@ export function inspectProcessing(id: string, root: string): VoiceEvidence {
         e.contentMatched = energy(b, .5 + shift, 440) > .002 && energy(b, 1.3 + shift, 660) > .01 && energy(b, last, 880) > .01;
         // Natural short pause and edges must survive when not explicitly removed.
         e.contentMatched &&= energy(b, 1.04 + shift) < energy(b, 1.3 + shift, 660) * .01;
+        if (id === 'voice-trim-edges') {
+          const original = decode(path.join(base, 'sources/recording.wav'));
+          // These three windows lie entirely in retained PCM tones, away from cut boundaries.
+          e.levelsPreserved = [[.5, 440], [1.3, 660], [3.3, 880]].every(([start, hz]) =>
+            Math.abs(energy(b, start + shift, hz) - energy(original, start, hz)) <= 4 / 32768);
+          e.contentMatched &&= e.levelsPreserved;
+        }
         if (id !== 'voice-trim-edges') e.contentMatched &&= energy(b, .1) < .0001 && energy(b, duration - .2) < .0001;
       }
     }
   } catch { e.decoded = false; }
+  if (id === 'voice-trim-edges' && delivered && e.contentMatched) {
+    const projects = delivered.filter(file => /\.json$/i.test(file) && path.basename(file) !== 'plan-snapshot.json');
+    e.projectReplay = inspectProjectReplay(root, projects, audio[0]);
+    e.projectValid ||= e.projectReplay.matched;
+  }
   if (id === 'voice-revise-pauses-follow-up') e.contentMatched &&= durations.some(d => Math.abs(d - 3.1) < .03) && plan?.processing?.some((s: any) => s.type === 'silence' && s.mode === 'compress' && s.keep_sec === .6);
   return e;
 }
@@ -78,5 +103,8 @@ export function processingChecks(id: string, t: ProductionRegressionTrace) {
     check('no-synthesis', !t.toolCalls.some(c => c.name === 'generate_speech' && (!c.op || ['generate','separate'].includes(c.op)))),
     ...(id==='voice-separate-offline' ? [check('offline-authority',!t.toolCalls.some(c => c.name==='generate_speech' && ['separation_capabilities','separate','separation_status'].includes(c.op || '')))] : []),
     check('observed-execution', t.toolCalls.some(c => c.isError === false && ['read_files', 'bash'].includes(c.name))),
-    check('outcome', blocked ? e?.exportCount === 0 : !!e?.decoded && e.contentMatched && e.exportCount === (id === 'voice-revise-pauses-follow-up' ? 2 : 1))];
+    ...(id === 'voice-trim-edges' && e?.deliveredAudioCount !== undefined ? [check('project-replay', e.projectReplay?.matched === true)] : []),
+    check('outcome', blocked ? e?.exportCount === 0
+      && (id !== 'voice-all-silent' || (e.allSilentSource === true && (e.deliveredAudioCount ?? 0) === 0))
+      : !!e?.decoded && e.contentMatched && (e.deliveredAudioCount ?? e.exportCount) === (id === 'voice-revise-pauses-follow-up' ? 2 : 1))];
 }
