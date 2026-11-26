@@ -99,7 +99,7 @@ test.describe('video replacement presentation', () => {
         await new Promise<void>((resolve, reject) => req('node:child_process').execFile(ffmpeg, [
           '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
           '-i', `color=c=${index ? 'blue' : 'red'}:size=1920x1080:rate=30`, '-t', '1', '-an',
-          '-c:v', 'libvpx', '-threads', '1', file,
+          '-c:v', 'libvpx', '-deadline', 'realtime', '-cpu-used', '8', '-threads', '1', file,
         ], { windowsHide: true, timeout: 30000 }, (error: Error | null) => error ? reject(error) : resolve()));
       }
     }, { module: path.resolve(__dirname, '../../src/main/util/bundled-runtime.ts'), files });

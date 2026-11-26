@@ -18,12 +18,13 @@ const pendingConvs = new Map();
 // controller. Keep it in the same pending predicate so delegated agents keep
 // the send button in "replying/stop" mode until the whole turn is quiescent.
 const groupBusyConvs = new Map();
+let _groupBusyRevision = 0;
 
 function isGroupConversationBusy(cid) { return groupBusyConvs.has(cid); }
 
 function setGroupConversationBusy(cid, busy) {
   if (!cid) return;
-  if (busy) groupBusyConvs.set(cid, true);
+  if (busy) groupBusyConvs.set(cid, ++_groupBusyRevision);
   else groupBusyConvs.delete(cid);
   try { window.VideoCanvas?.notifyBusy?.(cid, !!busy); } catch (_) { /* optional surface */ }
 }
@@ -154,6 +155,7 @@ function startPolling(cid) {
     // be stopped and re-started while that request is in flight.
     if (pollTimers.get(cid) !== timer || pollInFlight.has(cid)) return;
     const pendingOwner = pendingConvs.get(cid);
+    if (pendingOwner?.confirmingSend) return;
     const requestToken = {};
     pollInFlight.set(cid, requestToken);
     try {
@@ -166,7 +168,7 @@ function startPolling(cid) {
       // flight. Never let that stale poll fall through to _onPolledResponse:
       // it would reload the whole transcript after the final bubble was
       // already painted, causing a visible "Loading…" flash on every reply.
-      if (pollTimers.get(cid) !== timer || pendingConvs.get(cid) !== pendingOwner) return;
+      if (pollTimers.get(cid) !== timer || pendingConvs.get(cid) !== pendingOwner || pendingOwner?.confirmingSend) return;
       if (!runtimeRes.ok || !runtimeData || runtimeData.ok === false) return;
       const hasServerRuntime = Object.prototype.hasOwnProperty.call(runtimeData, 'processing');
       const runtimeBusy = hasServerRuntime
@@ -184,7 +186,7 @@ function startPolling(cid) {
         : `/api/conversations/${encodeURIComponent(cid)}/history?limit=10`;
       const historyRes = await apiFetch(historyUrl);
       const data = await historyRes.json();
-      if (pollTimers.get(cid) !== timer || pendingConvs.get(cid) !== pendingOwner) return;
+      if (pollTimers.get(cid) !== timer || pendingConvs.get(cid) !== pendingOwner || pendingOwner?.confirmingSend) return;
       if (!historyRes.ok || !data || data.ok === false || !data.history) return;
       // Same visibility filter as loadConversationHistory (drops `dispatch`
       // records AND redundant routing-only commander tails) so the polled
@@ -267,6 +269,7 @@ async function _onPolledResponse(cid, contentOrMessage, isError = false) {
     : null;
   const content = polledMessage ? (polledMessage.text || '') : contentOrMessage;
   const state = pendingConvs.get(cid);
+  if (state?.confirmingSend) return;
   pendingConvs.delete(cid);
   setGroupConversationBusy(cid, false);
   _updateConvSidebarBadge(cid, false);

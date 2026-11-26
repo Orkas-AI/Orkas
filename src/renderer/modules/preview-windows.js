@@ -14,7 +14,7 @@
   }
   function options(opts) {
     const result = {};
-    for (const key of ['cid', 'projectId', 'absPath', 'readOnly', 'autoplay', 'startTime', 'duration', 'ended']) {
+    for (const key of ['cid', 'projectId', 'absPath', 'readOnly', 'fileRevision', 'autoplay', 'startTime', 'duration', 'ended']) {
       const value = opts?.[key];
       if (value != null && (typeof value !== 'number' || Number.isFinite(value))) result[key] = value;
     }

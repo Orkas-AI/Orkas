@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
 function loadShim(
-  streamImpl: (...args: any[]) => { promise: Promise<void>; cancel: () => void },
+  streamImpl: ((...args: any[]) => { promise: Promise<void>; cancel: () => void }) | undefined,
   invokeImpl: (...args: any[]) => Promise<any> = vi.fn(),
 ) {
   const loggerWarn = vi.fn();
@@ -34,6 +34,12 @@ function loadShim(
 }
 
 describe('ipc-shim streams', () => {
+  it('distinguishes an absent stream bridge from a stream whose delivery is uncertain', async () => {
+    const { apiFetch } = loadShim(undefined);
+    const response = await apiFetch('/api/conversations/c1/send/stream', { method: 'POST' });
+    expect(response).toMatchObject({ ok: false, streamNotDispatched: true });
+  });
+
   it('closes renderer-cancelled streams without reporting ipc_stream errors', async () => {
     let rejectStream: (err: Error) => void = () => {};
     const { apiFetch, loggerWarn } = loadShim(() => ({

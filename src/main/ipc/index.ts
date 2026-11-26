@@ -18,6 +18,7 @@ import * as builtinApps from '../features/builtin_apps';
  */
 
 import { readTextPreview } from '../util/text-preview';
+import { fileSnapshotSignature } from '../util/file-snapshot';
 import { app, ipcMain, dialog, BrowserWindow, type WebContents } from 'electron';
 
 import * as users from '../features/users';
@@ -107,6 +108,7 @@ import {
   globalAutoTaskLocation,
 } from '../util/project-layout';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import { projectGoalAndRecapEnabled } from '../util/project-feature-flags';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { captureDeliveredTaskIntervention } from '../util/task-intervention-events';
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -560,6 +562,25 @@ async function _isAllowedPreviewFilePath(userId: string, payload: any, absPath: 
   return resolved === absPath;
 }
 
+async function _canFollowMarkdownPreviewLink(
+  userId: string, source: Extract<previewWindows.PreviewSource, { kind: 'file' }>, target: string,
+): Promise<boolean> {
+  const sourceDir = path.dirname(source.path);
+  const targetDir = path.dirname(target);
+  const roots = await _ipcFileSandboxAllowedRoots(userId, source.options);
+  // Standalone files may link to a sibling. Links between directories need a
+  // shared workspace or attachment scope, verified with symlink resolution.
+  const inSharedRoot = roots.some(root => {
+    const relative = path.relative(root, target);
+    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+      && isPathAllowed(source.path, [root]) && isPathAllowed(target, [root]);
+  });
+  if (!inSharedRoot && (sourceDir !== targetDir || !isPathAllowed(target, [sourceDir])
+      || !await _isAllowedPreviewFilePath(userId, source.options, target))) return false;
+  const stat = await fs.promises.stat(target).catch(() => null);
+  return !!stat?.isFile();
+}
+
 function _localPreviewPath(payload: any): string {
   const target = payload?.path;
   if (typeof target !== 'string' || !target) throw new Error('missing path');
@@ -917,6 +938,16 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
 // Contract: `(payload, { userId, sender }) => result` where result is
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
 
+// A queue admission may precede the persisted user message. Keep the recent
+// outcome available independently of delivery on the original send stream.
+const conversationSendReceipts = new Map<string, { status: 'accepted' | 'rejected'; expiresAt: number }>();
+
+function conversationSendReceiptKey(userId: string, cid: string, clientMsgId: unknown): string {
+  return typeof clientMsgId === 'string' && clientMsgId.length <= 64 && safeId(clientMsgId)
+    ? JSON.stringify([userId, cid, clientMsgId])
+    : '';
+}
+
 async function startupOperation(run: () => unknown | Promise<unknown>) {
   try { return await run(); }
   catch (error) {
@@ -1100,9 +1131,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         total_ms: totalMs, rows: page.history.length, anchored: anchorIndex !== null,
       });
     }
+    const receiptKey = args.receipt_client_msg_id
+      ? conversationSendReceiptKey(ctx.userId, cid, args.receipt_client_msg_id)
+      : '';
+    const sendReceipt = receiptKey ? conversationSendReceipts.get(receiptKey) : undefined;
     return {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: page.history,
+      ...(sendReceipt && sendReceipt.expiresAt > Date.now() ? { send_receipt: sendReceipt.status } : {}),
       ...(args.live === '1' ? { live_display: await groupChat.displaySnapshot(ctx.userId, cid, resolvedProjectId) } : {}),
       next_cursor: page.nextCursor,
       following_cursor: 'followingCursor' in page ? page.followingCursor : null,
@@ -1384,6 +1420,74 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true };
   },
 
+  // The project goal (goal.json) and "since you were last here". The goal tab
+  // reads and edits the goal; the digest is the same one the project
+  // Commander is told, computed from to-dos and automations.
+  'projects.goal.get': async ({ projectId } = {}, ctx) => {
+    if (!projectGoalAndRecapEnabled()) return { enabled: false };
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const project = await projects.getProject(ctx.userId, projectId);
+    if (!project) throw new Error('not_found');
+    const goals = await import('../features/project_goal');
+    return { shared: false, goal: await goals.readProjectGoal(ctx.userId, projectId) };
+  },
+
+  'projects.goal.set': async ({ projectId, goal, success_criteria, status } = {}, ctx) => {
+    if (!projectGoalAndRecapEnabled()) return { enabled: false };
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (goal !== undefined && typeof goal !== 'string') throw new Error('invalid goal');
+    if (success_criteria !== undefined && (!Array.isArray(success_criteria)
+      || success_criteria.some((item: unknown) => typeof item !== 'string'))) throw new Error('invalid success_criteria');
+    if (status !== undefined && typeof status !== 'string') throw new Error('invalid status');
+    const goals = await import('../features/project_goal');
+    const result = await goals.saveProjectGoal(ctx.userId, projectId, {
+      ...(goal !== undefined ? { goal } : {}),
+      ...(success_criteria !== undefined ? { success_criteria } : {}),
+      ...(status !== undefined ? { status } : {}),
+    }, 'ui');
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { goal: (result as { goal: unknown }).goal, action: (result as { action: unknown }).action };
+  },
+
+  'projects.recap.get': async ({ projectId, since } = {}, ctx) => {
+    if (!projectGoalAndRecapEnabled()) return { enabled: false };
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (since !== undefined && (typeof since !== 'string' || !Number.isFinite(Date.parse(since)))) throw new Error('invalid since');
+    const project = await projects.getProject(ctx.userId, projectId);
+    if (!project) throw new Error('not_found');
+    const recap = await import('../features/project_recap');
+    const tasks = await projectTasks.listTasks(ctx.userId, projectId);
+    const digest = await recap.computeProjectRecap(ctx.userId, projectId, { surface: 'page', tasks, ...(since !== undefined ? { since } : {}) });
+    const statusById = new Map(tasks.map((task) => [task.id, task.status]));
+    const row = (item: import('../features/project_recap').RecapItem) => ({
+      kind: item.kind, id: item.id, text: item.text, at: item.at,
+      ...(item.note ? { note: item.note } : {}), ...(item.cid ? { cid: item.cid } : {}),
+      ...(item.kind === 'task' && statusById.has(item.id) ? { status: statusById.get(item.id) } : {}),
+    });
+    return {
+      shared: false,
+      since: digest.since,
+      computed_at: digest.computed_at,
+      settling: digest.settling,
+      total: digest.total,
+      counts: recap.recapCounts(digest),
+      lines: digest.listed.map(({ line, items }) => ({ line, count: digest.lines[line].length, items: items.map(row) })),
+    };
+  },
+
+  'projects.recap.markSeen': async ({ projectId, computedAt, counts } = {}, ctx) => {
+    if (!projectGoalAndRecapEnabled()) return { seen: false };
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof computedAt !== 'string' || !Number.isFinite(Date.parse(computedAt))) throw new Error('invalid computedAt');
+    const count = (value: unknown) => (Number.isSafeInteger(value) && (value as number) >= 0 ? Math.min(value as number, 10_000) : 0);
+    const recap = await import('../features/project_recap');
+    const seen = await recap.markProjectRecapSeen(ctx.userId, projectId, computedAt, 'page', {
+      stuck: count(counts?.stuck), review: count(counts?.review), done: count(counts?.done),
+      automation: count(counts?.automation), added: count(counts?.added),
+    });
+    return { seen };
+  },
+
   // ── Project tasks (structured work backlog — user + agent shared) ─────────
   'chatTaskReferences.resolve': async ({ references } = {}, ctx) => {
     const { resolveChatTaskReferences } = await import('../features/chat_task_references');
@@ -1444,6 +1548,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, {
       content, title, detail, status, owner_agent, owner_agent_id, attachment_order,
       ...(due_at !== undefined ? { due_at: typeof due_at === 'string' && due_at ? due_at : null } : {}),
+      status_actor: 'user' as const,
     });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
@@ -1452,7 +1557,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.tasks.complete': async ({ projectId, taskId } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.completeTask(ctx.userId, scopeProjectId, taskId);
+    const r = await projectTasks.completeTask(ctx.userId, scopeProjectId, taskId, 'user');
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
@@ -1738,8 +1843,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, name };
   },
 
-  // ── Project bindings (the strict scope of agents visible inside a
-  // project conversation; see CLAUDE.md §6 outer-intersection rule) ──
+  // ── Project bindings (the Agents a project adds; with every built-in
+  // Agent they form the scope visible inside a project conversation; see
+  // CLAUDE.md §6 outer-intersection rule and features/projects.ts) ──
   // `bindings.list` returns the bound ids JOINED with name/description so
   // the renderer can paint the detail page in one round-trip. A catalog scan
   // may miss an updating package or a concurrent addition; reads must not
@@ -1751,13 +1857,19 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const agentList = await agents.listAgentSummaries();
     const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
     const bindings = await projects.getBindings(ctx.userId, projectId);
+    const isBuiltin = (agent: any) => agents.agentPrioritySource(agent) === 'builtin';
+    const markBuiltin = (agent: any) => isBuiltin(agent) ? { ...agent, builtin: true } : agent;
+    const agentDetails = bindings.agents.map(id => {
+      const agent = agentById.get(id);
+      return agent ? markBuiltin(agent) : { agent_id: id, name: '', enabled: false, unavailable: true };
+    });
+    const bound = new Set(bindings.agents);
+    const builtinAgents = agentList.filter((agent: any) => isBuiltin(agent) && agent.enabled !== false
+      && agent.runtime?.kind !== 'cli' && !bound.has(agent.agent_id)).map(markBuiltin);
     return {
       bindings,
-      agentDetails: bindings.agents
-        .map((id) => agentById.get(id) || {
-          agent_id: id, name: '',
-          enabled: false, unavailable: true,
-        }),
+      agentDetails,
+      availableAgents: [...agentDetails.filter((detail: any) => !detail.unavailable), ...builtinAgents],
     };
   },
 
@@ -1768,6 +1880,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!agents.isValidAgentId(id)) throw new Error('invalid id');
     const agent = await agents.getAgent(id);
     if (!agent || agent.enabled === false) throw new Error('agent_disabled');
+    if (agents.agentPrioritySource(agent) === 'builtin') {
+      if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
+      return { bindings: await projects.getBindings(ctx.userId, projectId) };
+    }
     const result = await projects.addAgentBinding(ctx.userId, projectId, id);
     if (!result.ok) throw new Error((result as { error: string }).error);
     return { bindings: result.bindings };
@@ -1784,7 +1900,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // Candidates = enabled Agents minus already-bound. Powers the
   // "Add" picker on the project detail page so disabled agents never appear
-  // as addable project members.
+  // as addable project members. Built-in Agents stay listed, marked
+  // `builtin`, so the picker can show them as already available.
   'projects.bindings.candidates': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
@@ -1792,7 +1909,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const boundAgents = new Set(bindings.agents);
     const agentList = await agents.listAgentSearchListings();
     return {
-      agents: agentList.filter((a: any) => a.enabled !== false && !boundAgents.has(a.agent_id)),
+      agents: agentList.filter((a: any) => a.enabled !== false
+        && (agents.agentPrioritySource(a) === 'builtin' || !boundAgents.has(a.agent_id)))
+        .map((a: any) => (agents.agentPrioritySource(a) === 'builtin' ? { ...a, builtin: true } : a)),
     };
   },
 
@@ -2041,9 +2160,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     });
   },
 
-  'groupChat.abort': async ({ cid }, ctx) => {
+  'groupChat.abort': async ({ cid, keep_queue }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    return groupChat.abort(ctx.userId, cid);
+    return keep_queue === true
+      ? groupChat.abort(ctx.userId, cid, { keepQueue: true })
+      : groupChat.abort(ctx.userId, cid);
   },
 
   'groupChat.tasks.list': async ({ cid }, ctx) => {
@@ -2375,7 +2496,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'savedApps.openInApp': async ({ appId }, ctx) => {
     return webAppInvokeHandlers['webApps.open']({ source: { appId } }, ctx);
   },
-  'previewWindows.open': async (payload, ctx) => previewWindows.openPreview(ctx.userId, ctx.sender, payload),
+  'previewWindows.open': async (payload, ctx) => previewWindows.openPreview(
+    ctx.userId, ctx.sender, payload, (source, target) => _canFollowMarkdownPreviewLink(ctx.userId, source, target),
+  ),
   'previewWindows.initialize': async (_payload, ctx) => previewWindows.initializePreview(ctx.userId, ctx.sender),
   'previewWindows.ready': async (_payload, ctx) => { previewWindows.readyPreview(ctx.userId, ctx.sender); return {}; },
   'previewWindows.replace': async (payload, ctx) => (await previewWindows.replacePreview(ctx.userId, ctx.sender, payload.accepted)) || {},
@@ -2586,12 +2709,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'skills.createFromDir': async ({ name, description, srcDir, force }) => {
     const r = await skills.createFromDir(name ?? null, description ?? null, String(srcDir || ''), { force: force === true });
     if (!r.ok) return r;
-    return { skill: r.skill, skills: r.skills, seedModelText: r.seedModelText, seedMessage: r.seedMessage };
+    return { skill: r.skill, skills: r.skills, seedModelText: r.seedModelText, seedMessage: r.seedMessage,
+      importMetadataId: r.importMetadataId };
   },
 
-  'skills.discardImportDraft': async ({ id }) => {
+  'skills.discardImportDraft': async ({ id, ownerId }, ctx) => {
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
-    return { discarded: await skills.discardImportDraftIfPristine(id) };
+    if (ownerId !== ctx.userId) return { discarded: false };
+    return { discarded: await skills.discardImportDraftIfPristine(id, ctx.userId) };
   },
 
   'skills.update': async ({ id, updates, skipRename }) => {
@@ -2653,8 +2778,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { cleared: await skills.clearSkillChat(ctx.userId, id) };
   },
 
-  'skills.chat.send': async ({ id, content, model_text, attachments }, ctx) => {
+  'skills.chat.send': async ({ id, content, model_text, attachments, import_metadata_id }, ctx) => {
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
+    if (import_metadata_id !== undefined) throw new Error(t('process.skill.final_no_changes'));
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
     const modelText = typeof model_text === 'string' ? model_text.trim() : '';
@@ -3255,6 +3381,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!groupChat.busIsQuiescent(ctx.userId, cid)) return { ok: false, code: 'busy' };
     return videoCanvasJobs.updateVideoCanvasVideo(await videoCanvasJobContext(ctx.userId, cid, dir), String(video));
   },
+  'videoCanvas.resolveDelivery': async ({ cid, dir, video, reviewId, decision }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const job = await videoCanvasJobContext(ctx.userId, cid, dir);
+    return videoCanvasJobs.resolveVideoCanvasDelivery(job, String(video), reviewId, decision,
+      () => !groupChat.busIsQuiescent(ctx.userId, cid));
+  },
   'videoCanvas.voices': async ({ cid, dir, video }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     return videoCanvas.readVideoCanvasVoices(ctx.userId, cid, dir, video);
@@ -3585,6 +3717,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       isDirectory: st.isDirectory(),
       size: st.size,
       mtimeMs: st.mtimeMs,
+      fileRevision: fileSnapshotSignature(st),
       readOnly: !isPathAllowed(norm, await _ipcFileSandboxAllowedRoots(ctx.userId, payload)),
     };
   },
@@ -3884,13 +4017,13 @@ const streamHandlers: Record<string, StreamHandler> = {
     client_msg_id,
   }, ctx, signal) {
     if (!safeId(cid)) {
-      yield { type: 'error', text: 'invalid cid' };
+      yield { type: 'error', text: 'invalid cid', admission_rejected: true };
       return;
     }
     bindWebAssistConversation(ctx.userId, cid, ctx.sender);
     const text = (content || '').trim();
     if (!text) {
-      yield { type: 'error', text: 'empty message' };
+      yield { type: 'error', text: 'empty message', admission_rejected: true };
       return;
     }
     const modelText = typeof model_text === 'string' ? model_text.trim() : '';
@@ -3938,9 +4071,12 @@ const streamHandlers: Record<string, StreamHandler> = {
     let firstProcessLogged = false;
     let sendDone = false;
     let acceptanceEmitted = false;
+    let acceptedRunId = '';
+    const beforeDispatch = async ({ runId }: { runId: string }) => { acceptedRunId = runId; };
     let sendRes: Awaited<ReturnType<typeof groupChat.send>>
       | Awaited<ReturnType<typeof groupChat.retryFailedTurn>>
       | null = null;
+    let admissionRejected = false;
     let sendErr: unknown = null;
     const sendPromise = (async () => {
       try {
@@ -3951,12 +4087,13 @@ const streamHandlers: Record<string, StreamHandler> = {
               cid,
               failedMessageId: retryMessageId,
               visibleText: text,
+              beforeDispatch,
               ...(typeof client_msg_id === 'string' && client_msg_id.trim()
                 ? { client_msg_id: client_msg_id.trim().slice(0, 64) }
                 : {}),
             })
           : await groupChat.send({
-              userId: ctx.userId, cid, text,
+              userId: ctx.userId, cid, text, beforeDispatch,
               ...(modelText ? { model_text: modelText } : {}),
               ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
                 ? { commander_mention_display } : {}),
@@ -3968,6 +4105,18 @@ const streamHandlers: Record<string, StreamHandler> = {
               ...(useSelections.length ? { use_selections: useSelections } : {}),
               ...(refs.length ? { references: refs } : {}),
             });
+        admissionRejected = !!sendRes && 'admission_rejected' in sendRes && sendRes.admission_rejected === true;
+        const receiptKey = conversationSendReceiptKey(ctx.userId, cid, client_msg_id);
+        if (receiptKey && (sendRes?.ok || admissionRejected)) {
+          conversationSendReceipts.set(receiptKey, {
+            status: sendRes?.ok ? 'accepted' : 'rejected',
+            expiresAt: Date.now() + 60_000,
+          });
+          if (conversationSendReceipts.size > 256) {
+            const oldest = conversationSendReceipts.keys().next();
+            if (!oldest.done) conversationSendReceipts.delete(oldest.value);
+          }
+        }
       } catch (err) {
         sendErr = err;
       } finally {
@@ -3997,12 +4146,19 @@ const streamHandlers: Record<string, StreamHandler> = {
             return;
           }
           if (!sendRes?.ok) {
-            yield { type: 'error', text: sendRes?.error || 'send failed' };
+            yield {
+              type: 'error',
+              text: sendRes?.error || 'send failed',
+              ...(admissionRejected ? { admission_rejected: true } : {}),
+            };
             return;
           }
           if (!acceptanceEmitted) {
             acceptanceEmitted = true;
-            yield { type: 'send_accepted' };
+            yield { type: 'send_accepted', ...(acceptedRunId ? { run_id: acceptedRunId } : {}) };
+            // More bus events can arrive while the consumer receives acceptance.
+            // Flush them before going idle or closing the stream.
+            if (buf.length) continue drainLoop;
           }
           if (groupChat.busIsQuiescent(ctx.userId, cid)) break drainLoop;
         }
@@ -4108,7 +4264,7 @@ const streamHandlers: Record<string, StreamHandler> = {
     }
   },
 
-  'skills.chat.sendStream': async function* ({ id, content, model_text, attachments }, ctx, signal) {
+  'skills.chat.sendStream': async function* ({ id, content, model_text, attachments, import_metadata_id }, ctx, signal) {
     if (!skills.isValidSkillId(id)) {
       yield { type: 'error', text: 'invalid skill id' };
       return;
@@ -4122,6 +4278,7 @@ const streamHandlers: Record<string, StreamHandler> = {
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string' && n) : [];
     yield* skills.streamSendToSkillChat(ctx.userId, id, text, {
       abortSignal: signal,
+      importMetadataId: import_metadata_id,
       ...(atts.length ? { attachments: atts } : {}),
       ...(modelText ? { modelText } : {}),
     });
@@ -4261,7 +4418,17 @@ async function isPrivateAppConversationPayload(uid: string, payload: any): Promi
   if (ids.some(id => id.startsWith('app_'))) return true;
   // Legacy app_task records are still in the old index until safely finalized.
   const legacy = [payload?.cid, payload?.conversation_id, ...(Array.isArray(payload?.cids) ? payload.cids.slice(0, 100) : [])];
-  for (const cid of legacy) if (typeof cid === 'string' && (await chats.getConversationMetadata(uid, cid))?.kind === 'app_task') return true;
+  // The project the caller named only chooses which index is read first; a row kept
+  // elsewhere is still found. A malformed id is the handler's to reject.
+  let projectIdHint: string | null | undefined;
+  try {
+    projectIdHint = payload && typeof payload === 'object' ? conversationProjectHint(payload) : undefined;
+  } catch {
+    projectIdHint = undefined;
+  }
+  for (const cid of legacy) {
+    if (typeof cid === 'string' && (await chats.getConversationMetadata(uid, cid, projectIdHint))?.kind === 'app_task') return true;
+  }
   return false;
 }
 

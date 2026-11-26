@@ -85,19 +85,24 @@ describe('shared Renderer state primitives', () => {
   });
 
   it('keeps group activity scoped to a non-empty conversation id', () => {
-    const sandbox: any = { groupBusyConvs: new Map() };
+    const notifyBusy = vi.fn();
+    const sandbox = { groupBusyConvs: new Map(), window: { VideoCanvas: { notifyBusy } } };
     vm.createContext(sandbox);
-  vm.runInContext(composerAccessorSource, sandbox);
+    const busyRevision = source.match(/^let _groupBusyRevision\s*=[^;\n]+;/m)?.[0];
+    if (!busyRevision) throw new Error('Missing Renderer busy revision state');
     vm.runInContext([
+      busyRevision,
       extractFunction('isGroupConversationBusy'),
       extractFunction('setGroupConversationBusy'),
     ].join('\n'), sandbox);
 
-    sandbox.setGroupConversationBusy('', true);
-    sandbox.setGroupConversationBusy('conversation-a', true);
-    expect(sandbox.groupBusyConvs.size).toBe(1);
-    expect(sandbox.isGroupConversationBusy('conversation-a')).toBe(true);
-    sandbox.setGroupConversationBusy('conversation-a', false);
-    expect(sandbox.isGroupConversationBusy('conversation-a')).toBe(false);
+    vm.runInContext("setGroupConversationBusy('', true)", sandbox);
+    expect(notifyBusy).not.toHaveBeenCalled();
+    vm.runInContext("setGroupConversationBusy('conversation-a', true)", sandbox);
+    expect(vm.runInContext('groupBusyConvs.size', sandbox)).toBe(1);
+    expect(vm.runInContext("isGroupConversationBusy('conversation-a')", sandbox)).toBe(true);
+    vm.runInContext("setGroupConversationBusy('conversation-a', false)", sandbox);
+    expect(vm.runInContext("isGroupConversationBusy('conversation-a')", sandbox)).toBe(false);
+    expect(notifyBusy.mock.calls).toEqual([['conversation-a', true], ['conversation-a', false]]);
   });
 });

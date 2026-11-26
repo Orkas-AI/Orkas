@@ -123,6 +123,7 @@ const PUSH_EVENT_CHANNELS = new Set([
   'local-agent:permission_cancelled',
   'local-agent:user-input',
   'local-agent:user-input_cancelled',
+  'local-agent:upgrade-progress',
 ]);
 // Local feature lifecycle events cross the same scoped push bridge.
 const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'web-assist:', 'client-config:', 'delete_file.', 'bridge:', 'bash:', 'folder:', 'interactive-cli:', 'projects:'];
