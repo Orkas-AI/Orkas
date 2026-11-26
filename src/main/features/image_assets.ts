@@ -1,22 +1,6 @@
-import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import type { Metadata } from 'sharp';
 
-import type { Metadata, OutputInfo } from 'sharp';
-
-import { isPathAllowed } from '../util/path-sandbox';
 import { encodeImage, imageMetadata } from '../util/sharp-runtime';
-
-export interface ImageAssetProcessResult {
-  output_path: string;
-  format: string;
-  width: number;
-  height: number;
-  channels: number;
-  bytes: number;
-  engine: 'sharp';
-  model_calls: 0;
-}
 
 export interface LosslessModelImageResult {
   buf: Buffer;
@@ -31,20 +15,6 @@ export interface LosslessModelImageResult {
 const MAX_DIMENSION = 16_384;
 const MAX_AREA = 100_000_000;
 
-function finiteInteger(value: unknown, name: string, minimum: number, maximum: number): number {
-  const number = Number(value);
-  if (!Number.isInteger(number) || number < minimum || number > maximum) {
-    throw new Error(`E_IMAGE_ASSET_ARGUMENT: ${name} must be an integer from ${minimum} to ${maximum}.`);
-  }
-  return number;
-}
-
-function assertProjectFile(projectDirAbs: string, absPath: string, label: string): void {
-  if (!isPathAllowed(absPath, [projectDirAbs])) {
-    throw new Error(`E_IMAGE_ASSET_PATH: ${label} must stay inside the image project.`);
-  }
-}
-
 export async function inspectImageAssetBuffer(buffer: Buffer): Promise<{
   format: string;
   width: number;
@@ -58,11 +28,11 @@ export async function inspectImageAssetBuffer(buffer: Buffer): Promise<{
     metadata = await imageMetadata(buffer, { failOn: 'error', limitInputPixels: MAX_AREA });
   } catch (error) {
     if (String((error as NodeJS.ErrnoException).code || '').startsWith('E_IMAGE_RUNTIME_')) throw error;
-    throw new Error(`E_IMAGE_ASSET_INVALID: workflow output is not a readable image (${(error as Error).message}).`);
+    throw new Error(`E_IMAGE_ASSET_INVALID: image input is not a readable image (${(error as Error).message}).`);
   }
-  if (!metadata.format || !metadata.width || !metadata.height) throw new Error('E_IMAGE_ASSET_INVALID: workflow output has no image dimensions.');
+  if (!metadata.format || !metadata.width || !metadata.height) throw new Error('E_IMAGE_ASSET_INVALID: image input has no image dimensions.');
   if (metadata.width > MAX_DIMENSION || metadata.height > MAX_DIMENSION || metadata.width * metadata.height > MAX_AREA) {
-    throw new Error('E_IMAGE_ASSET_LIMIT: workflow output exceeds the image dimension limit.');
+    throw new Error('E_IMAGE_ASSET_LIMIT: image input exceeds the image dimension limit.');
   }
   return {
     format: metadata.format,
@@ -86,6 +56,23 @@ export async function prepareLosslessModelImage(buffer: Buffer): Promise<Lossles
   if (inspected.format !== 'png') {
     throw new Error('E_IMAGE_ASSET_FORMAT: lossless model preprocessing requires PNG input.');
   }
+  return encodeLosslessModelPng(buffer, inspected);
+}
+
+/** Inspect and prepare one buffer so format routing and PNG encoding share the
+ * same validated dimensions. The caller handles formats it cannot attach. */
+export async function prepareModelImageAsset(buffer: Buffer) {
+  const { format, width, height } = await inspectImageAssetBuffer(buffer);
+  if (format === 'png') return { format, ...await encodeLosslessModelPng(buffer, { width, height }) };
+  const mediaType = format === 'jpeg' ? 'image/jpeg' as const
+    : format === 'webp' ? 'image/webp' as const : undefined;
+  return { format, width, height, buf: buffer, mediaType };
+}
+
+async function encodeLosslessModelPng(
+  buffer: Buffer,
+  { width, height }: { width: number; height: number },
+): Promise<LosslessModelImageResult> {
   const { data: webp } = await encodeImage(buffer, {
     failOn: 'error', limitInputPixels: MAX_AREA,
     format: 'webp', encodeOptions: { lossless: true, effort: 4 },
@@ -95,61 +82,10 @@ export async function prepareLosslessModelImage(buffer: Buffer): Promise<Lossles
   return {
     buf: selected,
     mediaType: useWebp ? 'image/webp' : 'image/png',
-    width: inspected.width,
-    height: inspected.height,
+    width,
+    height,
     sourceBytes: buffer.length,
     encodedBytes: selected.length,
     transcoded: useWebp,
-  };
-}
-
-export async function writeImageAssetBuffer(input: {
-  projectDirAbs: string;
-  outputAbsPath: string;
-  buffer: Buffer;
-  quality?: number;
-}): Promise<ImageAssetProcessResult> {
-  const projectDirAbs = path.resolve(input.projectDirAbs);
-  const outputAbsPath = path.resolve(input.outputAbsPath);
-  assertProjectFile(projectDirAbs, outputAbsPath, 'output_path');
-  const extension = path.extname(outputAbsPath).toLowerCase();
-  if (!['.png', '.jpg', '.jpeg', '.webp'].includes(extension)) {
-    throw new Error('E_IMAGE_ASSET_FORMAT: workflow output_path must end in png, jpg, jpeg, or webp.');
-  }
-  await inspectImageAssetBuffer(input.buffer);
-  const quality = input.quality === undefined ? 95 : finiteInteger(input.quality, 'quality', 1, 100);
-  const encoded = await encodeImage(input.buffer, {
-    failOn: 'error', limitInputPixels: MAX_AREA,
-    format: extension === '.png' ? 'png' : extension === '.webp' ? 'webp' : 'jpeg',
-    encodeOptions: { quality },
-  });
-  await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
-  const temporaryPath = `${outputAbsPath}.${process.pid}.${randomUUID()}.tmp${extension}`;
-  const info: OutputInfo = encoded.info;
-  try {
-    await fs.writeFile(temporaryPath, encoded.data);
-    // A sibling hard link publishes the fully-written inode atomically and,
-    // unlike rename, refuses to replace an existing path on every supported
-    // platform. This also closes the race between the caller's uniquify check
-    // and a concurrent writer choosing the same output.
-    await fs.link(temporaryPath, outputAbsPath);
-  } catch (error) {
-    await fs.unlink(temporaryPath).catch(() => undefined);
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new Error('E_IMAGE_ASSET_EXISTS: workflow output_path already exists.');
-    }
-    throw error;
-  }
-  // The published path remains valid if temporary cleanup is interrupted.
-  await fs.unlink(temporaryPath).catch(() => undefined);
-  return {
-    output_path: outputAbsPath,
-    format: info.format,
-    width: info.width,
-    height: info.height,
-    channels: info.channels,
-    bytes: info.size,
-    engine: 'sharp',
-    model_calls: 0,
   };
 }

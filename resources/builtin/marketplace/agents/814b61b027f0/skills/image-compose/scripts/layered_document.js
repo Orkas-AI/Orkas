@@ -159,11 +159,22 @@ function verifyPsd(result, prepared) {
   }
   visit(result.children, prepared.children);
 }
-async function publish(file, bytes) {
+async function publish(file, bytes, layeredCandidate = false) {
   if (fs.existsSync(file) || fs.lstatSync(path.dirname(file), { throwIfNoEntry: false })?.isSymbolicLink()) fail('E_LAYERED_EXISTS', 'choose a new output path');
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
-  try { await fs.promises.writeFile(temporary, bytes, { flag: 'wx' }); await fs.promises.link(temporary, file); return await fs.promises.stat(file); }
+  try {
+    await fs.promises.writeFile(temporary, bytes, { flag: 'wx' });
+    const stats = await fs.promises.stat(temporary);
+    const manifest = process.env.ORKAS_OUTPUT_MANIFEST;
+    if (layeredCandidate && manifest) {
+      const record = { kind: 'image-studio-layered-candidate', path: file,
+        identity: `${stats.dev}:${stats.ino}:${stats.birthtimeMs}`, size: stats.size, sha256: hash(bytes) };
+      await fs.promises.appendFile(manifest, `${JSON.stringify(record)}\n`);
+    }
+    await fs.promises.link(temporary, file);
+    return stats;
+  }
   finally { await fs.promises.rm(temporary, { force: true }); }
 }
 
@@ -214,13 +225,13 @@ module.exports = async function layeredDocument({ args }) {
   check(await fileHash(documentPath) === prepared.documentHash, 'document changed during processing');
   if (request.op === 'render') {
     const receiptStat = await publish(receiptPath, Buffer.from(JSON.stringify({ schema_version: 1, fingerprint: prepared.fingerprint, preview_sha256: hash(bytes) })));
-    try { await publish(output, bytes); }
+    try { await publish(output, bytes, true); }
     catch (error) {
       const current = await fs.promises.lstat(receiptPath).catch(() => null);
       if (current?.ino === receiptStat.ino && current?.dev === receiptStat.dev) await fs.promises.unlink(receiptPath);
       throw error;
     }
-  } else await publish(output, bytes);
+  } else await publish(output, bytes, true);
   return { ok: true, op: request.op, output_path: output, width: prepared.width, height: prepared.height,
     layer_count: prepared.nodes.length, image_layer_count: prepared.imageCount, text_layer_count: prepared.textCount,
     structure_verified: request.op === 'export_psd', verification: request.op === 'export_psd' ? 'local_psd_readback' : 'local_render',

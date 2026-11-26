@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from 'undici';
 
 // Tests cover the parts that *aren't* obvious from reading the code:
 //   - pickImageGenProfile's filter/match contract (the OAuth-skip + capability
@@ -12,6 +13,7 @@ import * as path from 'node:path';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let previousDispatcher: Dispatcher | undefined;
 const TEST_UID = '99999999';
 
 beforeEach(async () => {
@@ -26,6 +28,13 @@ beforeEach(async () => {
 afterEach(async () => {
   const proxy = await import('../../../src/main/util/proxy-dispatcher');
   proxy._resetProxyRoutingForTests();
+  if (previousDispatcher) {
+    const fixtureDispatcher = getGlobalDispatcher();
+    setGlobalDispatcher(previousDispatcher);
+    previousDispatcher = undefined;
+    if (fixtureDispatcher !== getGlobalDispatcher()) await fixtureDispatcher.close();
+    vi.unstubAllEnvs();
+  }
   vi.unstubAllGlobals();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -417,6 +426,25 @@ describe('image_gen › generateImage', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('preserves a file written by another process while a reserved image was generating', async () => {
+    writeProfilesFile({}, [], [
+      { id: 'own', provider: 'doubao', model: 'doubao-seedream-5-0-flash-260915', apiKey: 'fixture', createdAt: 1 },
+    ]);
+    const outputAbsPath = path.join(tmpDir, 'reserved');
+    const finalPath = `${outputAbsPath}.png`;
+    const fetch = vi.fn(async () => {
+      fs.writeFileSync(finalPath, 'independent file');
+      return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const { generateImage } = await import('../../../src/main/features/image_gen');
+    expect(await generateImage({ prompt: 'A still', outputAbsPath, assertNewOutputPath: () => {} }))
+      .toMatchObject({ ok: false, errorCode: 'IO_ERROR' });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(finalPath, 'utf8')).toBe('independent file');
+    expect(fs.readdirSync(tmpDir).filter((name) => name.startsWith('reserved'))).toEqual(['reserved.png']);
   });
 });
 
@@ -1266,6 +1294,12 @@ describe('mixed references across public adapters', () => {
         return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }));
       });
       vi.stubGlobal('fetch', fetchMock);
+      previousDispatcher = getGlobalDispatcher();
+      vi.stubEnv('HTTPS_PROXY', 'http://proxy.example.test:8080');
+      vi.stubEnv('NO_PROXY', '');
+      vi.stubEnv('no_proxy', '');
+      const proxy = await import('../../../src/main/util/proxy-dispatcher');
+      expect(await proxy.installEnvProxyDispatcher()).toBe(true);
       const m = await import('../../../src/main/features/image_gen');
       const adapter = provider === 'openai' ? m.callOpenAIImage : provider === 'gemini' ? m.callGeminiImage
         : provider === 'doubao' ? m.callDoubaoImage : m.callOrkasImage;

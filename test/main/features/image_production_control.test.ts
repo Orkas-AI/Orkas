@@ -187,7 +187,7 @@ describe('ImageStudio generation control', () => {
       stateAbsPath: statePath,
       transactionId: first.transaction.transaction_id,
       ok: false,
-      errorCode: 'E_IMAGE_WORKFLOW_INPUT',
+      errorCode: 'E_IMAGE_PROVIDER_PREFLIGHT',
       countsTowardBudget: false,
     });
 
