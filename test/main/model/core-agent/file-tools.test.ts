@@ -868,7 +868,7 @@ describe('file-tools › read_file (image)', () => {
   it('reports the source canvas alongside the resized image returned to the model', async () => {
     const { tools, wsDir } = await buildTools();
     const file = path.join(wsDir, 'portrait.png');
-    const { default: sharp } = await import('sharp');
+    const { default: sharp } = await import('../../../helpers/fixture-sharp');
     const original = await sharp({ create: { width: 1200, height: 1500, channels: 3, background: '#324c69' } })
       .png().toBuffer();
     fs.writeFileSync(file, original);

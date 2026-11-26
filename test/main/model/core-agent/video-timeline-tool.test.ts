@@ -701,7 +701,7 @@ describe('video.render paths', () => {
 
 describe('video.check preview', () => {
   it('attaches readable frames only on request and reports when the attachment is unavailable', async () => {
-    const { default: sharp } = await import('sharp');
+    const { default: sharp } = await import('../../../helpers/fixture-sharp');
     const png = await sharp({ create: { width: 64, height: 32, channels: 3, background: 'red' } }).png().toBuffer();
     const previewFolders: string[] = [];
     let readable = true;
