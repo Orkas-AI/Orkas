@@ -18,6 +18,7 @@ const log = createLogger('browser-tool');
 const contract = require('../../../../bin/browser-tool-contract.cjs');
 const schema = z.object(contract.shape(z)).strict();
 const { $schema: _schemaVersion, ...inputSchema } = schemaToJson(schema);
+type BrowserSnapshot = Exclude<NonNullable<ToolResult['observations']>['browserObservation'], 'reset' | undefined>;
 
 export interface BrowserToolCallbacks {
   tabs: () => Promise<Record<string, unknown>> | Record<string, unknown>;
@@ -31,6 +32,7 @@ export interface BrowserToolCallbacks {
     tabId?: string,
     scope?: 'full' | 'meta',
     window?: { textOffset?: number; elementOffset?: number; frameId?: string; tokenBudget?: number },
+    onCompleteSnapshot?: (snapshot: BrowserSnapshot) => void,
   ) => Promise<Record<string, unknown>>;
   readValue: (input: { tabId?: string; pageId: string; elementRef: string; textOffset: number; action?: 'read_value' | 'options'; optionOffset?: number }, signal?: AbortSignal) => Promise<Record<string, unknown>>;
   act: (input: {
@@ -54,15 +56,16 @@ export interface BrowserToolCallbacks {
     condition: 'loaded' | 'text';
     text?: string;
     timeoutMs?: number;
-  }, signal?: AbortSignal) => Promise<Record<string, unknown>>;
+  }, signal?: AbortSignal, onWaitBoundary?: () => void) => Promise<Record<string, unknown>>;
   close: (tabId: string) => Promise<Record<string, unknown>> | Record<string, unknown>;
   retain: (tabId: string, retention: 'deliverable' | 'handoff' | 'temporary') => Promise<Record<string, unknown>> | Record<string, unknown>;
 }
 
-function output(data: Record<string, unknown>): { content: string; isError?: true } {
+function output(data: Record<string, unknown>, browserObservation?: BrowserSnapshot | 'reset'): ToolResult {
   return {
     content: JSON.stringify(data),
     ...(data.ok === false ? { isError: true as const } : {}),
+    ...(browserObservation ? { observations: { browserObservation } } : {}),
   };
 }
 
@@ -102,7 +105,7 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
           if (label && label.length > 120) return error('`label` must be at most 120 characters');
           return output(await callbacks.open({ url, ...(label ? { label } : {}),
             ...(input.retention ? { retention: input.retention as BrowserTabRetention } : {}),
-          }));
+          }), 'reset');
         }
         if (operation === 'navigate') {
           const navigation = String(input.navigation || '').trim();
@@ -113,7 +116,7 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
             ...(tabId ? { tabId } : {}),
             action: navigation as 'goto' | 'back' | 'forward' | 'reload',
             ...(url ? { url } : {}),
-          }));
+          }), navigation === 'reload' ? undefined : 'reset');
         }
         if (operation === 'screenshot') {
           if (!callbacks.screenshot) return error('Screenshots are unavailable');
@@ -121,7 +124,7 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
         }
         if (operation === 'choose_files') {
           if (!callbacks.chooseFiles) return error('File selection is unavailable');
-          return output(await callbacks.chooseFiles(input.directory === true, context?.signal));
+          return output(await callbacks.chooseFiles(input.directory === true, context?.signal), 'reset');
         }
         if (operation === 'observe') {
           const scope = optionalString(input.scope) || 'full';
@@ -140,8 +143,11 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
             offsets[field] = parsed;
           }
           if (scope === 'full') {
-            return await withRetrievalBudget({ ...context, state: context?.state ?? {} }, async (_ctx, budget) =>
-              output(await callbacks.observe(tabId, 'full', { ...offsets, tokenBudget: budget })));
+            return await withRetrievalBudget({ ...context, state: context?.state ?? {} }, async (_ctx, budget) => {
+              let snapshot: BrowserSnapshot | 'reset' = 'reset';
+              const data = await callbacks.observe(tabId, 'full', { ...offsets, tokenBudget: budget }, evidence => { snapshot = evidence; });
+              return output(data, snapshot);
+            });
           }
           return output(await callbacks.observe(tabId, 'meta', offsets));
         }
@@ -190,7 +196,7 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
             ...(pageAction === 'upload' ? { filePaths: input.file_paths as string[] } : {}),
             ...(typeof input.text === 'string' ? { text: input.text } : {}),
             ...(direction ? { direction: direction as 'up' | 'down' | 'top' | 'bottom' | 'left' | 'right' } : {}),
-          }, context?.signal));
+          }, context?.signal), 'reset');
         }
         if (operation === 'wait') {
           const condition = String(input.wait_condition || 'loaded').trim();
@@ -202,21 +208,23 @@ export function buildBrowserTool(callbacks: BrowserToolCallbacks): AgentTool {
           if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 250 || timeout > 15_000)) {
             return error('`timeout_ms` must be an integer from 250 to 15000');
           }
-          return output(await callbacks.wait({
+          let reset = condition === 'text';
+          const data = await callbacks.wait({
             ...(tabId ? { tabId } : {}),
             condition,
             ...(text ? { text } : {}),
             ...(timeout !== undefined ? { timeoutMs: timeout } : {}),
-          }, context?.signal));
+          }, context?.signal, () => { reset = true; });
+          return output(data, reset ? 'reset' : undefined);
         }
         if (!tabId) return error(`\`tab_id\` is required for ${operation}`);
         if (operation === 'retain') {
           if (input.retention !== 'deliverable' && input.retention !== 'handoff' && input.retention !== 'temporary') {
             return error('`retention` must be deliverable, handoff or temporary');
           }
-          return output(await callbacks.retain(tabId, input.retention));
+          return output(await callbacks.retain(tabId, input.retention), input.retention === 'handoff' ? 'reset' : undefined);
         }
-        return output(await callbacks.close(tabId));
+        return output(await callbacks.close(tabId), 'reset');
       } catch {
         log.warn('browser operation failed', { operation });
         return error('The task browser operation failed');
@@ -241,7 +249,8 @@ export function buildConversationBrowserTool(uid: string, cid: string, isActive:
     tabs: () => withBrowser(web => web.listModelWebAssistTabs(uid, cid)),
     open: input => withBrowser(web => web.openModelWebAssist(uid, cid, input)),
     navigate: input => withBrowser(web => web.navigateModelWebAssist(uid, cid, input)),
-    observe: (tabId, scope, window) => withBrowser(web => web.observeModelWebAssist(uid, cid, tabId, scope, window)),
+    observe: (tabId, scope, window, onCompleteSnapshot) =>
+      withBrowser(web => web.observeModelWebAssist(uid, cid, tabId, scope, window, onCompleteSnapshot)),
     screenshot: async (input, signal) => {
       if (ended()) return output({ ok: false, code: 'task_run_ended' });
       const web = await import('../web_assist');
@@ -255,9 +264,9 @@ export function buildConversationBrowserTool(uid: string, cid: string, isActive:
     act: (input, signal) => withBrowser(web => web.actOnModelWebAssist(uid, cid, input, {
       signal, isActive: () => !ended(),
     })),
-    wait: (input, signal) => withBrowser(web => web.waitForModelWebAssist(uid, cid, input, {
+    wait: (input, signal, onWaitBoundary) => withBrowser(web => web.waitForModelWebAssist(uid, cid, input, {
       signal, isActive: () => !ended(),
-    })),
+    }, onWaitBoundary)),
     close: tabId => withBrowser(web => web.closeModelWebAssistTab(uid, cid, tabId)),
     retain: (tabId, retention) => withBrowser(web => web.retainModelWebAssistTab(uid, cid, tabId, retention)),
   });

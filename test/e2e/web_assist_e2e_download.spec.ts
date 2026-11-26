@@ -38,6 +38,11 @@ for (const kind of ['blob', 'data']) {
       const trigger = () => orkas.electronApp!.evaluate(async ({ webContents }, id) => {
         await webContents.fromId(id)!.executeJavaScript('document.getElementById("export").click(); void 0', true);
       }, nativeId);
+      const details = () => page.locator('#conversation-info-panel');
+      const attachmentsTab = () => details().locator('[data-info-tab="attachments"]');
+      const downloadedRow = () => details().locator('.ci-attach-row[data-attachment-name="site-export.csv"]');
+      if (kind === 'data') await attachmentsTab().click();
+      await expect(page.locator('#conversation-info-tab-count-attachments')).toBeEmpty();
       await trigger();
       const prompt = page.locator('.web-assist-download-prompt');
       await expect(prompt).toBeHidden();
@@ -47,6 +52,10 @@ for (const kind of ['blob', 'data']) {
       expect(readFileSync(file.path, 'utf8')).toBe(csv);
       expect(JSON.parse(readFileSync(join(dirname(file.path), '.generated-attachments.json'), 'utf8'))).toEqual(['site-export.csv']);
       expect((await orkas.invoke<any>('conversations.attachments.list', { cid })).items).toEqual([]);
+      await expect(page.locator('#conversation-info-tab-count-attachments')).toHaveText('1');
+      if (kind === 'blob') await attachmentsTab().click();
+      await expect(downloadedRow()).toBeVisible();
+      await details().screenshot({ path: testInfo.outputPath('download-in-attachments.png') });
       await expect(prompt).toBeHidden();
       await page.locator('#conversation-info-close').click();
       await page.locator('#chat-input').fill('Analyze the concentrated downloads.');
@@ -69,6 +78,10 @@ for (const kind of ['blob', 'data']) {
       page = await orkas.relaunch();
       await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
       await expect(page.locator('#chat-attachments .chat-attach-chip')).toHaveCount(2);
+      await page.locator('#conversation-info-toggle').click();
+      await attachmentsTab().click();
+      await expect(downloadedRow()).toBeVisible();
+      await page.locator('#conversation-info-close').click();
       await page.locator('#chat-input').fill('Use the two files I selected.');
       await page.locator('#chat-send-btn').click();
       const second = page.locator('#chat-history .chat-message.user').nth(1);

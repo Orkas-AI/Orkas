@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test as base, OrkasTestApp } from './fixtures/orkas';
 import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
@@ -108,6 +108,162 @@ test('a removed iframe cannot discard a pending root file upload', async ({ orka
     writeFileSync(info.outputPath('retired-frame-upload.json'), JSON.stringify(result, null, 2));
     expect(result).toEqual({ retained: true, attached: true, count: 1, uploadCommands: 1 });
     await expect.poll(() => receipts).toEqual(['retained-upload-字节']);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('hidden task browser uploads directories from a cross-origin frame without surfacing the window', async ({ orkas }) => {
+  const received: Array<{ label: string; changes: number; file: string; directoryPath: string; body: string }> = [];
+  const server = createServer((request, response) => {
+    if (request.url === '/receipt') {
+      const chunks: Buffer[] = [];
+      request.on('data', chunk => chunks.push(chunk));
+      request.on('end', () => {
+        received.push({ label: String(request.headers['x-control']), changes: Number(request.headers['x-changes']),
+          file: decodeURIComponent(String(request.headers['x-file'])),
+          directoryPath: decodeURIComponent(String(request.headers['x-relative-path'])), body: Buffer.concat(chunks).toString() });
+        response.writeHead(204).end();
+      });
+      return;
+    }
+    response.setHeader('Content-Type', 'text/html');
+    const port = (server.address() as { port: number }).port;
+    if (request.url !== '/child') {
+      response.end(`<!doctype html><iframe src="http://localhost:${port}/child"></iframe>`);
+      return;
+    }
+    response.end(`<!doctype html><input type="file" webkitdirectory aria-label="Folder">
+      <button id="submit">Submit selected folder</button><button id="detach">Detached folder</button>
+      <script>
+        function watch(input, label, sendOnChange) {
+          let changes = 0;
+          const send = async () => {
+            for (const file of input.files) await fetch('/receipt', { method: 'POST', body: file,
+              headers: { 'X-Control': label, 'X-Changes': String(changes), 'X-File': encodeURIComponent(file.name),
+                'X-Relative-Path': encodeURIComponent(file.webkitRelativePath) } });
+          };
+          input.addEventListener('change', () => {
+            changes++;
+            if (sendOnChange) void send();
+          });
+          return send;
+        }
+        document.getElementById('submit').onclick = watch(document.querySelector('input'), 'connected', false);
+        document.getElementById('detach').onclick = () => {
+          const input = document.createElement('input');
+          input.type = 'file'; input.webkitdirectory = true;
+          watch(input, 'detached', true); input.click();
+        };
+      </script>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '::', resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/`;
+  const root = path.resolve(__dirname, '../..');
+  const folder = path.join(orkas.userWorkspaceRoot, 'selected-folder');
+  mkdirSync(path.join(folder, '子目录'), { recursive: true });
+  writeFileSync(path.join(folder, '子目录', 'café.txt'), 'exact folder receipt 字节');
+  // Directory enumeration returns the on-disk spelling, which differs between HFS+ and APFS.
+  const [filename] = readdirSync(path.join(folder, '子目录'));
+  expect(filename.normalize('NFC')).toBe('café.txt');
+  const cid = (await orkas.invoke<any>('conversations.create', { title: 'Background folder upload' })).conversation.conversation_id;
+  try {
+    await orkas.electronApp!.evaluate(async ({ BrowserWindow }, { root, cid }) => {
+      const req = (process as any).mainModule.require;
+      const owner = BrowserWindow.getAllWindows()[0];
+      owner.hide();
+      const windowEvents: string[] = [];
+      owner.on('show', () => windowEvents.push('show'));
+      owner.on('focus', () => windowEvents.push('focus'));
+      (globalThis as any).__backgroundFolderWindowEvents = windowEvents;
+      req(root + '/src/main/features/web_assist.ts').bindWebAssistConversation('account-e2e', cid, owner.webContents);
+      req(root + '/src/main/features/web_assist_lifecycle.ts').beginBrowserTaskRun('account-e2e', cid, 'background-folders');
+      (globalThis as any).__backgroundFolderTool = req(root + '/src/main/features/group_chat/browser_tool.ts').buildConversationBrowserTool('account-e2e', cid);
+    }, { root, cid });
+    const call = (input: Record<string, unknown>): Promise<any> => orkas.electronApp!.evaluate(async (_electron, input) => {
+      const result = await (globalThis as any).__backgroundFolderTool.execute(input, {});
+      return JSON.parse(result.content);
+    }, input);
+    const tab = (await call({ operation: 'open', url })).active_tab_id;
+    expect(await call({ operation: 'wait', tab_id: tab })).toMatchObject({ ok: true });
+    let childFrameId: string | undefined;
+    // The top-level page may be ready before the cross-origin control is observable.
+    await expect.poll(async () => {
+      const main = await call({ operation: 'observe', tab_id: tab });
+      const frame = main.frames?.find((item: any) => item.display_url.endsWith('/child'));
+      if (!frame) return false;
+      const child = await call({ operation: 'observe', tab_id: tab, frame_id: frame.frame_id });
+      if (!child.elements?.some((item: any) => item.label === 'Folder')) return false;
+      childFrameId = frame.frame_id;
+      return true;
+    }).toBe(true);
+    const observe = () => call({ operation: 'observe', tab_id: tab, frame_id: childFrameId });
+    const act = (observation: any, element_ref: string, page_action: string, file_paths?: string[]) => call({
+      operation: 'act', tab_id: tab, page_id: observation.page_id, element_ref, page_action, file_paths,
+    });
+    const visibility = () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }, url) => {
+      const owner = BrowserWindow.getAllWindows().find(win => win.contentView.children.some(view =>
+        view instanceof WebContentsView && view.webContents.getURL() === url))!;
+      const view = owner.contentView.children.find(item => item instanceof WebContentsView && item.webContents.getURL() === url)!;
+      return { window: owner.isVisible(), view: view.getVisible(), windowCount: BrowserWindow.getAllWindows().length,
+        events: (globalThis as any).__backgroundFolderWindowEvents };
+    }, url);
+    const before = await visibility();
+    expect(before).toMatchObject({ window: false, view: false, events: [] });
+    expect(await orkas.electronApp!.evaluate(({ webContents }, url) => {
+      const contents = webContents.getAllWebContents().find(item => item.getURL() === url)!;
+      return contents.mainFrame.frames[0].executeJavaScript(`
+        [typeof require, typeof process, typeof __orkasReceiveDirectory, typeof orkas]
+      `);
+    }, url)).toEqual(Array(4).fill('undefined'));
+    // Observe the real target tab separately from the offscreen enumerator.
+    // File bytes arriving alone do not certify native access in the receiver.
+    const needsNativeAccess = process.platform === 'darwin' || process.platform === 'win32';
+    if (needsNativeAccess) await orkas.electronApp!.evaluate(({ webContents }, { url, file }) => {
+      const target = webContents.getAllWebContents().find(contents => contents.getURL() === url)!;
+      const send = target.debugger.sendCommand.bind(target.debugger);
+      const fs = (process as any).mainModule.require('node:fs');
+      (globalThis as any).__directoryFileAuthorized = false;
+      target.debugger.sendCommand = (async (method: string, params: any, sessionId?: string) => {
+        const result = await send(method, params, sessionId);
+        if (method === 'DOM.setFileInputFiles' && params.files?.length === 1
+            && fs.realpathSync(params.files[0]) === fs.realpathSync(file)) {
+          (globalThis as any).__directoryFileAuthorized = true;
+        }
+        return result;
+      }) as typeof target.debugger.sendCommand;
+    }, { url, file: path.join(folder, '子目录', filename) });
+    const direct = await observe();
+    const folderRef = direct.elements.find((item: any) => item.label === 'Folder').ref;
+    expect(await act(direct, folderRef, 'upload', [root])).toMatchObject({ ok: false, code: 'upload_files_unavailable' });
+    expect(received).toHaveLength(0);
+    const uploaded = await act(direct, folderRef, 'upload', [folder]);
+    expect(uploaded, JSON.stringify(uploaded)).toMatchObject({ ok: true, file_count: 1 });
+    if (needsNativeAccess) {
+      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__directoryFileAuthorized)).toBe(true);
+    }
+    expect(await visibility()).toEqual(before);
+    expect(received).toHaveLength(0);
+    const same = await observe();
+    expect(await act(same, same.elements.find((item: any) => item.label === 'Folder').ref, 'upload', [folder]))
+      .toMatchObject({ ok: false, code: 'upload_cancelled' });
+    // The page can read the original file even after the offscreen source is gone.
+    const submit = await observe();
+    expect(await act(submit, submit.elements.find((item: any) => item.label === 'Submit selected folder').ref, 'click'))
+      .toMatchObject({ ok: true });
+    const receipt = { changes: 1, file: filename, directoryPath: `selected-folder/子目录/${filename}`, body: 'exact folder receipt 字节' };
+    await expect.poll(() => received).toEqual([{ label: 'connected', ...receipt }]);
+    const afterUpload = await observe();
+    expect(await act(afterUpload, afterUpload.elements.find((item: any) => item.label === 'Detached folder').ref, 'click'))
+      .toMatchObject({ ok: true });
+    await expect.poll(() => call({ operation: 'observe', tab_id: tab })).toMatchObject({ dialog_type: 'file_chooser' });
+    const pending = await call({ operation: 'observe', tab_id: tab });
+    const selection = await act(pending, pending.elements[0].ref, 'upload', [folder]);
+    expect(selection, JSON.stringify(selection)).toMatchObject({ ok: true, file_count: 1 });
+    expect(await act(pending, pending.elements[0].ref, 'upload', [folder])).toMatchObject({ ok: false, code: 'stale_page' });
+    await expect.poll(() => received).toEqual([{ label: 'connected', ...receipt }, { label: 'detached', ...receipt }]);
+    expect(await visibility()).toEqual(before);
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
