@@ -137,7 +137,7 @@ const MAC_LOCALIZED_METADATA_CONTRACT = Object.freeze([
     directory: "hi.lproj",
     values: Object.freeze({
       NSBluetoothAlwaysUsageDescription: "Orkas ब्लूटूथ से पुष्टि करता है कि आपकी पासकी वाला फ़ोन पास में है।",
-      NSMicrophoneUsageDescription: "Orkas वॉइस इनपुट और आपके अनुमति दिए गए वेबसाइटों के लिए माइक्रोफ़ोन का उपयोग करता है।",
+      NSMicrophoneUsageDescription: "Orkas वॉइस इनपुट के लिए और आपकी अनुमति वाली वेबसाइटों पर माइक्रोफ़ोन का उपयोग करता है।",
       NSCameraUsageDescription: "Orkas आपकी अनुमति से वेबसाइटों को कैमरा इस्तेमाल करने देता है।",
     }),
   }),
@@ -179,6 +179,14 @@ const MAC_LOCALIZED_METADATA_CONTRACT = Object.freeze([
       NSBluetoothAlwaysUsageDescription: "Orkas 使用藍牙確認儲存通行密鑰的手機在附近。",
       NSMicrophoneUsageDescription: "Orkas 使用麥克風進行語音輸入，並供你授權的網站使用。",
       NSCameraUsageDescription: "Orkas 經你允許後，讓網站使用攝影機。",
+    }),
+  }),
+  Object.freeze({
+    directory: "pt-BR.lproj",
+    values: Object.freeze({
+      NSBluetoothAlwaysUsageDescription: "O Orkas usa o Bluetooth para verificar se o celular com a sua chave de acesso está por perto.",
+      NSCameraUsageDescription: "O Orkas permite que os sites usem a câmera com a sua permissão.",
+      NSMicrophoneUsageDescription: "O Orkas usa o microfone para a entrada de voz e permite que os sites que você autorizar também o utilizem.",
     }),
   }),
   Object.freeze({

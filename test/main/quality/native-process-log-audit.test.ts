@@ -261,7 +261,7 @@ describe('native process log capture', () => {
 
   it('binds WebKit media parsing to the actual unchanged browser actor and byte-exact child', async () => {
     const root = directory(), audit = begin(root), actor = {}, options = { headless: true }, receiver: any[] = [];
-    const text = '[WebKitWin:Media:-] MediaSessionManagerInterface::sessionWillBeginPlayback(0) 17\n'
+    const text = '[WebKitWin:Media:-] MediaSessionManagerInterface::startSessionAdmission(0) 17\n'
       + '[WebKitWin:Media:-] MediaSessionManagerInterface::dumpSessionStates(0)  Sessions:\n(abc): VideoAudio, Playing, \n';
     const browserType = { name: () => 'webkit', launch: async function (received: unknown) {
       receiver.push(this, received); const child = launch(`process.stderr.write(${JSON.stringify(text)});`);

@@ -73,11 +73,14 @@ function validateCommitMetadata(message, files, producerFiles = []) {
     problems.push('missing complete Prompt audit metadata');
   }
 
-  if ((promptFiles.some(isSystemPromptSourcePath) || producerFiles.length > 0)
-    && (!/^Prompt confirmation:/m.test(message)
-      || !/^[ \t]*-?[ \t]*Confirmed-by:[ \t]*\S/m.test(message)
-      || !/^[ \t]*Scope:[ \t]*\S/m.test(message))) {
-    problems.push('missing scoped Prompt confirmation metadata');
+  if (promptFiles.some(isSystemPromptSourcePath) || producerFiles.length > 0) {
+    const hasScopedConfirmation = /^Prompt confirmation:/m.test(message)
+      && /^[ \t]*-?[ \t]*Confirmed-by:[ \t]*\S/m.test(message)
+      && /^[ \t]*Scope:[ \t]*\S/m.test(message);
+    const hasEquivalenceRecord = /^[ \t]*-?[ \t]*Behavior preserved:[ \t]*\S/m.test(message);
+    if (!hasScopedConfirmation && !hasEquivalenceRecord) {
+      problems.push('missing scoped Prompt confirmation or Behavior preserved metadata');
+    }
   }
   return problems;
 }

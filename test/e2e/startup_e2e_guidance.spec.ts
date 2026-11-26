@@ -63,6 +63,8 @@ test('startup setting starts off with the accepted copy and persists across dire
   expect(existsSync(device(orkas)) ? JSON.parse(readFileSync(device(orkas), 'utf8')).desktop?.background_enabled : undefined).toBeUndefined();
 });
 test('tab entry prompts only for enabled automation; Not now persists once without enabling or showing a native window', async ({ orkas }, info) => {
+  // This journey includes two cold Electron launches and a graceful quit.
+  test.setTimeout(120_000);
   const page = orkas.page!; await isolatedOS(orkas);
   await orkas.invoke('config.setLanguage', { language: 'zh' }); await page.reload();
   const native = await orkas.electronApp!.browserWindow(page);
