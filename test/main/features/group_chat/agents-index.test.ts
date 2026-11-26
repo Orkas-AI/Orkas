@@ -419,7 +419,8 @@ describe('Commander shell context', () => {
       if (interpreter) {
         const bash = createLocalTools({ hostPlatform: platform }).find(tool => tool.name === 'bash');
         expect(bash?.description).toContain(interpreter);
-        const osContext = prompt.split('### OS\n')[1].split('### Environment')[0];
+        const osContext = /^### OS\r?\n([\s\S]*?)(?=^### Environment\b)/m.exec(prompt)?.[1];
+        expect(osContext, 'the Commander prompt includes the OS section').toBeDefined();
         expect(osContext).toContain(interpreter);
         expect(osContext).not.toContain('do not use POSIX `&&`');
         if (override?.includes('\\')) expect(prompt).not.toContain(override);
