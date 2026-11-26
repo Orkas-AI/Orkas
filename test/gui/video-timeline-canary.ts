@@ -229,7 +229,28 @@ function buildCases(root: string, clipFile: string): Case[] {
         await Promise.all([compiled.writeManifest(manifest(scenes)), reference.writeManifest(manifest(scenes))]);
         await reference.writePage(page(scenes.map(({ id }) => `<section data-scene-id="${id}"></section>`).join('')));
         const progress: Array<{ data?: { sceneId?: string; directCut?: boolean; directCutFallback?: boolean } }> = [];
-        const direct = await timelineApi.renderVideoTimeline({ ...compiled.renderOptions(), onProgress: (event: typeof progress[number]) => progress.push(event) });
+        const encoderErrors = path.join(root, 'direct-cut-encoder-stderr');
+        const bundled = process.env.ORKAS_BUNDLED_FFMPEG;
+        if (process.platform === 'linux') {
+          const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+          const wrapper = path.join(root, 'direct-cut-encoder');
+          await fs.writeFile(wrapper, [
+            '#!/bin/sh',
+            'case " $* " in',
+            '  *" -enc_time_base "*)',
+            `    ${quote(ffmpeg)} "$@" 2> ${quote(encoderErrors)}.$$`,
+            '    result=$?',
+            `    cat ${quote(encoderErrors)}.$$ >&2`,
+            '    exit "$result" ;;',
+            'esac',
+            `exec ${quote(ffmpeg)} "$@"`,
+          ].join('\n') + '\n', { mode: 0o700 });
+          process.env.ORKAS_BUNDLED_FFMPEG = wrapper;
+        }
+        const direct = await timelineApi.renderVideoTimeline({ ...compiled.renderOptions(), onProgress: (event: typeof progress[number]) => progress.push(event) }).finally(() => {
+          if (bundled === undefined) delete process.env.ORKAS_BUNDLED_FFMPEG;
+          else process.env.ORKAS_BUNDLED_FFMPEG = bundled;
+        });
         const rendered = await timelineApi.renderVideoTimeline(reference.renderOptions());
         assertWindow(rendered);
         if (!direct.ok || !rendered.ok) return [`render failed: ${direct.message || rendered.message}`];
@@ -244,7 +265,9 @@ function buildCases(root: string, clipFile: string): Case[] {
           const summary = versions.map(result => result.stdout.toString().split(/\r?\n/, 1)[0]);
           const data = probe.code === 0 ? JSON.parse(probe.stdout.toString()) : undefined;
           if (data?.format) delete data.format.filename;
-          failures.push(`direct-cut fixture: ${JSON.stringify({ versions: summary, probeExit: probe.code, stream: data?.streams?.[0], format: data?.format })}`);
+          const stderrFiles = (await fs.readdir(root)).filter(name => /^direct-cut-encoder-stderr\.\d+$/.test(name));
+          const errors = await Promise.all(stderrFiles.map(async (name) => (await fs.readFile(path.join(root, name), 'utf8')).replaceAll(root, '<fixture>').slice(-1000)));
+          failures.push(`direct-cut fixture: ${JSON.stringify({ versions: summary, probeExit: probe.code, stream: data?.streams?.[0], format: data?.format, errors })}`);
         }
         const readOutput = async (file: string, args: string[]) => {
           const decoded = await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', file, ...args, 'pipe:1']);

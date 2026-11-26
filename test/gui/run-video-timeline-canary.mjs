@@ -18,7 +18,7 @@ const env = { ...process.env, ELECTRON_RUN_AS_NODE: '',
   ORKAS_WORKSPACE_ROOT: data,
   ORKAS_GUI_TEST_USER_DATA_DIR: path.join(root, 'chromium'),
   ORKAS_GUI_TEST_RUNNER: path.join(here, 'video-timeline-canary.ts'),
-  ORKAS_VIDEO_TIMELINE_CASE: '',
+  ORKAS_VIDEO_TIMELINE_CASE: process.env.ORKAS_VIDEO_TIMELINE_CASE || '',
   ORKAS_VIDEO_TIMELINE_PERF: process.argv.includes('--perf') ? '1' : '',
 };
 const child = spawn(require('electron'), [path.join(here, 'electron-main.mjs')], {

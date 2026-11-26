@@ -71,6 +71,11 @@ jobs:
       - name: Prepare and verify built-in Linux dependencies
         run: node scripts/ensure-dev-dependencies.cjs
 
+      - name: Diagnose the native resized direct-cut route
+        env:
+          ORKAS_VIDEO_TIMELINE_CASE: a resized direct cut preserves non-keyframe edits
+        run: dbus-run-session -- xvfb-run --auto-servernum node test/gui/run-video-timeline-canary.mjs
+
       - name: Run Linux platform-native test lane
         run: |
           dbus-run-session -- xvfb-run --auto-servernum bash -eu -c '
