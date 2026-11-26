@@ -41,8 +41,8 @@ resources but isolates storage and disables host services; verify business
 actions in the running app.
 
 Read `unsupported` in the reference for excluded families and reasons. Shell,
-Skill execution, project/history/memory access and editing selected original
-files have no v1 adapter. Declared tasks run a private app-owned Studio session,
+Skill execution, project/history/memory access, direct media generation
+and editing selected original files have no v1 adapter. Declared tasks run a private app-owned Studio session,
 with its existing plan and spending gates.
 
 ## Failure and lifecycle

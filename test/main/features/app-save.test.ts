@@ -57,10 +57,14 @@ describe('Commander application save contract', () => {
     expect(tool.name).toBe('save_app');
     expect(tool.executionMode).not.toBe('parallel');
     expect((tool.inputSchema as any).properties.action.description).toBe('Both actions require exactly one source: artifact_id or path. Inspect returns the bound saved destination and its revision without saving.');
-    const first = await artifacts.createArtifact(uid, cid, 'maker', { title: 'Quote', files: [
+    const title = 'Budget Tracker';
+    const first = await artifacts.createArtifact(uid, cid, 'maker', { title, files: [
       { path: 'index.html', content: '<h1>Version one</h1>' }, { path: 'logo.png', content: 'AQID', encoding: 'base64' },
     ] });
     if (!first.ok) throw new Error(first.error);
+    expect(await call({ action: 'save', artifact_id: title, mode: 'auto' }))
+      .toMatchObject({ status: 'blocked', code: 'app_save_input' });
+    expect(saved.listSavedApps(uid)).toEqual([]);
     const source = { artifact_id: first.artifactId };
     expect(await call({ ...source, action: 'inspect' })).toMatchObject({ status: 'ready', target: null });
     expect(saved.listSavedApps(uid)).toEqual([]);
@@ -97,6 +101,30 @@ describe('Commander application save contract', () => {
     expect(saved.resolveSavedAppIndex(uid, created.app.id).ok).toBe(true);
     expect(fs.readFileSync(path.join(appDir(created.app.id), 'quote.html'), 'utf8')).toContain('Two');
     expect(fs.readFileSync(path.join(appDir(created.app.id), 'style.css'), 'utf8')).toBe('h1{color:blue}');
+  });
+
+  it('saves a complete workspace catalog without passing the application contents through model output', async () => {
+    const { call, saved } = await setup();
+    const folder = path.join(workspace, 'catalog');
+    fs.mkdirSync(folder);
+    const html = '<title>Catalog</title><script src="./catalog.js"></script><main id="catalog"></main>';
+    const entries = Array.from({ length: 376 }, (_, index) => ({
+      id: index + 1,
+      label: `Catalog entry ${index + 1}`,
+      description: 'A synthetic catalog item used to verify that the application save retains every record.',
+    }));
+    const catalog = `window.catalog = ${JSON.stringify(entries)};`;
+    expect(Buffer.byteLength(catalog)).toBeGreaterThan(48 * 1024);
+    fs.writeFileSync(path.join(folder, 'index.html'), html);
+    fs.writeFileSync(path.join(folder, 'catalog.js'), catalog);
+
+    const result = await call({ path: 'catalog' });
+
+    expect(result).toMatchObject({ ok: true, status: 'saved', action: 'created',
+      navigation: { surface_id: 'apps', action: 'configure' } });
+    expect(saved.listSavedApps(uid).map(app => app.id)).toEqual([result.app.id]);
+    expect(fs.readFileSync(path.join(appDir(result.app.id), 'index.html'), 'utf8')).toBe(html);
+    expect(fs.readFileSync(path.join(appDir(result.app.id), 'catalog.js'), 'utf8')).toBe(catalog);
   });
 
   it('rejects stale revisions, wrong destinations and deleted update targets without creating applications', async () => {

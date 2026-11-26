@@ -207,13 +207,22 @@ test('SDK inference survives initial document load and a throwing progress consu
     </script></body></html>`);
   orkas.createWorkspaceFile('load-race/load-gate.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>');
   orkas.createWorkspaceFile('load-race/orkas-app.json', JSON.stringify({ sdkVersion: 1, capabilities: ['ai'] }));
-  await orkas.electronApp!.evaluate(({ dialog }) => { (dialog as any).showMessageBox = async () => ({ response: 1, checkboxChecked: false }); });
+  const installDialogStub = () => orkas.electronApp!.evaluate(({ dialog }) => {
+    (dialog as any).showMessageBox = async () => ({ response: 1, checkboxChecked: false });
+  });
+  try {
+    await installDialogStub();
+  } catch (error) {
+    // Inspector delivery can drop this result. Reapplying this assignment is safe.
+    if (!(error instanceof Error) || error.message !== 'electronApplication.evaluate: Resulting promise was garbage collected.') throw error;
+    await installDialogStub();
+  }
   orkas.setModelMode('controlled-slow');
   const app: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'Loading notebook' });
   await openSidebarEntry(orkas.page, '#apps-btn');
-  const preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());
-  const frame = preview.locator('.saved-app-viewer-frame').contentFrame();
   try {
+    const preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());
+    const frame = preview.locator('.saved-app-viewer-frame').contentFrame();
     await expect.poll(() => requested).toBe(true);
     await expect.poll(() => orkas.modelRequests.length).toBe(1);
     expect(await frame.locator('body').evaluate(() => (window as any).finishedLoading)).toBe(false);
