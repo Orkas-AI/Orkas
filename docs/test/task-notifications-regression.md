@@ -37,6 +37,11 @@ sidebar-only: next to the Tasks/Projects section labels, the owning project,
 and each unread task row. No project header, project tab, or content task list
 may mirror those dots.
 
+On macOS, confirm that no Dock badge appears when a task finishes while a
+native sheet is open in active Orkas. Then minimize or hide all windows and
+confirm that a background completion raises the badge. Restore a visible window
+and confirm the badge clears.
+
 ## Scenario matrix
 
 | User goal / scenario | Starting state and variation | Expected observable outcome | Consequential failure and recovery | Layer and independent oracle | Current risk or coverage gap |

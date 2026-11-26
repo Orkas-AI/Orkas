@@ -756,14 +756,12 @@ const ConversationInfo = (() => {
     const seq = ++_attachmentSeq;
     try {
       const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments?scope=all`);
-      // Either entry may supply inventory. Only a successful read supersedes it.
+      if (!Array.isArray(data.items)) throw new Error('Invalid attachment inventory');
+      // Only a successful read supersedes confirmed inventory in this task.
       if (seq <= _appliedAttachmentSeq || target !== _cid) return;
       _appliedAttachmentSeq = seq;
-      _attachmentInventoryConfirmed = Array.isArray(data.items);
-      _snapshot = {
-        ..._snapshot,
-        attachments: Array.isArray(data.items) ? data.items : [],
-      };
+      _attachmentInventoryConfirmed = true;
+      _snapshot = { ..._snapshot, attachments: data.items };
       if (_activeTab === 'attachments') _renderBody();
       else _refreshTabCounts();
     } catch (err) {

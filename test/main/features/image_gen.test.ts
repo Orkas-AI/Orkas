@@ -13,8 +13,18 @@ import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from 'undic
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let previousDispatcher: Dispatcher | undefined;
 const TEST_UID = '99999999';
+
+let previousDispatcher: Dispatcher | undefined;
+
+async function routeReferenceFixtureThroughProxy(): Promise<void> {
+  previousDispatcher = getGlobalDispatcher();
+  vi.stubEnv('HTTPS_PROXY', 'http://proxy.example.test:8080');
+  vi.stubEnv('NO_PROXY', '');
+  vi.stubEnv('no_proxy', '');
+  const proxy = await import('../../../src/main/util/proxy-dispatcher');
+  expect(await proxy.installEnvProxyDispatcher()).toBe(true);
+}
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-imggen-'));
@@ -1294,12 +1304,7 @@ describe('mixed references across public adapters', () => {
         return new Response(JSON.stringify({ data: [{ b64_json: PNG_B64 }] }));
       });
       vi.stubGlobal('fetch', fetchMock);
-      previousDispatcher = getGlobalDispatcher();
-      vi.stubEnv('HTTPS_PROXY', 'http://proxy.example.test:8080');
-      vi.stubEnv('NO_PROXY', '');
-      vi.stubEnv('no_proxy', '');
-      const proxy = await import('../../../src/main/util/proxy-dispatcher');
-      expect(await proxy.installEnvProxyDispatcher()).toBe(true);
+      await routeReferenceFixtureThroughProxy();
       const m = await import('../../../src/main/features/image_gen');
       const adapter = provider === 'openai' ? m.callOpenAIImage : provider === 'gemini' ? m.callGeminiImage
         : provider === 'doubao' ? m.callDoubaoImage : m.callOrkasImage;

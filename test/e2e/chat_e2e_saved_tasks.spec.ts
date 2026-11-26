@@ -2,13 +2,13 @@ import { openSidebarEntry, expect, test } from './fixtures/orkas';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-
 test('opens completed todos at full column width from the conversation header', async ({ orkas: app }, testInfo) => {
   const page = app.page!;
   const { conversation } = await app.invoke<any>('conversations.create', { title: 'Review release readiness' });
   const cid = conversation.conversation_id;
   const content = 'Review release readiness and confirm the remaining rollout details';
   const { task } = await app.invoke<any>('projects.tasks.create', { content, status: 'done' });
+  expect(task.status).toBe('done');
   const uid = await page.evaluate<string>('currentUserId');
   const file = path.join(app.workspaceRoot, uid, 'cloud', 'tasks', `${task.id}.json`);
   // Seed the execution association without a model call.
@@ -34,7 +34,7 @@ test('opens completed todos at full column width from the conversation header', 
     await expect(card).toHaveClass(/\bis-highlighted\b/);
     await expect(toggle).toHaveAttribute('aria-expanded', 'true');
     await expect(page.locator(`[data-todo-group="${grouping}"]`)).toHaveAttribute('aria-pressed', 'true');
-    const [completedBox, pendingBox] = await Promise.all([card.boundingBox(), pending.boundingBox()]);
+    const [completedBox, pendingBox] = await Promise.all([completed.boundingBox(), pending.boundingBox()]);
     expect(completedBox!.width).toBeCloseTo(pendingBox!.width, 0);
     await expect(card.getByText(content, { exact: true })).toBeInViewport();
     await page.screenshot({ path: testInfo.outputPath(`completed-todo-shortcut-${locale}.png`) });
@@ -509,4 +509,3 @@ test('shows conversation source icons and header shortcuts together without crow
   await expect(page.locator('#chat-header-task-links')).toBeHidden();
   await page.screenshot({ path: testInfo.outputPath('conversation-task-links-empty.png') });
 });
-

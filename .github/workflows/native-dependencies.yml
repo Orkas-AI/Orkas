@@ -18,6 +18,9 @@ jobs:
         runner: [ubuntu-22.04, ubuntu-22.04-arm, windows-2022, macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    env:
+      # Hosted CPU runners use the CPU binaries bundled by ONNX Runtime.
+      ONNXRUNTIME_NODE_INSTALL_CUDA: skip
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -143,11 +146,20 @@ jobs:
           test/main/features/auto_tasks.test.ts
           test/main/model/core-agent/office-batch.test.ts
           test/main/model/core-agent/office-tools.test.ts
+      - name: Verify incremental shell output and terminal receipts
+        env:
+          ORKAS_TEST_USE_HOSTED_POWERSHELL_CACHE: '1'
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          src/core-agent/test/sandbox.test.ts
+          src/core-agent/test/process-session.test.ts
       - name: Verify Codex final stream records and lifecycle
         run: >-
           npm run test:js -- --maxWorkers=1
           test/main/features/local_agents/codex_backend.test.ts
           test/main/features/local_agents/codex_parser.test.ts
+          test/main/features/local_agents/context.test.ts
+          test/main/features/local_agents/compatibility.test.ts
           test/main/features/local_agents/cli_input_cancel.test.ts
       - name: Verify BGRA brightness and contrast calibration
         run: >-
@@ -155,6 +167,27 @@ jobs:
           test/main/features/video_studio_bitmap.test.ts
       - name: Prepare the declared video runtimes for delivery checks
         run: npm run ffmpeg:fetch
+      - name: Prepare declared video runtimes for frame-accurate cuts
+        run: npm run ffmpeg:fetch
+      - name: Verify beat-grid frame counts and picture timestamps
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/video_edit_assembly_fixes.test.ts
+          test/main/features/video_studio_core_freshness.test.ts
+          -t "cuts to a beat grid|committed lib"
+      - name: Verify audio frame draining and background music recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/features/voice_studio_pcm.test.ts
+          test/main/features/voice_studio_core.test.ts
+          test/main/features/voice_studio_e2e_channels.test.ts
+          test/main/features/voice_studio_processing.test.ts
+          test/main/features/voice_studio_enhancement.test.ts
+          test/main/features/voice_studio_e2e_delivery.test.ts
+          test/main/features/video_ducking_e2e_frames.test.ts
+          test/main/features/video_edit_mix_filter.test.ts
+          test/main/features/video_edit_assembly_fixes.test.ts
+          test/main/features/video_studio_core_freshness.test.ts
       - name: Verify HTML copy references and project acceptance
         run: >-
           npm run test:js -- --maxWorkers=1

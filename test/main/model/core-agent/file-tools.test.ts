@@ -3192,31 +3192,32 @@ describe('file-tools › search_files', () => {
     } finally { process.env.PATH = originalPath; }
   });
 
-  it('finds literal opening brackets in filenames while preserving valid bracket globs', async () => {
+  it.each(['default', 'fallback'])('handles literal filename brackets and valid ranges in the same search (%s)', async backend => {
     const { tools, wsDir } = await buildTools();
-    for (const name of ['invoice [draft.txt', 'invoice 1.txt', 'invoice 7.txt']) {
+    for (const name of ['invoice [draft.txt', 'invoice 1.txt', 'invoice 7.txt',
+      'invoice 1 [draft.txt', 'invoice 7 [draft.txt', 'invoice 2 final.txt',
+      'invoice 1 [7-4].txt', 'invoice 7 [7-4].txt']) {
       fs.writeFileSync(path.join(wsDir, name), '');
     }
     const search = getTool(tools, 'search_files');
-    for (const [query, wanted] of [
-      ['[draft', 'invoice [draft.txt'],
-      ['*[draft.txt', 'invoice [draft.txt'],
-      ['invoice [1-3].txt', 'invoice 1.txt'],
-    ]) {
-      const result = await run(search, { root: wsDir, query });
-      expect(searchResults(result.content).files.map(file => file.name)).toEqual([wanted]);
-    }
-  });
-
-  it('keeps a valid filename character class alongside an unclosed bracket in the same glob', async () => {
-    const { tools, wsDir } = await buildTools();
-    for (const name of ['invoice 1 [draft.txt', 'invoice 7 [draft.txt', 'invoice 2 final.txt']) {
-      fs.writeFileSync(path.join(wsDir, name), '');
-    }
-    for (const query of ['invoice [1-3] [draft.txt', 'invoice [1-3] [d*.txt']) {
-      const result = await run(getTool(tools, 'search_files'), { root: wsDir, query });
-      expect(searchResults(result.content).files.map(file => file.name)).toEqual(['invoice 1 [draft.txt']);
-    }
+    const originalPath = process.env.PATH;
+    if (backend === 'fallback') process.env.PATH = tmpDir;
+    try {
+      for (const [query, expected] of [
+        ['[draft', ['invoice [draft.txt', 'invoice 1 [draft.txt', 'invoice 7 [draft.txt']],
+        ['*[draft.txt', ['invoice [draft.txt', 'invoice 1 [draft.txt', 'invoice 7 [draft.txt']],
+        ['invoice [1-3].txt', ['invoice 1.txt']],
+        ['invoice [1-3] [draft.txt', ['invoice 1 [draft.txt']],
+        ['invoice [1-3] [d*.txt', ['invoice 1 [draft.txt']],
+        ['invoice [1-3] [7-4].txt', ['invoice 1 [7-4].txt']],
+      ] as const) {
+        const result = await run(search, { root: wsDir, query });
+        expect(result.isError, query).toBeFalsy();
+        expect(result.content, query).toContain('complete=true');
+        if (backend === 'fallback') expect(result.content, query).toContain('backend=walk');
+        expect(searchResults(result.content).files.map(file => file.name).sort(), query).toEqual([...expected].sort());
+      }
+    } finally { process.env.PATH = originalPath; }
   });
 
   it('reports cancellation as incomplete without scanning or claiming no matches', async () => {

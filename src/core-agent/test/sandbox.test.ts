@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import {
@@ -19,6 +20,18 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const IS_WINDOWS = process.platform === "win32";
 const NATIVE_SHELL_STARTUP_BUDGET_MS = IS_WINDOWS ? 15_000 : 5_000;
 const NATIVE_SHELL_TEST_TIMEOUT_MS = IS_WINDOWS ? 25_000 : 10_000;
+
+function nativeShellFixtureEnv(): Record<string, string> | undefined {
+  if (!IS_WINDOWS || process.env.ORKAS_TEST_USE_HOSTED_POWERSHELL_CACHE !== "1") return undefined;
+  const cachePath = process.env.PSModuleAnalysisCachePath;
+  if (process.env.GITHUB_ACTIONS !== "true" || !cachePath || !path.win32.isAbsolute(cachePath)
+    || !statSync(cachePath, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error("Hosted Windows shell tests require the runner's PowerShell module cache file");
+  }
+  // The runner prepares a non-default cache. Pass only that fixture input
+  // through the executor's existing explicit environment option.
+  return { PSModuleAnalysisCachePath: cachePath };
+}
 
 function shellQuote(value: string): string {
   return IS_WINDOWS
@@ -51,7 +64,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("executes a simple command", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir(), env: nativeShellFixtureEnv() });
     const result = await sandbox.execute("echo hello");
     expect(result.stdout.trim()).toBe("hello");
     expect(result.exitCode).toBe(0);
@@ -252,21 +265,23 @@ describe("SandboxExecutor", () => {
     expect((sandbox as any).checkBlockedCommand(command)).not.toBeNull();
   });
 
-  it("prints a blocked command name as data in foreground and detached execution", async () => {
+  it("prints a blocked command name as data in foreground execution", async () => {
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir(), env: nativeShellFixtureEnv() });
+    const result = await sandbox.execute("echo shutdown");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("shutdown");
+  }, NATIVE_SHELL_TEST_TIMEOUT_MS);
+
+  it("prints a blocked command name as data in detached execution", async ({ onTestFinished }) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-literal-"));
-    const sandbox = new SandboxExecutor({ workingDir: dir });
-    const command = "echo shutdown";
-    try {
-      const foreground = await sandbox.execute(command);
-      expect(foreground.exitCode).toBe(0);
-      expect(foreground.stdout.trim()).toBe("shutdown");
-      const logPath = path.join(dir, "output.log");
-      const background = sandbox.executeBackground(command, logPath);
-      expect(background.error).toBeUndefined();
-      expect(background.pid).toBeGreaterThan(0);
-      await expect.poll(async () => (await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
-      await waitForProcessExit(background.pid!);
-    } finally { await removeTree(dir); }
+    onTestFinished(() => removeTree(dir));
+    const sandbox = new SandboxExecutor({ workingDir: dir, env: nativeShellFixtureEnv() });
+    const logPath = path.join(dir, "output.log");
+    const { pid, error } = sandbox.executeBackground("echo shutdown", logPath);
+    expect(error).toBeUndefined();
+    expect(pid).toBeGreaterThan(0);
+    await waitForProcessExit(pid!, NATIVE_SHELL_STARTUP_BUDGET_MS);
+    expect((await fs.readFile(logPath, "utf8")).trim()).toBe("shutdown");
   }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 
   it("blocks custom commands", async () => {
@@ -394,7 +409,7 @@ describe("SandboxExecutor", () => {
   });
 
   it("reports duration", async () => {
-    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
+    const sandbox = new SandboxExecutor({ workingDir: os.tmpdir(), env: nativeShellFixtureEnv() });
     const result = await sandbox.execute("echo fast");
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(result.durationMs).toBeLessThan(NATIVE_SHELL_STARTUP_BUDGET_MS);

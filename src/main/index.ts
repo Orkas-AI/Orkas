@@ -1792,7 +1792,7 @@ if (!gotLock) {
       // write lifecycle reports. Normal source and packaged runs behave alike.
       enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
     });
-    app.once('will-quit', () => {
+    startupDisposers.push(() => {
       openLifecycleTracking?.stop();
       openLifecycleTracking = null;
     });

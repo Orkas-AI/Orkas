@@ -403,7 +403,7 @@ Chinese estimates use 4.5 Han characters per second. Uncalibrated estimates refu
 
 ### Untreated same-rate PCM cuts (2026-11-17)
 
-VoiceStudio 1.0.26 preserves integer PCM samples when a recorded-only WAV cut
+VoiceStudio preserves integer PCM samples when a recorded-only WAV cut
 keeps the source rate, precision and channels, uses unit speed/gain, and disables
 normalization without processing, fades, gaps, word edits or mixing. The renderer
 previously resampled every clip through 48 kHz/16-bit PCM even for this untreated
@@ -411,7 +411,9 @@ path. A real 16 kHz excerpt required an actor-side waveform workaround; its save
 project reproduced the altered samples. The owning `voice_studio_e2e_delivery.test.ts`
 cases compare decoded output with an independent original byte slice at 16 kHz/16-bit,
 24 kHz/24-bit and 44.1 kHz/32-bit, rerender the saved project, preserve earlier exports
-and sources, and check that requested nonunit gain remains a treatment. Default
+and sources, and check that requested nonunit gain remains a treatment. The focused
+`voice_studio_pcm.test.ts` cases also cover a fresh bundled-Node reopen,
+concatenation, request overrides and rejected-trim recovery. Default
 normalization and processed/composed/retimed routes keep their existing pipeline.
 This is deterministic local sample preservation, not a listening-quality or
 Windows codec verification claim.

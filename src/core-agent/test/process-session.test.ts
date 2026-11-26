@@ -115,9 +115,8 @@ setTimeout(()=>{process.stderr.write(err);process.stdout.write(out.subarray(1));
     const started = mode === "managed"
       ? await bashTool.execute({ command, yield_time_ms: 0 }, ctx)
       : await processStartTool.execute({ command }, ctx);
-    const result = await tool("process_session").execute({
-      action: "read", session_id: json(started.content).session_id, cursor: 0, wait_for: "exit", yield_time_ms: 5000,
-    }, ctx);
+    const { result } = await waitForProcessRead("split-output",
+      json(started.content).session_id, 0, payload => payload.status !== "running", 5000);
     const payload = json(result.content);
     expect(result.isError).toBeFalsy();
     expect(payload).toMatchObject({ status: "exited", exit_code: 0 });
@@ -150,9 +149,8 @@ setTimeout(()=>{process.stderr.write(err);process.stdout.write(out.subarray(1));
       for (const byte of stdout.subarray(1)) child.stdout.write(Buffer.from([byte]));
       child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
       const started = await pending;
-      const result = await tool("process_session").execute({
-        action: "read", session_id: json(started.content).session_id, cursor: 0, wait_for: "exit", yield_time_ms: 5000,
-      }, ctx);
+      const { result } = await waitForProcessRead("windows-split-output",
+        json(started.content).session_id, 0, payload => payload.status !== "running", 5000);
       expect(result.isError).toBeFalsy();
       expect(json(result.content)).toMatchObject({ status: "exited", exit_code: 0,
         output: stderr.toString("utf8") + stdout.toString("utf8") });

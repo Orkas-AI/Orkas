@@ -6,6 +6,35 @@ import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
 import type { HtmlPreviewDesignEvidence } from '../../src/main/features/html_preview';
 
+for (const broken of [false, true]) {
+  test(`audits fragment links by exact element ID when the targets are ${broken ? 'broken' : 'valid'}`, async ({ sdkOrkas: orkas }) => {
+    const entry = orkas.createWorkspaceFile('fragment-audit/index.html', `<!doctype html>
+      <meta charset="utf-8">
+      <nav>
+        <a href="#intro">Introduction</a>
+        <a href="#release:notes">Release notes</a>
+        <a href="#%E5%AF%BC%E8%88%AA">Navigation</a>
+        ${broken ? '<a href="#intro.note">Look-alike</a><a href="#%GG">Malformed</a>' : ''}
+      </nav>
+      <h1 id="intro" class="note">Introduction</h1>
+      <h2 id="release:notes">Release notes</h2>
+      <h2 id="导航">Navigation</h2>
+      <button onclick="document.getElementById('details').hidden = false">Show details</button>
+      <p id="details" hidden>Additional notes</p>`);
+    const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+      const { renderInteractiveHtmlSmoke } = (process as any).mainModule.require(args.modulePath);
+      return (await renderInteractiveHtmlSmoke(args.entry)).evidence;
+    }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+    expect(evidence.interactions.hashLinksChecked).toBe(3);
+    expect(evidence.interactions.failures).toEqual(broken ? [
+      'missing hash target for Look-alike',
+      'invalid hash target for Malformed',
+    ] : []);
+    expect(evidence.interactions.stateChangesObserved).toBe(1);
+    expect(evidence.ok, evidence.blockers.join('; ')).toBe(!broken);
+  });
+}
+
 for (const label of ['Resume', 'Continue', 'Download resume']) {
   test(`observes the same state change regardless of the button label: ${label}`, async ({ sdkOrkas: orkas }, info) => {
     const entry = orkas.createWorkspaceFile('state-action/index.html', `<!doctype html>

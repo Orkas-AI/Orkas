@@ -1344,6 +1344,11 @@ describe('Web Assist controlled connector lifecycle', () => {
         expect(unavailable).not.toHaveProperty('page_id');
         expect(debuggerSession.sendCommand).not.toHaveBeenCalledWith('Runtime.evaluate', expect.anything(), undefined);
 
+        page.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', url, true);
+        await expect.soft(observeModelWebAssist('u1', cid, tabId)).resolves.toMatchObject({
+          ok: false, code: 'page_load_failed',
+        });
+        page.emit('did-navigate', {}, url, 200, 'OK');
         frame = { id: 'current-frame', url };
         const stale = await observeModelWebAssist('u1', cid, tabId, 'full', { frameId: 'old-frame' });
         expect.soft(stale).toMatchObject({ ok: false, code: 'unknown_frame' });
@@ -1357,7 +1362,7 @@ describe('Web Assist controlled connector lifecycle', () => {
     });
 
     it.each(['', 'about:blank'])('observes a pending first document from %j on the same tab after commit', async initialUrl => {
-      const cid = 'c-sampling-first-document';
+      const cid = 'c-initial-document';
       const prototype = Object.getPrototypeOf(electronMock.createPage());
       const nativeLoad = prototype.loadURL;
       let finish!: () => Promise<void>;
@@ -1410,7 +1415,7 @@ describe('Web Assist controlled connector lifecycle', () => {
     });
 
     it('keeps an empty non-loading tab unavailable without telling the caller to wait', async () => {
-      const cid = 'c-sampling-empty-document';
+      const cid = 'c-empty-document';
       bindWebAssistConversation('u1', cid, electronMock.renderer);
       const added = await addWebAssistTab('u1', electronMock.renderer, { conversationId: cid });
       if (!added.ok) throw new Error('Blank tab could not be prepared');

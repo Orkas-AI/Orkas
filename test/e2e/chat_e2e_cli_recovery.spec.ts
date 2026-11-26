@@ -682,31 +682,6 @@ test.describe('CLI failed-turn recovery', () => {
   // bounded wait below.
   test.describe.configure({ timeout: 120_000 });
 
-  test('keeps a real OpenCode write available after failure without claiming the untouched file', async ({ cliOrkas }) => {
-    const { page, agentId } = await createCliAgent(cliOrkas, 'OpenCodeFilesE2E', 'opencode');
-    const project = path.join(cliOrkas.root, 'opencode-file-delivery');
-    mkdirSync(project, { recursive: true });
-    writeFileSync(path.join(project, 'existing-report.txt'), 'Original report bytes');
-    expect(await cliOrkas.invoke('agents.cliProjectDir.set', { agent_id: agentId, path: project }))
-      .toMatchObject({ ok: true });
-    const cid = await sendNewChat(page, '@OpenCodeFilesE2E E2E_OPENCODE_FAILED_FILE_EDIT');
-    const failure = 'The CLI could not continue the task.';
-    const saved = async () => (await cliOrkas.invoke<{
-      history: Array<{ produced?: string[]; text?: string }>;
-    }>('conversations.history', { cid })).history.find(row => row.text?.includes(failure));
-    await expect.poll(async () => (await saved())?.produced?.map(file => path.basename(file)))
-      .toEqual(['new-report.txt']);
-    const reply = page.locator('#chat-history .chat-message.assistant', { hasText: failure });
-    await expect(reply.locator('.bubble-retry-btn')).toHaveCount(1);
-    const outputs = reply.locator('.chat-msg-produced-item');
-    await expect(outputs).toHaveCount(1);
-    await expect(outputs).toContainText('new-report.txt');
-    const preview = await cliOrkas.openPreview(() => outputs.locator('.chat-msg-produced-main').click());
-    await expect(preview.locator('body')).toContainText('Report written before the task stopped.');
-    await cliOrkas.closePreview(preview);
-    expect(readFileSync(path.join(project, 'existing-report.txt'), 'utf8')).toBe('Original report bytes');
-  });
-
   for (const fault of ['version_unknown', 'initialize_exit'] as const) {
     test(`Hermes ${fault} remains visible after reopening and recovers once after repair`, async ({ cliOrkas }, testInfo) => {
       const name = 'HermesStartupRecoveryE2E';
@@ -784,6 +759,31 @@ test.describe('CLI failed-turn recovery', () => {
       expect(agentsAfter.agents.map(agent => agent.agent_id).sort()).toEqual(agentsBefore.agents.map(agent => agent.agent_id).sort());
     });
   }
+
+  test('keeps a real OpenCode write available after failure without claiming the untouched file', async ({ cliOrkas }) => {
+    const { page, agentId } = await createCliAgent(cliOrkas, 'OpenCodeFilesE2E', 'opencode');
+    const project = path.join(cliOrkas.root, 'opencode-file-delivery');
+    mkdirSync(project, { recursive: true });
+    writeFileSync(path.join(project, 'existing-report.txt'), 'Original report bytes');
+    expect(await cliOrkas.invoke('agents.cliProjectDir.set', { agent_id: agentId, path: project }))
+      .toMatchObject({ ok: true, info: { path: project } });
+    const cid = await sendNewChat(page, '@OpenCodeFilesE2E E2E_OPENCODE_FAILED_FILE_EDIT');
+    const failure = 'The CLI could not continue the task.';
+    const saved = async () => (await cliOrkas.invoke<{
+      history: Array<{ produced?: string[]; text?: string }>;
+    }>('conversations.history', { cid })).history.find(row => row.text?.includes(failure));
+    await expect.poll(async () => (await saved())?.produced?.map(file => path.basename(file)))
+      .toEqual(['new-report.txt']);
+    const reply = page.locator('#chat-history .chat-message.assistant', { hasText: failure });
+    await expect(reply.locator('.bubble-retry-btn')).toHaveCount(1);
+    const outputs = reply.locator('.chat-msg-produced-item');
+    await expect(outputs).toHaveCount(1);
+    await expect(outputs).toContainText('new-report.txt');
+    const preview = await cliOrkas.openPreview(() => outputs.locator('.chat-msg-produced-main').click());
+    await expect(preview.locator('body')).toContainText('Report written before the task stopped.');
+    await cliOrkas.closePreview(preview);
+    expect(readFileSync(path.join(project, 'existing-report.txt'), 'utf8')).toBe('Original report bytes');
+  });
 
   test('persists tool-state provenance across app relaunch and resumes the same native session', async ({ cliOrkas }) => {
     const { page } = await createCliAgent(cliOrkas, 'OpenCodeResumeE2E', 'opencode');

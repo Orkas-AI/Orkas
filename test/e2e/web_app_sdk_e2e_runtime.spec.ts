@@ -1008,8 +1008,20 @@ test('local SDK form results reach their original conversation from the card and
   // The preview shell can load before the app frame's SDK is ready.
   await expect(previewSubmit).toBeEnabled();
   const otherTask = orkas.page.locator(`#conversation-list .conv-item[data-cid="${otherCid}"]`);
+  await orkas.page.evaluate(expectedCid => {
+    const page = window as any;
+    const bindComposer = page.composerBindOwner;
+    page.composerBindOwner = function (input: string, owner: string) {
+      if (input === 'chat-input' && owner === expectedCid) {
+        page.composerBindOwner = bindComposer;
+        page.inlineFramesAtNavigation = document.querySelectorAll('#chat-history iframe.chat-artifact-frame').length;
+      }
+      return bindComposer.call(this, input, owner);
+    };
+  }, otherCid);
   await otherTask.click();
   await expect(otherTask).toHaveClass(/\bactive\b/);
+  expect(await orkas.page.evaluate(() => (window as any).inlineFramesAtNavigation)).toBe(0);
   await expect(inlineFrame).toHaveCount(0);
   await previewSubmit.click();
   await expect.poll(() => results(transcript).length).toBe(2);

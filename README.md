@@ -16,7 +16,7 @@ Orkas is built to keep a project moving, not just answer one prompt. A **project
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 [![Website: orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
 
-[English](./README.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md)
+[English](./README.en.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md) · [한국어](./README.ko.md) · [Español](./README.es.md) · [Bahasa Indonesia](./README.id.md) · [Español (Latinoamérica)](./README.es-419.md) · [Русский](./README.ru.md) · [Português (Brasil)](./README.pt-BR.md) · [Türkçe](./README.tr.md) · [繁體中文](./README.zh-TW.md) · [Tiếng Việt](./README.vi.md) · [Deutsch](./README.de.md) · [ไทย](./README.th.md) · [Français](./README.fr.md) · [Italiano](./README.it.md) · [Português (Portugal)](./README.pt-PT.md) · [العربية](./README.ar.md)
 
 ---
 
@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ## What the team delivers
 
-- **Videos, voice-overs and images** — VideoStudio, VoiceStudio, ImageStudio
+- **Videos, voice-overs and images** — [VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio), VoiceStudio, ImageStudio
 - **Research reports, SEO audits and market analysis** — DeepResearcher, SeoGeoAgent, StockAnalyser
 - **Posts, articles, newsletters and slide decks** — ContentWriter, PptMaker
 - **Websites, UI and code** — UIDesigner, ProductDeveloper
@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | Content & media | **ContentWriter** | Publish-ready posts, articles, newsletters and case studies from a goal, sources or a rough draft |
 | | **PptMaker** | Editable, reviewable PPTX decks from a topic, outline or document |
 | | **ImageStudio** | Posters, covers, social images and infographics |
-| | **VideoStudio** | Narration, AI presenters, captions and dubbing, highlight clips, localization, and reference-video recreation with your own content and footage |
+| | **[VideoStudio](https://github.com/Orkas-AI/Orkas-VideoStudio)** | Narration, AI presenters, captions and dubbing, highlight clips, localization, and reference-video recreation with your own content and footage |
 | | **VoiceStudio** | Narration, multi-voice audio, transcripts and subtitles, audio editing and mixing |
 | | **UIDesigner** | Editable, HTML-first UI from product goals, PRDs, screenshots or Figma material |
 | Build & office | **ProductDeveloper** | Repo-aware engineering — implement a PRD, fix bugs, refactor, review, with verifiable results |

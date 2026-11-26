@@ -1139,8 +1139,11 @@ export class OrkasTestApp {
       `--lang=${this.appLocale}`,
       ...(process.platform === 'darwin' ? ['-AppleLanguages', `(${this.appLocale})`] : []),
     ] : [];
+    const softwareRendering = this.options.softwareRendering
+      ?? (process.env.ORKAS_E2E_SOFTWARE_RENDERING === '1');
+    delete environment.ORKAS_E2E_SOFTWARE_RENDERING;
     const app = await electron.launch({
-      args: [...(!this.enableSystemProxy ? ['--no-proxy-server'] : []), ...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), ...(this.appLocale ? ['--require', path.join(__dirname, 'system-locale-preload.cjs')] : []), '.', ...localeArgs],
+      args: [...(!this.enableSystemProxy ? ['--no-proxy-server'] : []), ...(softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), ...(this.appLocale ? ['--require', path.join(__dirname, 'system-locale-preload.cjs')] : []), '.', ...localeArgs],
       cwd: PC_ROOT,
       env: environment,
       timeout: 30_000,

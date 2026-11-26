@@ -4192,7 +4192,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       fs.writeFileSync(agentFile, JSON.stringify(spec));
       const workdir = path.join(tmpDir, 'workspace');
       const agents = await import('../../../../src/main/features/agents');
-      await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, workdir);
+      fs.mkdirSync(workdir, { recursive: true });
+      expect(await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, workdir)).toMatchObject({ path: workdir });
       const oldFile = path.join(workdir, 'existing-report.txt');
       const newFile = path.join(workdir, 'new-report.txt');
       fs.writeFileSync(oldFile, 'Original content');

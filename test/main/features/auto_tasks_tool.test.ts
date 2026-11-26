@@ -434,8 +434,10 @@ describe('auto_tasks shared tool', () => {
   it.each(['update', 'enable', 'disable', 'delete'] as const)(
     'keeps a concurrent move to a project when an older automation %s arrives',
     async action => {
-      const created = await tasks.applyAutoTaskMutation(uid, { action: 'create', updates: draft as any });
-      const id = created.taskId!;
+      const enabled = action === 'disable';
+      const created = await run(createTool({ userId: uid }), { action: 'create', ...draft, enabled });
+      expect(created.ok).toBe(true);
+      const id = created.taskId;
       const getTask = tasks.getTask;
       const read = vi.spyOn(tasks, 'getTask').mockImplementationOnce(async (userId, taskId) => {
         const before = await getTask(userId, taskId);
@@ -447,7 +449,7 @@ describe('auto_tasks shared tool', () => {
           action, task_id: id, ...(action === 'update' ? { title: 'Stale title' } : {}),
         });
         expect(result).toMatchObject({ ok: false, isError: true, error: 'not_found' });
-        expect(await getTask(uid, id)).toMatchObject({ project_id: pid, enabled: false, content: draft.content });
+        expect(await getTask(uid, id)).toMatchObject({ project_id: pid, enabled, content: draft.content });
         expect((await getTask(uid, id))?.title).not.toBe('Stale title');
       } finally { read.mockRestore(); }
     });

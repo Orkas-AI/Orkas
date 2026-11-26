@@ -83,7 +83,7 @@ const DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY: LocalAccessSensitivePolicy = {
     '/etc/cron',
     '/etc/systemd',
     '(^|/)\\.config/autostart(/|$)',
-    '\\\\Start Menu\\\\Programs\\\\Startup',
+    ...(process.platform === 'win32' ? ['(^|/)Start Menu/Programs/Startup(/|$)'] : []),
     '^/etc/',
   ],
   sensitive_command_patterns: [
