@@ -1335,6 +1335,8 @@
   "settings.models.add_tts": "Tambahkan layanan suara",
   "settings.models.order_hint": "Seret baris untuk mengubah prioritas, atau gunakan tombol panah. Model bawaan yang dinonaktifkan dilewati.",
   "settings.general.page_sub": "Sesuaikan preferensi, izin agen, dan pembaruan aplikasi.",
+  "home.open_source.message": "Jika Orkas membantu Anda, beri bintang untuk proyek ini.",
+  "home.open_source.dismiss": "Jangan tampilkan lagi",
   "settings.open_source.title": "Dukung sumber terbuka",
   "settings.open_source.star": "Beri bintang untuk Orkas di GitHub",
   "settings.open_source.open_github": "Buka GitHub",

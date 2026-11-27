@@ -3167,6 +3167,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'config.getLocales': async () => ({ tables: getRendererTables() }),
 
+  'openSourceSupport.record': async (payload) => {
+    const { recordOpenSourceSupport } = await import('../features/open_source_support');
+    await recordOpenSourceSupport(payload);
+  },
+
   'prefs.getTodoGrouping': async (_args, ctx) => ({ grouping: appConfig.getTodoGrouping(ctx.userId) }),
   'prefs.setTodoGrouping': async ({ grouping }, ctx) => ({ grouping: appConfig.setTodoGrouping(ctx.userId, grouping) }),
 
@@ -4463,7 +4468,7 @@ export function register(): void {
     const envelope = parseInvokeEnvelope(request);
     if (!envelope) return { ok: false, error: 'invalid ipc request', code: 'E_IPC_REQUEST' };
     const { channel, payload } = envelope;
-    if ((channel.startsWith('voice.') || channel.startsWith('voiceInput.')) && (event.senderFrame !== event.sender.mainFrame || previewWindows.isPreviewContents(event.sender))) {
+    if ((channel === 'openSourceSupport.record' || channel.startsWith('voice.') || channel.startsWith('voiceInput.')) && (event.senderFrame !== event.sender.mainFrame || previewWindows.isPreviewContents(event.sender))) {
       return { ok: false, code: 'E_IPC_SENDER' };
     }
     if ((channel.startsWith('desktop.') || channel.startsWith('webApps.') || channel.startsWith('previewWindows.') || channel === 'savedApps.openInApp' || ['workspace.statPath', 'produced.readText', 'produced.officePreviewHtml', 'produced.grantHtmlPreviewAssets'].includes(channel) || previewWindows.isPreviewContents(event.sender)) && event.senderFrame !== event.sender.mainFrame) return { ok: false, code: 'E_IPC_SENDER' };

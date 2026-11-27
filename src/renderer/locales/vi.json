@@ -1335,6 +1335,8 @@
   "settings.models.add_tts": "Thêm dịch vụ giọng nói",
   "settings.models.order_hint": "Kéo hàng để đổi mức ưu tiên hoặc dùng nút mũi tên. Mô hình tích hợp bị tắt sẽ được bỏ qua.",
   "settings.general.page_sub": "Điều chỉnh tùy chọn, quyền tác tử và cập nhật ứng dụng.",
+  "home.open_source.message": "Nếu Orkas hữu ích với bạn, hãy tặng dự án một sao.",
+  "home.open_source.dismiss": "Không hiển thị lại",
   "settings.open_source.title": "Ủng hộ mã nguồn mở",
   "settings.open_source.star": "Tặng Orkas một sao trên GitHub",
   "settings.open_source.open_github": "Mở GitHub",

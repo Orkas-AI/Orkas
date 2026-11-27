@@ -1335,6 +1335,8 @@
   "settings.models.add_tts": "वाणी सेवा जोड़ें",
   "settings.models.order_hint": "प्राथमिकता बदलने के लिए पंक्तियाँ खींचें या तीर बटन इस्तेमाल करें। अक्षम अंतर्निहित मॉडल छोड़ दिए जाते हैं।",
   "settings.general.page_sub": "पसंद, एजेंट अनुमतियाँ और ऐप अपडेट समायोजित करें।",
+  "home.open_source.message": "अगर Orkas आपके काम आता है, तो प्रोजेक्ट को एक स्टार दें।",
+  "home.open_source.dismiss": "फिर से न दिखाएँ",
   "settings.open_source.title": "ओपन सोर्स का समर्थन करें",
   "settings.open_source.star": "GitHub पर Orkas को स्टार दें",
   "settings.open_source.open_github": "GitHub खोलें",

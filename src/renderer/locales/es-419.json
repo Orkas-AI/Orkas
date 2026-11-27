@@ -1335,6 +1335,8 @@
   "settings.models.add_tts": "Agregar servicio de voz",
   "settings.models.order_hint": "Arrastra las filas para cambiar la prioridad o usa los botones de flecha. Los modelos integrados desactivados se omiten.",
   "settings.general.page_sub": "Ajusta las preferencias, los permisos de agentes y las actualizaciones de la aplicación.",
+  "home.open_source.message": "Si Orkas te resulta útil, dale una estrella al proyecto.",
+  "home.open_source.dismiss": "No volver a mostrar",
   "settings.open_source.title": "Apoya el código abierto",
   "settings.open_source.star": "Dale una estrella a Orkas en GitHub",
   "settings.open_source.open_github": "Abrir GitHub",

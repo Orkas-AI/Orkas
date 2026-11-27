@@ -1335,6 +1335,8 @@
   "settings.models.add_tts": "添加语音服务",
   "settings.models.order_hint": "拖动列表调整优先级，也可使用上下箭头。已停用的 Orkas 内置模型不参与轮转。",
   "settings.general.page_sub": "调整使用偏好与智能体权限。",
+  "home.open_source.message": "如果 Orkas 对你有帮助，欢迎给项目点个 Star。",
+  "home.open_source.dismiss": "不再提醒",
   "settings.open_source.title": "支持开源",
   "settings.open_source.star": "在 GitHub 上给 Orkas 点个 Star",
   "settings.open_source.open_github": "打开 GitHub",
