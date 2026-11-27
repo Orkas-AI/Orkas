@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "a4ca1003ea5ecee489e98f03f5008329fd3439f5b6b78c09fdb942cacf0f9550",
+  "content_tree_sha256": "6d667114f4d274ab356a9e02e9e864a4f642ea48585665981142502e9edd270f",
   "files": [
     {
       "path": "apps/builtin-content-workbench/__orkas-meta.json",
@@ -849,8 +849,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/scripts/crawl.py",
-      "bytes": 31041,
-      "sha256": "091b6c270b95fd0fd26d78c94671d560cf0dc1bdec729d5bd893eab9a32a8461"
+      "bytes": 31683,
+      "sha256": "45d96cfc3afc29a27f08983234bb05fc93d0caf2cf81c2ad3d9d4b36eb3dceb1"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/scripts/url_safety.py",
