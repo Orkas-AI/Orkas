@@ -102,6 +102,61 @@ class LookAlikeTest(unittest.TestCase):
         self.assertIn("sitemap_undeclared", {f["id"] for f in r["findings"]})
 
 
+class CanonicalIdentityTest(unittest.TestCase):
+    def _result(self, page_url, canonical):
+        return audit(crawl(dict(GOOD_PAGE, url=page_url, final_url=page_url,
+                                canonical=canonical)))
+
+    def test_query_variants_are_different_pages(self):
+        for page_url, canonical in (
+            ("https://x.com/product?id=1", "https://x.com/product?id=2"),
+            ("https://x.com/search?q=one", "https://x.com/search"),
+            ("https://x.com/search", "https://x.com/search?q=one"),
+            ("https://x.com/?x=1&x=2", "https://x.com/?x=2&x=1"),
+            ("https://x.com/?q=a+b", "https://x.com/?q=a%20b"),
+        ):
+            with self.subTest(page_url=page_url, canonical=canonical):
+                result = self._result(page_url, canonical)
+                self.assertIn("canonical_elsewhere", {f["id"] for f in result["findings"]})
+                finding = next(f for f in result["findings"]
+                               if f["id"] == "canonical_elsewhere")
+                self.assertEqual(finding["severity"], "high")
+                self.assertEqual(result["health_score"], 88)
+
+    def test_same_query_with_fragment_remains_self_canonical(self):
+        result = self._result("https://x.com/p?id=1#section",
+                              "HTTPS://X.com:443/p/?id=1#other")
+        self.assertNotIn("canonical_elsewhere", {f["id"] for f in result["findings"]})
+        self.assertEqual(result["health_score"], 100)
+
+    def test_only_scheme_default_port_is_equivalent(self):
+        for scheme, default in (("http", 80), ("https", 443)):
+            with self.subTest(scheme=scheme):
+                self.assertEqual(_norm_url(f"{scheme}://x.com:{default}/p?q=1"),
+                                 _norm_url(f"{scheme}://x.com/p?q=1"))
+
+    def test_nondefault_ports_are_different_pages(self):
+        for scheme, port in (("https", 80), ("http", 443), ("https", 0),
+                             ("https", 8443)):
+            with self.subTest(scheme=scheme, port=port):
+                result = self._result(f"{scheme}://x.com:{port}/p",
+                                      f"{scheme}://x.com/p")
+                self.assertIn("canonical_elsewhere", {f["id"] for f in result["findings"]})
+
+    def test_ipv6_host_and_port_do_not_collide(self):
+        result = self._result("https://[2001:db8::1]:8443/",
+                              "https://[2001:db8::1:8443]/")
+        self.assertIn("canonical_elsewhere", {f["id"] for f in result["findings"]})
+
+    def test_ipv6_default_port_remains_equivalent(self):
+        self.assertEqual(_norm_url("https://[2001:DB8::1]:443/p/?q=1"),
+                         _norm_url("https://[2001:db8::1]/p?q=1"))
+
+    def test_query_casing_and_encoded_delimiters_are_preserved(self):
+        self.assertEqual(_norm_url("HTTPS://X.COM:443/p/?Q=A%26B&x=2#ignored"),
+                         "https://x.com/p?Q=A%26B&x=2")
+
+
 class DimensionTest(unittest.TestCase):
     def test_dimension_scores_and_counts(self):
         r = audit(crawl(BAD_PAGE))
