@@ -494,11 +494,13 @@ function _taskBoardRender(cid) {
   if (!panel || !list) return;
   _taskBoardWireHeader(panel);
   _taskBoardWireDrag(list);
-  // Keep the native drag source attached while runtime events update the
-  // snapshots. A source that starts/sends meanwhile cancels the gesture.
-  if (_taskBoardDragging) {
-    if (_taskBoardDragging.cid === cid && _taskBoardCanDrag(cid, _taskBoardDragging.taskId)) return;
+  // Keep the source attached from the mouse press through the native drag.
+  // A source that starts/sends meanwhile cancels the gesture.
+  const drag = _taskBoardDragging || _taskBoardDragPress;
+  if (drag) {
+    if (drag.cid === cid && _taskBoardCanDrag(cid, drag.taskId)) return;
     _taskBoardDragging = null;
+    _taskBoardDragPress = null;
   }
   const tasksById = cid ? _taskBoardMapFor(cid) : new Map();
   const all = [...tasksById.values()];
@@ -680,6 +682,7 @@ function _taskBoardRender(cid) {
 }
 
 let _taskBoardDragging = null; // { cid, taskId }; never accepted from external drag data
+let _taskBoardDragPress = null; // { cid, taskId, pointerId } before native dragstart
 
 function _taskBoardCanDrag(cid, taskId) {
   const task = _taskBoardMapFor(cid).get(taskId);
@@ -693,6 +696,29 @@ function _taskBoardCanDrag(cid, taskId) {
 function _taskBoardWireDrag(list) {
   if (list.dataset.taskBoardDragWired === '1') return;
   list.dataset.taskBoardDragWired = '1';
+  const sourceRow = (event) => {
+    const row = event.target.closest('.chat-queue-item[data-task-id]');
+    if (!row || event.target.closest('button') || !_taskBoardCanDrag(currentCid, row.dataset.taskId)) return null;
+    return row;
+  };
+  const releasePress = (event) => {
+    const press = _taskBoardDragPress;
+    if (!press || (event && event.pointerId !== press.pointerId)) return;
+    _taskBoardDragPress = null;
+    _taskBoardRender(press.cid);
+  };
+  list.addEventListener('pointerdown', (event) => {
+    if (event.pointerType !== 'mouse' || !event.isPrimary || event.button !== 0) return;
+    const row = sourceRow(event);
+    if (row) _taskBoardDragPress = { cid: currentCid, taskId: row.dataset.taskId, pointerId: event.pointerId };
+  });
+  document.addEventListener('pointerup', releasePress, true);
+  document.addEventListener('pointercancel', releasePress, true);
+  document.addEventListener('pointerout', (event) => {
+    if (!event.relatedTarget) releasePress(event);
+  }, true);
+  document.defaultView?.addEventListener('blur', () => releasePress());
+
   const clearTargets = () => {
     list.querySelectorAll('.drop-target').forEach((row) => {
       row.classList.remove('drop-target');
@@ -717,13 +743,13 @@ function _taskBoardWireDrag(list) {
     return order ? { row, order, after } : null;
   };
   list.addEventListener('dragstart', (event) => {
-    const row = event.target.closest('.chat-queue-item[data-task-id]');
-    const cid = currentCid;
-    if (!row || event.target.closest('button') || !_taskBoardCanDrag(cid, row.dataset.taskId)) {
+    const row = sourceRow(event);
+    if (!row) {
       event.preventDefault();
       return;
     }
-    _taskBoardDragging = { cid, taskId: row.dataset.taskId };
+    _taskBoardDragPress = null;
+    _taskBoardDragging = { cid: currentCid, taskId: row.dataset.taskId };
     row.classList.add('dragging');
     event.dataTransfer.effectAllowed = 'move';
     event.dataTransfer.setData('application/x-orkas-task', row.dataset.taskId);

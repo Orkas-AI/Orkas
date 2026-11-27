@@ -443,6 +443,32 @@ describe('renderer task board › agent groups and queued drag order', () => {
       task.task_id === 'a3' ? { ...task, status: 'running' } : task
     )))).toBeNull();
   });
+
+  it.each(['pointerup', 'pointercancel'])('keeps a pressed drag row through a refresh and paints after %s', (releaseEvent) => {
+    const { context, list, board } = boardHarness();
+    const listEvents = new Map<string, (event: unknown) => void>();
+    const documentEvents = new Map<string, (event: unknown) => void>();
+    list.addEventListener = (type: string, handler: (event: unknown) => void) => listEvents.set(type, handler);
+    context.document.addEventListener = (type: string, handler: (event: unknown) => void) => documentEvents.set(type, handler);
+
+    const queued = { task_id: 'queued', assignee: 'a', status: 'queued', instruction: 'Queued draft' };
+    const running = { task_id: 'running', assignee: 'a', status: 'running', instruction: 'First title' };
+    board.onEvent('c1', { task: running });
+    board.onEvent('c1', { task: queued });
+    const target = {
+      closest: (selector: string) => selector === '.chat-queue-item[data-task-id]' ? { dataset: { taskId: queued.task_id } } : null,
+    };
+    listEvents.get('pointerdown')?.({ target, pointerId: 1, button: 0, isPrimary: true, pointerType: 'mouse' });
+    board.onEvent('c1', { task: { ...running, instruction: 'Updated title' } });
+    expect(list.innerHTML).toContain('First title');
+    expect(list.innerHTML).not.toContain('Updated title');
+
+    documentEvents.get(releaseEvent)?.({ pointerId: 2 });
+    expect(list.innerHTML).not.toContain('Updated title');
+    documentEvents.get(releaseEvent)?.({ pointerId: 1 });
+    expect(list.innerHTML).toContain('Updated title');
+    expect(list.innerHTML).toContain('Queued draft');
+  });
 });
 
 describe('renderer task board › seed/resync merge (terminal-wins)', () => {
