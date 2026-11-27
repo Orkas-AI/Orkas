@@ -572,6 +572,48 @@ describe('run_program Host policy', () => {
       .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_CATALOG_MUTATION_NOT_ALLOWED' });
   });
 
+  it('blocks IPv4-mapped IPv6 literals and keeps hostnames that start with fc or fd', async () => {
+    const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+
+    for (const url of [
+      'http://[::ffff:127.0.0.1]/a',
+      'http://[::ffff:169.254.169.254]/latest/meta-data/',
+      'http://[::ffff:10.0.0.1]/a',
+      'http://[::ffff:6440:1]/a',
+      'http://[fc00::1]/a',
+      'http://[fd12:3456::1]/a',
+      'http://[fe80::1]/a',
+      'http://[febf::1]/a',
+    ]) {
+      await expect(policy.authorize('web_fetch', { url }, context()), url)
+        .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_NETWORK_SCOPE' });
+    }
+    for (const url of [
+      'https://fda.gov/safety',
+      'https://fcc.gov/',
+      'https://fdic.gov/',
+      'https://fcbarcelona.com/',
+      'https://fdroid.org/',
+      'http://[2606:4700::1111]/',
+    ]) {
+      await expect(policy.authorize('web_fetch', { url }, context()), url)
+        .resolves.toEqual({ allowed: true });
+    }
+  });
+
+  it('uses the same policy for either representation of a public IPv4 address', async () => {
+    const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+
+    for (const url of [
+      'https://8.8.8.8/',
+      'https://[::ffff:8.8.8.8]/',
+      'https://[::ffff:808:808]/',
+    ]) {
+      await expect(policy.authorize('web_fetch', { url }, context()), url)
+        .resolves.toEqual({ allowed: true });
+    }
+  });
+
   it('exposes run_program only in normal task runtimes', () => {
     expect(programmaticExecutionExposureFromSessionId('gconv-1')).toBe(true);
     expect(programmaticExecutionExposureFromSessionId('gmember-1')).toBe(true);
