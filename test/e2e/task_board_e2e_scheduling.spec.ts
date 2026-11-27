@@ -444,10 +444,46 @@ test.describe('task board scheduling (D29 planned dependencies)', () => {
     await expect(row('discard this unsent revision.')).toHaveCount(0);
     expect((await readTasks()).find((task) => task.task_id === cancelledId)?.status).toBe('cancelled');
 
-    // Native mouse drag exercises the actual Chromium gesture and IPC path.
-    await row('queued second revision.').locator('.chat-queue-drag').dragTo(row('queued first revision.'), {
-      sourcePosition: { x: 8, y: 8 }, targetPosition: { x: 130, y: 3 },
+    // Keep one native gesture pressed across a refresh, all the way to the persisted reorder.
+    const dragHandle = row('queued second revision.').locator('.chat-queue-drag');
+    // Runtime repaint can replace the row while the fixture scrolls it into view.
+    await expect(async () => {
+      await dragHandle.scrollIntoViewIfNeeded({ timeout: 1000 });
+    }).toPass({ timeout: 5000 });
+    const expectedTask = await row('queued second revision.').getAttribute('data-task-id');
+    const geometry: { bounds: Awaited<ReturnType<typeof dragHandle.boundingBox>> } = { bounds: null };
+    await expect.poll(async () => {
+      geometry.bounds = await dragHandle.boundingBox();
+      return geometry.bounds !== null;
+    }).toBe(true);
+    const bounds = geometry.bounds;
+    if (!bounds) throw new Error('Queued drag handle is unavailable');
+    const { x, y } = bounds;
+    // A repaint can replace the locator's node before mouse-down. Observe the
+    // actual pressed node and use only that node for the held-gesture assertion.
+    const pressed = await page.evaluateHandle(() => {
+      let source: Element | null = null;
+      function capture(event: PointerEvent) {
+        source = (event.target as Element | null)?.closest('.chat-queue-drag') ?? null;
+      }
+      document.addEventListener('pointerdown', capture, { capture: true, once: true });
+      return { get source() { return source; }, dispose: () => document.removeEventListener('pointerdown', capture, true) };
     });
+    try {
+      await page.mouse.move(x + 8, y + 8);
+      await page.mouse.down();
+      expect(await pressed.evaluate(state => state.source?.closest('.chat-queue-item')?.getAttribute('data-task-id'))).toBe(expectedTask);
+      await page.evaluate((conversationId) => { (window as any).TaskBoard.render(conversationId); }, cid);
+      expect(await pressed.evaluate(state => state.source?.isConnected)).toBe(true);
+      const target = await row('queued first revision.').boundingBox();
+      if (!target) throw new Error('Queued drop target is unavailable');
+      await page.mouse.move(target.x + 130, target.y + 3, { steps: 8 });
+      await page.mouse.move(target.x + 131, target.y + 3);
+    } finally {
+      await page.mouse.up();
+      await pressed.evaluate(state => state.dispose());
+      await pressed.dispose();
+    }
     await expect(groups.nth(0).locator('.chat-queue-item')).toHaveText([
       /draft the article/, /queued second revision/, /queued first revision/,
     ]);
