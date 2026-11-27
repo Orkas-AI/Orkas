@@ -1,7 +1,9 @@
+import { safeId } from '../storage';
 import { fetchWithRetry } from '../util/retry';
+import { withCommonHeaders } from './api_common';
 import { apiBase } from './marketplace';
 
-export async function recordOpenSourceSupport(input: unknown): Promise<void> {
+export async function recordOpenSourceSupport(input: unknown, uid: string): Promise<void> {
   if (!input || typeof input !== 'object') return;
   const { surface, action } = input as { surface?: unknown; action?: unknown };
   if ((surface !== 'home' && surface !== 'settings')
@@ -9,13 +11,12 @@ export async function recordOpenSourceSupport(input: unknown): Promise<void> {
   if (process.env.ORKAS_E2E_USER_DATA_DIR || process.env.ORKAS_TELEMETRY_DISABLED === '1'
     || process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE) return;
 
-  // Only these two enums leave the device. The standard headers also carry
-  // installation metadata, so this request sends only the required channel.
+  const body = { surface, action, ...(safeId(uid) && uid.length <= 50 ? { uid } : {}) };
   try {
     const response = await fetchWithRetry('open-source-support', `${apiBase()}/analytics/open-github-star`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Orkas-Channel': 'open' },
-      body: JSON.stringify({ surface, action }),
+      headers: withCommonHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+      body: JSON.stringify(body),
       credentials: 'omit',
       redirect: 'error',
     }, { retries: 0, timeoutMs: 5_000, timeoutMessage: 'Open-source support report timed out' });

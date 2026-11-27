@@ -3167,9 +3167,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'config.getLocales': async () => ({ tables: getRendererTables() }),
 
-  'openSourceSupport.record': async (payload) => {
+  'openSourceSupport.record': async (payload, ctx) => {
     const { recordOpenSourceSupport } = await import('../features/open_source_support');
-    await recordOpenSourceSupport(payload);
+    await recordOpenSourceSupport(payload, ctx.userId);
   },
 
   'prefs.getTodoGrouping': async (_args, ctx) => ({ grouping: appConfig.getTodoGrouping(ctx.userId) }),

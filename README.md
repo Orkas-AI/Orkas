@@ -112,7 +112,7 @@ Orkas runs the CLI agents you already have installed as local sessions, next to 
 
 > ⭐ If Orkas is useful to you, a star helps more people find the project.
 
-The open-source desktop app sends anonymous counts for views, opens, and dismissals of its GitHub Star invitation. The event contains only the entry point and action. Task content, task identifiers, installation identifiers, and GitHub accounts are excluded.
+The open-source desktop app reports views, opens, and dismissals of its GitHub Star invitation. It uses the same local OrkasOpen ID and standard app metadata as its enter and leave events to deduplicate counts. Reports exclude task content, task identifiers, and GitHub account information.
 
 ---
 
