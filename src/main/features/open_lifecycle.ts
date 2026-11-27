@@ -57,6 +57,10 @@ export function openLifecycleRequestBody(
   return { uid, event: record.event, trigger: record.trigger };
 }
 
+export function openAnalyticsUrl(): string {
+  return `${apiBase()}/analytics/open-app-lifecycle`;
+}
+
 export async function reportOpenLifecycle(uid: string, record: OpenLifecycleRecord): Promise<void> {
   if (!safeId(uid) || uid.length > 50) {
     warnTransport('lifecycle event skipped because the active uid is invalid', { reason: 'invalid_uid' });
@@ -65,7 +69,7 @@ export async function reportOpenLifecycle(uid: string, record: OpenLifecycleReco
   try {
     const response = await fetchWithRetry(
       'open-lifecycle',
-      `${apiBase()}/analytics/open-app-lifecycle`,
+      openAnalyticsUrl(),
       {
         method: 'POST',
         headers: withCommonHeaders({

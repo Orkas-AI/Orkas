@@ -1,7 +1,7 @@
 import { safeId } from '../storage';
 import { fetchWithRetry } from '../util/retry';
 import { withCommonHeaders } from './api_common';
-import { apiBase } from './marketplace';
+import { openAnalyticsUrl } from './open_lifecycle';
 
 export async function recordOpenSourceSupport(input: unknown, uid: string): Promise<void> {
   if (!input || typeof input !== 'object') return;
@@ -11,9 +11,9 @@ export async function recordOpenSourceSupport(input: unknown, uid: string): Prom
   if (process.env.ORKAS_E2E_USER_DATA_DIR || process.env.ORKAS_TELEMETRY_DISABLED === '1'
     || process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE) return;
 
-  const body = { surface, action, ...(safeId(uid) && uid.length <= 50 ? { uid } : {}) };
+  const body = { event: 'github_star', surface, action, ...(safeId(uid) && uid.length <= 50 ? { uid } : {}) };
   try {
-    const response = await fetchWithRetry('open-source-support', `${apiBase()}/analytics/open-github-star`, {
+    const response = await fetchWithRetry('open-source-support', openAnalyticsUrl(), {
       method: 'POST',
       headers: withCommonHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
       body: JSON.stringify(body),
