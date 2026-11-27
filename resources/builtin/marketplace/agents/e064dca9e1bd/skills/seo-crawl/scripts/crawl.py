@@ -459,16 +459,38 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
 
     origin = "{0.scheme}://{0.netloc}".format(urlsplit(page_url))
 
+    # One malformed URL in untrusted markup must not discard the entire page.
+    # Keep rejected attributes as evidence instead of silently losing them.
+    invalid_url_attributes = []
+
+    def resolve_attribute(value, element, attribute):
+        try:
+            resolved = urljoin(page_url, value)
+            parsed = urlsplit(resolved)
+            if parsed.scheme in ("http", "https"):
+                if not parsed.hostname:
+                    raise ValueError("missing hostname")
+                parsed.port  # validate nonnumeric and out-of-range ports
+            return resolved
+        except ValueError:
+            invalid_url_attributes.append({
+                "element": element, "attribute": attribute, "value": value,
+            })
+            return None
+
     # canonical / hreflang / icons from <link>
     canonical = None
     hreflangs = []
     for ln in p.links:
         rel = ln.get("rel", "").lower()
         if "canonical" in rel and ln.get("href"):
-            canonical = urljoin(page_url, ln["href"].strip())
+            candidate = resolve_attribute(ln["href"].strip(), "link", "href")
+            if candidate is not None:
+                canonical = candidate
         if "alternate" in rel and ln.get("hreflang"):
-            hreflangs.append({"hreflang": ln["hreflang"].strip(),
-                              "href": urljoin(page_url, ln.get("href", "").strip())})
+            candidate = resolve_attribute(ln.get("href", "").strip(), "link", "href")
+            if candidate is not None:
+                hreflangs.append({"hreflang": ln["hreflang"].strip(), "href": candidate})
 
     # links split by origin
     internal, external = [], []
@@ -477,7 +499,9 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
         href = href.strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
             continue
-        absu = urljoin(page_url, href)
+        absu = resolve_attribute(href, "a", "href")
+        if absu is None:
+            continue
         sp = urlsplit(absu)
         if sp.scheme not in ("http", "https"):
             continue
@@ -485,7 +509,7 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
         (internal if target_origin == origin else external).append(absu)
 
     # images / alt coverage
-    images = [{"src": urljoin(page_url, im["src"].strip()) if im["src"] else "", "alt": im["alt"]}
+    images = [{"src": (resolve_attribute(im["src"].strip(), "img", "src") or "") if im["src"] else "", "alt": im["alt"]}
               for im in p.images]
     missing_alt = sum(1 for im in p.images if im["alt"] is None or not str(im["alt"]).strip())
 
@@ -538,6 +562,7 @@ def extract_fields(html: str, page_url: str, *, status: int | None = 200,
         "meta_description": _meta_get(p.metas, name="description"),
         "meta_robots": meta_robots,
         "canonical": canonical,
+        "invalid_url_attributes": invalid_url_attributes,
         "og_title": _meta_get(p.metas, prop="og:title"),
         "og_description": _meta_get(p.metas, prop="og:description"),
         "og_image": _meta_get(p.metas, prop="og:image"),
