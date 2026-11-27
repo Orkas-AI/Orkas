@@ -160,7 +160,7 @@ Le lien de téléchargement détecte votre système et lance le bon programme d'
 
 **Vous hésitez entre plusieurs agents de codage ?** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Alternatives à Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**Comparaisons détaillées côte à côte →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**Comparaisons détaillées côte à côte →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

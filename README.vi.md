@@ -160,7 +160,7 @@ Liên kết tải xuống sẽ nhận diện hệ điều hành của bạn và 
 
 **Đang phân vân giữa các tác tử lập trình?** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Các lựa chọn thay thế Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**So sánh chi tiết song song →** [so với Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [so với Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [so với Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [so với LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [so với ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [so với OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [so với Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**So sánh chi tiết song song →** [so với Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [so với Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [so với Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [so với LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [so với ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [so với OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [so với Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

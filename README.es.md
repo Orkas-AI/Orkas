@@ -160,7 +160,7 @@ El enlace de descarga detecta tu sistema e inicia el instalador adecuado.
 
 **¿Dudas entre agentes de programación?** [Codex vs. OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs. Codex vs. OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Alternativas a Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**Comparativas completas, punto por punto →** [frente a Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [frente a Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [frente a Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [frente a LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [frente a ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [frente a OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [frente a Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**Comparativas completas, punto por punto →** [frente a Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [frente a Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [frente a Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [frente a LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [frente a ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [frente a OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [frente a Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

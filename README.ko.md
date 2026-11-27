@@ -160,7 +160,7 @@ Orkas는 이미 설치해 둔 CLI 에이전트를 자체 전문 에이전트와 
 
 **코딩 에이전트를 고르고 계신가요?** [Codex와 OpenCode 비교](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code, Codex, OpenCode 비교](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code 대안](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**전체 상세 비교 →** [Claude Code와 비교](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [Codex와 비교](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [Cline과 비교](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [LangChain과 비교](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [ChatGPT와 비교](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [OpenClaw와 비교](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [Hermes-Agent와 비교](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**전체 상세 비교 →** [Claude Code와 비교](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [Codex와 비교](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [Cline과 비교](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [LangChain과 비교](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [ChatGPT와 비교](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [OpenClaw와 비교](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [Hermes-Agent와 비교](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

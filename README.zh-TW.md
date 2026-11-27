@@ -160,7 +160,7 @@ Orkas 將你已安裝的 CLI 智能體作為本地會話執行，與內建專業
 
 **選擇程式設計智能體？** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code 替代方案](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**逐項對比 →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**逐項對比 →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

@@ -160,7 +160,7 @@ Orkas, bilgisayarınızda zaten kurulu olan CLI ajanlarını kendi uzmanlarını
 
 **Kodlama ajanları arasında seçim mi yapıyorsunuz?** [Codex mi, OpenCode mu?](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code mu, Codex mi, OpenCode mu?](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code alternatifleri](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**Yan yana ayrıntılı karşılaştırmalar →** [Claude Code ile](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [Codex ile](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [Cline ile](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [LangChain ile](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [ChatGPT ile](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [OpenClaw ile](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [Hermes-Agent ile](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**Yan yana ayrıntılı karşılaştırmalar →** [Claude Code ile](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [Codex ile](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [Cline ile](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [LangChain ile](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [ChatGPT ile](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [OpenClaw ile](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [Hermes-Agent ile](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 
