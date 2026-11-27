@@ -18,6 +18,8 @@ const utilsSource = readFileSync(
   resolve(__dirname, '../../src/renderer/modules/utils.js'),
   'utf8',
 );
+const iconsSource = readFileSync(resolve(__dirname, '../../src/renderer/modules/icons.js'), 'utf8');
+const projectsSource = readFileSync(resolve(__dirname, '../../src/renderer/modules/projects.js'), 'utf8');
 const styleSource = readFileSync(resolve(__dirname, '../../src/renderer/style.css'), 'utf8');
 
 function extractFunction(source: string, name: string): string {
@@ -63,13 +65,15 @@ function renderHeaderMeta(opts: {
     conversations: opts.conv ? [opts.conv] : [],
     _conversationHeaderRenameCid: '',
     t: (key: string) => key,
-    getCommanderProjectIdName: (pid: string) => (pid === 'p1' ? opts.projectName : ''),
+    _projectsCache: opts.projectName ? [{ project_id: 'p1', name: opts.projectName }] : [],
     _groupMembersCache: new Map(),
     _agentsCache: [],
     _commanderAvatar: () => ({ icon: '', color: '' }),
     renderAvatarHtml: () => '',
   };
   const context = vm.createContext(globals);
+  vm.runInContext(iconsSource, context);
+  vm.runInContext(extractFunction(projectsSource, 'getCachedProject'), context);
   vm.runInContext(extractFunction(utilsSource, 'escapeHtml'), context);
   vm.runInContext(extractFunction(conversationSource, '_refreshChatHeader'), context);
   vm.runInContext('_refreshChatHeader()', context);
@@ -77,6 +81,14 @@ function renderHeaderMeta(opts: {
 }
 
 describe('conversation header › project name link', () => {
+  it('uses the local project folder icon next to the name', () => {
+    const html = renderHeaderMeta({
+      conv: { conversation_id: 'c1', title: 'T', project_id: 'p1' },
+      projectName: 'Iterate Orkas',
+    });
+    expect(html).toMatch(/<svg class="[^"]*\bchat-header-meta-project-icon\b[^"]*\bis-folder\b/);
+  });
+
   it('renders the project name as a keyboard-reachable button carrying the project id', () => {
     const html = renderHeaderMeta({
       conv: { conversation_id: 'c1', title: 'T', project_id: 'p1' },
@@ -106,12 +118,14 @@ describe('conversation header › project name link', () => {
       projectName: 'Iterate Orkas',
     });
     expect(orphan).not.toContain('data-header-project-id');
+    expect(orphan).not.toContain('chat-header-meta-project-icon');
     // A just-deleted project resolves to no name: nothing to navigate to.
     const deleted = renderHeaderMeta({
       conv: { conversation_id: 'c1', title: 'T', project_id: 'p1' },
       projectName: '',
     });
     expect(deleted).not.toContain('data-header-project-id');
+    expect(deleted).not.toContain('chat-header-meta-project-icon');
   });
 });
 

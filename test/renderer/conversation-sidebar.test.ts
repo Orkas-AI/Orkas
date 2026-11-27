@@ -1206,7 +1206,10 @@ describe('conversation history response ordering', () => {
     const getElement = s.context.document.getElementById;
     s.context.document.getElementById = (id: string) => id === 'chat-header-title' ? title
       : id === 'chat-header-meta' ? meta : getElement(id);
-    s.context.getCommanderProjectIdName = () => 'Archived project';
+    s.context.getCachedProject = (pid: string) => pid === 'project-old'
+      ? { project_id: pid, name: 'Archived project' } : null;
+    s.context.projectIconName = () => 'folder';
+    s.context.uiIconHtml = () => '';
     s.context.conversations = [{ conversation_id: 'other', title: 'Unrelated task' }];
     const loading = s.context.loadConversationHistory('c1');
     s.resolve(response([question, answer], { conversation: {

@@ -2758,16 +2758,13 @@ function _refreshChatHeader() {
   }
   if (metaEl) {
     const parts = [];
-    // Project swatch + name (when conv belongs to a project). The name is a
+    // Project icon + name (when conv belongs to a project). The name is a
     // link to the project page; activation is delegated from
     // `_bindChatHeaderActions` so the innerHTML repaint needs no rebinding.
-    const pid = (conv && conv.project_id) || '';
-    if (pid && typeof getCommanderProjectIdName === 'function') {
-      const pname = getCommanderProjectIdName(pid);
-      if (pname) {
-        parts.push('<span class="chat-header-meta-project-swatch" aria-hidden="true"></span>');
-        parts.push(`<span class="chat-header-meta-text chat-header-meta-project-link" data-header-project-id="${escapeHtml(pid)}" role="button" tabindex="0">${escapeHtml(pname)}</span>`);
-      }
+    const project = typeof getCachedProject === 'function' ? getCachedProject(conv?.project_id) : null;
+    if (project?.name) {
+      parts.push(uiIconHtml(projectIconName(project), 'chat-header-meta-project-icon'));
+      parts.push(`<span class="chat-header-meta-text chat-header-meta-project-link" data-header-project-id="${escapeHtml(project.project_id)}" role="button" tabindex="0">${escapeHtml(project.name)}</span>`);
     }
     // Stacked actor avatars: commander only when it actually participated
     // in this conv (`conv.commander_in_chat`, backend-derived from a
