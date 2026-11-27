@@ -2179,21 +2179,33 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
 .todo-scope-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 12px; }
 #panel-todos .todo-column:not(.is-collapsed) { align-self: start; }
 #panel-todos .todo-column-body { min-height: 224px; }
-/* Both boards return collapsed lanes' width to the open lanes. */
+/* Collapsed lanes stay compact while open lanes size to their scroll area. */
 .todo-column.is-collapsed {
   flex: 0 0 40px;
   min-width: 40px;
+  height: 96px;
+  align-self: flex-start;
   border-radius: var(--radius-sm);
   background: var(--surface-2);
 }
-.todo-column.is-collapsed > .todo-column-head { justify-content: center; padding: 0; }
+.todo-column.is-collapsed > .todo-column-head { flex: 1; padding: 0; }
 .todo-column.is-collapsed .todo-collapse {
-  flex: 0 0 auto;
+  height: 100%;
   flex-direction: column;
+  justify-content: space-between;
   gap: 8px;
   padding: 10px 0;
+  border-radius: var(--radius-sm);
 }
-.todo-column.is-collapsed .todo-collapse-label { writing-mode: vertical-rl; letter-spacing: 0.1em; }
+.todo-column.is-collapsed .todo-collapse:focus-visible { outline-offset: -2px; }
+.todo-column.is-collapsed .todo-collapse-label {
+  min-height: 0;
+  writing-mode: vertical-rl;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .todo-column.is-collapsed .todo-disclosure-chevron { display: none; }
 .todo-board .project-todo-status-select {
   opacity: 0;

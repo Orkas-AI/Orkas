@@ -36,6 +36,7 @@ for (const language of ['zh', 'en']) {
       const completed = done.locator(`.project-todo-item[data-tid="${task.id}"]`);
       await expect(done.locator('.todo-collapse')).toHaveAttribute('aria-expanded', 'false');
       await expect(done).toHaveCSS('width', '40px');
+      await expect(done).toHaveCSS('height', '96px');
       await expect(done.locator('.todo-collapse-label')).toHaveCSS('writing-mode', 'vertical-rl');
       await expect(completed).toBeHidden();
       await page.screenshot({ path: testInfo.outputPath(`empty-lanes-${entry}-${language}.png`) });
@@ -51,9 +52,34 @@ for (const language of ['zh', 'en']) {
       await page.keyboard.press('Enter');
       await expect(empty).toBeHidden();
       await expect(review).toHaveCSS('width', '40px');
+      await expect(review).toHaveCSS('height', '96px');
+      await expect(toggle).toHaveAccessibleName(language === 'zh' ? /^待确认\s*0$/ : /^Awaiting confirmation\s*0$/);
+      await expect(toggle).toHaveAttribute('title', language === 'zh' ? '待确认' : 'Awaiting confirmation');
+      const countFits = await toggle.locator('.project-detail-tab-count').evaluate(count => {
+        const strip = count.closest('.todo-column')!.getBoundingClientRect();
+        const number = count.getBoundingClientRect();
+        return number.height > 0 && number.bottom < strip.bottom;
+      });
+      expect(countFits).toBe(true);
       await page.keyboard.press('Enter');
       await expect(empty).toBeVisible();
       await expect(toggle).toBeFocused();
+
+      // Closing the remaining lanes should keep all four strips the same size.
+      for (const status of ['todo', 'progress', 'review']) {
+        await board.locator(`.todo-column.is-${status} .todo-collapse`).click();
+      }
+      const strips = board.locator('.todo-column.is-collapsed');
+      await expect(strips).toHaveCount(4);
+      const bounds = await strips.evaluateAll(columns =>
+        columns.map(column => {
+          const { top, height } = column.getBoundingClientRect();
+          return { top, height };
+        }),
+      );
+      expect(bounds.map(({ height }) => height)).toEqual([96, 96, 96, 96]);
+      expect(new Set(bounds.map(({ top }) => top)).size).toBe(1);
+      await page.screenshot({ path: testInfo.outputPath(`collapsed-lanes-${entry}-${language}.png`) });
     }
   });
 }
