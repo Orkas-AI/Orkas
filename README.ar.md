@@ -160,7 +160,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 **هل تختار بين وكلاء البرمجة؟** [Codex مقابل OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code مقابل Codex مقابل OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [بدائل Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**مقارنات تفصيلية جنبًا إلى جنب ←** [مقابل Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [مقابل Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [مقابل Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [مقابل LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [مقابل ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [مقابل OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [مقابل Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**مقارنات تفصيلية جنبًا إلى جنب ←** [مقابل Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [مقابل Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [مقابل Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [مقابل LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [مقابل ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [مقابل OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [مقابل Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

@@ -160,7 +160,7 @@ Orkas は、すでにインストール済みの CLI エージェント（コー
 
 **コーディングエージェントを比較検討中ですか？** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Claude Code の代替ツール](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**詳しい比較はこちら →** [Claude Code との比較](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [Codex との比較](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [Cline との比較](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [LangChain との比較](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [ChatGPT との比較](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [OpenClaw との比較](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [Hermes-Agent との比較](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**詳しい比較はこちら →** [Claude Code との比較](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [Codex との比較](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [Cline との比較](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [LangChain との比較](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [ChatGPT との比較](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [OpenClaw との比較](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [Hermes-Agent との比較](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

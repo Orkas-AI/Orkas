@@ -160,7 +160,7 @@ Orkas запускает уже установленных у вас CLI-аге�
 
 **Выбираете агента для программирования?** [Codex или OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code, Codex или OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Альтернативы Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**Подробные сравнения бок о бок →** [с Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [с Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [с Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [с LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [с ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [с OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [с Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**Подробные сравнения бок о бок →** [с Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [с Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [с Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [с LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [с ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [с OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [с Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 

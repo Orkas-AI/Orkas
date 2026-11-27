@@ -160,7 +160,7 @@ Tautan unduhan akan mendeteksi sistem Anda dan memulai penginstal yang sesuai.
 
 **Sedang memilih agen pemrograman?** [Codex vs OpenCode](https://orkas.ai/compare/codex-vs-opencode/?source=gh-orkas) · [Claude Code vs Codex vs OpenCode](https://orkas.ai/compare/claude-code-vs-codex-vs-opencode/?source=gh-orkas) · [Alternatif Claude Code](https://orkas.ai/compare/claude-code-alternatives/?source=gh-orkas)
 
-**Perbandingan lengkap secara berdampingan →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent?source=gh-orkas)
+**Perbandingan lengkap secara berdampingan →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) · [vs Codex](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline/?source=gh-orkas) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain/?source=gh-orkas) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt/?source=gh-orkas) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw/?source=gh-orkas) · [vs Hermes-Agent](https://orkas.ai/compare/orkas-vs-hermes-agent/?source=gh-orkas)
 
 ---
 
