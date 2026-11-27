@@ -579,6 +579,7 @@ describe('run_program Host policy', () => {
       'http://[::ffff:127.0.0.1]/a',
       'http://[::ffff:169.254.169.254]/latest/meta-data/',
       'http://[::ffff:10.0.0.1]/a',
+      'http://[::ffff:6440:1]/a',
       'http://[fc00::1]/a',
       'http://[fd12:3456::1]/a',
       'http://[fe80::1]/a',
@@ -594,6 +595,19 @@ describe('run_program Host policy', () => {
       'https://fcbarcelona.com/',
       'https://fdroid.org/',
       'http://[2606:4700::1111]/',
+    ]) {
+      await expect(policy.authorize('web_fetch', { url }, context()), url)
+        .resolves.toEqual({ allowed: true });
+    }
+  });
+
+  it('uses the same policy for either representation of a public IPv4 address', async () => {
+    const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+
+    for (const url of [
+      'https://8.8.8.8/',
+      'https://[::ffff:8.8.8.8]/',
+      'https://[::ffff:808:808]/',
     ]) {
       await expect(policy.authorize('web_fetch', { url }, context()), url)
         .resolves.toEqual({ allowed: true });
