@@ -1442,9 +1442,10 @@ function _renderTodoBoard(tasks, context, scope) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'todo-collapse';
+    toggle.title = t('project.todo.status_' + status);
     toggle.setAttribute('aria-expanded', String(!collapsed));
     toggle.innerHTML = '<span class="project-todo-status-dot"></span><span class="todo-collapse-label">'
-      + escapeHtml(t('project.todo.status_' + status)) + '</span><span class="project-detail-tab-count">'
+      + escapeHtml(toggle.title) + '</span><span class="project-detail-tab-count">'
       + items.length + '</span>'
       + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'todo-disclosure-chevron') : '');
     const body = document.createElement('div');
