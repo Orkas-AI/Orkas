@@ -15221,6 +15221,8 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 
 .settings-sheet-foot[hidden] { display: none; }
 
+#settings-open-source .btn { text-decoration: none; }
+
 .settings-link-btn {
   flex: 0 0 auto;
   display: inline-flex;
