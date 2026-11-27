@@ -5,14 +5,12 @@
   const settings = document.getElementById('settings-open-source');
   if (!card || !settings) return;
 
-  const events = new Set(['home:show', 'home:open', 'home:dismiss', 'settings:show', 'settings:open']);
   let saved;
   try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) { /* optional state */ }
   const state = {
     firstRun: typeof saved?.firstRun === 'string' ? saved.firstRun : '',
     eligible: saved?.eligible === true,
     decision: ['opened', 'dismissed'].includes(saved?.decision) ? saved.decision : '',
-    recorded: Array.isArray(saved?.recorded) ? Array.from(new Set(saved.recorded.filter(entry => events.has(entry)))) : [],
   };
 
   function save() {
@@ -20,40 +18,33 @@
   }
 
   function record(surface, action) {
-    const event = `${surface}:${action}`;
-    if (state.recorded.includes(event)) return;
-    state.recorded.push(event);
-    save();
     window.orkas?.invoke('openSourceSupport.record', { surface, action }).catch(() => {});
   }
 
-  const visible = new Set();
-  const surfaces = new Map([[card, 'home'], [settings, 'settings']]);
-  function recordVisible() {
-    if (document.visibilityState !== 'visible') return;
-    for (const element of visible) {
-      if (!element.checkVisibility({ visibilityProperty: true })) continue;
-      record(surfaces.get(element), 'show');
-      visible.delete(element);
-      observer.unobserve(element);
+  const surfaces = new Map([
+    [card, { name: 'home', inView: false, wasVisible: false }],
+    [settings, { name: 'settings', inView: false, wasVisible: false }],
+  ]);
+  function updateExposures(entries = []) {
+    for (const entry of entries) {
+      surfaces.get(entry.target).inView = entry.isIntersecting && entry.intersectionRatio >= 0.5;
+    }
+    for (const [element, exposure] of surfaces) {
+      const visible = document.visibilityState === 'visible' && exposure.inView
+        && element.checkVisibility({ visibilityProperty: true });
+      if (visible && !exposure.wasVisible) record(exposure.name, 'show');
+      exposure.wasVisible = visible;
     }
   }
-  const observer = new IntersectionObserver(entries => {
-    for (const entry of entries) {
-      if (entry.isIntersecting && entry.intersectionRatio >= 0.5) visible.add(entry.target);
-      else visible.delete(entry.target);
-    }
-    recordVisible();
-  }, { threshold: 0.5 });
+  const observer = new IntersectionObserver(updateExposures, { threshold: 0.5 });
   for (const element of surfaces.keys()) observer.observe(element);
-  document.addEventListener('visibilitychange', recordVisible);
+  document.addEventListener('visibilitychange', () => updateExposures(observer.takeRecords()));
 
   function decide(surface, action) {
-    record(surface, 'show');
+    updateExposures(observer.takeRecords());
     state.decision ||= action === 'dismiss' ? 'dismissed' : 'opened';
     state.firstRun = '';
     card.hidden = true;
-    // Preserve the choice even if this action has already been counted.
     save();
     record(surface, action);
   }

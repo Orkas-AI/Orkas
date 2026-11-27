@@ -32,11 +32,9 @@ test('invites after two successful user rounds and respects local dismissal', as
   await appPage.locator('#new-chat-btn').click();
   await expect(card.getByRole('heading', { name: '支持开源' })).toBeVisible();
   await expect(card.locator('a')).toHaveAttribute('href', REPOSITORY);
-  await expect.poll(async () => (await state()).recorded).toEqual(expect.arrayContaining(['settings:show', 'home:show']));
   await appPage.locator('#settings-btn').click();
   await appPage.locator('#new-chat-btn').click();
   await expect(card).toBeVisible();
-  expect((await state()).recorded.filter((entry: string) => entry === 'home:show')).toHaveLength(1);
   await appPage.screenshot({ path: testInfo.outputPath('commander-home-star.png'), animations: 'disabled', scale: 'css' });
   await card.getByRole('button', { name: '不再提醒' }).click();
   await expect(card).toBeHidden();
@@ -44,7 +42,6 @@ test('invites after two successful user rounds and respects local dismissal', as
   await appPage.locator('#new-chat-btn').click();
   await expect(card).toBeHidden();
   expect((await state()).decision).toBe('dismissed');
-  expect((await state()).recorded).toContain('home:dismiss');
 });
 
 test('opening GitHub from General suppresses the home invitation before eligibility', async ({ orkas, appPage }) => {
@@ -61,7 +58,7 @@ test('opening GitHub from General suppresses the home invitation before eligibil
     await appPage.locator('#settings-open-source a').press('Enter');
     await expect.poll(() => app.evaluate(() => (globalThis as any).starOpened)).toEqual([REPOSITORY]);
     const result = await appPage.evaluate(key => JSON.parse(localStorage.getItem(key) ?? '{}'), STORAGE_KEY);
-    expect(result).toMatchObject({ decision: 'opened', recorded: ['settings:show', 'settings:open'] });
+    expect(result.decision).toBe('opened');
     const native = await app.browserWindow(appPage);
     await native.evaluate(win => {
       for (const runId of ['a', 'b']) {
