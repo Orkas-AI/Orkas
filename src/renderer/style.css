@@ -5854,13 +5854,7 @@ html[dir="rtl"] .home-row-action-icon { transform: scaleX(-1); }
 .chat-recipient-chip.is-task-link:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .chat-recipient-chip.is-task-link:disabled { opacity: 0.6; cursor: wait; }
 
-.chat-header-meta-project-swatch {
-  width: 7px;
-  height: 7px;
-  border-radius: 2px;
-  background: var(--primary);
-  flex: 0 0 auto;
-}
+.chat-header-meta-project-icon { flex: 0 0 auto; }
 .chat-header-meta-sep {
   flex: 0 0 auto;
 }

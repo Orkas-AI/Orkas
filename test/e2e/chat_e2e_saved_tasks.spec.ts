@@ -307,6 +307,11 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
   await app.invoke('projects.tasks.create', { projectId: project.project.project_id, content: 'Another release check' });
   await expect(page.locator('#chat-history [data-saved-task-key]')).toHaveCount(2);
   await expect(page.locator('#chat-header-task-links')).toBeHidden();
+  const projectIcon = () => page.locator('#chat-header-meta svg.chat-header-meta-project-icon');
+  await expect(projectIcon()).toHaveClass(/\bis-folder\b/);
+  await expect(projectIcon()).toBeInViewport();
+  await expect(page.locator('#chat-header-meta [data-header-project-id]')).toHaveText('Release review');
+  await page.screenshot({ path: testInfo.outputPath('conversation-project-folder-en.png') });
   await page.evaluate(() => (window as any).setLang('zh'));
   await expect(page.locator('#chat-history [data-saved-task-key] .chat-msg-created-agent-label').first()).toContainText('打开');
   await page.evaluate(() => (window as any).setLang('en'));
@@ -369,6 +374,9 @@ test('keeps saved automation and todo shortcuts usable live and after restart', 
     .toContainText('The tasks have been saved.');
   await page.setViewportSize({ width: 1024, height: 720 });
   await page.evaluate(() => (window as any).setLang('zh'));
+  await expect(projectIcon()).toBeInViewport();
+  await expect(projectIcon()).toHaveClass(/\bis-folder\b/);
+  await page.screenshot({ path: testInfo.outputPath('conversation-project-folder-zh-narrow.png') });
   await page.locator('#chat-history [data-saved-task-key]', { hasText: 'Review release notes' }).click();
   await expect(todoCard).toBeInViewport();
   await expect(todoCard).not.toHaveCSS('background-color', restingStyle.background, { timeout: 1500 });

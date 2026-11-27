@@ -936,15 +936,18 @@ async function _confirmDeleteProject(pid, source = 'sidebar') {
 // Empty-state composer no longer carries a project chip — new conversations
 // from the commander tab are always orphan. Project membership is bound
 // only via the per-project page. This resolver is kept because the
-// conversation header + workspace chip tooltip still need a pid → name
-// lookup for already-bound conversations.
+// conversation header and workspace chip tooltip still use cached project
+// metadata for already-bound conversations.
+
+function getCachedProject(pid) {
+  if (!pid || !Array.isArray(_projectsCache)) return null;
+  return _projectsCache.find((project) => project?.project_id === pid) || null;
+}
 
 /** Resolve a project id to its display name from the cache. Returns empty
  *  string when the pid is unknown (e.g. just deleted). */
 function getCommanderProjectIdName(pid) {
-  if (!pid || !Array.isArray(_projectsCache)) return '';
-  const p = _projectsCache.find((x) => x && x.project_id === pid);
-  return (p && p.name) || '';
+  return getCachedProject(pid)?.name || '';
 }
 
 // Commander navigation uses the same sidebar/create/detail workflows as a
