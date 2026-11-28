@@ -1,5 +1,3 @@
-import { isIP } from 'node:net';
-
 import type {
   ProgrammaticToolAuthorization,
   ProgrammaticToolPolicy,
@@ -7,6 +5,7 @@ import type {
 } from '#core-agent';
 
 import { resolveVisibleConnectors } from '../../features/connectors/tools-adapter';
+import { isRestrictedNetworkAddress } from '../../util/restricted-network-address';
 import { getToolCatalogEntry } from './tool-catalog';
 
 export interface ProgrammaticToolPolicyOptions {
@@ -173,31 +172,5 @@ function stringArg(value: unknown): string {
 function isLocalOrPrivateHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
-  if (host === '::' || host === '::1') return true;
-
-  const version = isIP(host);
-  if (version === 6) {
-    const first = Number.parseInt(host.split(':')[0] || '0', 16);
-    if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true;
-
-    // URL.hostname canonicalizes a mapped IPv4 literal to two hex groups.
-    // Apply the same IPv4 policy to the embedded address.
-    const mapped = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(host);
-    if (!mapped) return false;
-    const prefix = Number.parseInt(mapped[1], 16);
-    return isLocalOrPrivateIpv4Prefix(prefix >>> 8, prefix & 0xff);
-  }
-  if (version !== 4) return false;
-  const [first, second] = host.split('.').map(Number);
-  return isLocalOrPrivateIpv4Prefix(first, second);
-}
-
-function isLocalOrPrivateIpv4Prefix(first: number, second: number): boolean {
-  return first === 0
-    || first === 10
-    || first === 127
-    || (first === 169 && second === 254)
-    || (first === 172 && second >= 16 && second <= 31)
-    || (first === 192 && second === 168)
-    || (first === 100 && second >= 64 && second <= 127);
+  return isRestrictedNetworkAddress(host);
 }

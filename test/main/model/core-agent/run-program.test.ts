@@ -580,10 +580,17 @@ describe('run_program Host policy', () => {
       'http://[::ffff:169.254.169.254]/latest/meta-data/',
       'http://[::ffff:10.0.0.1]/a',
       'http://[::ffff:6440:1]/a',
+      'http://[::127.0.0.1]/a',
+      'http://[::ffff:0:127.0.0.1]/a',
+      'http://[64:ff9b::169.254.169.254]/latest/meta-data/',
+      'http://[64:ff9b:1::10.0.0.1]/a',
+      'http://[2002:7f00:1::1]/a',
+      'http://[2001:0:4136:e378:8000:63bf:f5ff:fffe]/a',
       'http://[fc00::1]/a',
       'http://[fd12:3456::1]/a',
       'http://[fe80::1]/a',
       'http://[febf::1]/a',
+      'http://[ff02::1]/a',
     ]) {
       await expect(policy.authorize('web_fetch', { url }, context()), url)
         .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_NETWORK_SCOPE' });
@@ -608,10 +615,20 @@ describe('run_program Host policy', () => {
       'https://8.8.8.8/',
       'https://[::ffff:8.8.8.8]/',
       'https://[::ffff:808:808]/',
+      'https://[64:ff9b::8.8.8.8]/',
+      'https://[2002:808:808::1]/',
     ]) {
       await expect(policy.authorize('web_fetch', { url }, context()), url)
         .resolves.toEqual({ allowed: true });
     }
+  });
+
+  it('keeps local-use translation addresses out of the public web_fetch scope', async () => {
+    const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+    const url = 'https://[64:ff9b:1::808:808]/';
+
+    await expect(policy.authorize('web_fetch', { url }, context()))
+      .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_NETWORK_SCOPE' });
   });
 
   it('exposes run_program only in normal task runtimes', () => {

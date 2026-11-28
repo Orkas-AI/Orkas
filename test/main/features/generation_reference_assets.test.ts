@@ -226,6 +226,13 @@ describe('generation reference assets', () => {
       'https://[::ffff:169.254.169.254]/reference.png',
       'https://[::ffff:10.0.0.1]/reference.png',
       'https://[::ffff:192.168.1.1]/reference.png',
+      'https://[::127.0.0.1]/reference.png',
+      'https://[::ffff:0:127.0.0.1]/reference.png',
+      'https://[64:ff9b::169.254.169.254]/reference.png',
+      'https://[64:ff9b:1::10.0.0.1]/reference.png',
+      'https://[2002:7f00:1::1]/reference.png',
+      'https://[2001:0:4136:e378:8000:63bf:f5ff:fffe]/reference.png',
+      'https://[ff02::1]/reference.png',
       'https://100.64.0.1/reference.png',
       'asset:not-a-provider-asset',
       'not a URL',
@@ -236,6 +243,24 @@ describe('generation reference assets', () => {
         maxItems: 1,
       }), url).rejects.toThrow(/HTTPS public URL or asset:\/\//);
     }
+  });
+
+  it('accepts public IPv6 references and rejects local-use translation addresses', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const { prepareReferenceUrls } = await import('../../../src/main/features/generation_reference_assets');
+    const publicUrls = [
+      'https://[2606:4700::1111]/image.png',
+      'https://[::ffff:808:808]/image.png',
+      'https://[64:ff9b::808:808]/image.png',
+    ];
+
+    await expect(prepareReferenceUrls({ kind: 'image', urls: publicUrls, maxItems: 3 }))
+      .resolves.toEqual(publicUrls);
+    await expect(prepareReferenceUrls({
+      kind: 'image', urls: ['https://[64:ff9b:1::808:808]/image.png'], maxItems: 1,
+    })).rejects.toThrow(/HTTPS public URL/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('fails closed on unavailable upload and on cancellation without returning a partial local reference', async () => {
