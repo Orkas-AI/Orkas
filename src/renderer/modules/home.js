@@ -483,6 +483,7 @@ function _homeBind() {
 
 /** Called by `onEnterNewChatView` on every visit to the home. */
 function homeOnEnter() {
+  window.OpenSourceSupport?.onHomeEnter();
   _homeBind();
   _homeExpanded.clear();
   clearTimeout(_homeRefreshTimer);

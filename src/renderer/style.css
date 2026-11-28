@@ -15227,6 +15227,39 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 
 .settings-sheet-foot[hidden] { display: none; }
 
+#settings-open-source .btn,
+.home-open-source-support .btn { text-decoration: none; }
+
+.home-open-source-support {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 80;
+  width: min(320px, calc(100vw - 48px));
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, .10);
+}
+.home-open-source-support header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.home-open-source-support h2 { font-size: 14px; font-weight: 600; }
+.home-open-source-support p { margin: 4px 0 12px; font-size: 13px; line-height: 1.55; color: var(--text-2); }
+.home-open-source-support .btn { display: inline-flex; }
+.home-open-source-close {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.home-open-source-close:hover { background: var(--surface-2); color: var(--text); }
+.home-open-source-close .ui-icon { width: 15px; height: 15px; }
+
 .settings-link-btn {
   flex: 0 0 auto;
   display: inline-flex;

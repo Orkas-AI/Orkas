@@ -178,6 +178,16 @@
             </section>
           </div>
         </div>
+        <aside id="home-open-source-support" class="home-open-source-support" aria-labelledby="home-open-source-support-title" hidden>
+          <header>
+            <h2 id="home-open-source-support-title" data-i18n="settings.open_source.title">Support open source</h2>
+            <button class="home-open-source-close" type="button" aria-label="Do not show again" data-i18n-aria-label="home.open_source.dismiss" data-i18n-title="home.open_source.dismiss">
+              <span data-ui-icon="x" aria-hidden="true"></span>
+            </button>
+          </header>
+          <p data-i18n="home.open_source.message">If Orkas helps you, consider giving the project a star.</p>
+          <a class="btn btn-sm" href="https://github.com/Orkas-AI/Orkas" target="_blank" rel="noopener noreferrer" data-i18n="settings.open_source.open_github">Open GitHub</a>
+        </aside>
       </section>
 
       <!-- Conversation Detail -->
@@ -1296,6 +1306,20 @@
                   <p data-i18n="settings.general.page_sub">调整使用偏好与智能体权限。</p>
                 </header>
 
+                <section class="settings-section" id="settings-open-source">
+                  <div class="settings-section-title">
+                    <h2 data-i18n="settings.open_source.title">Support open source</h2>
+                  </div>
+                  <div class="settings-sheet">
+                    <div class="settings-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" data-i18n="settings.open_source.star">Star Orkas on GitHub</div>
+                      </div>
+                      <a class="btn btn-sm" href="https://github.com/Orkas-AI/Orkas" target="_blank" rel="noopener noreferrer" data-i18n="settings.open_source.open_github">Open GitHub</a>
+                    </div>
+                  </div>
+                </section>
+
                 <section class="settings-section">
                   <div class="settings-section-title">
                     <h2 data-i18n="settings.general.preferences_title">使用偏好</h2>
@@ -2200,6 +2224,7 @@
   <script src="./modules/validation-report-view.js"></script>
   <script src="./modules/oss.js"></script>
   <script src="./modules/settings_tabs.js"></script>
+  <script src="./modules/open-source-support.js"></script>
 
   <!--
     MathJax v3.2.2 — TeX → CommonHTML.

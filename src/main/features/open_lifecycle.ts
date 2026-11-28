@@ -57,29 +57,28 @@ export function openLifecycleRequestBody(
   return { uid, event: record.event, trigger: record.trigger };
 }
 
+export function openAnalyticsUrl(): string {
+  return `${apiBase()}/analytics/open-app`;
+}
+
 export async function reportOpenLifecycle(uid: string, record: OpenLifecycleRecord): Promise<void> {
   if (!safeId(uid) || uid.length > 50) {
     warnTransport('lifecycle event skipped because the active uid is invalid', { reason: 'invalid_uid' });
     return;
   }
   try {
-    const response = await fetchWithRetry(
-      'open-lifecycle',
-      `${apiBase()}/analytics/open-app-lifecycle`,
-      {
-        method: 'POST',
-        headers: withCommonHeaders({
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        }),
-        body: JSON.stringify(openLifecycleRequestBody(uid, record)),
-      },
-      {
-        retries: 0,
-        timeoutMs: REQUEST_TIMEOUT_MS,
-        timeoutMessage: 'open lifecycle request timed out',
-      },
-    );
+    const init = {
+      method: 'POST',
+      headers: withCommonHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+      body: JSON.stringify(openLifecycleRequestBody(uid, record)),
+    };
+    const options = { retries: 0, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
+    let response = await fetchWithRetry('open-lifecycle', openAnalyticsUrl(), init, options);
+    // Servers deployed before the migration still accept the original lifecycle body.
+    if (response.status === 404 || response.status === 405) {
+      await response.body?.cancel().catch(() => {});
+      response = await fetchWithRetry('open-lifecycle', `${apiBase()}/analytics/open-app-lifecycle`, init, options);
+    }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
       warnTransport('lifecycle event rejected', { status_code: response.status });
