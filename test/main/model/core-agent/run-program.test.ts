@@ -623,6 +623,14 @@ describe('run_program Host policy', () => {
     }
   });
 
+  it('keeps local-use translation addresses out of the public web_fetch scope', async () => {
+    const policy = createProgrammaticToolPolicy({ userId: 'u1' });
+    const url = 'https://[64:ff9b:1::808:808]/';
+
+    await expect(policy.authorize('web_fetch', { url }, context()))
+      .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_NETWORK_SCOPE' });
+  });
+
   it('exposes run_program only in normal task runtimes', () => {
     expect(programmaticExecutionExposureFromSessionId('gconv-1')).toBe(true);
     expect(programmaticExecutionExposureFromSessionId('gmember-1')).toBe(true);

@@ -13,6 +13,7 @@ import { logPathRef } from '../util/log-redact';
 import { createLogger } from '../logger';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
+import { isRestrictedNetworkAddress } from '../util/restricted-network-address';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
 
 import { MEDIA_TRANSFER_POLICY } from '../util/media-transfer-policy';
@@ -528,95 +529,7 @@ function isPrivateReferenceHost(hostname: string): boolean {
     || host.endsWith('.internal')
   ) return true;
 
-  const ipVersion = isIP(host);
-  if (ipVersion === 4) return isPrivateReferenceIpv4(host);
-  if (ipVersion === 6) {
-    const words = parseReferenceIpv6Words(host);
-    if (!words) return true;
-    const [w0, , , , , , , w7] = words;
-    if (words.every((w) => w === 0)) return true;
-    if (words.slice(0, 7).every((w) => w === 0) && w7 === 1) return true;
-    if ((w0 & 0xfe00) === 0xfc00 || (w0 & 0xffc0) === 0xfe80 || (w0 & 0xff00) === 0xff00) return true;
-
-    const embedded = embeddedReferenceIpv4(words);
-    if (embedded) return isPrivateReferenceIpv4(embedded);
-    return false;
-  }
-  return false;
-}
-
-function parseReferenceIpv6Words(host: string): number[] | null {
-  let normalized = host;
-  const lastColon = normalized.lastIndexOf(':');
-  if (lastColon >= 0 && normalized.includes('.', lastColon)) {
-    const ipv4Part = normalized.slice(lastColon + 1);
-    if (isIP(ipv4Part) !== 4) return null;
-    const [a, b, c, d] = ipv4Part.split('.').map(Number);
-    normalized = `${normalized.slice(0, lastColon + 1)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
-  }
-  const halves = normalized.split('::');
-  if (halves.length > 2) return null;
-  const head = halves[0] ? halves[0].split(':') : [];
-  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
-  const missing = 8 - head.length - tail.length;
-  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
-  const words = [...head, ...Array<string>(missing).fill('0'), ...tail].map((part) => (
-    /^[0-9a-f]{1,4}$/i.test(part) ? Number.parseInt(part, 16) : Number.NaN
-  ));
-  return words.every((w) => Number.isInteger(w) && w >= 0 && w <= 0xffff) ? words : null;
-}
-
-function embeddedReferenceIpv4(words: readonly number[]): string | null {
-  const [w0, w1, w2, w3, w4, w5, w6, w7] = words;
-  const dotted = (hi: number, lo: number): string => (
-    `${(hi >>> 8) & 0xff}.${hi & 0xff}.${(lo >>> 8) & 0xff}.${lo & 0xff}`
-  );
-  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0xffff) {
-    return dotted(w6, w7);
-  }
-  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0xffff && w5 === 0) {
-    return dotted(w6, w7);
-  }
-  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0 && (w6 !== 0 || w7 > 1)) {
-    return dotted(w6, w7);
-  }
-  if (w0 === 0x0064 && w1 === 0xff9b && ((w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0) || w2 === 1)) {
-    return dotted(w6, w7);
-  }
-  if (w0 === 0x2002) {
-    return dotted(w1, w2);
-  }
-  if (w0 === 0x2001 && w1 === 0x0000) {
-    return dotted(w6 ^ 0xffff, w7 ^ 0xffff);
-  }
-  return null;
-}
-
-function isPrivateReferenceIpv4(host: string): boolean {
-  const [a, b] = host.split('.').map(Number);
-  return a === 0
-    || a === 10
-    || (a === 100 && b >= 64 && b <= 127)
-    || a === 127
-    || (a === 169 && b === 254)
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 168)
-    || a >= 224;
-}
-
-function isLoopbackReferenceHost(hostname: string): boolean {
-  const host = hostname.trim().replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
-  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1') return true;
-  const version = isIP(host);
-  if (version === 4) return host.split('.')[0] === '127';
-  if (version === 6) {
-    const words = parseReferenceIpv6Words(host);
-    if (!words) return false;
-    if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
-    const embedded = embeddedReferenceIpv4(words);
-    return embedded !== null && embedded.split('.')[0] === '127';
-  }
-  return false;
+  return isRestrictedNetworkAddress(host);
 }
 
 function detectImageMime(buf: Buffer, fileName = ''): 'image/png' | 'image/jpeg' | 'image/webp' | null {

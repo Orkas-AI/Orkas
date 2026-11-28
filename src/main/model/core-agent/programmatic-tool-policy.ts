@@ -1,5 +1,3 @@
-import { isIP } from 'node:net';
-
 import type {
   ProgrammaticToolAuthorization,
   ProgrammaticToolPolicy,
@@ -7,6 +5,7 @@ import type {
 } from '#core-agent';
 
 import { resolveVisibleConnectors } from '../../features/connectors/tools-adapter';
+import { isRestrictedNetworkAddress } from '../../util/restricted-network-address';
 import { getToolCatalogEntry } from './tool-catalog';
 
 export interface ProgrammaticToolPolicyOptions {
@@ -173,83 +172,5 @@ function stringArg(value: unknown): string {
 function isLocalOrPrivateHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
-  if (host === '::' || host === '::1') return true;
-
-  const version = isIP(host);
-  if (version === 6) {
-    const words = parseIpv6Words(host);
-    if (!words) return true;
-    const [w0, , , , , , w6, w7] = words;
-    if (words.every((w) => w === 0)) return true;
-    if (words.slice(0, 7).every((w) => w === 0) && w7 === 1) return true;
-    if ((w0 & 0xfe00) === 0xfc00 || (w0 & 0xffc0) === 0xfe80 || (w0 & 0xff00) === 0xff00) return true;
-
-    const embedded = embeddedIpv4Octets(words);
-    if (!embedded) return false;
-    return isLocalOrPrivateIpv4Prefix(embedded[0], embedded[1]);
-  }
-  if (version !== 4) return false;
-  const [first, second] = host.split('.').map(Number);
-  return isLocalOrPrivateIpv4Prefix(first, second);
-}
-
-function parseIpv6Words(host: string): number[] | null {
-  let normalized = host;
-  const lastColon = normalized.lastIndexOf(':');
-  if (lastColon >= 0 && normalized.includes('.', lastColon)) {
-    const ipv4Part = normalized.slice(lastColon + 1);
-    if (isIP(ipv4Part) !== 4) return null;
-    const [a, b, c, d] = ipv4Part.split('.').map(Number);
-    normalized = `${normalized.slice(0, lastColon + 1)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
-  }
-  const halves = normalized.split('::');
-  if (halves.length > 2) return null;
-  const head = halves[0] ? halves[0].split(':') : [];
-  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
-  const missing = 8 - head.length - tail.length;
-  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
-  const words = [...head, ...Array<string>(missing).fill('0'), ...tail].map((part) => (
-    /^[0-9a-f]{1,4}$/i.test(part) ? Number.parseInt(part, 16) : Number.NaN
-  ));
-  return words.every((w) => Number.isInteger(w) && w >= 0 && w <= 0xffff) ? words : null;
-}
-
-function embeddedIpv4Octets(words: readonly number[]): [number, number, number, number] | null {
-  const [w0, w1, w2, w3, w4, w5, w6, w7] = words;
-  const octets = (hi: number, lo: number): [number, number, number, number] => [
-    (hi >>> 8) & 0xff,
-    hi & 0xff,
-    (lo >>> 8) & 0xff,
-    lo & 0xff,
-  ];
-  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0xffff) {
-    return octets(w6, w7);
-  }
-  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0xffff && w5 === 0) {
-    return octets(w6, w7);
-  }
-  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0 && (w6 !== 0 || w7 > 1)) {
-    return octets(w6, w7);
-  }
-  if (w0 === 0x0064 && w1 === 0xff9b && ((w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0) || w2 === 1)) {
-    return octets(w6, w7);
-  }
-  if (w0 === 0x2002) {
-    return octets(w1, w2);
-  }
-  if (w0 === 0x2001 && w1 === 0x0000) {
-    return octets(w6 ^ 0xffff, w7 ^ 0xffff);
-  }
-  return null;
-}
-
-function isLocalOrPrivateIpv4Prefix(first: number, second: number): boolean {
-  return first === 0
-    || first === 10
-    || first === 127
-    || (first === 169 && second === 254)
-    || (first === 172 && second >= 16 && second <= 31)
-    || (first === 192 && second === 168)
-    || (first === 100 && second >= 64 && second <= 127)
-    || first >= 224;
+  return isRestrictedNetworkAddress(host);
 }
